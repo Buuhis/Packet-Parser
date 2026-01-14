@@ -15,11 +15,10 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 
-#include "packet_queue.h"
+#include "multiple_thread.h"
 
-#define MAX_PKT 65536
 #define MAX_WAN 10
-#define NUM_WORKER_THREADS 4
+#define NUM_TX_THREADS 4
 #define QUEUE_MAX_SIZE 1000
 
 typedef struct {
@@ -44,9 +43,17 @@ static volatile int running = 1;
 static pthread_mutex_t rr_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t seq_lock = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t seq_counter = 0;
-static thread_pool_t *worker_pool = NULL;
+
+// TX thread pool
+static tx_thread_pool_t *tx_pool = NULL;
+
+// RX reorder buffer
 static reorder_buffer_t *reorder_buf = NULL;
-static pthread_t timeout_check_tid;
+static pthread_t timeout_thread;
+
+// Statistics
+static uint64_t packets_tx = 0;
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void handle_signal(int sig) {
     (void)sig;
@@ -161,6 +168,7 @@ int init_sockets() {
     return 0;
 }
 
+// Callback for reorder buffer - send original packet to local interface
 void send_to_local(uint8_t *pkt, int len) {
     struct iphdr *ip = (struct iphdr *)pkt;
 
@@ -171,6 +179,7 @@ void send_to_local(uint8_t *pkt, int len) {
     sll.sll_halen = 6;
     memset(sll.sll_addr, 0xff, 6);
 
+    // Try to get destination MAC from ARP cache
     struct arpreq req;
     memset(&req, 0, sizeof(req));
     struct sockaddr_in *sin = (struct sockaddr_in *)&req.arp_pa;
@@ -189,9 +198,8 @@ void send_to_local(uint8_t *pkt, int len) {
     sendto(cfg.local_fd, pkt, len, 0, (struct sockaddr *)&sll, sizeof(sll));
 }
 
-void send_to_wan_callback(uint8_t *pkt, int len, int wan_idx, const uuid_t uuid) {
-    (void)uuid;
-
+// Callback for TX pool - send packet with seq header to WAN interface
+void send_to_wan(uint8_t *pkt, int len, int wan_idx) {
     if (wan_idx < 0 || wan_idx >= cfg.nwan) {
         fprintf(stderr, "Invalid WAN index: %d\n", wan_idx);
         return;
@@ -210,11 +218,15 @@ void send_to_wan_callback(uint8_t *pkt, int len, int wan_idx, const uuid_t uuid)
 
     if (sent < 0) {
         perror("sendto WAN");
+    } else {
+        pthread_mutex_lock(&stats_lock);
+        packets_tx++;
+        pthread_mutex_unlock(&stats_lock);
     }
 }
 
-// ===== Timeout check thread =====
-void *timeout_check_worker(void *arg) {
+// Timeout check thread for reorder buffer
+void *timeout_worker(void *arg) {
     (void)arg;
 
     while (running) {
@@ -230,6 +242,7 @@ void *timeout_check_worker(void *arg) {
 
 // ===== CAPTURE THREADS =====
 
+// Capture from local interface -> submit to TX queue -> round robin to WAN
 void *capture_local(void *arg) {
     (void)arg;
     uint8_t buf[MAX_PKT];
@@ -255,9 +268,9 @@ void *capture_local(void *arg) {
             continue;
         }
 
-        // Submit to thread pool (round robin will be done in worker)
-        if (thread_pool_submit(worker_pool, buf, n, 0) < 0) {
-            fprintf(stderr, "Failed to submit packet to pool\n");
+        // Submit to TX pool for round-robin forwarding to WAN
+        if (tx_pool_submit(tx_pool, buf, n) < 0) {
+            fprintf(stderr, "Failed to submit packet to TX pool\n");
         }
     }
 
@@ -265,6 +278,7 @@ void *capture_local(void *arg) {
     return NULL;
 }
 
+// Capture from WAN interface -> extract seq -> insert to reorder buffer -> send original to local
 void *capture_wan(void *arg) {
     wan_t *w = (wan_t *)arg;
     uint8_t buf[MAX_PKT];
@@ -280,62 +294,32 @@ void *capture_wan(void *arg) {
 
         struct iphdr *ip = (struct iphdr *)buf;
 
+        // Only handle UDP packets
         if (ip->protocol != IPPROTO_UDP) {
             continue;
         }
 
-        int ip_header_len = ip->ihl * 4;
-        if (n < ip_header_len + (int)sizeof(struct udphdr)) {
+        // Check if packet has seq header (at least SEQ_HEADER_SIZE bytes of payload)
+        if (n < SEQ_HEADER_SIZE) {
             continue;
         }
 
-        struct udphdr *udp = (struct udphdr *)(buf + ip_header_len);
+        // Extract sequence number from the beginning of packet
+        uint32_t seq_network;
+        memcpy(&seq_network, buf, SEQ_HEADER_SIZE);
+        uint32_t seq_num = ntohl(seq_network);
 
-        // Check if this is our wrapped packet (port 9999)
-        if (ntohs(udp->dest) != PACKET_UDP_PORT) {
-            // Normal UDP packet - forward directly to local
-            send_to_local(buf, n);
+        // Get original packet (after seq header)
+        uint8_t *original_pkt = buf + SEQ_HEADER_SIZE;
+        int original_len = n - SEQ_HEADER_SIZE;
+
+        if (original_len <= 0) {
             continue;
         }
 
-        // Extract payload (after IP+UDP headers)
-        uint8_t *payload = buf + ip_header_len + UDP_HEADER_SIZE;
-        int payload_len = n - ip_header_len - UDP_HEADER_SIZE;
-
-        if (payload_len < PACKET_WRAPPER_HEADER_SIZE) {
-            continue;
-        }
-
-        // Check magic number
-        uint16_t magic;
-        memcpy(&magic, payload, 2);
-        magic = ntohs(magic);
-
-        if (magic != PACKET_WRAPPER_MAGIC) {
-            // Not our packet, forward as-is
-            send_to_local(buf, n);
-            continue;
-        }
-
-        // Unwrap packet and extract sequence number
-        uuid_t uuid;
-        uint32_t seq_num;
-        uint8_t original_pkt[MAX_PKT];
-        int original_len = MAX_PKT;
-
-        if (unwrap_packet_from_wan(payload, payload_len,
-                                    uuid, &seq_num,
-                                    original_pkt, &original_len) == 0) {
-
-            printf("[WAN%d] Received packet: seq=%u, len=%d\n",
-                   wan_idx, seq_num, original_len);
-
-            // Insert into reorder buffer (will deliver in order)
-            if (reorder_buf) {
-                reorder_buffer_insert(reorder_buf, original_pkt, original_len, seq_num);
-            }
-        } else {
-            fprintf(stderr, "[WAN%d] Failed to unwrap packet\n", wan_idx);
+        // Insert into reorder buffer (will deliver in-order to local)
+        if (reorder_buf) {
+            reorder_buffer_insert(reorder_buf, original_pkt, original_len, seq_num);
         }
     }
 
@@ -354,6 +338,8 @@ int main(int argc, char **argv) {
 
     printf("==============================================\n");
     printf("  UDP Load Balancer (Round Robin + Reorder)\n");
+    printf("  TX: Local -> [Seq+Pkt] -> WAN (round robin)\n");
+    printf("  RX: WAN -> Extract Seq -> Reorder -> Local\n");
     printf("==============================================\n\n");
 
     printf("Loading configuration from %s\n", argv[1]);
@@ -368,6 +354,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // Create reorder buffer for RX
     printf("Creating reorder buffer for RX\n");
     reorder_buf = reorder_buffer_create(send_to_local);
     if (!reorder_buf) {
@@ -375,19 +362,21 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("Creating thread pool with %d workers\n", NUM_WORKER_THREADS);
-    worker_pool = thread_pool_create(NUM_WORKER_THREADS, QUEUE_MAX_SIZE,
-                                      send_to_wan_callback,
-                                      &rr_lock, &cfg.rr_idx, cfg.nwan,
-                                      &seq_counter, &seq_lock);
-    if (!worker_pool) {
-        fprintf(stderr, "Failed to create thread pool\n");
+    // Create TX pool (Local -> WAN)
+    printf("Creating TX thread pool with %d workers\n", NUM_TX_THREADS);
+    tx_pool = tx_pool_create(NUM_TX_THREADS, QUEUE_MAX_SIZE,
+                              send_to_wan,
+                              &rr_lock, &cfg.rr_idx, cfg.nwan,
+                              &seq_counter, &seq_lock);
+    if (!tx_pool) {
+        fprintf(stderr, "Failed to create TX thread pool\n");
+        reorder_buffer_destroy(reorder_buf);
         return 1;
     }
 
     // Start timeout check thread
-    if (pthread_create(&timeout_check_tid, NULL, timeout_check_worker, NULL) != 0) {
-        fprintf(stderr, "Failed to create timeout check thread\n");
+    if (pthread_create(&timeout_thread, NULL, timeout_worker, NULL) != 0) {
+        fprintf(stderr, "Failed to create timeout thread\n");
         return 1;
     }
 
@@ -405,38 +394,40 @@ int main(int argc, char **argv) {
     printf("  Load balancer started. Press Ctrl+C to stop.\n");
     printf("==============================================\n\n");
 
-    // Main loop - monitor queue and stats
+    // Main loop - monitor stats
     while (running) {
         sleep(1);
 
-        if (worker_pool && worker_pool->queue) {
-            int queue_size = packet_queue_size(worker_pool->queue);
-            if (queue_size > 0) {
-                printf("[STATUS] Queue size: %d packets, Seq counter: %u\n",
-                       queue_size, seq_counter);
-            }
-        }
+        pthread_mutex_lock(&stats_lock);
+        int tx_q = tx_pool ? packet_queue_size(tx_pool->queue) : 0;
+        printf("[STATS] TX: %lu (queue: %d) | Seq: %u\n",
+               packets_tx, tx_q, seq_counter);
+        pthread_mutex_unlock(&stats_lock);
     }
 
     printf("\nShutting down...\n");
 
-    // Wait for threads to finish
+    // Wait for capture threads to finish
     pthread_join(local_tid, NULL);
     for (int i = 0; i < cfg.nwan; i++) {
         pthread_join(wan_tid[i], NULL);
     }
-    pthread_join(timeout_check_tid, NULL);
+    pthread_join(timeout_thread, NULL);
 
     // Print statistics
+    printf("\n========== FINAL STATISTICS ==========\n");
+    printf("Total packets TX (Local->WAN): %lu\n", packets_tx);
+    printf("=======================================\n");
+
     if (reorder_buf) {
         reorder_buffer_print_stats(reorder_buf);
         reorder_buffer_destroy(reorder_buf);
     }
 
     // Cleanup
-    if (worker_pool) {
-        thread_pool_shutdown(worker_pool);
-        thread_pool_destroy(worker_pool);
+    if (tx_pool) {
+        tx_pool_shutdown(tx_pool);
+        tx_pool_destroy(tx_pool);
     }
 
     if (cfg.local_fd >= 0) {

@@ -1,4 +1,4 @@
-# UDP Load Balancer - Round Robin + Reorder
+# UDP Load Balancer - Simple Round Robin
 # Makefile
 
 CC = gcc
@@ -8,6 +8,7 @@ LDFLAGS = -pthread
 TARGET = udp_lb
 SRCS = main.c multiple_thread.c
 OBJS = $(SRCS:.c=.o)
+HEADER = multiple_thread.h
 
 .PHONY: all clean run
 
@@ -16,14 +17,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
-%.o: %.c packet_queue.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-# Note: packet_queue.h is the header file (multiple_thread.h)
-main.o: main.c packet_queue.h
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-multiple_thread.o: multiple_thread.c packet_queue.h
+%.o: %.c $(HEADER)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
