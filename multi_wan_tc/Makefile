@@ -7,6 +7,8 @@ SRC := \
   src/main.c \
   src/app_context.c \
   src/config/config_parser.c \
+  src/system/sysctl.c \
+  src/system/routing.c \
   src/utils/logger.c
 
 OBJ := $(SRC:.c=.o)

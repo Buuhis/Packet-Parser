@@ -1,5 +1,6 @@
 #include "app_context.h"
 #include "utils/logger.h"
+#include "system/system.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -48,6 +49,19 @@ int main(int argc, char **argv) {
 
     app_context_t ctx;
     if (app_context_init(&ctx, config_path) != 0) {
+        return 1;
+    }
+
+    if (system_enable_ip_forward() != 0) {
+        log_error("Failed to enable IP forwarding");
+        return 1;
+    }
+
+    if (system_add_route_dev(ctx.cfg.remote_cidr,
+                             ctx.cfg.local_if) != 0) {
+        log_error("Failed to add route for %s via %s",
+                  ctx.cfg.remote_cidr,
+                  ctx.cfg.local_if);
         return 1;
     }
 
