@@ -81,6 +81,19 @@ int main(int argc, char **argv) {
         }
     }    
 
+    /* Clean old filters (safe) */
+    tc_del_filters(ctx.cfg.local_if);
+
+    /* Redirect all remote traffic to WAN0 → class 1:10 */
+    if (tc_add_redirect_filter(ctx.cfg.local_if,
+                               ctx.cfg.remote_cidr,
+                               10,                      /* class 1:10 */
+                               ctx.cfg.wans[0].ifname)  /* wan0 */
+        != 0) {
+        log_error("Failed to add redirect filter to WAN0");
+        return 1;
+    }
+
     app_context_dump(&ctx);
     return 0;
 }

@@ -28,8 +28,20 @@ int tc_add_root_qdisc(const char *ifname)
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-             "tc qdisc add dev %s root handle 1: prio",
-             ifname);
+    "tc qdisc del dev %s root 2>/dev/null", ifname);
+    system(cmd);
+
+    snprintf(cmd, sizeof(cmd),
+        "tc qdisc add dev %s root handle 1: htb default 10",
+        ifname);
+
+    if (run_tc(cmd) != 0) {
+        return -1;
+    }
+
+    snprintf(cmd, sizeof(cmd),
+        "tc class add dev %s parent 1: classid 1:1 htb rate 1000mbit ceil 1000mbit",
+        ifname);
 
     return run_tc(cmd);
 }

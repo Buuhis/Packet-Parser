@@ -11,6 +11,7 @@ SRC := \
   src/system/routing.c \
   src/tc/tc_init.c \
   src/tc/tc_class.c \
+  src/tc/tc_filter \
   src/utils/logger.c
 
 OBJ := $(SRC:.c=.o)

@@ -16,5 +16,13 @@ int tc_del_class(const char *ifname,
                  int parent_major,
                  int class_minor);
 
+/* Filter + redirect */
+int tc_add_redirect_filter(const char *ifname,
+                           const char *dst_cidr,
+                           int class_minor,
+                           const char *out_ifname);
+
+int tc_del_filters(const char *ifname);
+
 #endif /* TC_H */
 

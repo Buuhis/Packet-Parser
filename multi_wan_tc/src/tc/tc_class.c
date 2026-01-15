@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 202405L
 
 #include "tc.h"
 #include "../utils/logger.h"
@@ -28,7 +28,7 @@ int tc_add_class(const char *ifname,
 
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-        "tc class add dev %s parent %d: classid %d:%d htb rate 1000mbit ceil 1000mbit",
+        "tc class add dev %s parent %d:1 classid %d:%d htb rate 1000mbit ceil 1000mbit",
         ifname,
         parent_major,
         parent_major,
