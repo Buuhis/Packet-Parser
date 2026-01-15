@@ -9,6 +9,7 @@ SRC := \
   src/config/config_parser.c \
   src/system/sysctl.c \
   src/system/routing.c \
+  src/tc/tc_init.c \
   src/utils/logger.c
 
 OBJ := $(SRC:.c=.o)

@@ -1,6 +1,7 @@
 #include "app_context.h"
 #include "utils/logger.h"
 #include "system/system.h"
+#include "tc/tc.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -61,6 +62,12 @@ int main(int argc, char **argv) {
                              ctx.cfg.local_if) != 0) {
         log_error("Failed to add route for %s via %s",
                   ctx.cfg.remote_cidr,
+                  ctx.cfg.local_if);
+        return 1;
+    }
+
+    if (tc_add_root_qdisc(ctx.cfg.local_if) != 0) {
+        log_error("Failed to attach TC root qdisc on %s",
                   ctx.cfg.local_if);
         return 1;
     }

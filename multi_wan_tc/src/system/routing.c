@@ -34,7 +34,7 @@ int system_add_route_dev(const char *cidr, const char *ifname)
         log_error("system_add_route_dev: invalid args");
         return -1;
     }
-    return run_ip_route("add", cidr, ifname);
+    return run_ip_route("replace", cidr, ifname);
 }
 
 int system_del_route_dev(const char *cidr, const char *ifname)
