@@ -10,6 +10,7 @@ SRC := \
   src/system/sysctl.c \
   src/system/routing.c \
   src/tc/tc_init.c \
+  src/tc/tc_class.c \
   src/utils/logger.c
 
 OBJ := $(SRC:.c=.o)

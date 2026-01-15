@@ -72,6 +72,15 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
+        int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
+        if (tc_add_class(ctx.cfg.local_if, 1, class_minor) != 0) {
+            log_error("Failed to add TC class %d:%d",
+                      1, class_minor);
+            return 1;
+        }
+    }    
+
     app_context_dump(&ctx);
     return 0;
 }

@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 202405L
 
 #include "config_parser.h"
 #include "../utils/logger.h"
