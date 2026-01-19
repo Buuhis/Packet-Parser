@@ -34,7 +34,6 @@ SRC_MAIN := \
 	$(SRC_DIR)/tc/tc_init.c \
 	$(SRC_DIR)/tc/tc_class.c \
 	$(SRC_DIR)/tc/tc_filter.c \
-	$(SRC_DIR)/tc/tc_cleanup.c \
 	$(SRC_DIR)/utils/logger.c
 
 OBJ_MAIN := $(SRC_MAIN:%.c=$(BUILD_DIR)/%.o)
