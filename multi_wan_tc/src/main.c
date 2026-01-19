@@ -1,27 +1,44 @@
 #include "app_context.h"
-#include "utils/logger.h"
 #include "system/system.h"
 #include "tc/tc.h"
+#include "utils/logger.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+/* ---------- global state ---------- */
 
-static void usage(const char *prog) {
-    fprintf(stderr,
-        "Usage:\n"
-        "  %s --config <path> --dump-config\n"
-        "\n"
-        "Step 1 only: parse config and print it. No kernel networking changes.\n",
-        prog
-    );
+static volatile int running = 1;
+static app_context_t *g_ctx = NULL;
+
+/* ---------- signal handler ---------- */
+
+static void handle_signal(int sig)
+{
+    (void)sig;
+    running = 0;
 }
 
-int main(int argc, char **argv) {
+/* ---------- usage ---------- */
+
+static void usage(const char *prog)
+{
+    fprintf(stderr,
+        "Usage: %s --config <file> [--dump-config]\n", prog);
+}
+
+/* ---------- main ---------- */
+
+int main(int argc, char **argv)
+{
     const char *config_path = NULL;
     int dump = 0;
 
     log_set_level(LOG_INFO);
 
+    /* ---- parse args ---- */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0) {
             if (i + 1 >= argc) {
@@ -31,33 +48,43 @@ int main(int argc, char **argv) {
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--dump-config") == 0) {
             dump = 1;
-        } else if (strcmp(argv[i], "--debug") == 0) {
-            log_set_level(LOG_DEBUG);
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
         } else {
-            log_warn("Unknown arg: %s", argv[i]);
+            log_error("Unknown argument: %s", argv[i]);
             usage(argv[0]);
             return 2;
         }
     }
 
-    if (!config_path || !dump) {
+    if (!config_path) {
         usage(argv[0]);
         return 2;
     }
 
+    /* ---- load config ---- */
     app_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+
     if (app_context_init(&ctx, config_path) != 0) {
+        log_error("Failed to load config");
         return 1;
     }
 
+    if (dump) {
+        app_context_dump(&ctx);
+    }
+
+    g_ctx = &ctx;
+
+    /* ---- STEP 2: enable ip_forward ---- */
     if (system_enable_ip_forward() != 0) {
         log_error("Failed to enable IP forwarding");
         return 1;
     }
 
+    /* ---- STEP 3: force routing into TC ---- */
     if (system_add_route_dev(ctx.cfg.remote_cidr,
                              ctx.cfg.local_if) != 0) {
         log_error("Failed to add route for %s via %s",
@@ -66,34 +93,60 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    /* ---- STEP 4: TC root qdisc + root class ---- */
     if (tc_add_root_qdisc(ctx.cfg.local_if) != 0) {
         log_error("Failed to attach TC root qdisc on %s",
                   ctx.cfg.local_if);
-        return 1;
+        goto cleanup_route;
     }
 
+    /* ---- STEP 5: create WAN classes ---- */
     for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
         int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
         if (tc_add_class(ctx.cfg.local_if, 1, class_minor) != 0) {
             log_error("Failed to add TC class %d:%d",
                       1, class_minor);
-            return 1;
+            goto cleanup_tc;
         }
-    }    
+    }
 
-    /* Clean old filters (safe) */
+    /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
     tc_del_filters(ctx.cfg.local_if);
 
-    /* Redirect all remote traffic to WAN0 → class 1:10 */
     if (tc_add_redirect_filter(ctx.cfg.local_if,
                                ctx.cfg.remote_cidr,
                                10,                      /* class 1:10 */
-                               ctx.cfg.wans[0].ifname)  /* wan0 */
+                               ctx.cfg.wans[0].ifname)  /* WAN0 */
         != 0) {
-        log_error("Failed to add redirect filter to WAN0");
-        return 1;
+        log_error("Failed to add redirect filter");
+        goto cleanup_tc;
     }
 
-    app_context_dump(&ctx);
+    /* ---- install signal handlers ---- */
+    signal(SIGINT, handle_signal);
+    signal(SIGTERM, handle_signal);
+
+    log_info("Press Ctrl+C to stop.");
+
+    /* ---- RUN LOOP (control-plane placeholder) ---- */
+    while (running) {
+        sleep(1);
+    }
+
+    log_info("Cleaning up...");
+
+    /* ---------- CLEANUP (FAIL-OPEN) ---------- */
+
+cleanup_tc:
+    tc_del_filters(ctx.cfg.local_if);
+    tc_del_root_qdisc(ctx.cfg.local_if);
+
+cleanup_route:
+    system_del_route_dev(ctx.cfg.remote_cidr,
+                         ctx.cfg.local_if);
+
+    log_info("Cleanup done.");
+
     return 0;
 }
+
