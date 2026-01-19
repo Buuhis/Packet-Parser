@@ -24,5 +24,8 @@ int tc_add_redirect_filter(const char *ifname,
 
 int tc_del_filters(const char *ifname);
 
+int tc_ingress_redirect(const char *src_if, const char *dst_if);
+int tc_ingress_cleanup(const char *src_if);
+
 #endif /* TC_H */
 

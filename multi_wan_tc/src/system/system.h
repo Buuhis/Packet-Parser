@@ -20,6 +20,9 @@ int system_add_route_dev(const char *cidr, const char *ifname);
 /* Delete route: <cidr> dev <ifname> */
 int system_del_route_dev(const char *cidr, const char *ifname);
 
+int netdev_create_veth_pair(const char *if_in, const char *if_out, int mtu);
+int netdev_delete(const char *ifname);
+int netdev_set_up(const char *ifname);
 
 #endif /* SYSTEM_H */
 

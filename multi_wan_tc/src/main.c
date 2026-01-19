@@ -93,17 +93,37 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* ---- STEP 4: TC root qdisc + root class ---- */
-    if (tc_add_root_qdisc(ctx.cfg.local_if) != 0) {
-        log_error("Failed to attach TC root qdisc on %s",
-                  ctx.cfg.local_if);
+    /* ===================================================== */
+    /* ==== STEP 3.5: 7A-A1 – create veth for userspace ==== */
+    /* ===================================================== */
+
+    const char *veth_in  = "veth_tx_in";
+    const char *veth_out = "veth_tx_out";
+
+    if (netdev_create_veth_pair(veth_in, veth_out, 1500) != 0) {
+        log_error("Failed to create veth pair");
         goto cleanup_route;
+    }
+
+    /* ===================================================== */
+    /* ==== STEP 3.6: 7A-A2 – TC ingress → veth_tx_in ====== */
+    /* ===================================================== */
+
+    if (tc_ingress_redirect(ctx.cfg.local_if, veth_in) != 0) {
+        log_error("Failed to redirect ingress traffic to %s", veth_in);
+        goto cleanup_veth;
+    }
+
+    /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
+    if (tc_add_root_qdisc(veth_in) != 0) {
+        log_error("Failed to attach TC root qdisc on %s", veth_in);
+        goto cleanup_tc_ingress;
     }
 
     /* ---- STEP 5: create WAN classes ---- */
     for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
         int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
-        if (tc_add_class(ctx.cfg.local_if, 1, class_minor) != 0) {
+        if (tc_add_class(veth_in, 1, class_minor) != 0) {
             log_error("Failed to add TC class %d:%d",
                       1, class_minor);
             goto cleanup_tc;
@@ -111,9 +131,9 @@ int main(int argc, char **argv)
     }
 
     /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
-    tc_del_filters(ctx.cfg.local_if);
+    tc_del_filters(veth_in);
 
-    if (tc_add_redirect_filter(ctx.cfg.local_if,
+    if (tc_add_redirect_filter(veth_in,
                                ctx.cfg.remote_cidr,
                                10,                      /* class 1:10 */
                                ctx.cfg.wans[0].ifname)  /* WAN0 */
@@ -136,10 +156,15 @@ int main(int argc, char **argv)
     log_info("Cleaning up...");
 
     /* ---------- CLEANUP (FAIL-OPEN) ---------- */
+cleanup_tc_ingress:
+    tc_ingress_cleanup(ctx.cfg.local_if);
+
+cleanup_veth:
+    netdev_delete(veth_in);
 
 cleanup_tc:
-    tc_del_filters(ctx.cfg.local_if);
-    tc_del_root_qdisc(ctx.cfg.local_if);
+    tc_del_filters(veth_in);
+    tc_del_root_qdisc(veth_in);
 
 cleanup_route:
     system_del_route_dev(ctx.cfg.remote_cidr,
