@@ -53,7 +53,9 @@ int tc_del_class(const char *ifname,
     );
 
     log_info("EXEC: %s", cmd);
-    system(cmd);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error executing command %s\n", cmd);
+    }
     return 0;
 }
 

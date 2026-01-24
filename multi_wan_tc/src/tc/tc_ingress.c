@@ -27,7 +27,7 @@ int tc_ingress_redirect(const char *src_if, const char *dst_if)
         "protocol ip "
         "prio 10 "
         "flower "
-        "action mirred ingress redirect dev %s",
+        "action mirred egress redirect dev %s",
         src_if, dst_if);
 
     if (system(cmd) != 0) {

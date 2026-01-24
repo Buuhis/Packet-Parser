@@ -1,4 +1,4 @@
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE 202405L
 
 #include "tc.h"
 #include "../utils/logger.h"
@@ -25,7 +25,9 @@ int tc_del_filters(const char *ifname)
              "tc filter del dev %s parent 1:",
              ifname);
     log_info("EXEC: %s", cmd);
-    system(cmd);
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error executing command %s\n", cmd);
+    }
     return 0;
 }
 

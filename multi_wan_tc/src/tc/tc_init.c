@@ -29,7 +29,10 @@ int tc_add_root_qdisc(const char *ifname)
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
     "tc qdisc del dev %s root 2>/dev/null", ifname);
-    system(cmd);
+
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error executing command %s\n", cmd);
+    }
 
     snprintf(cmd, sizeof(cmd),
         "tc qdisc add dev %s root handle 1: htb default 10",
@@ -60,7 +63,10 @@ int tc_del_root_qdisc(const char *ifname)
 
     /* delete may fail if not exists → treat as OK */
     log_info("EXEC: %s", cmd);
-    system(cmd);
+    
+    if (system(cmd) != 0) {
+        fprintf(stderr, "Error executing command %s\n", cmd);
+    }
     return 0;
 }
 

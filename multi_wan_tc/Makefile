@@ -15,6 +15,8 @@ SRC := \
     src/tc/tc_class.c \
     src/tc/tc_filter.c \
     src/tc/tc_ingress.c \
+	src/tc/tc_egress.c \
+	src/userio/afpkt.c \
     src/utils/logger.c
 
 OBJ := $(SRC:.c=.o)

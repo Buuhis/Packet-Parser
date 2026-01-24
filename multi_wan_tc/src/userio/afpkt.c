@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/mman.h>
 #include <sys/poll.h>
+#include <arpa/inet.h>
 
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
@@ -131,11 +132,57 @@ int afpkt_poll_and_count(int fd)
             (g_ctx.frame_idx + 1) % g_ctx.frame_nr;
     }
 
-    if (pkt_cnt && (pkt_cnt % 1000 == 0)) {
+    if (pkt_cnt && (pkt_cnt % 10 == 0)) {
         log_info("AF_PACKET RX packets=%lu", pkt_cnt);
     }
 
     return pkt_cnt;
+}
+
+int afpkt_poll_and_forward(int fd)
+{
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLIN,
+    };
+
+    static unsigned long pkt_cnt = 0;
+
+    int ret = poll(&pfd, 1, 1000);
+    if (ret <= 0)
+        return 0;
+
+    while (1) {
+        struct tpacket_hdr *hdr =
+            (struct tpacket_hdr *)((char *)g_ctx.ring + (g_ctx.frame_idx * RX_FRAME_SIZE));
+
+        if (!(hdr->tp_status & TP_STATUS_USER))
+            break;
+
+        /* L2 frame start */
+        unsigned char *frame = (unsigned char *)hdr + hdr->tp_mac;
+        unsigned int  len    = hdr->tp_len;   /* includes Ethernet header */
+
+        /* PASS-THROUGH: send the frame back out via the same interface (veth_tx_out) */
+        ssize_t n = send(fd, frame, len, 0);
+        if (n < 0) {
+            /* vẫn release frame để không kẹt ring */
+            // log_error("send() failed: %s", strerror(errno));
+        } else {
+            pkt_cnt++;
+        }
+
+        /* mark frame as free */
+        hdr->tp_status = TP_STATUS_KERNEL;
+        g_ctx.frame_idx =
+            (g_ctx.frame_idx + 1) % g_ctx.frame_nr;
+    }
+
+    if (pkt_cnt && (pkt_cnt % 10 == 0)) {
+        log_info("AF_PACKET FWD packets=%lu", pkt_cnt);
+    }
+
+    return (int)pkt_cnt;
 }
 
 /* -------------------------------------------------- */
