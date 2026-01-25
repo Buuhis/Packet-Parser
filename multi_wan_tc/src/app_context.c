@@ -48,6 +48,15 @@ int app_context_init(app_context_t *ctx,
         return -1;
     }
 
+    /* Log WAN configuration for debugging */
+    for (size_t i = 0; i < ctx->cfg.wan_count; i++) {
+        log_info("WAN[%zu]: ifname=%s, dst_mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                 i, ctx->cfg.wans[i].ifname,
+                 ctx->cfg.wans[i].dst_mac[0], ctx->cfg.wans[i].dst_mac[1],
+                 ctx->cfg.wans[i].dst_mac[2], ctx->cfg.wans[i].dst_mac[3],
+                 ctx->cfg.wans[i].dst_mac[4], ctx->cfg.wans[i].dst_mac[5]);
+    }
+
     return 0;
 }
 

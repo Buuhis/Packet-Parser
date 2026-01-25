@@ -6,19 +6,31 @@
 #include <stdlib.h>
 #include <ctype.h>
 
-static int parse_mac(const char *s, unsigned char mac[6])
+static int parse_mac(const char *mac_str, unsigned char mac_bytes[6])
 {
-    return sscanf(s, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                  &mac[0], &mac[1], &mac[2],
-                  &mac[3], &mac[4], &mac[5]) == 6 ? 0 : -1;
+    int result = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+                        &mac_bytes[0], &mac_bytes[1], &mac_bytes[2],
+                        &mac_bytes[3], &mac_bytes[4], &mac_bytes[5]);
+    return (result == 6) ? 0 : -1;
 }
 
-static char *trim(char *s)
+static char *trim_whitespace(char *str)
 {
-    while (isspace(*s)) s++;
-    char *e = s + strlen(s) - 1;
-    while (e > s && isspace(*e)) *e-- = 0;
-    return s;
+    if (str == NULL) return NULL;
+
+    // Remove the leading whitespace
+    while (isspace((unsigned char)*str)) str++;
+
+    if (*str == 0) return str;
+
+    // Remove the tail whitespace
+    char *end_ptr = str + strlen(str) - 1;
+    while (end_ptr > str && isspace((unsigned char)*end_ptr)) {
+        *end_ptr = '\0';
+        end_ptr--;
+    }
+
+    return str;
 }
 
 int config_load_env(const char *path,
@@ -37,7 +49,7 @@ int config_load_env(const char *path,
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
-        char *s = trim(line);
+        char *s = trim_whitespace(line);
         if (*s == '#' || *s == '\0')
             continue;
 
@@ -46,8 +58,8 @@ int config_load_env(const char *path,
             continue;
 
         *eq = 0;
-        char *key = trim(s);
-        char *val = trim(eq + 1);
+        char *key = trim_whitespace(s);
+        char *val = trim_whitespace(eq + 1);
 
         if (strncmp(key, prefix, strlen(prefix)) != 0)
             continue;
@@ -99,8 +111,16 @@ int config_load_env(const char *path,
                     strncpy(w->gateway, val, sizeof(w->gateway)-1);
                 else if (!strcmp(field, "WEIGHT"))
                     w->weight = atoi(val);
-                else if (!strcmp(field, "DST_MAC"))
-                    parse_mac(val, w->dst_mac);
+                else if (!strcmp(field, "DST_MAC")) {
+                    if (parse_mac(val, w->dst_mac) != 0) {
+                        log_error("Failed to parse DST_MAC for WAN[%d]: '%s'", idx, val);
+                        // Có thể set default hoặc return error
+                    } else {
+                        log_debug("WAN[%d] DST_MAC = %02x:%02x:%02x:%02x:%02x:%02x",
+                                  idx, w->dst_mac[0], w->dst_mac[1], w->dst_mac[2],
+                                  w->dst_mac[3], w->dst_mac[4], w->dst_mac[5]);
+                    }
+                }
             }
         }
     }
@@ -122,12 +142,12 @@ int config_load_env(const char *path,
 // #include <string.h>
 // #include <stdlib.h>
 
-// static char *trim_left(char *s) {
+// static char *trim_whitespace_left(char *s) {
 //     while (*s && isspace((unsigned char)*s)) s++;
 //     return s;
 // }
 
-// static void trim_right_inplace(char *s) {
+// static void trim_whitespace_right_inplace(char *s) {
 //     size_t n = strlen(s);
 //     while (n > 0 && isspace((unsigned char)s[n - 1])) {
 //         s[n - 1] = '\0';
@@ -208,8 +228,8 @@ int config_load_env(const char *path,
 //     while (fgets(line, sizeof(line), fp)) {
 //         lineno++;
 
-//         trim_right_inplace(line);
-//         char *p = trim_left(line);
+//         trim_whitespace_right_inplace(line);
+//         char *p = trim_whitespace_left(line);
 
 //         if (is_ignorable_line(p)) continue;
 

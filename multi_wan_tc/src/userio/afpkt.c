@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "userio/afpkt.h"
 #include "utils/logger.h"
+#include "system/system.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -139,7 +140,7 @@ int afpkt_poll_and_count(int fd)
     return pkt_cnt;
 }
 
-int afpkt_poll_and_forward(int fd)
+int afpkt_poll_and_forward(int fd, const app_context_t *ctx)
 {
     struct pollfd pfd = {
         .fd = fd,
@@ -162,6 +163,52 @@ int afpkt_poll_and_forward(int fd)
         /* L2 frame start */
         unsigned char *frame = (unsigned char *)hdr + hdr->tp_mac;
         unsigned int  len    = hdr->tp_len;   /* includes Ethernet header */
+        struct ethhdr *eth = (struct ethhdr *)frame;
+
+        /* 7A-A5: tạm chọn WAN0 */
+        int selected_wan = 0;
+
+        unsigned char src_mac[6];
+        if (system_get_if_hwaddr(ctx->cfg.wans[selected_wan].ifname, src_mac) != 0) {
+            log_error("Failed to get MAC for WAN[%d] interface '%s', dropping packet",
+                        selected_wan, ctx->cfg.wans[selected_wan].ifname);
+            hdr->tp_status = TP_STATUS_KERNEL;
+            g_ctx.frame_idx = (g_ctx.frame_idx + 1) % g_ctx.frame_nr;
+            continue;
+        }
+
+        /* Validate dst_mac */
+        int is_valid_mac = 0;
+        for (int i = 0; i < 6; i++) {
+            if (ctx->cfg.wans[selected_wan].dst_mac[i] != 0) {
+                is_valid_mac = 1;
+                break;
+            }
+        }
+
+        if (!is_valid_mac) {
+            log_error("Invalid dst_mac for WAN[%d] - all zeros, dropping packet",
+                            selected_wan);
+            hdr->tp_status = TP_STATUS_KERNEL;
+            g_ctx.frame_idx = (g_ctx.frame_idx + 1) % g_ctx.frame_nr;
+            continue;
+        }
+
+        /* dst_mac lấy từ config.env */  
+        memcpy(eth->h_dest, ctx->cfg.wans[selected_wan].dst_mac, 6);
+        log_debug("Setting dst_mac = %02x:%02x:%02x:%02x:%02x:%02x",
+          eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+          eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+        
+        /* src_mac lấy runtime từ wan interface */
+        memcpy(eth->h_source, src_mac, 6);
+
+        log_debug("Forwarding packet: src_mac=%02x:%02x:%02x:%02x:%02x:%02x, "
+          "dst_mac=%02x:%02x:%02x:%02x:%02x:%02x",
+          eth->h_source[0], eth->h_source[1], eth->h_source[2],
+          eth->h_source[3], eth->h_source[4], eth->h_source[5],
+          eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
+          eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
 
         /* PASS-THROUGH: send the frame back out via the same interface (veth_tx_out) */
         ssize_t n = send(fd, frame, len, 0);

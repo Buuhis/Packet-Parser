@@ -1,5 +1,5 @@
 CC      := gcc
-CFLAGS  := -O2 -Wall -Wextra -std=c11 -Isrc
+CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc
 LDFLAGS :=
 
 BIN := mwanc

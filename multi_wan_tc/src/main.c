@@ -169,7 +169,7 @@ int main(int argc, char **argv)
 
     /* ---- RUN LOOP (control-plane placeholder) ---- */
     while (running) {
-        afpkt_poll_and_forward(rx_fd);
+        afpkt_poll_and_forward(rx_fd, &ctx);
     }
 
     log_info("Cleaning up...");

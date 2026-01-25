@@ -1,6 +1,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
 
 #include "system.h"
 #include "../utils/logger.h"
@@ -70,3 +76,25 @@ int netdev_set_up(const char *ifname)
     return system(cmd);
 }
 
+int system_get_if_hwaddr(const char *ifname, unsigned char mac[6])
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        log_error("socket(AF_INET) failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) != 0) {
+        log_error("ioctl(SIOCGIFHWADDR, %s) failed: %s", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+
+    memcpy(mac, (unsigned char *)ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
+    return 0;
+}
