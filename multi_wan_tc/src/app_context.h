@@ -1,18 +1,3 @@
-// #ifndef APP_CONTEXT_H
-// #define APP_CONTEXT_H
-
-// #include "config/config_parser.h"
-
-// typedef struct {
-//     app_cfg_t cfg;
-// } app_context_t;
-
-// int app_context_init(app_context_t *ctx, const char *config_path);
-// void app_context_dump(const app_context_t *ctx);
-
-// #endif /* APP_CONTEXT_H */ 
-
-
 #ifndef APP_CONTEXT_H
 #define APP_CONTEXT_H
 
@@ -25,6 +10,7 @@ typedef struct {
     char ip[32];
     char gw[32];
     unsigned char dst_mac[6];
+    unsigned char src_mac[6];   /* NEW: MAC of local_if (cached) */
 } lan_cfg_t;
 
 typedef struct {
@@ -33,6 +19,7 @@ typedef struct {
     char gateway[32];
     int  weight;
     unsigned char dst_mac[6];
+    unsigned char src_mac[6];   /* NEW: MAC of wan if (cached) */
 } wan_cfg_t;
 
 typedef struct {
@@ -41,6 +28,7 @@ typedef struct {
     char gateway[32];
     int  weight;
     unsigned char dst_mac[6];
+    unsigned char src_mac[6];   /* NEW: optional cache */
 } ne_tunnel_cfg_t;
 
 typedef struct {
@@ -79,4 +67,3 @@ int app_context_init(app_context_t *ctx,
 void app_context_dump(const app_context_t *ctx);
 
 #endif
-
