@@ -10,6 +10,8 @@
 #include <net/if.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <netpacket/packet.h>
+
 
 static int bind_if(int fd, const char *ifname)
 {
@@ -133,6 +135,77 @@ int afpkt_rx_poll_count(afpkt_rx_ctx_t *rx)
 
     if (pkt_cnt && (pkt_cnt % 1000 == 0)) {
         log_info("RX-2 AF_PACKET captured packets=%lu", pkt_cnt);
+    }
+
+    return got;
+}
+
+
+int afpkt_rx_poll_forward_local(afpkt_rx_ctx_t *rx,
+                                int tx_fd,
+                                unsigned int local_ifindex,
+                                const unsigned char local_src_mac[6],
+                                const unsigned char lan_dst_mac[6])
+{
+    struct pollfd pfd = { .fd = rx->fd, .events = POLLIN };
+    static unsigned long fwd_cnt = 0;
+
+    int ret = poll(&pfd, 1, 1000);
+    if (ret <= 0)
+        return 0;
+
+    int got = 0;
+
+    /* sockaddr_ll for TX to local_if */
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family   = AF_PACKET;
+    sll.sll_protocol = htons(ETH_P_ALL);
+    sll.sll_ifindex  = (int)local_ifindex;
+    sll.sll_halen    = 6;
+    memcpy(sll.sll_addr, lan_dst_mac, 6);
+
+    while (1) {
+        struct tpacket_hdr *hdr =
+            (struct tpacket_hdr *)((char *)rx->ring + (rx->frame_idx * rx->frame_size));
+
+        if (!(hdr->tp_status & TP_STATUS_USER))
+            break;
+
+        unsigned char *frame = (unsigned char *)hdr + hdr->tp_mac;
+        unsigned int  len    = hdr->tp_len;
+
+        if (len < sizeof(struct ethhdr)) {
+            /* bad frame, drop */
+            hdr->tp_status = TP_STATUS_KERNEL;
+            rx->frame_idx = (rx->frame_idx + 1) % rx->frame_nr;
+            continue;
+        }
+
+        struct ethhdr *eth = (struct ethhdr *)frame;
+
+        /* RX-4: rewrite MAC for LAN delivery */
+        memcpy(eth->h_source, local_src_mac, 6);
+        memcpy(eth->h_dest,   lan_dst_mac,   6);
+
+        /* RX-3: send out local_if */
+        ssize_t n = sendto(tx_fd, frame, len, 0,
+                           (struct sockaddr *)&sll, sizeof(sll));
+
+        if (n < 0) {
+            log_error("RX sendto(local_if) failed: %s", strerror(errno));
+        } else {
+            fwd_cnt++;
+            got++;
+        }
+
+        /* free ring frame */
+        hdr->tp_status = TP_STATUS_KERNEL;
+        rx->frame_idx = (rx->frame_idx + 1) % rx->frame_nr;
+    }
+
+    if (fwd_cnt && (fwd_cnt % 1000 == 0)) {
+        log_info("RX-3/4 forwarded packets=%lu", fwd_cnt);
     }
 
     return got;

@@ -29,5 +29,12 @@ void afpkt_rx_close(afpkt_rx_ctx_t *rx);
 /* poll + count packets; returns number of forwarded/handled packets in this poll */
 int afpkt_rx_poll_count(afpkt_rx_ctx_t *rx);
 
+/* RX-3 & RX-4: rewrite MAC then send out local_if */
+int afpkt_rx_poll_forward_local(afpkt_rx_ctx_t *rx,
+                                int tx_fd,
+                                unsigned int local_ifindex,
+                                const unsigned char local_src_mac[6],
+                                const unsigned char lan_dst_mac[6]);
+
 #endif /* MWANC_USERIO_AFPKT_H */
 

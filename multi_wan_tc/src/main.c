@@ -178,6 +178,25 @@ int main(int argc, char **argv)
     }
 
     log_info("RX-2 running: capturing packets on %s (Ctrl+C to stop)", veth_rx_in);
+
+    unsigned char local_src_mac[6];
+    if (system_get_if_hwaddr(ctx.cfg.local_if, local_src_mac) != 0) {
+        log_error("Failed to get local_if MAC for %s", ctx.cfg.local_if);
+        return 1;
+    }
+
+    unsigned int local_ifindex = if_nametoindex(ctx.cfg.local_if);
+    if (local_ifindex == 0) {
+        log_error("if_nametoindex(local_if=%s) failed", ctx.cfg.local_if);
+        return 1;
+    }
+
+    int tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (tx_fd < 0) {
+        log_error("socket(AF_PACKET TX) failed: %s", strerror(errno));
+        return 1;
+    }
+
     /* ==================================== */
 
     rx_fd = afpkt_open_rx("veth_tx_out");
@@ -203,13 +222,18 @@ int main(int argc, char **argv)
     while (running) {
         afpkt_poll_and_forward(rx_fd, &ctx);
 
-        afpkt_rx_poll_count(&rx);
+        afpkt_rx_poll_forward_local(&rx,
+                                    tx_fd,
+                                    local_ifindex,
+                                    local_src_mac,
+                                    ctx.cfg.lan.dst_mac);
     }
 
     log_info("Cleaning up...");
 
     afpkt_rx_close(&rx);
     tc_rx_cleanup(wan_if);
+    close(tx_fd);
 
     /* ---------- CLEANUP (FAIL-OPEN) ---------- */
 cleanup_tc_egress:
@@ -222,9 +246,9 @@ cleanup_tc_ingress:
 cleanup_veth:
     netdev_delete(veth_in);
 
-cleanup_tc:
-    tc_del_filters(veth_in);
-    tc_del_root_qdisc(veth_in);
+// cleanup_tc:
+//     tc_del_filters(veth_in);
+//     tc_del_root_qdisc(veth_in);
 
 cleanup_route:
     system_del_route_dev(ctx.cfg.remote_cidr,
