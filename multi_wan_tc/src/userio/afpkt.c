@@ -25,7 +25,6 @@
 
 struct afpkt_ctx {
     int fd;
-    int tx_fd;  /* TX socket for sending to WAN interfaces */
     void *ring;
     size_t ring_size;
     unsigned int frame_nr;
@@ -95,15 +94,6 @@ int afpkt_open_rx(const char *ifname)
     g_ctx.ring_size = ring_sz;
     g_ctx.frame_nr  = req.tp_frame_nr;
     g_ctx.frame_idx = 0;
-
-    /* Create TX socket for sending packets to WAN interfaces */
-    g_ctx.tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (g_ctx.tx_fd < 0) {
-        log_error("socket(AF_PACKET TX) failed: %s", strerror(errno));
-        munmap(ring, ring_sz);
-        close(fd);
-        return -1;
-    }
 
     log_info("AF_PACKET RX ready on %s (frames=%u)",
              ifname, g_ctx.frame_nr);
@@ -220,30 +210,11 @@ int afpkt_poll_and_forward(int fd, const app_context_t *ctx)
           eth->h_dest[0], eth->h_dest[1], eth->h_dest[2],
           eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
 
-        /* Send packet to WAN interface using sendto() */
-        unsigned int wan_ifindex = if_nametoindex(ctx->cfg.wans[selected_wan].ifname);
-        if (wan_ifindex == 0) {
-            log_error("Failed to get ifindex for WAN[%d] '%s'",
-                      selected_wan, ctx->cfg.wans[selected_wan].ifname);
-            hdr->tp_status = TP_STATUS_KERNEL;
-            g_ctx.frame_idx = (g_ctx.frame_idx + 1) % g_ctx.frame_nr;
-            continue;
-        }
-
-        struct sockaddr_ll sll = {
-            .sll_family   = AF_PACKET,
-            .sll_protocol = htons(ETH_P_ALL),
-            .sll_ifindex  = wan_ifindex,
-            .sll_halen    = 6,
-        };
-        memcpy(sll.sll_addr, eth->h_dest, 6);
-
-        ssize_t n = sendto(g_ctx.tx_fd, frame, len, 0,
-                          (struct sockaddr *)&sll, sizeof(sll));
+        /* PASS-THROUGH: send the frame back out via the same interface (veth_tx_out) */
+        ssize_t n = send(fd, frame, len, 0);
         if (n < 0) {
-            log_error("sendto() to WAN[%d] '%s' failed: %s",
-                      selected_wan, ctx->cfg.wans[selected_wan].ifname,
-                      strerror(errno));
+            /* vẫn release frame để không kẹt ring */
+            // log_error("send() failed: %s", strerror(errno));
         } else {
             pkt_cnt++;
         }
@@ -267,9 +238,6 @@ void afpkt_close(int fd)
 {
     if (g_ctx.ring)
         munmap(g_ctx.ring, g_ctx.ring_size);
-
-    if (g_ctx.tx_fd >= 0)
-        close(g_ctx.tx_fd);
 
     if (fd >= 0)
         close(fd);

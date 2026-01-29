@@ -98,7 +98,7 @@ int main(int argc, char **argv)
     }
 
     /* ===================================================== */
-    /* ==== create veth for userspace ==== */
+    /* ==== STEP 3.5: 7A-A1 – create veth for userspace ==== */
     /* ===================================================== */
 
     const char *veth_in  = "veth_tx_in";
@@ -111,7 +111,7 @@ int main(int argc, char **argv)
     }
 
     /* ===================================================== */
-    /* ====  TC ingress → veth_tx_in ====== */
+    /* ==== STEP 3.6: 7A-A2 – TC ingress → veth_tx_in ====== */
     /* ===================================================== */
 
     if (tc_ingress_redirect(ctx.cfg.local_if, veth_out) != 0) {
@@ -119,33 +119,33 @@ int main(int argc, char **argv)
         goto cleanup_veth;
     }
 
-    // /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
-    // if (tc_add_root_qdisc(veth_in) != 0) {
-    //     log_error("Failed to attach TC root qdisc on %s", veth_in);
-    //     goto cleanup_tc_ingress;
-    // }
+    /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
+    if (tc_add_root_qdisc(veth_in) != 0) {
+        log_error("Failed to attach TC root qdisc on %s", veth_in);
+        goto cleanup_tc_ingress;
+    }
 
-    // /* ---- STEP 5: create WAN classes ---- */
-    // for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
-    //     int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
-    //     if (tc_add_class(veth_in, 1, class_minor) != 0) {
-    //         log_error("Failed to add TC class %d:%d",
-    //                   1, class_minor);
-    //         goto cleanup_tc;
-    //     }
-    // }
+    /* ---- STEP 5: create WAN classes ---- */
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
+        int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
+        if (tc_add_class(veth_in, 1, class_minor) != 0) {
+            log_error("Failed to add TC class %d:%d",
+                      1, class_minor);
+            goto cleanup_tc;
+        }
+    }
 
-    // /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
-    // tc_del_filters(veth_in);
+    /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
+    tc_del_filters(veth_in);
 
-    // if (tc_add_redirect_filter(veth_in,
-    //                            ctx.cfg.remote_cidr,
-    //                            10,                      /* class 1:10 */
-    //                            ctx.cfg.wans[0].ifname)  /* WAN0 */
-    //     != 0) {
-    //     log_error("Failed to add redirect filter");
-    //     goto cleanup_tc;
-    // }
+    if (tc_add_redirect_filter(veth_in,
+                               ctx.cfg.remote_cidr,
+                               10,                      /* class 1:10 */
+                               ctx.cfg.wans[0].ifname)  /* WAN0 */
+        != 0) {
+        log_error("Failed to add redirect filter");
+        goto cleanup_tc;
+    }
 
     rx_fd = afpkt_open_rx("veth_tx_out");
     if (rx_fd < 0) {
