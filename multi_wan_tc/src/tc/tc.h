@@ -30,5 +30,9 @@ int tc_ingress_cleanup(const char *src_if);
 int tc_egress_redirect(const char *src_if, const char *dst_if);
 int tc_egress_cleanup(const char *src_if);
 
+int tc_rx_wan_ingress_to_veth(const char *wan_if, const char *veth_rx_in);
+int tc_rx_cleanup(const char *wan_if);
+
+
 #endif /* TC_H */
 

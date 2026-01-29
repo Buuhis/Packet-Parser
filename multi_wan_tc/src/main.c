@@ -119,33 +119,66 @@ int main(int argc, char **argv)
         goto cleanup_veth;
     }
 
-    /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
-    if (tc_add_root_qdisc(veth_in) != 0) {
-        log_error("Failed to attach TC root qdisc on %s", veth_in);
-        goto cleanup_tc_ingress;
+    // /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
+    // if (tc_add_root_qdisc(veth_in) != 0) {
+    //     log_error("Failed to attach TC root qdisc on %s", veth_in);
+    //     goto cleanup_tc_ingress;
+    // }
+
+    // /* ---- STEP 5: create WAN classes ---- */
+    // for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
+    //     int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
+    //     if (tc_add_class(veth_in, 1, class_minor) != 0) {
+    //         log_error("Failed to add TC class %d:%d",
+    //                   1, class_minor);
+    //         goto cleanup_tc;
+    //     }
+    // }
+
+    // /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
+    // tc_del_filters(veth_in);
+
+    // if (tc_add_redirect_filter(veth_in,
+    //                            ctx.cfg.remote_cidr,
+    //                            10,                      /* class 1:10 */
+    //                            ctx.cfg.wans[0].ifname)  /* WAN0 */
+    //     != 0) {
+    //     log_error("Failed to add redirect filter");
+    //     goto cleanup_tc;
+    // }
+
+    // ======================== RX ======================================
+
+    /* -------- RX-1: veth RX pair + TC ingress on WAN -------- */
+
+    const char *wan_if     = ctx.cfg.wans[0].ifname;  /* tạm: WAN0 */
+    const char *veth_rx_in  = "veth_rx_in";
+    const char *veth_rx_out = "veth_rx_out";
+
+    /* create RX veth pair */
+    if (netdev_create_veth_pair(veth_rx_in, veth_rx_out, ctx.cfg.dataplane.mtu) != 0) {
+        log_error("Failed to create RX veth pair");
+        return 1;
     }
 
-    /* ---- STEP 5: create WAN classes ---- */
-    for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
-        int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
-        if (tc_add_class(veth_in, 1, class_minor) != 0) {
-            log_error("Failed to add TC class %d:%d",
-                      1, class_minor);
-            goto cleanup_tc;
-        }
+    /* TC ingress: wan_if -> veth_rx_in (and drop) */
+    if (tc_rx_wan_ingress_to_veth(wan_if, veth_rx_in) != 0) {
+        log_error("Failed to attach RX TC ingress on %s", wan_if);
+        return 1;
     }
 
-    /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
-    tc_del_filters(veth_in);
+    log_info("RX-1 done: %s ingress -> %s", wan_if, veth_rx_in);
 
-    if (tc_add_redirect_filter(veth_in,
-                               ctx.cfg.remote_cidr,
-                               10,                      /* class 1:10 */
-                               ctx.cfg.wans[0].ifname)  /* WAN0 */
-        != 0) {
-        log_error("Failed to add redirect filter");
-        goto cleanup_tc;
+    /* -------- RX-2: AF_PACKET RX on veth_rx_in -------- */
+
+    afpkt_rx_ctx_t rx;
+    if (afpkt_rx_open(&rx, veth_rx_in, 4096, 2048) != 0) {
+        log_error("Failed to open AF_PACKET RX on %s", veth_rx_in);
+        return 1;
     }
+
+    log_info("RX-2 running: capturing packets on %s (Ctrl+C to stop)", veth_rx_in);
+    /* ==================================== */
 
     rx_fd = afpkt_open_rx("veth_tx_out");
     if (rx_fd < 0) {
@@ -160,7 +193,6 @@ int main(int argc, char **argv)
         goto cleanup_tc_egress;
     }
 
-
     /* ---- install signal handlers ---- */
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -170,9 +202,14 @@ int main(int argc, char **argv)
     /* ---- RUN LOOP (control-plane placeholder) ---- */
     while (running) {
         afpkt_poll_and_forward(rx_fd, &ctx);
+
+        afpkt_rx_poll_count(&rx);
     }
 
     log_info("Cleaning up...");
+
+    afpkt_rx_close(&rx);
+    tc_rx_cleanup(wan_if);
 
     /* ---------- CLEANUP (FAIL-OPEN) ---------- */
 cleanup_tc_egress:
