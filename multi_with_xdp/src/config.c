@@ -72,6 +72,7 @@ enum section_type {
     SECTION_GLOBAL,
     SECTION_LOCAL,
     SECTION_WAN,
+    SECTION_PIPELINE,
 };
 
 int config_load(struct app_config *cfg, const char *filename) {
@@ -129,6 +130,10 @@ int config_load(struct app_config *cfg, const char *filename) {
                 current_wan->frame_size = cfg->global_frame_size;
                 current_wan->batch_size = cfg->global_batch_size;
                 cfg->wan_count++;
+            }
+
+            else if (strcmp(trimmed, "[PIPELINE]") == 0) {
+                current_section = SECTION_PIPELINE;
             }
 
             continue;
@@ -235,6 +240,18 @@ int config_load(struct app_config *cfg, const char *filename) {
 
             else if (strcmp(key, "batch_size") == 0) {
                 current_wan->batch_size = atoi(value);
+            }
+            break;
+
+        case SECTION_PIPELINE:
+            if (strcmp(key, "outbound_workers") == 0) {
+                cfg->num_outbound_workers = atoi(value);
+            } else if (strcmp(key, "inbound_workers") == 0) {
+                cfg->num_inbound_workers = atoi(value);
+            } else if (strcmp(key, "ring_size") == 0) {
+                cfg->pipeline_ring_size = atoi(value);
+            } else if (strcmp(key, "pool_size") == 0) {
+                cfg->pipeline_pool_size = atoi(value);
             }
             break;
 
@@ -373,5 +390,15 @@ void config_print(struct app_config *cfg) {
         printf("╟──────────────────────────────────────────────────────────────╢\n");
     }
 
+    if (cfg->num_outbound_workers || cfg->num_inbound_workers) {
+        printf("║ [PIPELINE]                                                   ║\n");
+        printf("║   outbound_workers: %-42d ║\n", cfg->num_outbound_workers);
+        printf("║   inbound_workers:  %-42d ║\n", cfg->num_inbound_workers);
+        printf("║   ring_size:        %-42d ║\n",
+               cfg->pipeline_ring_size ? cfg->pipeline_ring_size : 8192);
+        printf("║   pool_size:        %-42d ║\n",
+               cfg->pipeline_pool_size ? cfg->pipeline_pool_size : 16384);
+        printf("╟──────────────────────────────────────────────────────────────╢\n");
+    }
     printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 }

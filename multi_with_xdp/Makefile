@@ -8,7 +8,7 @@ KERNEL_HEADERS = /usr/include
 
 BIN_DIR = bin
 
-SRC = main.c src/config.c src/interface.c src/forwarder.c src/flow_table.c src/fragment.c
+SRC = main.c src/config.c src/interface.c src/forwarder.c src/flow_table.c src/fragment.c src/pipeline.c
 OBJ = $(SRC:.c=.o)
 TARGET = $(BIN_DIR)/xdp_forwarder
 

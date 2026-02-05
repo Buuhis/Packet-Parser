@@ -43,6 +43,11 @@ struct app_config {
     int wan_count;
 
     char bpf_file[256];
+
+    int num_outbound_workers;
+    int num_inbound_workers;
+    uint32_t pipeline_ring_size;
+    uint32_t pipeline_pool_size;
 };
 
 int config_load(struct app_config *cfg, const char *filename);

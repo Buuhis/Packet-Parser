@@ -2,6 +2,7 @@
 #define FORWARDER_H
 
 #include "interface.h"
+#include "pipeline.h"
 
 struct forwarder {
     struct xsk_interface locals[MAX_INTERFACES];
@@ -18,6 +19,8 @@ struct forwarder {
     uint64_t local_to_wan;
     uint64_t wan_to_local;
     uint64_t total_dropped;
+
+    struct pipeline_ctx pipeline;
 };
 
 int forwarder_init(struct forwarder *fwd, struct app_config *cfg);
