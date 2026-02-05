@@ -12,8 +12,10 @@ typedef struct {
     int             tx_fd;
     void           *ring;
     size_t          ring_size;
-    unsigned int    frame_nr;
-    unsigned int    frame_idx;
+    
+    /* TPACKET_V3 specific state */
+    unsigned int    block_count;   /* Number of blocks in ring (req.tp_block_nr) */
+    unsigned int    current_block; /* Index of current block being processed */
 } afpkt_worker_t;
 
 /* Fanout group containing N workers */
