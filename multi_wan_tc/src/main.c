@@ -9,6 +9,9 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <errno.h>
+
 /* ---------- global state ---------- */
 
 static volatile int running = 1;
@@ -27,7 +30,27 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Usage: %s --config <file> [--dump-config]\n", prog);
+        "Usage: %s --config <file> --node <id> [--dump-config]\n", prog);
+}
+
+/* ---------- worker thread arg ---------- */
+
+typedef struct {
+    afpkt_worker_t       *worker;
+    const afpkt_fanout_t *fg;
+    app_context_t        *ctx;
+    volatile int         *running;
+    int                   is_outbound;
+} worker_thread_arg_t;
+
+static void *worker_fn(void *arg)
+{
+    worker_thread_arg_t *a = (worker_thread_arg_t *)arg;
+    if (a->is_outbound)
+        afpkt_worker_loop_outbound(a->worker, a->fg, a->ctx, a->running);
+    else
+        afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running);
+    return NULL;
 }
 
 /* ---------- main ---------- */
@@ -49,6 +72,10 @@ int main(int argc, char **argv)
             }
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--node") == 0) {
+            if (i + 1 >= argc) {
+                usage(argv[0]);
+                return 2;
+            }
             node_id = argv[++i];
         } else if (strcmp(argv[i], "--dump-config") == 0) {
             dump = 1;
@@ -62,7 +89,7 @@ int main(int argc, char **argv)
         }
     }
 
-    if (!config_path) {
+    if (!config_path || !node_id) {
         usage(argv[0]);
         return 2;
     }
@@ -82,13 +109,13 @@ int main(int argc, char **argv)
 
     g_ctx = &ctx;
 
-    /* ---- STEP 2: enable ip_forward ---- */
+    /* ---- STEP 1: enable ip_forward ---- */
     if (system_enable_ip_forward() != 0) {
         log_error("Failed to enable IP forwarding");
         return 1;
     }
 
-    /* ---- STEP 3: force routing into TC ---- */
+    /* ---- STEP 2: force routing into TC ---- */
     if (system_add_route_dev(ctx.cfg.remote_cidr,
                              ctx.cfg.local_if) != 0) {
         log_error("Failed to add route for %s via %s",
@@ -97,165 +124,137 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* ---- STEP 3: Optimize Interfaces (RPS + Coalescing) ---- */
+    netdev_optimize_interface(ctx.cfg.local_if);
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
+        netdev_optimize_interface(ctx.cfg.wans[i].ifname);
+    }
+
     /* ===================================================== */
-    /* ==== STEP 3.5: 7A-A1 – create veth for userspace ==== */
+    /* ==== FANOUT: open N workers directly on NICs ======== */
     /* ===================================================== */
 
-    const char *veth_in  = "veth_tx_in";
-    const char *veth_out = "veth_tx_out";
-    int rx_fd = -1;  
-
-    if (netdev_create_veth_pair(veth_in, veth_out, 1500) != 0) {
-        log_error("Failed to create veth pair");
+    afpkt_fanout_t fg_out;
+    if (afpkt_fanout_open(&fg_out, ctx.cfg.local_if, 1) != 0) {
+        log_error("Failed to open fanout outbound on %s", ctx.cfg.local_if);
         goto cleanup_route;
     }
 
+    afpkt_fanout_t fg_in;
+    if (afpkt_fanout_open(&fg_in, ctx.cfg.wans[0].ifname, 2) != 0) {
+        log_error("Failed to open fanout inbound on %s", ctx.cfg.wans[0].ifname);
+        goto cleanup_fanout_out;
+    }
+
     /* ===================================================== */
-    /* ==== STEP 3.6: 7A-A2 – TC ingress → veth_tx_in ====== */
+    /* ==== TC DROP: Prevent kernel from double processing = */
     /* ===================================================== */
 
-    if (tc_ingress_redirect(ctx.cfg.local_if, veth_out) != 0) {
-        log_error("Failed to redirect ingress traffic to %s", veth_in);
-        goto cleanup_veth;
+    /* Outbound: Drop packets from local going to remote CIDR */
+    if (tc_ingress_drop_cidr(ctx.cfg.local_if, ctx.cfg.remote_cidr) != 0) {
+        log_warn("Failed to setup TC ingress drop on %s", ctx.cfg.local_if);
     }
 
-    // /* ---- STEP 4: TC root qdisc on veth_tx_in ---- */
-    // if (tc_add_root_qdisc(veth_in) != 0) {
-    //     log_error("Failed to attach TC root qdisc on %s", veth_in);
-    //     goto cleanup_tc_ingress;
-    // }
-
-    // /* ---- STEP 5: create WAN classes ---- */
-    // for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
-    //     int class_minor = (int)(i + 1) * 10;  /* 10, 20, 30 */
-    //     if (tc_add_class(veth_in, 1, class_minor) != 0) {
-    //         log_error("Failed to add TC class %d:%d",
-    //                   1, class_minor);
-    //         goto cleanup_tc;
-    //     }
-    // }
-
-    // /* ---- STEP 6: redirect ALL traffic to WAN0 (test) ---- */
-    // tc_del_filters(veth_in);
-
-    // if (tc_add_redirect_filter(veth_in,
-    //                            ctx.cfg.remote_cidr,
-    //                            10,                      /* class 1:10 */
-    //                            ctx.cfg.wans[0].ifname)  /* WAN0 */
-    //     != 0) {
-    //     log_error("Failed to add redirect filter");
-    //     goto cleanup_tc;
-    // }
-
-    // ======================== RX ======================================
-
-    /* -------- RX-1: veth RX pair + TC ingress on WAN -------- */
-
-    const char *wan_if     = ctx.cfg.wans[0].ifname;  /* tạm: WAN0 */
-    const char *veth_rx_in  = "veth_rx_in";
-    const char *veth_rx_out = "veth_rx_out";
-
-    /* create RX veth pair */
-    if (netdev_create_veth_pair(veth_rx_in, veth_rx_out, ctx.cfg.dataplane.mtu) != 0) {
-        log_error("Failed to create RX veth pair");
-        return 1;
+    /* Inbound: Drop packets from remote CIDR coming into WAN */
+    if (tc_wan_ingress_drop_cidr(ctx.cfg.wans[0].ifname, ctx.cfg.remote_cidr) != 0) {
+        log_warn("Failed to setup TC WAN ingress drop on %s", ctx.cfg.wans[0].ifname);
     }
 
-    /* TC ingress: wan_if -> veth_rx_in (and drop) */
-    if (tc_rx_wan_ingress_to_veth(wan_if, veth_rx_in) != 0) {
-        log_error("Failed to attach RX TC ingress on %s", wan_if);
-        return 1;
-    }
+    /* ===================================================== */
+    /* ==== INIT CACHE ===================================== */
+    /* ===================================================== */
 
-    log_info("RX-1 done: %s ingress -> %s", wan_if, veth_rx_in);
+    afpkt_fanout_init_cache_outbound(&fg_out, &ctx);
+    afpkt_fanout_init_cache_inbound(&fg_in, &ctx);
 
-    /* -------- RX-2: AF_PACKET RX on veth_rx_in -------- */
+    /* ===================================================== */
+    /* ==== START THREADS ================================== */
+    /* ===================================================== */
 
-    afpkt_rx_ctx_t rx;
-    if (afpkt_rx_open(&rx, veth_rx_in, 4096, 2048) != 0) {
-        log_error("Failed to open AF_PACKET RX on %s", veth_rx_in);
-        return 1;
-    }
-
-    log_info("RX-2 running: capturing packets on %s (Ctrl+C to stop)", veth_rx_in);
-
-    unsigned char local_src_mac[6];
-    if (system_get_if_hwaddr(ctx.cfg.local_if, local_src_mac) != 0) {
-        log_error("Failed to get local_if MAC for %s", ctx.cfg.local_if);
-        return 1;
-    }
-
-    unsigned int local_ifindex = if_nametoindex(ctx.cfg.local_if);
-    if (local_ifindex == 0) {
-        log_error("if_nametoindex(local_if=%s) failed", ctx.cfg.local_if);
-        return 1;
-    }
-
-    int tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (tx_fd < 0) {
-        log_error("socket(AF_PACKET TX) failed: %s", strerror(errno));
-        return 1;
-    }
-
-    /* ==================================== */
-
-    rx_fd = afpkt_open_rx("veth_tx_out");
-    if (rx_fd < 0) {
-        log_error("Failed to open AF_PACKET RX");
-        goto cleanup_tc_ingress;
-    }
-
-    /* 7A-A5: TC egress redirect veth_tx_in → WAN0 */
-    if (tc_egress_redirect("veth_tx_in",
-                            ctx.cfg.wans[0].ifname) != 0) {
-        log_error("Failed to setup TC egress redirect");
-        goto cleanup_tc_egress;
-    }
-
-    /* ---- install signal handlers ---- */
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    log_info("Press Ctrl+C to stop.");
+    int total_threads = NUM_WORKERS * 2;
+    pthread_t threads[NUM_WORKERS * 2];
+    worker_thread_arg_t args[NUM_WORKERS * 2];
 
-    /* ---- RUN LOOP (control-plane placeholder) ---- */
-    while (running) {
-        afpkt_poll_and_forward(rx_fd, &ctx);
+    for (int i = 0; i < NUM_WORKERS; i++) {
+        /* Outbound worker */
+        args[i] = (worker_thread_arg_t){
+            .worker      = &fg_out.workers[i],
+            .fg          = &fg_out,
+            .ctx         = &ctx,
+            .running     = &running,
+            .is_outbound = 1,
+        };
+        if (pthread_create(&threads[i], NULL, worker_fn, &args[i]) != 0) {
+            log_error("Failed to create outbound worker thread %d", i);
+            running = 0;
+            for (int k = 0; k < i; k++)
+                pthread_join(threads[k], NULL);
+            goto cleanup_tc;
+        }
 
-        afpkt_rx_poll_forward_local(&rx,
-                                    tx_fd,
-                                    local_ifindex,
-                                    local_src_mac,
-                                    ctx.cfg.lan.dst_mac);
+        /* Inbound worker */
+        int j = NUM_WORKERS + i;
+        args[j] = (worker_thread_arg_t){
+            .worker      = &fg_in.workers[i],
+            .fg          = &fg_in,
+            .ctx         = &ctx,
+            .running     = &running,
+            .is_outbound = 0,
+        };
+        if (pthread_create(&threads[j], NULL, worker_fn, &args[j]) != 0) {
+            log_error("Failed to create inbound worker thread %d", i);
+            running = 0;
+            for (int k = 0; k <= i; k++)
+                pthread_join(threads[k], NULL);
+            for (int k = NUM_WORKERS; k < j; k++)
+                pthread_join(threads[k], NULL);
+            goto cleanup_tc;
+        }
     }
+
+    log_info("===========================================");
+    log_info("  PACKET_FANOUT (Direct) forwarding started");
+    log_info("  Architecture: Capture & TC-Drop (No-Veth)");
+    log_info("  Workers: %d outbound + %d inbound = %d total",
+             NUM_WORKERS, NUM_WORKERS, total_threads);
+    log_info("  OUTBOUND: %s -> WAN[0..%zu]",
+             ctx.cfg.local_if, ctx.cfg.wan_count - 1);
+    log_info("  INBOUND:  WAN[0] (%s) -> %s",
+             ctx.cfg.wans[0].ifname, ctx.cfg.local_if);
+    log_info("  Press Ctrl+C to stop.");
+    log_info("===========================================");
+
+    /* Wait for all threads */
+    for (int i = 0; i < total_threads; i++)
+        pthread_join(threads[i], NULL);
 
     log_info("Cleaning up...");
 
-    afpkt_rx_close(&rx);
-    tc_rx_cleanup(wan_if);
-    close(tx_fd);
-
-    /* ---------- CLEANUP (FAIL-OPEN) ---------- */
-cleanup_tc_egress:
-    tc_egress_cleanup(veth_in);
-
-cleanup_tc_ingress:
+    /* ---------- CLEANUP ---------- */
+cleanup_tc:
     tc_ingress_cleanup(ctx.cfg.local_if);
-    afpkt_close(rx_fd);
+    tc_wan_ingress_cleanup(ctx.cfg.wans[0].ifname);
 
-cleanup_veth:
-    netdev_delete(veth_in);
+// cleanup_fanout_in:
+//     afpkt_fanout_close(&fg_in);
 
-// cleanup_tc:
-//     tc_del_filters(veth_in);
-//     tc_del_root_qdisc(veth_in);
+cleanup_fanout_out:
+    afpkt_fanout_close(&fg_out);
 
 cleanup_route:
     system_del_route_dev(ctx.cfg.remote_cidr,
                          ctx.cfg.local_if);
 
+    /* Reset optimization settings */
+    netdev_reset_interface(ctx.cfg.local_if);
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++) {
+        netdev_reset_interface(ctx.cfg.wans[i].ifname);
+    }
+
     log_info("Cleanup done.");
 
     return 0;
 }
-

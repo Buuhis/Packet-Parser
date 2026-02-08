@@ -2,39 +2,54 @@
 #define AFPKT_H
 
 #include "app_context.h"
-#include <stddef.h>
 
+#define NUM_WORKERS 2
+
+/* Each worker owns 1 RX socket (fanout) + 1 TX socket */
 typedef struct {
-    int fd;
-    void *ring;
-    size_t frame_nr;
-    size_t frame_size;
-    size_t frame_idx;
-} afpkt_rx_ctx_t;
+    int             id;
+    int             rx_fd;
+    int             tx_fd;
+    void           *ring;
+    size_t          ring_size;
+    
+    /* TPACKET_V3 specific state */
+    unsigned int    block_count;   /* Number of blocks in ring (req.tp_block_nr) */
+    unsigned int    current_block; /* Index of current block being processed */
+} afpkt_worker_t;
 
-int afpkt_open_rx(const char *ifname);
-void afpkt_close(int fd);
+/* Fanout group containing N workers */
+typedef struct {
+    int              num_workers;
+    int              fanout_group_id;
+    afpkt_worker_t   workers[NUM_WORKERS];
 
-int afpkt_poll_and_count(int fd);
+    /* Cached MAC/ifindex (written once before threads start, read-only after) */
+    struct {
+        int ifindex;
+        unsigned char src_mac[6];
+        int valid;
+    } wans[MAX_WANS];
 
-int afpkt_poll_and_forward(int fd, const app_context_t *ctx);
+    struct {
+        int ifindex;
+        unsigned char src_mac[6];
+        int valid;
+    } local;
+} afpkt_fanout_t;
 
-// ===========================================
+/* Open N sockets on ifname, join fanout group */
+int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id);
+void afpkt_fanout_close(afpkt_fanout_t *fg);
 
-int afpkt_rx_open(afpkt_rx_ctx_t *rx, const char *ifname,
-                  size_t frame_nr, size_t frame_size);
+/* Init cache (call once before starting threads) */
+void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx);
+void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ctx);
 
-void afpkt_rx_close(afpkt_rx_ctx_t *rx);
+/* Worker loops — each thread runs one of these */
+void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+                                 const app_context_t *ctx, volatile int *running);
+void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+                                const app_context_t *ctx, volatile int *running);
 
-/* poll + count packets; returns number of forwarded/handled packets in this poll */
-int afpkt_rx_poll_count(afpkt_rx_ctx_t *rx);
-
-/* RX-3 & RX-4: rewrite MAC then send out local_if */
-int afpkt_rx_poll_forward_local(afpkt_rx_ctx_t *rx,
-                                int tx_fd,
-                                unsigned int local_ifindex,
-                                const unsigned char local_src_mac[6],
-                                const unsigned char lan_dst_mac[6]);
-
-#endif /* MWANC_USERIO_AFPKT_H */
-
+#endif /* AFPKT_H */

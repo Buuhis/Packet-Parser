@@ -1,25 +1,17 @@
 CC      := gcc
 CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc
-LDFLAGS :=
+LDFLAGS := -pthread
 
 BIN := mwanc
 
 SRC := \
     src/main.c \
     src/app_context.c \
-    src/config/config_parser.c \
-    src/system/sysctl.c \
-    src/system/routing.c \
-    src/system/netdev.c \
-    src/tc/tc_init.c \
-    src/tc/tc_class.c \
-    src/tc/tc_filter.c \
-    src/tc/tc_ingress.c \
-	src/tc/tc_egress.c \
-	src/tc/tc_rx.c \
-    src/userio/afpkt.c \
-    src/userio/afpkt_rx.c \
-    src/utils/logger.c
+    $(wildcard src/config/*.c) \
+    $(wildcard src/system/*.c) \
+    $(wildcard src/tc/*.c) \
+    $(wildcard src/userio/*.c) \
+    $(wildcard src/utils/*.c)
 
 OBJ := $(SRC:.c=.o)
 

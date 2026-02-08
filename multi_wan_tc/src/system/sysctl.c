@@ -28,14 +28,14 @@ int system_get_ip_forward(void) {
     return value;
 }
 
-int system_enable_ip_forward(void) {
+static int system_set_ip_forward(int value) {
     int current = system_get_ip_forward();
-    if (current < 0) {
+    if (current < 0)
         return -1;
-    }
 
-    if (current == 1) {
-        log_info("IPv4 forwarding already enabled");
+    if (current == value) {
+        log_info("IPv4 forwarding already %s",
+                 value ? "enabled" : "disabled");
         return 0;
     }
 
@@ -47,22 +47,29 @@ int system_enable_ip_forward(void) {
         return -1;
     }
 
-    if (fprintf(fp, "1\n") < 0) {
+    if (fprintf(fp, "%d\n", value) < 0) {
         log_error("Failed to write ip_forward value");
         fclose(fp);
         return -1;
     }
-
     fclose(fp);
 
-    /* Re-check */
     current = system_get_ip_forward();
-    if (current != 1) {
+    if (current != value) {
         log_error("IPv4 forwarding verification failed");
         return -1;
     }
 
-    log_info("IPv4 forwarding enabled successfully");
+    log_info("IPv4 forwarding %s successfully",
+             value ? "enabled" : "disabled");
     return 0;
+}
+
+int system_enable_ip_forward(void) {
+    return system_set_ip_forward(1);
+}
+
+int system_disable_ip_forward(void) {
+    return system_set_ip_forward(0);
 }
 

@@ -76,6 +76,24 @@ int netdev_set_up(const char *ifname)
     return system(cmd);
 }
 
+int netdev_disable_offloads(const char *ifname)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "ethtool -K %s gro off gso off tso off lro off2>/dev/null",
+             ifname);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        log_error("Failed to disable offloads on %s (ethtool not available?)",
+                  ifname);
+        return -1;
+    }
+
+    log_info("Disabled GRO/GSO/TSO on %s", ifname);
+    return 0;
+}
+
 int system_get_if_hwaddr(const char *ifname, unsigned char mac[6])
 {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -97,4 +115,58 @@ int system_get_if_hwaddr(const char *ifname, unsigned char mac[6])
     memcpy(mac, (unsigned char *)ifr.ifr_hwaddr.sa_data, 6);
     close(fd);
     return 0;
+}
+
+int netdev_optimize_interface(const char *ifname)
+{
+    char cmd[512];
+    int ret = 0;
+    /*    Enable Busy Polling (Low Latency) */
+    /*    busy_read=50 means wait 50us for packets in recvmsg/poll loop */
+    /*    busy_poll=50 recommended for high throughput */
+    snprintf(cmd, sizeof(cmd), "sysctl -w net.core.busy_read=50 >/dev/null 2>&1");
+    if (system(cmd) != 0) {
+        log_error("Failed to set busy_read on %s (ethtool failed?)", ifname);
+    }
+    /* Increase Ring Buffer (Reduce rx_missed errors) */
+    snprintf(cmd, sizeof(cmd), "ethtool -G %s rx 4096 2>/dev/null", ifname);
+    if (system(cmd) != 0) {
+        /* Fallback if 4096 too big, try 2048 or 1024? For now just log debug */
+        log_debug("Failed to maximize ring buffer on %s (maybe 4096 is not supported)", ifname);
+    } else {
+        log_info("Maximized RX Ring Buffer on %s to 4096", ifname);
+    }
+
+    /* Disable Flow Control (Reduce rx_fifo_errors caused by pause frames) */
+    snprintf(cmd, sizeof(cmd), "ethtool -A %s rx off tx off 2>/dev/null", ifname);
+    if (system(cmd) != 0) {
+        log_error("Failed to set flow control on %s (ethtool failed?)", ifname);
+    }
+
+    return ret;
+}
+
+int netdev_reset_interface(const char *ifname)
+{
+    char cmd[512];
+    int ret = 0;
+
+    log_info("Restoring defaults for %s...", ifname);
+
+    /* Reset Busy Polling defaults (usually 0) */
+    snprintf(cmd, sizeof(cmd), "sysctl -w net.core.busy_read=0 >/dev/null 2>&1");
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "sysctl -w net.core.busy_poll=0 >/dev/null 2>&1");
+    system(cmd);
+
+    /* Restore Ring Buffer (Typical default 256 or 512, trying safe 256) */
+    /* Note: Hard to know original value without reading it first. 256 is safe common default */
+    snprintf(cmd, sizeof(cmd), "ethtool -G %s rx 256 2>/dev/null", ifname);
+    system(cmd);
+
+    /* Restore Flow Control (Enable Auto-negotiation or RX/TX on) */
+    snprintf(cmd, sizeof(cmd), "ethtool -A %s rx on tx on 2>/dev/null", ifname);
+    system(cmd);
+
+    return ret;
 }

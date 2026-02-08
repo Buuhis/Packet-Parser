@@ -25,14 +25,19 @@ int tc_add_redirect_filter(const char *ifname,
 int tc_del_filters(const char *ifname);
 
 int tc_ingress_redirect(const char *src_if, const char *dst_if);
+int tc_ingress_drop_cidr(const char *ifname, const char *dst_cidr);
 int tc_ingress_cleanup(const char *src_if);
 
 int tc_egress_redirect(const char *src_if, const char *dst_if);
 int tc_egress_cleanup(const char *src_if);
 
-int tc_rx_wan_ingress_to_veth(const char *wan_if, const char *veth_rx_in);
-int tc_rx_cleanup(const char *wan_if);
+int tc_wan_ingress_redirect(const char *wan_if, const char *dst_if);
+int tc_wan_ingress_drop_cidr(const char *wan_if, const char *src_cidr);
+int tc_wan_ingress_redirect_cidr(const char *wan_if,
+                                  const char *dst_if,
+                                  const char *src_cidr);
 
+int tc_wan_ingress_cleanup(const char *wan_if);
 
 #endif /* TC_H */
 
