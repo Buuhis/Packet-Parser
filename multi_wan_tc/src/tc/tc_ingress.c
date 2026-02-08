@@ -17,7 +17,10 @@ int tc_ingress_redirect(const char *src_if, const char *dst_if)
     snprintf(cmd, sizeof(cmd),
              "tc qdisc del dev %s clsact 2>/dev/null",
              src_if);
-    system(cmd);  /* ignore error */
+    if (system(cmd) != 0) {
+        log_error("Failed to delete clsact qdisc on %s", src_if);
+        return -1;
+    }
 
     /* Add clsact qdisc */
     snprintf(cmd, sizeof(cmd),
@@ -51,7 +54,10 @@ int tc_ingress_drop_cidr(const char *ifname, const char *dst_cidr)
 
     /* Delete existing clsact first */
     snprintf(cmd, sizeof(cmd), "tc qdisc del dev %s clsact 2>/dev/null", ifname);
-    system(cmd);
+    if (system(cmd) != 0) {
+        log_error("Failed to delete clsact qdisc on %s", ifname);
+        return -1;
+    }
 
     /* Add clsact qdisc */
     snprintf(cmd, sizeof(cmd), "tc qdisc add dev %s clsact", ifname);

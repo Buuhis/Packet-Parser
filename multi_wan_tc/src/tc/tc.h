@@ -34,8 +34,7 @@ int tc_egress_cleanup(const char *src_if);
 int tc_wan_ingress_redirect(const char *wan_if, const char *dst_if);
 int tc_wan_ingress_drop_cidr(const char *wan_if, const char *src_cidr);
 int tc_wan_ingress_redirect_cidr(const char *wan_if,
-                                  const char *dst_if,
-                                  const char *src_cidr);
+                                  const char *dst_if);
 
 int tc_wan_ingress_cleanup(const char *wan_if);
 

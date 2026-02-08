@@ -10,11 +10,9 @@
  *
  *   wan_if     : WAN interface (enp4s0, enp5s0, ...)
  *   dst_if     : veth_rx_out (userspace side)
- *   src_cidr   : remote CIDR to filter (192.168.182.0/24)
  */
 int tc_wan_ingress_redirect_cidr(const char *wan_if,
-                                  const char *dst_if,
-                                  const char *src_cidr)
+                                  const char *dst_if)
 {
     char cmd[512];
 

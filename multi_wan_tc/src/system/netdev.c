@@ -155,18 +155,26 @@ int netdev_reset_interface(const char *ifname)
 
     /* Reset Busy Polling defaults (usually 0) */
     snprintf(cmd, sizeof(cmd), "sysctl -w net.core.busy_read=0 >/dev/null 2>&1");
-    system(cmd);
+    if (system(cmd) != 0) {
+        log_error("Failed to reset sysctl busy_read\n");
+    }
     snprintf(cmd, sizeof(cmd), "sysctl -w net.core.busy_poll=0 >/dev/null 2>&1");
-    system(cmd);
+    if (system(cmd) != 0) {
+        log_error("Failed to reset sysctl busy_poll\n");
+    }
 
     /* Restore Ring Buffer (Typical default 256 or 512, trying safe 256) */
     /* Note: Hard to know original value without reading it first. 256 is safe common default */
     snprintf(cmd, sizeof(cmd), "ethtool -G %s rx 256 2>/dev/null", ifname);
-    system(cmd);
+    if (system(cmd) != 0) {
+        log_error("Failed to reset ethtool Rx ring buffer %s\n", ifname);
+    }
 
     /* Restore Flow Control (Enable Auto-negotiation or RX/TX on) */
     snprintf(cmd, sizeof(cmd), "ethtool -A %s rx on tx on 2>/dev/null", ifname);
-    system(cmd);
+    if (system(cmd) != 0) {
+        log_error("Failed to reset ethtool flow control on Rx & TX of %s\n", ifname);
+    }
 
     return ret;
 }
