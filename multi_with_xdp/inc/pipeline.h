@@ -31,13 +31,16 @@ struct pkt_slot {
  * Lock-free, supports multiple producers + multiple consumers
  * ================================================================ */
 struct ring_entry {
-    atomic_uint_fast32_t seq;
+    //atomic_uint_fast32_t seq;
+    _Atomic uint32_t seq;
     uint32_t data;
 };
 
 struct mpmc_ring {
-    alignas(64) atomic_uint_fast32_t head;
-    alignas(64) atomic_uint_fast32_t tail;
+    //alignas(64) atomic_uint_fast32_t head;
+    //alignas(64) atomic_uint_fast32_t tail;
+    alignas(64) _Atomic uint32_t head;
+    alignas(64) _Atomic uint32_t tail;
     uint32_t capacity;
     uint32_t mask;
     struct ring_entry *entries;
