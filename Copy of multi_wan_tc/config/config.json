@@ -1,0 +1,65 @@
+{
+  "version": 1,
+  "topology": {
+    "path": ["server1", "server2"]
+  },
+
+  "nodes": [
+    {
+      "id": "server1",
+      "role": "server",
+      "local_if": "eth0",
+      "remote_cidr": "192.168.100.0/24",
+      "lan": {
+        "ip": "192.168.100.10/24",
+        "gw": "192.168.100.1",
+        "dst_mac":""
+      },
+      "wans": [
+        { "name": "wan0", "ifname": "wan0", "gateway": "192.168.1.1", "weight": 3, "dst_mac": "00:11:22:33:44:55" },
+        { "name": "wan1", "ifname": "wan1", "gateway": "192.168.2.1", "weight": 2, "dst_mac": "00:11:22:33:44:66" },
+        { "name": "wan2", "ifname": "wan2", "gateway": "192.168.3.1", "weight": 1, "dst_mac": "00:11:22:33:44:77" }
+      ],
+
+      "ne_tunnel": [
+        { "name": "ne_tunnel1", "ifname": "ne_tunnel1", "gateway": "192.168.1.1", "weight": 3, "dst_mac": "00:11:22:33:44:55" },
+        { "name": "ne_tunnel2", "ifname": "ne_tunnel2", "gateway": "192.168.2.1", "weight": 2, "dst_mac": "00:11:22:33:44:66" },
+        { "name": "ne_tunnel3", "ifname": "ne_tunnel3", "gateway": "192.168.3.1", "weight": 1, "dst_mac": "00:11:22:33:44:77" }
+      ],
+      "dataplane": {
+        "veth_rx_in":  "veth_rx_in",
+        "veth_rx_out": "veth_rx_out",
+        "mtu": 1500
+      }
+    },
+
+    {
+      "id": "server2",
+      "role": "server",
+      "local_if": "eth0",
+      "remote_cidr": "192.168.9.0/24",
+      "lan": {
+        "ip": "192.168.100.10/24",
+        "gw": "192.168.100.1",
+        "dst_mac": ""
+      },
+      "wans": [
+        { "name": "wan0", "ifname": "wan0", "gateway": "192.168.1.1", "weight": 3, "dst_mac": "00:11:22:33:44:55" },
+        { "name": "wan1", "ifname": "wan1", "gateway": "192.168.2.1", "weight": 2, "dst_mac": "00:11:22:33:44:66" },
+        { "name": "wan2", "ifname": "wan2", "gateway": "192.168.3.1", "weight": 1, "dst_mac": "00:11:22:33:44:77" }
+      ],
+
+      "ne_tunnel": [
+        { "name": "ne_tunnel1", "ifname": "ne_tunnel1", "gateway": "192.168.1.1", "weight": 3, "dst_mac": "00:11:22:33:44:55" },
+        { "name": "ne_tunnel2", "ifname": "ne_tunnel2", "gateway": "192.168.2.1", "weight": 2, "dst_mac": "00:11:22:33:44:66" },
+        { "name": "ne_tunnel3", "ifname": "ne_tunnel3", "gateway": "192.168.3.1", "weight": 1, "dst_mac": "00:11:22:33:44:77" }
+      ],
+      "dataplane": {
+        "veth_rx_in":  "veth_rx_in",
+        "veth_rx_out": "veth_rx_out",
+        "mtu": 1500
+      }
+    }
+  ]
+}
+

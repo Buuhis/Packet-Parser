@@ -3,6 +3,7 @@
 #include "tc/tc.h"
 #include "utils/logger.h"
 #include "userio/afpkt.h"
+#include "proto/mwan_proto.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,6 +42,7 @@ typedef struct {
     app_context_t        *ctx;
     volatile int         *running;
     int                   is_outbound;
+    reorder_ctx_t        *reorder;   /* inbound only */
 } worker_thread_arg_t;
 
 static void *worker_fn(void *arg)
@@ -49,8 +51,29 @@ static void *worker_fn(void *arg)
     if (a->is_outbound)
         afpkt_worker_loop_outbound(a->worker, a->fg, a->ctx, a->running);
     else
-        afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running);
+        afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running, a->reorder);
     return NULL;
+}
+
+/* ---------- reorder output thread arg ---------- */
+
+static void *reorder_thread_fn(void *arg)
+{
+    reorder_ctx_t *ctx = (reorder_ctx_t *)arg;
+    reorder_output_loop(ctx);
+    return NULL;
+}
+
+/* ---------- helper: close single worker ---------- */
+
+static void worker_close(afpkt_worker_t *w)
+{
+    if (w->ring) {
+        munmap(w->ring, w->ring_size);
+        w->ring = NULL;
+    }
+    if (w->tx_fd >= 0) { close(w->tx_fd); w->tx_fd = -1; }
+    if (w->rx_fd >= 0) { close(w->rx_fd); w->rx_fd = -1; }
 }
 
 /* ---------- main ---------- */
@@ -66,33 +89,22 @@ int main(int argc, char **argv)
     /* ---- parse args ---- */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--config") == 0) {
-            if (i + 1 >= argc) {
-                usage(argv[0]);
-                return 2;
-            }
+            if (i + 1 >= argc) { usage(argv[0]); return 2; }
             config_path = argv[++i];
         } else if (strcmp(argv[i], "--node") == 0) {
-            if (i + 1 >= argc) {
-                usage(argv[0]);
-                return 2;
-            }
+            if (i + 1 >= argc) { usage(argv[0]); return 2; }
             node_id = argv[++i];
         } else if (strcmp(argv[i], "--dump-config") == 0) {
             dump = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
+            usage(argv[0]); return 0;
         } else {
             log_error("Unknown argument: %s", argv[i]);
-            usage(argv[0]);
-            return 2;
+            usage(argv[0]); return 2;
         }
     }
 
-    if (!config_path || !node_id) {
-        usage(argv[0]);
-        return 2;
-    }
+    if (!config_path || !node_id) { usage(argv[0]); return 2; }
 
     /* ---- load config ---- */
     app_context_t ctx;
@@ -103,11 +115,13 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (dump) {
-        app_context_dump(&ctx);
-    }
-
+    if (dump) app_context_dump(&ctx);
     g_ctx = &ctx;
+
+    if (ctx.cfg.ne_tunnel_count == 0) {
+        log_error("No ne_tunnel defined for node %s", node_id);
+        return 1;
+    }
 
     /* ---- STEP 1: enable ip_forward ---- */
     if (system_enable_ip_forward() != 0) {
@@ -116,81 +130,89 @@ int main(int argc, char **argv)
     }
 
     /* ---- STEP 2: force routing into TC ---- */
-    if (system_add_route_dev(ctx.cfg.remote_cidr,
-                             ctx.cfg.local_if) != 0) {
+    if (system_add_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if) != 0) {
         log_error("Failed to add route for %s via %s",
-                  ctx.cfg.remote_cidr,
-                  ctx.cfg.local_if);
+                  ctx.cfg.remote_cidr, ctx.cfg.local_if);
         return 1;
     }
 
-    /* ===================================================== */
-    /* ==== OUTBOUND: create veth_tx pair ================== */
-    /* ===================================================== */
-
-    const char *veth_tx_in  = "veth_tx_in";
-    const char *veth_tx_out = "veth_tx_out";
-
-    if (netdev_create_veth_pair(veth_tx_in, veth_tx_out, 1500) != 0) {
-        log_error("Failed to create veth_tx pair");
-        goto cleanup_route;
-    }
-
-    /* TC ingress on LOCAL_IF -> veth_tx_out */
-    if (tc_ingress_redirect(ctx.cfg.local_if, veth_tx_out) != 0) {
-        log_error("Failed to redirect ingress traffic to %s", veth_tx_out);
-        goto cleanup_veth_tx;
-    }
-
-    /* TC egress redirect veth_tx_in -> WAN0 */
-    if (tc_egress_redirect(veth_tx_in, ctx.cfg.wans[0].ifname) != 0) {
-        log_error("Failed to setup TC egress redirect");
-        goto cleanup_tc_ingress_local;
-    }
+    /* ---- STEP 3: Optimize Interfaces ---- */
+    netdev_optimize_interface(ctx.cfg.local_if);
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+        netdev_optimize_interface(ctx.cfg.wans[i].ifname);
 
     /* ===================================================== */
-    /* ==== INBOUND: create veth_rx pair =================== */
-    /* ===================================================== */
-
-    const char *veth_rx_in  = "veth_rx_in";
-    const char *veth_rx_out = "veth_rx_out";
-
-    if (netdev_create_veth_pair(veth_rx_in, veth_rx_out, 1500) != 0) {
-        log_error("Failed to create veth_rx pair");
-        goto cleanup_tc_egress;
-    }
-
-    /* TC ingress on WAN[0] with filter src REMOTE_CIDR -> veth_rx_out */
-    if (tc_wan_ingress_redirect_cidr(ctx.cfg.wans[0].ifname,
-                                      veth_rx_out,
-                                      ctx.cfg.remote_cidr) != 0) {
-        log_error("Failed to setup TC WAN ingress redirect on %s",
-                  ctx.cfg.wans[0].ifname);
-        goto cleanup_veth_rx;
-    }
-
-    /* ===================================================== */
-    /* ==== FANOUT: open N workers per direction =========== */
+    /* ==== FANOUT: outbound workers on local_if =========== */
     /* ===================================================== */
 
     afpkt_fanout_t fg_out;
-    if (afpkt_fanout_open(&fg_out, veth_tx_out, 1) != 0) {
-        log_error("Failed to open fanout outbound on %s", veth_tx_out);
-        goto cleanup_tc_wan_ingress;
-    }
-
-    afpkt_fanout_t fg_in;
-    if (afpkt_fanout_open(&fg_in, veth_rx_out, 2) != 0) {
-        log_error("Failed to open fanout inbound on %s", veth_rx_out);
-        goto cleanup_fanout_out;
+    if (afpkt_fanout_open(&fg_out, ctx.cfg.local_if, 1) != 0) {
+        log_error("Failed to open fanout outbound on %s", ctx.cfg.local_if);
+        goto cleanup_route;
     }
 
     /* ===================================================== */
-    /* ==== INIT CACHE ===================================== */
+    /* ==== INBOUND: 1 single socket per ne_tunnel ========= */
+    /* ===================================================== */
+
+    afpkt_worker_t in_workers[MAX_NE_TUNNELS];
+    size_t in_worker_count = 0;
+    memset(in_workers, 0, sizeof(in_workers));
+    for (size_t i = 0; i < MAX_NE_TUNNELS; i++) {
+        in_workers[i].rx_fd = -1;
+        in_workers[i].tx_fd = -1;
+    }
+
+    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++) {
+        in_workers[w].id = (int)w;
+        if (afpkt_single_open(&in_workers[w], ctx.cfg.ne_tunnels[w].ifname) != 0) {
+            log_error("Failed to open inbound on %s", ctx.cfg.ne_tunnels[w].ifname);
+            goto cleanup_inbound;
+        }
+        in_worker_count++;
+    }
+
+    /* ===================================================== */
+    /* ==== TC DROP: Prevent kernel from double processing = */
+    /* ===================================================== */
+
+    /* Outbound: Drop packets from local going to remote CIDR */
+    if (tc_ingress_drop_cidr(ctx.cfg.local_if, ctx.cfg.remote_cidr) != 0)
+        log_warn("Failed to setup TC ingress drop on %s", ctx.cfg.local_if);
+
+    /* Inbound: Drop mwan protocol packets on ne_tunnel interfaces */
+    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++) {
+        if (tc_wan_ingress_drop_cidr(ctx.cfg.ne_tunnels[w].ifname, ctx.cfg.remote_cidr) != 0)
+            log_warn("Failed to setup TC drop on %s", ctx.cfg.ne_tunnels[w].ifname);
+    }
+
+    /* ===================================================== */
+    /* ==== INIT CACHES ==================================== */
     /* ===================================================== */
 
     afpkt_fanout_init_cache_outbound(&fg_out, &ctx);
-    afpkt_fanout_init_cache_inbound(&fg_in, &ctx);
+    /* Inbound cache: we need local_if info for the reorder output thread */
+    /* Use fg_out.local for convenience (init it here) */
+    afpkt_fanout_init_cache_inbound(&fg_out, &ctx);
+
+    /* ===================================================== */
+    /* ==== REORDER CONTEXT ================================ */
+    /* ===================================================== */
+
+    reorder_ctx_t reorder;
+    reorder_init(&reorder);
+    reorder.running = &running;
+
+    /* TX socket for reorder output thread */
+    reorder.tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (reorder.tx_fd < 0) {
+        log_error("Failed to create reorder TX socket: %s", strerror(errno));
+        goto cleanup_tc;
+    }
+
+    reorder.local_ifindex = fg_out.local.ifindex;
+    memcpy(reorder.local_src_mac, fg_out.local.src_mac, 6);
+    memcpy(reorder.lan_dst_mac, ctx.cfg.lan.dst_mac, 6);
 
     /* ===================================================== */
     /* ==== START THREADS ================================== */
@@ -199,55 +221,72 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
-    int total_threads = NUM_WORKERS * 2;
-    pthread_t threads[NUM_WORKERS * 2];
-    worker_thread_arg_t args[NUM_WORKERS * 2];
+    int total_out = NUM_WORKERS;
+    int total_in  = (int)ctx.cfg.ne_tunnel_count;
+    int total_threads = total_out + total_in + 1;  /* +1 for reorder output */
 
+    pthread_t threads[NUM_WORKERS + MAX_NE_TUNNELS + 1];
+    worker_thread_arg_t args[NUM_WORKERS + MAX_NE_TUNNELS];
+    int tidx = 0;
+
+    /* Outbound workers (fanout on local_if) */
     for (int i = 0; i < NUM_WORKERS; i++) {
-        /* Outbound worker */
-        args[i] = (worker_thread_arg_t){
+        args[tidx] = (worker_thread_arg_t){
             .worker      = &fg_out.workers[i],
             .fg          = &fg_out,
             .ctx         = &ctx,
             .running     = &running,
             .is_outbound = 1,
+            .reorder     = NULL,
         };
-        if (pthread_create(&threads[i], NULL, worker_fn, &args[i]) != 0) {
-            log_error("Failed to create outbound worker thread %d", i);
+        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0) {
+            log_error("Failed to create outbound worker %d", i);
             running = 0;
-            for (int k = 0; k < i; k++)
-                pthread_join(threads[k], NULL);
-            goto cleanup_fanout_in;
+            for (int k = 0; k < tidx; k++) pthread_join(threads[k], NULL);
+            goto cleanup_reorder;
         }
+        tidx++;
+    }
 
-        /* Inbound worker */
-        int j = NUM_WORKERS + i;
-        args[j] = (worker_thread_arg_t){
-            .worker      = &fg_in.workers[i],
-            .fg          = &fg_in,
+    /* Inbound workers (1 per ne_tunnel) */
+    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++) {
+        args[tidx] = (worker_thread_arg_t){
+            .worker      = &in_workers[w],
+            .fg          = &fg_out,    /* Used only for local cache */
             .ctx         = &ctx,
             .running     = &running,
             .is_outbound = 0,
+            .reorder     = &reorder,
         };
-        if (pthread_create(&threads[j], NULL, worker_fn, &args[j]) != 0) {
-            log_error("Failed to create inbound worker thread %d", i);
+        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0) {
+            log_error("Failed to create inbound worker tunnel[%zu]", w);
             running = 0;
-            for (int k = 0; k <= i; k++)
-                pthread_join(threads[k], NULL);
-            for (int k = NUM_WORKERS; k < j; k++)
-                pthread_join(threads[k], NULL);
-            goto cleanup_fanout_in;
+            for (int k = 0; k < tidx; k++) pthread_join(threads[k], NULL);
+            goto cleanup_reorder;
         }
+        tidx++;
     }
 
+    /* Reorder output thread */
+    if (pthread_create(&threads[tidx], NULL, reorder_thread_fn, &reorder) != 0) {
+        log_error("Failed to create reorder output thread");
+        running = 0;
+        for (int k = 0; k < tidx; k++) pthread_join(threads[k], NULL);
+        goto cleanup_reorder;
+    }
+    tidx++;
+
     log_info("===========================================");
-    log_info("  PACKET_FANOUT forwarding started");
-    log_info("  Workers: %d outbound + %d inbound = %d total",
-             NUM_WORKERS, NUM_WORKERS, total_threads);
-    log_info("  OUTBOUND: %s -> WAN[0..%zu]",
-             ctx.cfg.local_if, ctx.cfg.wan_count - 1);
-    log_info("  INBOUND:  WAN[0] (%s) -> %s",
-             ctx.cfg.wans[0].ifname, ctx.cfg.local_if);
+    log_info("  MWAN Tunnel Forwarding Started");
+    log_info("  Architecture: Fragment + Reassembly + Reorder");
+    log_info("  Threshold: %d bytes (no-frag), Tunnel MTU: %d",
+             MWAN_FRAG_THRESHOLD, MWAN_NE_TUNNEL_MTU);
+    log_info("  Workers: %d outbound + %d inbound + 1 reorder = %d total",
+             total_out, total_in, total_threads);
+    log_info("  OUTBOUND: %s -> TUNNEL[0..%zu] (RR by seq)",
+             ctx.cfg.local_if, ctx.cfg.ne_tunnel_count - 1);
+    log_info("  INBOUND:  TUNNEL[0..%zu] -> reassemble -> reorder -> %s",
+             ctx.cfg.ne_tunnel_count - 1, ctx.cfg.local_if);
     log_info("  Press Ctrl+C to stop.");
     log_info("===========================================");
 
@@ -258,32 +297,30 @@ int main(int argc, char **argv)
     log_info("Cleaning up...");
 
     /* ---------- CLEANUP ---------- */
-cleanup_fanout_in:
-    afpkt_fanout_close(&fg_in);
+cleanup_reorder:
+    if (reorder.tx_fd >= 0) {
+        close(reorder.tx_fd);
+        reorder.tx_fd = -1;
+    }
 
-cleanup_fanout_out:
+cleanup_tc:
+    tc_ingress_cleanup(ctx.cfg.local_if);
+    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
+        tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
+
+cleanup_inbound:
+    for (size_t w = 0; w < in_worker_count; w++)
+        worker_close(&in_workers[w]);
+
     afpkt_fanout_close(&fg_out);
 
-cleanup_tc_wan_ingress:
-    tc_wan_ingress_cleanup(ctx.cfg.wans[0].ifname);
-
-cleanup_veth_rx:
-    netdev_delete(veth_rx_in);
-
-cleanup_tc_egress:
-    tc_egress_cleanup(veth_tx_in);
-
-cleanup_tc_ingress_local:
-    tc_ingress_cleanup(ctx.cfg.local_if);
-
-cleanup_veth_tx:
-    netdev_delete(veth_tx_in);
-
 cleanup_route:
-    system_del_route_dev(ctx.cfg.remote_cidr,
-                         ctx.cfg.local_if);
+    system_del_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if);
+
+    netdev_reset_interface(ctx.cfg.local_if);
+    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+        netdev_reset_interface(ctx.cfg.wans[i].ifname);
 
     log_info("Cleanup done.");
-
     return 0;
 }
