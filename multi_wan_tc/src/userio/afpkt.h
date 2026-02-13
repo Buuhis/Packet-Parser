@@ -2,6 +2,7 @@
 #define AFPKT_H
 
 #include "app_context.h"
+#include "proto/mwan_proto.h"
 
 #define NUM_WORKERS 2
 
@@ -12,7 +13,7 @@ typedef struct {
     int             tx_fd;
     void           *ring;
     size_t          ring_size;
-    
+
     /* TPACKET_V3 specific state */
     unsigned int    block_count;   /* Number of blocks in ring (req.tp_block_nr) */
     unsigned int    current_block; /* Index of current block being processed */
@@ -31,6 +32,13 @@ typedef struct {
         int valid;
     } wans[MAX_WANS];
 
+    /* Cached ne_tunnel MAC/ifindex for outbound TX */
+    struct {
+        int ifindex;
+        unsigned char src_mac[6];
+        int valid;
+    } tunnels[MAX_NE_TUNNELS];
+
     struct {
         int ifindex;
         unsigned char src_mac[6];
@@ -40,6 +48,10 @@ typedef struct {
 
 /* Open N sockets on ifname, join fanout group */
 int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id);
+
+/* Open a single RX+TX socket (no fanout, for inbound per-tunnel) */
+int  afpkt_single_open(afpkt_worker_t *w, const char *ifname);
+
 void afpkt_fanout_close(afpkt_fanout_t *fg);
 
 /* Init cache (call once before starting threads) */

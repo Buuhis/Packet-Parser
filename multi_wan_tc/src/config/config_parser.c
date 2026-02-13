@@ -121,6 +121,40 @@ int config_load_env(const char *path,
                     }
                 }
             }
+
+        /* ---- NE_TUNNEL COUNT ---- */
+        } else if (!strcmp(key, "NE_TUNNEL_COUNT")) {
+            cfg->ne_tunnel_count = atoi(val);
+
+        /* ---- NE_TUNNEL ARRAY ---- */
+        } else if (!strncmp(key, "NE_TUNNEL_", 10)) {
+            int idx;
+            char field[32];
+            if (sscanf(key, "NE_TUNNEL_%d_%31s", &idx, field) == 2 &&
+                idx < MAX_NE_TUNNELS) {
+
+                ne_tunnel_cfg_t *t = &cfg->ne_tunnels[idx];
+
+                if (!strcmp(field, "NAME"))
+                    strncpy(t->name, val, sizeof(t->name)-1);
+                else if (!strcmp(field, "IFNAME"))
+                    strncpy(t->ifname, val, sizeof(t->ifname)-1);
+                else if (!strcmp(field, "GATEWAY"))
+                    strncpy(t->gateway, val, sizeof(t->gateway)-1);
+                else if (!strcmp(field, "WEIGHT"))
+                    t->weight = atoi(val);
+                else if (!strcmp(field, "DST_MAC")) {
+                    if (strlen(val) > 0) {
+                        if (parse_mac(val, t->dst_mac) != 0) {
+                            log_error("Failed to parse DST_MAC for NE_TUNNEL[%d]: '%s'", idx, val);
+                        } else {
+                            log_debug("NE_TUNNEL[%d] DST_MAC = %02x:%02x:%02x:%02x:%02x:%02x",
+                                      idx, t->dst_mac[0], t->dst_mac[1], t->dst_mac[2],
+                                      t->dst_mac[3], t->dst_mac[4], t->dst_mac[5]);
+                        }
+                    }
+                }
+            }
         }
     }
 

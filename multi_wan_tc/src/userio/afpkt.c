@@ -2,12 +2,14 @@
 #include "userio/afpkt.h"
 #include "utils/logger.h"
 #include "system/system.h"
+#include "proto/mwan_proto.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #include <sys/socket.h>
 #include <sys/mman.h>
@@ -19,9 +21,12 @@
 #include <net/if.h>
 
 /* TPACKET_V3 constants */
-#define V3_BLOCK_SIZE   (1 << 21) /* 2MB Blocks */
-#define V3_BLOCK_NR     64        /* 64 blocks = 128MB Ring */
-#define V3_FRAME_SIZE   2048      /* Max frame size (not physically strictly enforced in V3 blocks but used in req) */
+#define V3_BLOCK_SIZE (1 << 21) /* 2MB Blocks */
+#define V3_BLOCK_NR 64          /* 64 blocks = 128MB Ring */
+#define V3_FRAME_SIZE 2048
+
+/* Global outbound sequence counter (shared across all outbound workers) */
+static _Atomic uint32_t g_outbound_seq = 0;
 
 /* ================================================== */
 /* ============ FANOUT OPEN / CLOSE ================= */
@@ -34,28 +39,32 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
     fg->fanout_group_id = fanout_group_id;
 
     int ifidx = if_nametoindex(ifname);
-    if (ifidx == 0) {
+    if (ifidx == 0)
+    {
         log_error("if_nametoindex(%s) failed", ifname);
         return -1;
     }
 
-    for (int i = 0; i < NUM_WORKERS; i++) {
+    for (int i = 0; i < NUM_WORKERS; i++)
+    {
         afpkt_worker_t *w = &fg->workers[i];
         w->id = i;
 
         /* 1. RX socket */
         w->rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        if (w->rx_fd < 0) {
+        if (w->rx_fd < 0)
+        {
             log_error("Fanout[%d] worker %d: socket(RX) failed: %s",
                       fanout_group_id, i, strerror(errno));
             return -1;
         }
 
-        /* 2. Set TPACKET_V3 version (MUST be done before ring setup) */
+        /* 2. Set TPACKET_V3 version */
         int version = TPACKET_V3;
-        if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0) {
+        if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0)
+        {
             log_error("Fanout[%d] worker %d: setsockopt(PACKET_VERSION=V3) failed: %s",
-                     fanout_group_id, i, strerror(errno));
+                      fanout_group_id, i, strerror(errno));
             return -1;
         }
 
@@ -69,11 +78,12 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
 
         /* 3. Bind to interface */
         struct sockaddr_ll sll = {
-            .sll_family   = AF_PACKET,
+            .sll_family = AF_PACKET,
             .sll_protocol = htons(ETH_P_ALL),
-            .sll_ifindex  = ifidx,
+            .sll_ifindex = ifidx,
         };
-        if (bind(w->rx_fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
+        if (bind(w->rx_fd, (struct sockaddr *)&sll, sizeof(sll)) != 0)
+        {
             log_error("Fanout[%d] worker %d: bind(%s) failed: %s",
                       fanout_group_id, i, ifname, strerror(errno));
             close(w->rx_fd);
@@ -85,14 +95,15 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         struct tpacket_req3 req;
         memset(&req, 0, sizeof(req));
         req.tp_block_size = V3_BLOCK_SIZE;
-        req.tp_frame_size = V3_FRAME_SIZE; 
-        req.tp_block_nr   = V3_BLOCK_NR;
-        req.tp_frame_nr   = (V3_BLOCK_SIZE * V3_BLOCK_NR) / V3_FRAME_SIZE;
-        req.tp_retire_blk_tov = 10; /* ms timeout to retire block even if not full */
+        req.tp_frame_size = V3_FRAME_SIZE;
+        req.tp_block_nr = V3_BLOCK_NR;
+        req.tp_frame_nr = (V3_BLOCK_SIZE * V3_BLOCK_NR) / V3_FRAME_SIZE;
+        req.tp_retire_blk_tov = 10;
         req.tp_feature_req_word = TP_FT_REQ_FILL_RXHASH;
 
         if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_RX_RING,
-                       &req, sizeof(req)) != 0) {
+                       &req, sizeof(req)) != 0)
+        {
             log_error("Fanout[%d] worker %d: PACKET_RX_RING (V3) failed: %s",
                       fanout_group_id, i, strerror(errno));
             close(w->rx_fd);
@@ -103,7 +114,8 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         size_t ring_sz = (size_t)req.tp_block_size * req.tp_block_nr;
         w->ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE,
                        MAP_SHARED, w->rx_fd, 0);
-        if (w->ring == MAP_FAILED) {
+        if (w->ring == MAP_FAILED)
+        {
             log_error("Fanout[%d] worker %d: mmap failed: %s",
                       fanout_group_id, i, strerror(errno));
             w->ring = NULL;
@@ -115,12 +127,11 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         w->block_count = req.tp_block_nr;
         w->current_block = 0;
 
-        /* 5. PACKET_FANOUT — kernel distributes packets round-robin (Load Balancing) */
-        /*    This ensures single-flow traffic is distributed to ALL workers */
-        int fanout_arg = (fanout_group_id & 0xFFFF)
-                       | (PACKET_FANOUT_HASH << 16);
+        /* 5. PACKET_FANOUT — hash-based distribution */
+        int fanout_arg = (fanout_group_id & 0xFFFF) | (PACKET_FANOUT_HASH << 16);
         if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_FANOUT,
-                       &fanout_arg, sizeof(fanout_arg)) != 0) {
+                       &fanout_arg, sizeof(fanout_arg)) != 0)
+        {
             log_error("Fanout[%d] worker %d: PACKET_FANOUT failed: %s",
                       fanout_group_id, i, strerror(errno));
             munmap(w->ring, w->ring_size);
@@ -130,9 +141,10 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
             return -1;
         }
 
-        /* 6. TX socket (each worker gets its own) */
+        /* 6. TX socket */
         w->tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        if (w->tx_fd < 0) {
+        if (w->tx_fd < 0)
+        {
             log_error("Fanout[%d] worker %d: socket(TX) failed: %s",
                       fanout_group_id, i, strerror(errno));
             munmap(w->ring, w->ring_size);
@@ -149,20 +161,127 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
     return 0;
 }
 
+/* Open a single RX+TX socket without fanout (for inbound per-tunnel) */
+int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
+{
+    memset(w, 0, sizeof(*w));
+    w->rx_fd = -1;
+    w->tx_fd = -1;
+
+    int ifidx = if_nametoindex(ifname);
+    if (ifidx == 0)
+    {
+        log_error("afpkt_single_open: if_nametoindex(%s) failed", ifname);
+        return -1;
+    }
+
+    /* RX socket */
+    w->rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (w->rx_fd < 0)
+    {
+        log_error("afpkt_single_open(%s): socket(RX) failed: %s", ifname, strerror(errno));
+        return -1;
+    }
+
+    /* TPACKET_V3 */
+    int version = TPACKET_V3;
+    if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version)) < 0)
+    {
+        log_error("afpkt_single_open(%s): PACKET_VERSION failed: %s", ifname, strerror(errno));
+        close(w->rx_fd);
+        w->rx_fd = -1;
+        return -1;
+    }
+
+    int ignore_out = 1;
+    setsockopt(w->rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
+
+    int busy_poll_us = 50;
+    setsockopt(w->rx_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+
+    /* Bind */
+    struct sockaddr_ll sll = {
+        .sll_family = AF_PACKET,
+        .sll_protocol = htons(ETH_P_ALL),
+        .sll_ifindex = ifidx,
+    };
+    if (bind(w->rx_fd, (struct sockaddr *)&sll, sizeof(sll)) != 0)
+    {
+        log_error("afpkt_single_open(%s): bind failed: %s", ifname, strerror(errno));
+        close(w->rx_fd);
+        w->rx_fd = -1;
+        return -1;
+    }
+
+    /* RX ring */
+    struct tpacket_req3 req;
+    memset(&req, 0, sizeof(req));
+    req.tp_block_size = V3_BLOCK_SIZE;
+    req.tp_frame_size = V3_FRAME_SIZE;
+    req.tp_block_nr = V3_BLOCK_NR;
+    req.tp_frame_nr = (V3_BLOCK_SIZE * V3_BLOCK_NR) / V3_FRAME_SIZE;
+    req.tp_retire_blk_tov = 10;
+    req.tp_feature_req_word = TP_FT_REQ_FILL_RXHASH;
+
+    if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) != 0)
+    {
+        log_error("afpkt_single_open(%s): PACKET_RX_RING failed: %s", ifname, strerror(errno));
+        close(w->rx_fd);
+        w->rx_fd = -1;
+        return -1;
+    }
+
+    size_t ring_sz = (size_t)req.tp_block_size * req.tp_block_nr;
+    w->ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED, w->rx_fd, 0);
+    if (w->ring == MAP_FAILED)
+    {
+        log_error("afpkt_single_open(%s): mmap failed: %s", ifname, strerror(errno));
+        w->ring = NULL;
+        close(w->rx_fd);
+        w->rx_fd = -1;
+        return -1;
+    }
+    w->ring_size = ring_sz;
+    w->block_count = req.tp_block_nr;
+    w->current_block = 0;
+
+    /* No FANOUT — single socket per tunnel */
+
+    /* TX socket */
+    w->tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (w->tx_fd < 0)
+    {
+        log_error("afpkt_single_open(%s): socket(TX) failed: %s", ifname, strerror(errno));
+        munmap(w->ring, w->ring_size);
+        w->ring = NULL;
+        close(w->rx_fd);
+        w->rx_fd = -1;
+        return -1;
+    }
+
+    log_info("afpkt_single_open(%s): rx_fd=%d tx_fd=%d V3_Blocks=%u",
+             ifname, w->rx_fd, w->tx_fd, w->block_count);
+    return 0;
+}
+
 void afpkt_fanout_close(afpkt_fanout_t *fg)
 {
-    for (int i = 0; i < fg->num_workers; i++) {
+    for (int i = 0; i < fg->num_workers; i++)
+    {
         afpkt_worker_t *w = &fg->workers[i];
 
-        if (w->ring) {
+        if (w->ring)
+        {
             munmap(w->ring, w->ring_size);
             w->ring = NULL;
         }
-        if (w->tx_fd >= 0) {
+        if (w->tx_fd >= 0)
+        {
             close(w->tx_fd);
             w->tx_fd = -1;
         }
-        if (w->rx_fd >= 0) {
+        if (w->rx_fd >= 0)
+        {
             close(w->rx_fd);
             w->rx_fd = -1;
         }
@@ -177,27 +296,50 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
 
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx)
 {
-    for (size_t i = 0; i < ctx->cfg.wan_count && i < MAX_WANS; i++) {
+    /* Cache WAN interfaces (kept for reference) */
+    for (size_t i = 0; i < ctx->cfg.wan_count && i < MAX_WANS; i++)
+    {
         const char *ifname = ctx->cfg.wans[i].ifname;
         int ifidx = if_nametoindex(ifname);
-        if (ifidx == 0) {
+        if (ifidx == 0)
+        {
             log_error("Cache outbound: Failed to get ifindex for WAN '%s'", ifname);
             continue;
         }
-
         unsigned char mac[6];
-        if (system_get_if_hwaddr(ifname, mac) != 0) {
+        if (system_get_if_hwaddr(ifname, mac) != 0)
+        {
             log_error("Cache outbound: Failed to get MAC for WAN '%s'", ifname);
             continue;
         }
-
         fg->wans[i].ifindex = ifidx;
         memcpy(fg->wans[i].src_mac, mac, 6);
         fg->wans[i].valid = 1;
-
         log_info("Cache outbound: WAN[%zu] %s: ifindex=%d, mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                 i, ifname, ifidx,
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                 i, ifname, ifidx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+
+    /* Cache ne_tunnel interfaces for TX */
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count && i < MAX_NE_TUNNELS; i++)
+    {
+        const char *ifname = ctx->cfg.ne_tunnels[i].ifname;
+        int ifidx = if_nametoindex(ifname);
+        if (ifidx == 0)
+        {
+            log_error("Cache outbound: Failed to get ifindex for TUNNEL '%s'", ifname);
+            continue;
+        }
+        unsigned char mac[6];
+        if (system_get_if_hwaddr(ifname, mac) != 0)
+        {
+            log_error("Cache outbound: Failed to get MAC for TUNNEL '%s'", ifname);
+            continue;
+        }
+        fg->tunnels[i].ifindex = ifidx;
+        memcpy(fg->tunnels[i].src_mac, mac, 6);
+        fg->tunnels[i].valid = 1;
+        log_info("Cache outbound: TUNNEL[%zu] %s: ifindex=%d, mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                 i, ifname, ifidx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
     }
 }
 
@@ -207,16 +349,18 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
     int local_idx = if_nametoindex(local_if);
     unsigned char local_mac[6];
 
-    if (local_idx > 0 && system_get_if_hwaddr(local_if, local_mac) == 0) {
+    if (local_idx > 0 && system_get_if_hwaddr(local_if, local_mac) == 0)
+    {
         fg->local.ifindex = local_idx;
         memcpy(fg->local.src_mac, local_mac, 6);
         fg->local.valid = 1;
-
         log_info("Cache inbound: LOCAL %s: ifindex=%d, mac=%02x:%02x:%02x:%02x:%02x:%02x",
                  local_if, local_idx,
                  local_mac[0], local_mac[1], local_mac[2],
                  local_mac[3], local_mac[4], local_mac[5]);
-    } else {
+    }
+    else
+    {
         log_error("Cache inbound: Failed to cache LOCAL interface '%s'", local_if);
     }
 }
@@ -225,225 +369,230 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 /* ============ WORKER LOOP OUTBOUND ================ */
 /* ================================================== */
 
+/*
+ * Outbound: capture from local_if → forward to ne_tunnel (Round Robin)
+ * No fragmentation, no custom header insertion (except Ethernet rewrite).
+ */
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
-                                 const app_context_t *ctx, volatile int *running)
+                                const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
-    log_info("Worker outbound[%d] started (V3 Polling)", w->id);
+    unsigned long captured_cnt = 0;
+    unsigned long ip_pkts = 0;
+    log_info("Worker outbound[%d] started (L3 Forwarding Only)", w->id);
 
-    struct mmsghdr msgs[64];
-    struct iovec iovs[64];
-    struct sockaddr_ll sas[64];
-    /* frame_ptrs not needed */
+    /* Buffer for building new frames. 1514 (ETH) */
+    uint8_t *tx_buf = malloc(2048);
+    if (!tx_buf) {
+        log_error("Worker outbound[%d]: failed to allocate tx_buf", w->id);
+        return;
+    }
 
-    while (*running) {
-        /* 1. Poll for blocks */
-        struct pollfd pfd = { .fd = w->rx_fd, .events = POLLIN };
-        if (poll(&pfd, 1, 0) == 0) {
+    size_t tunnel_count = ctx->cfg.ne_tunnel_count;
+    if (tunnel_count == 0)
+    {
+        log_error("Worker outbound[%d]: no ne_tunnels configured!", w->id);
+        free(tx_buf);
+        return;
+    }
+
+    while (*running)
+    {
+        struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 0) == 0)
             continue;
-        }
 
-        /* 2. Process ALL ready blocks */
-        while (*running) {
-            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
-                ((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
+        while (*running)
+        {
+            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
 
             if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
-                break; /* Not ready */
+                break;
 
-            /* 3. Walk packets inside block */
             int num_pkts = bd->hdr.bh1.num_pkts;
-            struct tpacket3_hdr *ppd;
-            
-            ppd = (struct tpacket3_hdr *) ((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
+            struct tpacket3_hdr *ppd =
+                (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
 
-            int batch_cnt = 0;
-            for (int i = 0; i < num_pkts; i++) {
+            for (int i = 0; i < num_pkts; i++)
+            {
                 unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
                 unsigned int len = ppd->tp_snaplen;
+
+                captured_cnt++;
+
+                /* Need at least Ethernet header */
+                if (len < 14)
+                    goto next_pkt;
+
                 struct ethhdr *eth = (struct ethhdr *)frame;
+
+                /* 1. IGNORE MWAN protocol packets to avoid loops */
+                if (ntohs(eth->h_proto) == MWAN_ETHERTYPE)
+                    goto next_pkt;
+
+                /* 2. IGNORE packets where source MAC is our own LOCAL MAC */
+                if (memcmp(eth->h_source, fg->local.src_mac, 6) == 0)
+                    goto next_pkt;
+
+                /* 3. ONLY process IP packets */
+                if (ntohs(eth->h_proto) != ETH_P_IP && ntohs(eth->h_proto) != ETH_P_IPV6)
+                    goto next_pkt;
+
+                /* Extract IP data */
+                uint8_t *ip_data = frame + 14;
+                uint16_t ip_len = (uint16_t)(len - 14);
+
+                if (ip_len == 0)
+                    goto next_pkt;
+
+                ip_pkts++;
+
+                /* Select tunnel Round-Robin */
+                uint32_t seq = atomic_fetch_add(&g_outbound_seq, 1);
+                int tunnel_idx = (int)(seq % tunnel_count);
+
+                if (!fg->tunnels[tunnel_idx].valid)
+                    goto next_pkt;
                 
-                /* --- Logic Outbound --- */
-                
-                /* Round-robin WAN selection for simplicity in this optimization phase */
-                /* For production, consider hashing flow (ppd->hv1.tp_rxhash) */
-                int selected_wan = (pkt_cnt + i) % ctx->cfg.wan_count;
+                pkt_cnt++;
 
-                if (fg->wans[selected_wan].valid) {
-                     int is_valid = 0;
-                     /* Manual unrolled check for speed */
-                     if (ctx->cfg.wans[selected_wan].dst_mac[0] | ctx->cfg.wans[selected_wan].dst_mac[1] |
-                         ctx->cfg.wans[selected_wan].dst_mac[2] | ctx->cfg.wans[selected_wan].dst_mac[3] |
-                         ctx->cfg.wans[selected_wan].dst_mac[4] | ctx->cfg.wans[selected_wan].dst_mac[5]) {
-                         is_valid = 1;
-                     }
+                struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
+                memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                eth_out->h_proto = htons(MWAN_ETHERTYPE); // 0x88B5 for tunnnel
 
-                     if (is_valid) {
-                        /* Rewrite MAC */
-                        memcpy(eth->h_source, fg->wans[selected_wan].src_mac, 6);
-                        memcpy(eth->h_dest, ctx->cfg.wans[selected_wan].dst_mac, 6);
+                /* Copy original IP packet */
+                memcpy(tx_buf + 14, ip_data, ip_len);
 
-                        /* Add to batch */
-                        iovs[batch_cnt].iov_base = frame;
-                        iovs[batch_cnt].iov_len  = len;
+                struct sockaddr_ll sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sll_family = AF_PACKET;
+                sa.sll_protocol = htons(MWAN_ETHERTYPE);
+                sa.sll_ifindex = fg->tunnels[tunnel_idx].ifindex;
+                sa.sll_halen = 6;
+                memcpy(sa.sll_addr, eth_out->h_dest, 6);
 
-                        memset(&sas[batch_cnt], 0, sizeof(struct sockaddr_ll));
-                        sas[batch_cnt].sll_family   = AF_PACKET;
-                        sas[batch_cnt].sll_protocol = htons(ETH_P_ALL);
-                        sas[batch_cnt].sll_ifindex  = fg->wans[selected_wan].ifindex;
-                        sas[batch_cnt].sll_halen    = 6;
-                        memcpy(sas[batch_cnt].sll_addr, eth->h_dest, 6);
-
-                        memset(&msgs[batch_cnt], 0, sizeof(struct mmsghdr));
-                        msgs[batch_cnt].msg_hdr.msg_name    = &sas[batch_cnt];
-                        msgs[batch_cnt].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        msgs[batch_cnt].msg_hdr.msg_iov     = &iovs[batch_cnt];
-                        msgs[batch_cnt].msg_hdr.msg_iovlen  = 1;
-                        
-                        batch_cnt++;
-                     }
+                if (sendto(w->tx_fd, tx_buf, 14 + ip_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+                    /* Log occasional error? */
                 }
 
-                if (batch_cnt == 64) {
-                    int n = sendmmsg(w->tx_fd, msgs, batch_cnt, 0);
-                    if (n > 0) pkt_cnt += n;
-                    batch_cnt = 0;
-                }
-                
-                ppd = (struct tpacket3_hdr *) ((char *)ppd + ppd->tp_next_offset);
-            }
-            
-            if (batch_cnt > 0) {
-                 int n = sendmmsg(w->tx_fd, msgs, batch_cnt, 0);
-                 if (n > 0) pkt_cnt += n;
+            next_pkt:
+                ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
-            /* 4. Release Block */
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
         }
-
-        if (pkt_cnt % 100000 == 0 && pkt_cnt > 0) {
-             // log_info("Worker outbound[%d] pkt=%lu", w->id, pkt_cnt);
-        }
     }
-    log_info("Worker outbound[%d] stopped, pkt_cnt=%lu", w->id, pkt_cnt);
+    free(tx_buf);
+    log_info("Worker outbound[%d] stopped: captured=%lu ip_pkts=%lu processed=%lu",
+             w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
-
 
 /* ================================================== */
 /* ============ WORKER LOOP INBOUND ================= */
 /* ================================================== */
 
-
+/*
+ * Inbound: capture from ne_tunnel → forward to local_if
+ * No reassembly, no reordering.
+ */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
-                                const app_context_t *ctx, volatile int *running)
+                               const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
-    log_info("Worker inbound[%d] started (V3 Polling)", w->id);
+    unsigned long total_pkts = 0;
+    unsigned long non_mwan = 0;
 
-    struct mmsghdr msgs[64];
-    struct iovec iovs[64];
-    struct sockaddr_ll sas[64];
-    /* frame_ptrs array isn't needed for V3 walk, we use pointers directly */
+    log_info("Worker inbound[%d] started (L3 Forwarding Only)", w->id);
 
-    while (*running) {
-        /* 1. Poll (busy-wait or sleep) until a block is ready */
-        /*    Since we enabled busy_poll sysctl and setsockopt, poll() will spin in kernel first */
-        struct pollfd pfd = { .fd = w->rx_fd, .events = POLLIN };
-        if (poll(&pfd, 1, 0) == 0) {
-           /* No blocks ready, loop again. 
-              Maybe add cpu_relax() or tight loop optimization if needed. */
-           continue; 
-        }
+    /* TX Buffer */
+    uint8_t *tx_buf = malloc(2048);
+    if (!tx_buf) {
+        log_error("Worker inbound[%d]: failed to allocate tx_buf", w->id);
+        return;
+    }
 
-        /* 2. Process ALL ready blocks */
-        while (*running) {
-            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
-                ((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
+    if (!fg->local.valid) {
+        log_error("Worker inbound[%d]: Local interface info missing!", w->id);
+        free(tx_buf);
+        return;
+    }
+
+    while (*running)
+    {
+        struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 0) == 0)
+            continue;
+
+        while (*running)
+        {
+            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
 
             if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
-                break; /* Current block is owned by kernel */
+                break;
 
-            /* 3. Walk packets inside the block */
             int num_pkts = bd->hdr.bh1.num_pkts;
-            struct tpacket3_hdr *ppd;
-            
-            /* First packet is at offset_to_first_pkt */
-            ppd = (struct tpacket3_hdr *) ((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
+            struct tpacket3_hdr *ppd =
+                (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
 
-            int batch_cnt = 0;
-            for (int i = 0; i < num_pkts; i++) {
-                /* Packet payload pointer */
+            for (int i = 0; i < num_pkts; i++)
+            {
                 unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
-                unsigned int len = ppd->tp_snaplen; 
+                unsigned int len = ppd->tp_snaplen;
+
+                total_pkts++;
+                if (len < 14)
+                    goto next_in;
+
                 struct ethhdr *eth = (struct ethhdr *)frame;
-                
-                /* --- Logic Inbound --- */
 
-                if (fg->local.valid) {
-                    /* Only process if valid, otherwise drop/skip */
-                    int valid_dst = 0;
-                    if (ctx->cfg.lan.dst_mac[0] | ctx->cfg.lan.dst_mac[1] | 
-                        ctx->cfg.lan.dst_mac[2] | ctx->cfg.lan.dst_mac[3] |
-                        ctx->cfg.lan.dst_mac[4] | ctx->cfg.lan.dst_mac[5]) {
-                        valid_dst = 1;
-                    }
-
-                    if (valid_dst) {
-                         /* Rewrite L2 */
-                        memcpy(eth->h_dest, ctx->cfg.lan.dst_mac, 6);
-                        memcpy(eth->h_source, fg->local.src_mac, 6);
-
-                        /* Add to batch */
-                        iovs[batch_cnt].iov_base = frame;
-                        iovs[batch_cnt].iov_len  = len;
-
-                        memset(&sas[batch_cnt], 0, sizeof(struct sockaddr_ll));
-                        sas[batch_cnt].sll_family   = AF_PACKET;
-                        sas[batch_cnt].sll_protocol = htons(ETH_P_ALL);
-                        sas[batch_cnt].sll_ifindex  = fg->local.ifindex;
-                        sas[batch_cnt].sll_halen    = 6;
-                        memcpy(sas[batch_cnt].sll_addr, ctx->cfg.lan.dst_mac, 6);
-
-                        memset(&msgs[batch_cnt], 0, sizeof(struct mmsghdr));
-                        msgs[batch_cnt].msg_hdr.msg_name    = &sas[batch_cnt];
-                        msgs[batch_cnt].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        msgs[batch_cnt].msg_hdr.msg_iov     = &iovs[batch_cnt];
-                        msgs[batch_cnt].msg_hdr.msg_iovlen  = 1;
-                        
-                        batch_cnt++;
-                    }
-                }
-                
-                /* Flush batch if full */
-                if (batch_cnt == 64) {
-                    int n = sendmmsg(w->tx_fd, msgs, batch_cnt, 0);
-                    if (n > 0) pkt_cnt += n;
-                    batch_cnt = 0;
+                /* Only process our protocol */
+                if (ntohs(eth->h_proto) != MWAN_ETHERTYPE)
+                {
+                    non_mwan++;
+                    goto next_in;
                 }
 
-                /* Move to next packet in block */
-                ppd = (struct tpacket3_hdr *) ((char *)ppd + ppd->tp_next_offset);
+                /* Extract IP data (Skip Eth header) - Assuming NO mwan_header */
+                uint8_t *ip_data = frame + 14;
+                uint16_t ip_len = (uint16_t)(len - 14);
+                
+                if (ip_len == 0) goto next_in;
+
+                pkt_cnt++;
+
+                /* Rewrite Ethernet Header for LAN */
+                struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
+                memcpy(eth_out->h_source, fg->local.src_mac, 6);
+                memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
+                eth_out->h_proto = htons(ETH_P_IP);
+
+                /* Copy IP data */
+                memcpy(tx_buf + 14, ip_data, ip_len);
+
+                /* Send to local_if */
+                struct sockaddr_ll sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sll_family = AF_PACKET;
+                sa.sll_protocol = htons(ETH_P_IP);
+                sa.sll_ifindex = fg->local.ifindex;
+                sa.sll_halen = 6;
+                memcpy(sa.sll_addr, eth_out->h_dest, 6);
+
+                if (sendto(w->tx_fd, tx_buf, 14 + ip_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+                    /* Log error */
+                }
+
+            next_in:
+                ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
-            /* Flush remaining packets in block */
-            if (batch_cnt > 0) {
-                 int n = sendmmsg(w->tx_fd, msgs, batch_cnt, 0);
-                 if (n > 0) pkt_cnt += n;
-            }
-
-            /* 4. Release Block back to Kernel */
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
-            
-            /* Move to next block ring index */
             w->current_block = (w->current_block + 1) % w->block_count;
         }
-        
-        if (pkt_cnt % 100000 == 0 && pkt_cnt > 0) {
-             // log_info("Worker inbound[%d] pkt=%lu", w->id, pkt_cnt);
-        }
     }
-    log_info("Worker inbound[%d] stopped, pkt_cnt=%lu", w->id, pkt_cnt);
+    free(tx_buf);
+    log_info("Worker inbound[%d] stopped: total=%lu non_mwan=%lu forwarded=%lu",
+             w->id, total_pkts, non_mwan, pkt_cnt);
 }
-

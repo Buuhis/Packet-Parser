@@ -8,6 +8,7 @@ SRC := \
     src/main.c \
     src/app_context.c \
     $(wildcard src/config/*.c) \
+    $(wildcard src/proto/*.c) \
     $(wildcard src/system/*.c) \
     $(wildcard src/tc/*.c) \
     $(wildcard src/userio/*.c) \
