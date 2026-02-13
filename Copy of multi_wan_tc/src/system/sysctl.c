@@ -10,6 +10,9 @@
 /* Path used by kernel for IPv4 forwarding */
 #define IP_FORWARD_PATH "/proc/sys/net/ipv4/ip_forward"
 
+/* Static variable to save original IP forward state */
+static int s_original_ip_forward = -1;  /* -1 means not saved yet */
+
 int system_get_ip_forward(void) {
     FILE *fp = fopen(IP_FORWARD_PATH, "r");
     if (!fp) {
@@ -70,6 +73,27 @@ int system_enable_ip_forward(void) {
 }
 
 int system_disable_ip_forward(void) {
+    /* Save original state before disabling */
+    if (s_original_ip_forward < 0) {
+        s_original_ip_forward = system_get_ip_forward();
+        if (s_original_ip_forward < 0) {
+            log_error("Failed to read original IP forward state");
+            s_original_ip_forward = 1;  /* Default to enabled */
+        }
+        log_info("Saved original IP forward state: %d", s_original_ip_forward);
+    }
     return system_set_ip_forward(0);
+}
+
+int system_restore_ip_forward(void) {
+    if (s_original_ip_forward < 0) {
+        log_info("No saved IP forward state to restore");
+        return 0;
+    }
+    
+    log_info("Restoring IP forward to original state: %d", s_original_ip_forward);
+    int rc = system_set_ip_forward(s_original_ip_forward);
+    s_original_ip_forward = -1;  /* Clear saved state */
+    return rc;
 }
 

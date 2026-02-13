@@ -6,6 +6,7 @@
 int system_get_ip_forward(void);
 int system_enable_ip_forward(void);
 int system_disable_ip_forward(void);
+int system_restore_ip_forward(void);  /* Restore to state before disable was called */
 
 /* ---- Routing ---- */
 

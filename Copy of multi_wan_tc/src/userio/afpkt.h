@@ -62,7 +62,6 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                  const app_context_t *ctx, volatile int *running);
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
-                                const app_context_t *ctx, volatile int *running,
-                                reorder_ctx_t *reorder);
+                                const app_context_t *ctx, volatile int *running);
 
 #endif /* AFPKT_H */
