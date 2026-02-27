@@ -3,6 +3,7 @@
 
 #include "app_context.h"
 #include "proto/mwan_proto.h"
+#include "proto/fragment.h"
 
 #define NUM_WORKERS 2
 
@@ -44,6 +45,8 @@ typedef struct {
         unsigned char src_mac[6];
         int valid;
     } local;
+
+    struct frag_table *frag_tbl;
 } afpkt_fanout_t;
 
 /* Open N sockets on ifname, join fanout group */
