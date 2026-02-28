@@ -30,10 +30,11 @@ void frag_table_gc(struct frag_table *ft) {
     uint64_t now = get_time_ns();
     for (int i = 0; i < FRAG_TABLE_SIZE; i++) {
         struct frag_entry *entry = &ft->entries[i];
-        if (entry->valid) {
+        if (entry->has_frag0 || entry->has_frag1) {
             pthread_spin_lock(&entry->lock);
-            if (entry->valid && (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
-                entry->valid = 0;
+            if ((entry->has_frag0 || entry->has_frag1) && (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
+                entry->has_frag0 = 0;
+                entry->has_frag1 = 0;
             }
             pthread_spin_unlock(&entry->lock);
         }
@@ -174,11 +175,23 @@ int frag_is_fragment(const uint8_t *pkt_data, uint32_t pkt_len,
     if (pkt_len < (uint32_t)(14 + 20 + FRAG_PLAIN_HDR_SIZE))
         return 0;
 
-    uint8_t ip_proto = pkt_data[14 + 9];
+    uint8_t ip_ver = pkt_data[14] >> 4;
+    int ip_hdr_len = 0;
+    uint8_t ip_proto = 0;
+
+    if (ip_ver == 4) {
+        ip_proto = pkt_data[14 + 9];
+        ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+    } else if (ip_ver == 6) {
+        ip_proto = pkt_data[14 + 6];
+        ip_hdr_len = 40;
+    } else {
+        return 0;
+    }
+
     if (ip_proto != FRAG_PROTOCOL)
         return 0;
 
-    int ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
     int frag_off = 14 + ip_hdr_len;
 
     if (pkt_len < (uint32_t)(frag_off + FRAG_PLAIN_HDR_SIZE))
@@ -199,15 +212,25 @@ int frag_defragment(uint8_t *packet, size_t pkt_len,
 
     uint16_t ether_type = ((uint16_t)packet[12] << 8) | packet[13];
     int ip_hdr_len;
+    int is_ipv4 = 0;
 
     if (ether_type == 0x0800) {
-        if (packet[14 + 9] != FRAG_PROTOCOL) return -1;
-        ip_hdr_len = (packet[14] & 0x0F) * 4;
+        is_ipv4 = 1;
     } else if (ether_type == 0x86DD) {
-        if (packet[14 + 6] != FRAG_PROTOCOL) return -1;
-        ip_hdr_len = 40;
+        is_ipv4 = 0;
+    } else if (ether_type == MWAN_ETHERTYPE) {
+        if ((packet[14] >> 4) == 4) is_ipv4 = 1;
+        else is_ipv4 = 0;
     } else {
         return -1;
+    }
+
+    if (is_ipv4) {
+        if (packet[14 + 9] != FRAG_PROTOCOL) return -1;
+        ip_hdr_len = (packet[14] & 0x0F) * 4;
+    } else {
+        if (packet[14 + 6] != FRAG_PROTOCOL) return -1;
+        ip_hdr_len = 40;
     }
 
     int frag_off = 14 + ip_hdr_len;
@@ -222,7 +245,7 @@ int frag_defragment(uint8_t *packet, size_t pkt_len,
     memmove(packet + frag_off, packet + frag_off + FRAG_PLAIN_HDR_SIZE, payload_len);
 
     /* Restore original protocol */
-    if (ether_type == 0x0800) {
+    if (is_ipv4) {
         packet[14 + 9] = orig_proto;
         uint16_t old_totlen = ((uint16_t)packet[14 + 2] << 8) | packet[14 + 3];
         uint16_t new_totlen = old_totlen - FRAG_PLAIN_HDR_SIZE;
@@ -254,12 +277,23 @@ int frag_try_reassemble(struct frag_table *ft,
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
     int ip_hdr_len;
+    int is_ipv4 = 0;
+
     if (ether_type == 0x0800) {
-        ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+        is_ipv4 = 1;
     } else if (ether_type == 0x86DD) {
-        ip_hdr_len = 40;
+        is_ipv4 = 0;
+    } else if (ether_type == MWAN_ETHERTYPE) {
+        if ((pkt_data[14] >> 4) == 4) is_ipv4 = 1;
+        else is_ipv4 = 0;
     } else {
         return -1;
+    }
+
+    if (is_ipv4) {
+        ip_hdr_len = (pkt_data[14] & 0x0F) * 4;
+    } else {
+        ip_hdr_len = 40;
     }
 
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len + FRAG_PLAIN_HDR_SIZE;
@@ -271,64 +305,81 @@ int frag_try_reassemble(struct frag_table *ft,
     
     pthread_spin_lock(&entry->lock);
 
-    if (frag_index == 0) {
+    // Xử lý timeout nếu có mảnh cũ treo cứng
+    if ((entry->has_frag0 || entry->has_frag1) && (now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
+        entry->has_frag0 = 0;
+        entry->has_frag1 = 0;
+    }
+
+    // Nếu slot đang chứa pkt_id hiện tại, hoặc đang rỗng thì xài
+    if ((entry->has_frag0 || entry->has_frag1) && entry->pkt_id != pkt_id) {
+        // Có gói mới chiếm slot => Clear slot ghi đè
+        entry->has_frag0 = 0;
+        entry->has_frag1 = 0;
+    }
+
+    if (!entry->has_frag0 && !entry->has_frag1) {
         entry->pkt_id = pkt_id;
-        entry->data_len = payload_len;
-        if (payload_len > sizeof(entry->data)) {
-            pthread_spin_unlock(&entry->lock);
-            return -1;
-        }
-        memcpy(entry->data, payload, payload_len);
+        entry->timestamp_ns = now;
+        // Copy Ethernet & IP Header của gói rơi vào trước (có thể là h1 hoặc h2)
         memcpy(entry->eth_hdr, pkt_data, 14);
         memcpy(entry->ip_hdr, pkt_data + 14, ip_hdr_len);
         entry->ip_hdr_len = ip_hdr_len;
         uint8_t orig_proto, ignored_idx;
         uint16_t ignored_id;
         frag_read_hdr(pkt_data + 14 + ip_hdr_len, &orig_proto, &ignored_id, &ignored_idx);
-        
         entry->orig_proto = orig_proto;
-        entry->timestamp_ns = now;
-        entry->valid = 1;
-        pthread_spin_unlock(&entry->lock);
-        return 0; // successfully stored frag 0
     }
 
-    if (frag_index == 1) {
-        if (!entry->valid || entry->pkt_id != pkt_id) {
+    // Lưu mảng theo index tương ứng
+    if (frag_index == 0) {
+        if (payload_len > sizeof(entry->data0)) {
             pthread_spin_unlock(&entry->lock);
             return -1;
         }
-
-        if ((now - entry->timestamp_ns) > FRAG_TIMEOUT_NS) {
-            entry->valid = 0;
+        memcpy(entry->data0, payload, payload_len);
+        entry->data0_len = payload_len;
+        entry->has_frag0 = 1;
+    } else if (frag_index == 1) {
+        if (payload_len > sizeof(entry->data1)) {
             pthread_spin_unlock(&entry->lock);
             return -1;
         }
+        memcpy(entry->data1, payload, payload_len);
+        entry->data1_len = payload_len;
+        entry->has_frag1 = 1;
+    } else {
+        pthread_spin_unlock(&entry->lock);
+        return -1;
+    }
 
-        uint32_t total_payload = entry->data_len + payload_len;
+    // Xem đủ 2 mảnh chưa?
+    if (entry->has_frag0 && entry->has_frag1) {
+        uint32_t total_payload = entry->data0_len + entry->data1_len;
         uint32_t total_pkt = 14 + entry->ip_hdr_len + total_payload;
 
         if (total_pkt > 4096) {
-            entry->valid = 0;
+            entry->has_frag0 = 0;
+            entry->has_frag1 = 0;
             pthread_spin_unlock(&entry->lock);
             return -1;
         }
 
         int off = 0;
-
         memcpy(out_buf, entry->eth_hdr, 14);
         off += 14;
 
         memcpy(out_buf + off, entry->ip_hdr, entry->ip_hdr_len);
         off += entry->ip_hdr_len;
 
-        memcpy(out_buf + off, entry->data, entry->data_len);
-        off += entry->data_len;
+        // Bơm theo đúng thứ tự data0 rồi data1
+        memcpy(out_buf + off, entry->data0, entry->data0_len);
+        off += entry->data0_len;
 
-        memcpy(out_buf + off, payload, payload_len);
-        off += payload_len;
+        memcpy(out_buf + off, entry->data1, entry->data1_len);
+        off += entry->data1_len;
 
-        if (ether_type == 0x0800) {
+        if (is_ipv4) {
             uint16_t ip_total = (uint16_t)(entry->ip_hdr_len + total_payload);
             out_buf[14 + 2] = (uint8_t)(ip_total >> 8);
             out_buf[14 + 3] = (uint8_t)(ip_total & 0xFF);
@@ -348,11 +399,16 @@ int frag_try_reassemble(struct frag_table *ft,
         }
 
         *out_len = (uint32_t)off;
-        entry->valid = 0;
+        
+        // Reset slot
+        entry->has_frag0 = 0;
+        entry->has_frag1 = 0;
+        
         pthread_spin_unlock(&entry->lock);
         return 1; // successfully reassembled
     }
 
+    // Thiếu mảnh, chưa đủ
     pthread_spin_unlock(&entry->lock);
-    return -1;
+    return 0; // successfully stored frag
 }

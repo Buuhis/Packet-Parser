@@ -183,8 +183,8 @@ int main(int argc, char **argv)
 
     /* ---- STEP 3: Optimize Interfaces ---- */
     netdev_optimize_interface(ctx.cfg.local_if);
-    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-        netdev_optimize_interface(ctx.cfg.wans[i].ifname);
+    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+    //     netdev_optimize_interface(ctx.cfg.wans[i].ifname);
 
     /* ===================================================== */
     /* ==== FANOUT: outbound workers on local_if =========== */
@@ -332,7 +332,7 @@ int main(int argc, char **argv)
 
     /* ---------- CLEANUP ---------- */
 
-    tc_ingress_cleanup(ctx.cfg.local_if);
+    // tc_ingress_cleanup(ctx.cfg.local_if);
     // for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
     //     tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
 
@@ -354,8 +354,8 @@ cleanup_route:
     system_restore_ip_forward();
 
     netdev_reset_interface(ctx.cfg.local_if);
-    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-        netdev_reset_interface(ctx.cfg.wans[i].ifname);
+    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+    //     netdev_reset_interface(ctx.cfg.wans[i].ifname);
 
     log_info("Cleanup done.");
     return 0;

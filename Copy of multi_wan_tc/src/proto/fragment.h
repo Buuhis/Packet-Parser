@@ -17,14 +17,17 @@
 
 struct frag_entry {
     uint16_t pkt_id;
-    uint8_t  data[1600];
-    uint32_t data_len;
+    uint8_t  data0[2048];
+    uint32_t data0_len;
+    uint8_t  data1[2048];
+    uint32_t data1_len;
     uint8_t  eth_hdr[14];
     uint8_t  ip_hdr[60];
     int      ip_hdr_len;
     uint8_t  orig_proto;
     uint64_t timestamp_ns;
-    int      valid;
+    uint8_t  has_frag0;
+    uint8_t  has_frag1;
     pthread_spinlock_t lock;
 };
 

@@ -644,7 +644,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                             struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
                             memcpy(eth_out->h_source, fg->local.src_mac, 6);
                             memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
-                            eth_out->h_proto = htons(ETH_P_IP);
+                            eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
 
                             /* Copy IP data */
                             memcpy(tx_buf + 14, ip_data, ip_len);
@@ -673,7 +673,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
                     memcpy(eth_out->h_source, fg->local.src_mac, 6);
                     memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
-                    eth_out->h_proto = htons(ETH_P_IP);
+                    eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
 
                     /* Copy IP data */
                     memcpy(tx_buf + 14, ip_data, ip_len);
