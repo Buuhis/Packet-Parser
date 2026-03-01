@@ -4,6 +4,7 @@
 #include "utils/logger.h"
 #include "userio/afpkt.h"
 #include "proto/mwan_proto.h"
+#include "proto/fragment.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +62,16 @@ static void *worker_fn(void *arg)
     return NULL;
 }
 
+static void *gc_worker_fn(void *arg)
+{
+    struct frag_table *ft = (struct frag_table *)arg;
+    while (running) {
+        frag_table_gc(ft);
+        usleep(100000); /* 100ms */
+    }
+    return NULL;
+}
+
 /* ---------- helper: close single worker ---------- */
 
 static void worker_close(afpkt_worker_t *w)
@@ -90,7 +101,7 @@ int main(int argc, char **argv)
     const char *node_id = NULL;
     int dump = 0;
 
-    log_set_level(LOG_INFO);
+    log_set_level(LOG_DEBUG);
 
     /* ---- parse args ---- */
     for (int i = 1; i < argc; i++)
@@ -172,17 +183,29 @@ int main(int argc, char **argv)
 
     /* ---- STEP 3: Optimize Interfaces ---- */
     netdev_optimize_interface(ctx.cfg.local_if);
-    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-        netdev_optimize_interface(ctx.cfg.wans[i].ifname);
+    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+    //     netdev_optimize_interface(ctx.cfg.wans[i].ifname);
 
     /* ===================================================== */
     /* ==== FANOUT: outbound workers on local_if =========== */
     /* ===================================================== */
 
     afpkt_fanout_t fg_out;
+    memset(&fg_out, 0, sizeof(fg_out));
+
     if (afpkt_fanout_open(&fg_out, ctx.cfg.local_if, 1) != 0)
     {
         log_error("Failed to open fanout outbound on %s", ctx.cfg.local_if);
+        goto cleanup_route;
+    }
+
+    struct frag_table *ft = malloc(sizeof(struct frag_table));
+    if (ft) {
+        frag_table_init(ft);
+        fg_out.frag_tbl = ft;
+    } else {
+        log_error("Failed to allocate fragment table!");
+        afpkt_fanout_close(&fg_out);
         goto cleanup_route;
     }
 
@@ -229,6 +252,13 @@ int main(int argc, char **argv)
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+
+    pthread_t gc_thread;
+    if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
+        log_error("Failed to create GC thread");
+        running = 0;
+        goto cleanup_inbound;
+    }
 
     int total_out = NUM_WORKERS;
     int total_in = (int)ctx.cfg.ne_tunnel_count;
@@ -282,7 +312,7 @@ int main(int argc, char **argv)
 
     log_info("===========================================");
     log_info("  MWAN Tunnel Forwarding Started");
-    log_info("  Mode: Simple L3 Forwarding (No Frag/Reasm/Reorder)");
+    log_info("  Mode: Forwarding (With Fragmentation & Reassembly)");
     log_info("  Workers: %d outbound + %d inbound = %d total",
              total_out, total_in, total_threads);
     log_info("  OUTBOUND: %s -> TUNNEL[0..%zu] (RR)",
@@ -296,29 +326,36 @@ int main(int argc, char **argv)
     for (int i = 0; i < total_threads; i++)
         pthread_join(threads[i], NULL);
 
+    pthread_join(gc_thread, NULL);
+
     log_info("Cleaning up...");
 
     /* ---------- CLEANUP ---------- */
 
-    tc_ingress_cleanup(ctx.cfg.local_if);
-    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-        tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
+    // tc_ingress_cleanup(ctx.cfg.local_if);
+    // for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
+    //     tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
 
 cleanup_inbound:
     for (size_t w = 0; w < in_worker_count; w++)
         worker_close(&in_workers[w]);
 
+    if (fg_out.frag_tbl) {
+        free(fg_out.frag_tbl);
+        fg_out.frag_tbl = NULL;
+    }
+
     afpkt_fanout_close(&fg_out);
 
 cleanup_route:
-    system_del_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if);
+    // system_del_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if);
 
     /* Restore IP forward to original state */
     system_restore_ip_forward();
 
     netdev_reset_interface(ctx.cfg.local_if);
-    for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-        netdev_reset_interface(ctx.cfg.wans[i].ifname);
+    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
+    //     netdev_reset_interface(ctx.cfg.wans[i].ifname);
 
     log_info("Cleanup done.");
     return 0;
