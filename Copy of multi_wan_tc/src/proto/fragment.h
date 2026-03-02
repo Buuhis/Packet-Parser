@@ -11,8 +11,8 @@
 #define FRAG_PLAIN_HDR_SIZE 4   /* marker(1) + pkt_id(2) + frag_index(1) */
 #define FRAG_FLAG_BIT       0x80
 #define FRAG_MTU            MWAN_NE_TUNNEL_MTU // 1418
-#define FRAG_TABLE_SIZE     4096
-#define FRAG_TIMEOUT_NS     (100ULL * 1000000ULL) // 100ms
+#define FRAG_TABLE_SIZE     65536
+#define FRAG_TIMEOUT_NS     (50ULL * 1000000ULL) // Giảm xuống 50ms để dọn slot nhanh hơn
 #define FRAG_PROTOCOL       253
 
 struct frag_entry {

@@ -113,7 +113,8 @@ int main(int argc, char **argv)
     const char *node_id = NULL;
     int dump = 0;
 
-    log_set_level(LOG_DEBUG);
+    log_set_level(LOG_INFO);
+    // log_set_level(LOG_DEBUG);
 
     /* ---- parse args ---- */
     for (int i = 1; i < argc; i++)
