@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "app_context.h"
 #include "system/system.h"
 #include "tc/tc.h"
@@ -11,6 +12,7 @@
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sched.h>
 #include <pthread.h>
 #include <errno.h>
 
@@ -24,6 +26,16 @@
 /* ---------- global state ---------- */
 
 static volatile int running = 1;
+
+/* ---------- thread affinity ---------- */
+
+static int bind_thread_to_core(pthread_t thread, int core_id)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+}
 
 /* ---------- signal handler ---------- */
 
@@ -253,12 +265,23 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
+    int available_cores[] = {1, 3, 5, 7, 9, 11};
+    int num_available_cores = sizeof(available_cores) / sizeof(available_cores[0]);
+    int current_core_idx = 0;
+
     pthread_t gc_thread;
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
         running = 0;
         goto cleanup_inbound;
     }
+    int gc_core = available_cores[current_core_idx % num_available_cores];
+    if (bind_thread_to_core(gc_thread, gc_core) == 0) {
+        log_info("Bound GC thread to core %d", gc_core);
+    } else {
+        log_warn("Failed to bind GC thread to core %d", gc_core);
+    }
+    current_core_idx++;
 
     int total_out = NUM_WORKERS;
     int total_in = (int)ctx.cfg.ne_tunnel_count;
@@ -286,6 +309,15 @@ int main(int argc, char **argv)
                 pthread_join(threads[k], NULL);
             goto cleanup_inbound;
         }
+
+        int core_id = available_cores[current_core_idx % num_available_cores];
+        if (bind_thread_to_core(threads[tidx], core_id) == 0) {
+            log_info("Bound outbound worker %d to core %d", i, core_id);
+        } else {
+            log_warn("Failed to bind outbound worker %d to core %d", i, core_id);
+        }
+        current_core_idx++;
+
         tidx++;
     }
 
@@ -307,6 +339,15 @@ int main(int argc, char **argv)
                 pthread_join(threads[k], NULL);
             goto cleanup_inbound;
         }
+
+        int core_id = available_cores[current_core_idx % num_available_cores];
+        if (bind_thread_to_core(threads[tidx], core_id) == 0) {
+            log_info("Bound inbound worker %zu to core %d", w, core_id);
+        } else {
+            log_warn("Failed to bind inbound worker %zu to core %d", w, core_id);
+        }
+        current_core_idx++;
+
         tidx++;
     }
 
