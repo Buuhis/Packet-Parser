@@ -29,6 +29,83 @@
 static _Atomic uint32_t g_outbound_seq = 0;
 
 /* ================================================== */
+/* =============== SENDMMSG BATCH =================== */
+/* ================================================== */
+
+#define SENDMMSG_BATCH 64
+#define SENDMMSG_BUF_SIZE 4096
+
+typedef struct {
+    struct mmsghdr     msgs[SENDMMSG_BATCH];
+    struct iovec       iovs[SENDMMSG_BATCH];
+    struct sockaddr_ll addrs[SENDMMSG_BATCH];
+    uint8_t            bufs[SENDMMSG_BATCH][SENDMMSG_BUF_SIZE];
+    int                count;
+    int                tx_fd;
+} send_batch_t;
+
+static send_batch_t *batch_create(int tx_fd)
+{
+    send_batch_t *b = (send_batch_t *)malloc(sizeof(send_batch_t));
+    if (!b) return NULL;
+    memset(b, 0, sizeof(*b));
+    b->tx_fd = tx_fd;
+    return b;
+}
+
+static void batch_flush(send_batch_t *b)
+{
+    if (b->count == 0) return;
+    sendmmsg(b->tx_fd, b->msgs, b->count, 0);
+    b->count = 0;
+}
+
+static inline void batch_add(send_batch_t *b,
+                             const uint8_t *pkt, uint32_t pkt_len,
+                             const struct sockaddr_ll *addr)
+{
+    int idx = b->count;
+    memcpy(b->bufs[idx], pkt, pkt_len);
+    b->addrs[idx] = *addr;
+    b->iovs[idx].iov_base = b->bufs[idx];
+    b->iovs[idx].iov_len  = pkt_len;
+    b->msgs[idx].msg_hdr.msg_name       = &b->addrs[idx];
+    b->msgs[idx].msg_hdr.msg_namelen    = sizeof(struct sockaddr_ll);
+    b->msgs[idx].msg_hdr.msg_iov        = &b->iovs[idx];
+    b->msgs[idx].msg_hdr.msg_iovlen     = 1;
+    b->msgs[idx].msg_hdr.msg_control    = NULL;
+    b->msgs[idx].msg_hdr.msg_controllen = 0;
+    b->msgs[idx].msg_hdr.msg_flags      = 0;
+    b->count++;
+    if (b->count >= SENDMMSG_BATCH)
+        batch_flush(b);
+}
+
+static inline uint8_t *batch_next_buf(send_batch_t *b)
+{
+    return b->bufs[b->count];
+}
+
+static inline void batch_commit(send_batch_t *b, uint32_t pkt_len,
+                                const struct sockaddr_ll *addr)
+{
+    int idx = b->count;
+    b->addrs[idx] = *addr;
+    b->iovs[idx].iov_base = b->bufs[idx];
+    b->iovs[idx].iov_len  = pkt_len;
+    b->msgs[idx].msg_hdr.msg_name       = &b->addrs[idx];
+    b->msgs[idx].msg_hdr.msg_namelen    = sizeof(struct sockaddr_ll);
+    b->msgs[idx].msg_hdr.msg_iov        = &b->iovs[idx];
+    b->msgs[idx].msg_hdr.msg_iovlen     = 1;
+    b->msgs[idx].msg_hdr.msg_control    = NULL;
+    b->msgs[idx].msg_hdr.msg_controllen = 0;
+    b->msgs[idx].msg_hdr.msg_flags      = 0;
+    b->count++;
+    if (b->count >= SENDMMSG_BATCH)
+        batch_flush(b);
+}
+
+/* ================================================== */
 /* ============ FANOUT OPEN / CLOSE ================= */
 /* ================================================== */
 
@@ -296,29 +373,6 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
 
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx)
 {
-    // /* Cache WAN interfaces (kept for reference) */
-    // for (size_t i = 0; i < ctx->cfg.wan_count && i < MAX_WANS; i++)
-    // {
-    //     const char *ifname = ctx->cfg.wans[i].ifname;
-    //     int ifidx = if_nametoindex(ifname);
-    //     if (ifidx == 0)
-    //     {
-    //         log_error("Cache outbound: Failed to get ifindex for WAN '%s'", ifname);
-    //         continue;
-    //     }
-    //     unsigned char mac[6];
-    //     if (system_get_if_hwaddr(ifname, mac) != 0)
-    //     {
-    //         log_error("Cache outbound: Failed to get MAC for WAN '%s'", ifname);
-    //         continue;
-    //     }
-    //     fg->wans[i].ifindex = ifidx;
-    //     memcpy(fg->wans[i].src_mac, mac, 6);
-    //     fg->wans[i].valid = 1;
-    //     log_info("Cache outbound: WAN[%zu] %s: ifindex=%d, mac=%02x:%02x:%02x:%02x:%02x:%02x",
-    //              i, ifname, ifidx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    // }
-
     /* Cache ne_tunnel interfaces for TX */
     for (size_t i = 0; i < ctx->cfg.ne_tunnel_count && i < MAX_NE_TUNNELS; i++)
     {
@@ -379,12 +433,11 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long pkt_cnt = 0;
     unsigned long captured_cnt = 0;
     unsigned long ip_pkts = 0;
-    log_info("Worker outbound[%d] started (L3 Forwarding Only)", w->id);
+    log_info("Worker outbound[%d] started (sendmmsg batch mode)", w->id);
 
-    /* Buffer for building new frames. 1514 (ETH) */
-    uint8_t *tx_buf = malloc(2048);
-    if (!tx_buf) {
-        log_error("Worker outbound[%d]: failed to allocate tx_buf", w->id);
+    send_batch_t *batch = batch_create(w->tx_fd);
+    if (!batch) {
+        log_error("Worker outbound[%d]: failed to allocate batch", w->id);
         return;
     }
 
@@ -392,7 +445,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     if (tunnel_count == 0)
     {
         log_error("Worker outbound[%d]: no ne_tunnels configured!", w->id);
-        free(tx_buf);
+        free(batch);
         return;
     }
 
@@ -468,6 +521,15 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 
                 pkt_cnt++;
 
+                /* Prepare common sockaddr_ll for this tunnel */
+                struct sockaddr_ll sa;
+                memset(&sa, 0, sizeof(sa));
+                sa.sll_family = AF_PACKET;
+                sa.sll_protocol = htons(MWAN_ETHERTYPE);
+                sa.sll_ifindex = fg->tunnels[tunnel_idx].ifindex;
+                sa.sll_halen = 6;
+                memcpy(sa.sll_addr, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+
                 if (frag_need_split((uint32_t)len)) {
                     uint8_t frag1_pkt[2048];
                     uint32_t frag1_len;
@@ -475,76 +537,42 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     uint32_t frag2_len;
 
                     if (frag_split(frame, (uint32_t)len, frag1_pkt, &frag1_len, frag2_pkt, &frag2_len) == 0) {
-                        /* Send Frag 1 */
                         struct ethhdr *eth_out1 = (struct ethhdr *)frag1_pkt;
                         memcpy(eth_out1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                         memcpy(eth_out1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                         eth_out1->h_proto = htons(MWAN_ETHERTYPE);
-                        
-                        struct sockaddr_ll sa1;
-                        memset(&sa1, 0, sizeof(sa1));
-                        sa1.sll_family = AF_PACKET;
-                        sa1.sll_protocol = htons(MWAN_ETHERTYPE);
-                        sa1.sll_ifindex = fg->tunnels[tunnel_idx].ifindex;
-                        sa1.sll_halen = 6;
-                        memcpy(sa1.sll_addr, eth_out1->h_dest, 6);
-                        
-                        sendto(w->tx_fd, frag1_pkt, frag1_len, 0, (struct sockaddr *)&sa1, sizeof(sa1));
+                        batch_add(batch, frag1_pkt, frag1_len, &sa);
 
-                        /* Send Frag 2 */
                         struct ethhdr *eth_out2 = (struct ethhdr *)frag2_pkt;
                         memcpy(eth_out2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                         memcpy(eth_out2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                         eth_out2->h_proto = htons(MWAN_ETHERTYPE);
-                        
-                        struct sockaddr_ll sa2;
-                        memset(&sa2, 0, sizeof(sa2));
-                        sa2.sll_family = AF_PACKET;
-                        sa2.sll_protocol = htons(MWAN_ETHERTYPE);
-                        sa2.sll_ifindex = fg->tunnels[tunnel_idx].ifindex;
-                        sa2.sll_halen = 6;
-                        memcpy(sa2.sll_addr, eth_out2->h_dest, 6);
-                        
-                        sendto(w->tx_fd, frag2_pkt, frag2_len, 0, (struct sockaddr *)&sa2, sizeof(sa2));
-                        
-                        log_debug("Worker outbound[%d]: FRAGMENTED seq %u to tunnel %d", w->id, seq, tunnel_idx);
-                    } else {
-                        log_error("Worker outbound[%d]: frag_split failed for pkt_len=%u", w->id, len);
+                        batch_add(batch, frag2_pkt, frag2_len, &sa);
                     }
                 } else {
-                    struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
+                    /* Build packet directly in batch buffer (zero-copy) */
+                    uint8_t *buf = batch_next_buf(batch);
+                    struct ethhdr *eth_out = (struct ethhdr *)buf;
                     memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                     memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                    eth_out->h_proto = htons(MWAN_ETHERTYPE); // 0x88B5 for tunnnel
-
-                    /* Copy original IP packet */
-                    memcpy(tx_buf + 14, ip_data, ip_len);
-
-                    struct sockaddr_ll sa;
-                    memset(&sa, 0, sizeof(sa));
-                    sa.sll_family = AF_PACKET;
-                    sa.sll_protocol = htons(MWAN_ETHERTYPE);
-                    sa.sll_ifindex = fg->tunnels[tunnel_idx].ifindex;
-                    sa.sll_halen = 6;
-                    memcpy(sa.sll_addr, eth_out->h_dest, 6);
-
-                    if (sendto(w->tx_fd, tx_buf, 14 + ip_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                        log_error("Worker outbound[%d]: sendto failed: %s", w->id, strerror(errno));
-                    } else {
-                        log_debug("Worker outbound[%d]: Forwarded seq %u to tunnel %d (%s) ip_len=%u",
-                                   w->id, seq, tunnel_idx, ctx->cfg.ne_tunnels[tunnel_idx].ifname, ip_len);
-                    }
+                    eth_out->h_proto = htons(MWAN_ETHERTYPE);
+                    memcpy(buf + 14, ip_data, ip_len);
+                    batch_commit(batch, 14 + ip_len, &sa);
                 }
 
             next_pkt:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
+            /* Flush batch after each block */
+            batch_flush(batch);
+
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
         }
     }
-    free(tx_buf);
+    batch_flush(batch);
+    free(batch);
     log_info("Worker outbound[%d] stopped: captured=%lu ip_pkts=%lu processed=%lu",
              w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
@@ -564,20 +592,28 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long total_pkts = 0;
     unsigned long non_mwan = 0;
 
-    log_info("Worker inbound[%d] started (L3 Forwarding Only)", w->id);
+    log_info("Worker inbound[%d] started (sendmmsg batch mode)", w->id);
 
-    /* TX Buffer */
-    uint8_t *tx_buf = malloc(2048);
-    if (!tx_buf) {
-        log_error("Worker inbound[%d]: failed to allocate tx_buf", w->id);
+    send_batch_t *batch = batch_create(w->tx_fd);
+    if (!batch) {
+        log_error("Worker inbound[%d]: failed to allocate batch", w->id);
         return;
     }
 
     if (!fg->local.valid) {
         log_error("Worker inbound[%d]: Local interface info missing!", w->id);
-        free(tx_buf);
+        free(batch);
         return;
     }
+
+    /* Pre-build common sockaddr_ll for local interface */
+    struct sockaddr_ll sa_local;
+    memset(&sa_local, 0, sizeof(sa_local));
+    sa_local.sll_family = AF_PACKET;
+    sa_local.sll_protocol = htons(ETH_P_IP);
+    sa_local.sll_ifindex = fg->local.ifindex;
+    sa_local.sll_halen = 6;
+    memcpy(sa_local.sll_addr, ctx->cfg.lan.dst_mac, 6);
 
     while (*running)
     {
@@ -636,73 +672,43 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     uint32_t reassem_len = 0;
                     if (fg->frag_tbl) {
                         int ret = frag_try_reassemble(fg->frag_tbl, frame, len, pkt_id, frag_index, reassembled, &reassem_len);
-                        if (ret == 1) { // successfully reassembled
-                            // extract new payload size to send
+                        if (ret == 1) {
                             ip_data = reassembled + 14;
                             ip_len = reassem_len - 14;
-                            
-                            struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
+
+                            uint8_t *buf = batch_next_buf(batch);
+                            struct ethhdr *eth_out = (struct ethhdr *)buf;
                             memcpy(eth_out->h_source, fg->local.src_mac, 6);
                             memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
                             eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
-
-                            /* Copy IP data */
-                            memcpy(tx_buf + 14, ip_data, ip_len);
-
-                            struct sockaddr_ll sa;
-                            memset(&sa, 0, sizeof(sa));
-                            sa.sll_family = AF_PACKET;
-                            sa.sll_protocol = htons(ETH_P_IP);
-                            sa.sll_ifindex = fg->local.ifindex;
-                            sa.sll_halen = 6;
-                            memcpy(sa.sll_addr, eth_out->h_dest, 6);
-
-                            if (sendto(w->tx_fd, tx_buf, 14 + ip_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                                log_error("Worker inbound[%d]: sendto failed (local_if, reassembled): %s", w->id, strerror(errno));
-                            } else {
-                                log_debug("Worker inbound[%d]: Forwarded REASSEMBLED packet to local LAN (ip_len=%u)", w->id, ip_len);
-                            }
-                        } else if (ret == 0) {
-                             log_debug("Worker inbound[%d]: Stored fragment pkt_id=%u idx=%u", w->id, pkt_id, frag_index);
-                        } else {
-                             log_debug("Worker inbound[%d]: fragment drop/error pkt_id=%u", w->id, pkt_id);
+                            memcpy(buf + 14, ip_data, ip_len);
+                            batch_commit(batch, 14 + ip_len, &sa_local);
                         }
+                        /* ret == 0: stored frag, ret < 0: error — silently continue */
                     }
                 } else {
-                    /* Rewrite Ethernet Header for LAN */
-                    struct ethhdr *eth_out = (struct ethhdr *)tx_buf;
+                    uint8_t *buf = batch_next_buf(batch);
+                    struct ethhdr *eth_out = (struct ethhdr *)buf;
                     memcpy(eth_out->h_source, fg->local.src_mac, 6);
                     memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
                     eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
-
-                    /* Copy IP data */
-                    memcpy(tx_buf + 14, ip_data, ip_len);
-
-                    /* Send to local_if */
-                    struct sockaddr_ll sa;
-                    memset(&sa, 0, sizeof(sa));
-                    sa.sll_family = AF_PACKET;
-                    sa.sll_protocol = htons(ETH_P_IP);
-                    sa.sll_ifindex = fg->local.ifindex;
-                    sa.sll_halen = 6;
-                    memcpy(sa.sll_addr, eth_out->h_dest, 6);
-
-                    if (sendto(w->tx_fd, tx_buf, 14 + ip_len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
-                        log_error("Worker inbound[%d]: sendto failed (local_if): %s", w->id, strerror(errno));
-                    } else {
-                        log_debug("Worker inbound[%d]: Forwarded packet from tunnel to local LAN (ip_len=%u)", w->id, ip_len);
-                    }
+                    memcpy(buf + 14, ip_data, ip_len);
+                    batch_commit(batch, 14 + ip_len, &sa_local);
                 }
 
             next_in:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
+            /* Flush batch after each block */
+            batch_flush(batch);
+
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
         }
     }
-    free(tx_buf);
+    batch_flush(batch);
+    free(batch);
     log_info("Worker inbound[%d] stopped: total=%lu non_mwan=%lu forwarded=%lu",
              w->id, total_pkts, non_mwan, pkt_cnt);
 }
