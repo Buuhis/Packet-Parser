@@ -10,7 +10,6 @@ SRC := \
     $(wildcard src/config/*.c) \
     $(wildcard src/proto/*.c) \
     $(wildcard src/system/*.c) \
-    $(wildcard src/tc/*.c) \
     $(wildcard src/userio/*.c) \
     $(wildcard src/utils/*.c)
 

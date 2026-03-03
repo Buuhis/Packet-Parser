@@ -785,15 +785,32 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
                                volatile int *running)
 {
     unsigned long total = 0, pushed = 0, dropped = 0;
+    unsigned long prev_pushed = 0, prev_dropped = 0;
     uint32_t rr = 0;
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     log_info("Pipeline RX thread started (distributing to %d TX workers)", num_queues);
 
     while (*running)
     {
         struct pollfd pfd = {.fd = rx_w->rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 100) <= 0)
+        if (poll(&pfd, 1, 100) <= 0) {
+            /* Periodic stats even when idle */
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            double elapsed = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
+            if (elapsed >= 2.0) {
+                unsigned long delta_push = pushed - prev_pushed;
+                unsigned long delta_drop = dropped - prev_dropped;
+                log_info("[RX STATS] push_rate=%lu pkt/s | q_full_drops=%lu/s | total_dropped=%lu",
+                         (unsigned long)(delta_push / elapsed),
+                         (unsigned long)(delta_drop / elapsed), dropped);
+                prev_pushed = pushed;
+                prev_dropped = dropped;
+                clock_gettime(CLOCK_MONOTONIC, &ts_start);
+            }
             continue;
+        }
 
         while (*running)
         {
@@ -820,7 +837,6 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
                 struct ethhdr *eth = (struct ethhdr *)frame;
                 uint16_t h_proto = ntohs(eth->h_proto);
 
-                /* Filter: same as outbound */
                 if (h_proto == MWAN_ETHERTYPE)
                     goto rx_next;
                 if (memcmp(eth->h_source, fg->local.src_mac, 6) == 0)
@@ -830,21 +846,33 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
                 if (len <= 14)
                     goto rx_next;
 
-                /* Round-robin push to TX worker queues */
                 int q_idx = (int)(rr++ % (uint32_t)num_queues);
                 if (pkt_queue_push(queues[q_idx], frame, len) == 0) {
                     pushed++;
                 } else {
-                    dropped++;  /* queue full — TX worker can't keep up */
+                    dropped++;
                 }
 
             rx_next:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
-            /* Release block immediately so kernel can reuse */
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             rx_w->current_block = (rx_w->current_block + 1) % rx_w->block_count;
+        }
+
+        /* Periodic stats under load */
+        clock_gettime(CLOCK_MONOTONIC, &ts_now);
+        double elapsed = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
+        if (elapsed >= 2.0) {
+            unsigned long delta_push = pushed - prev_pushed;
+            unsigned long delta_drop = dropped - prev_dropped;
+            log_info("[RX STATS] push_rate=%lu pkt/s | q_full_drops=%lu/s | total_dropped=%lu",
+                     (unsigned long)(delta_push / elapsed),
+                     (unsigned long)(delta_drop / elapsed), dropped);
+            prev_pushed = pushed;
+            prev_dropped = dropped;
+            clock_gettime(CLOCK_MONOTONIC, &ts_start);
         }
     }
 
@@ -861,6 +889,11 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
                            volatile int *running)
 {
     unsigned long pkt_cnt = 0;
+    unsigned long prev_pkt_cnt = 0;
+    unsigned long send_calls = 0;
+    struct timespec ts_start, ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
     log_info("Pipeline TX worker[%d] started", worker_id);
 
     size_t tunnel_count = ctx->cfg.ne_tunnel_count;
@@ -898,7 +931,19 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
         uint32_t write_pos = pkt_queue_write_pos(q);
 
         if (local_read == write_pos) {
-            /* Queue empty — spin briefly */
+            /* Queue empty — print stats periodically */
+            clock_gettime(CLOCK_MONOTONIC, &ts_now);
+            double elapsed = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
+            if (elapsed >= 2.0) {
+                unsigned long delta = pkt_cnt - prev_pkt_cnt;
+                uint32_t q_depth = (atomic_load_explicit(&q->write_idx, memory_order_relaxed)
+                                   - local_read) & PKT_QUEUE_MASK;
+                log_info("[TX%d STATS] proc_rate=%lu pkt/s | sendmmsg_calls=%lu | q_depth=%u",
+                         worker_id, (unsigned long)(delta / elapsed), send_calls, q_depth);
+                prev_pkt_cnt = pkt_cnt;
+                send_calls = 0;
+                clock_gettime(CLOCK_MONOTONIC, &ts_start);
+            }
             continue;
         }
 
@@ -922,7 +967,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
 
             if (frag_need_split(len)) {
                 if (batch_n + 2 > TX_PIPE_BATCH || frag_idx + 2 > TX_PIPE_BATCH)
-                    break;  /* flush what we have */
+                    break;
 
                 uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
                 uint8_t *f2 = frag_arena + (size_t)(frag_idx + 1) * 2048;
@@ -961,7 +1006,6 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
                 if (batch_n >= TX_PIPE_BATCH)
                     break;
 
-                /* Rewrite ETH in-place on queue slot (safe: we own it) */
                 struct ethhdr *eth_out = (struct ethhdr *)frame;
                 memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                 memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
@@ -979,11 +1023,11 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
             local_read = (local_read + 1) & PKT_QUEUE_MASK;
         }
 
-        /* Send batch then release slots */
-        if (batch_n > 0)
+        if (batch_n > 0) {
             sendmmsg(tx_fd, tx_batch, batch_n, 0);
+            send_calls++;
+        }
 
-        /* Advance read_idx AFTER send — slots are safe to reuse now */
         pkt_queue_consume_to(q, local_read);
     }
 

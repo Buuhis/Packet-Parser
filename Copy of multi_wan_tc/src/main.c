@@ -53,6 +53,51 @@ static void usage(const char *prog)
             "Usage: %s --config <file> --node <id> [--dump-config]\n", prog);
 }
 
+/* ---- Pipeline RX thread arg ---- */
+typedef struct {
+    afpkt_worker_t *rx;
+    const afpkt_fanout_t *fg;
+    struct pkt_queue **queues;
+    int num_queues;
+    volatile int *running;
+} rx_arg_t;
+
+static void *rx_fn(void *a) {
+    rx_arg_t *r = (rx_arg_t *)a;
+    afpkt_rx_distribute_loop(r->rx, r->fg, r->queues, r->num_queues, r->running);
+    return NULL;
+}
+
+/* ---- Pipeline TX worker thread args ---- */
+typedef struct {
+    int id;
+    struct pkt_queue *q;
+    int tx_fd;
+    const afpkt_fanout_t *fg;
+    app_context_t *ctx;
+    volatile int *running;
+} tx_arg_t;
+
+static void *tx_fn(void *a) {
+    tx_arg_t *t = (tx_arg_t *)a;
+    afpkt_tx_worker_loop(t->id, t->q, t->tx_fd, t->fg, t->ctx, t->running);
+    return NULL;
+}
+
+/* ---- Inbound workers (1 per ne_tunnel, unchanged) ---- */
+typedef struct {
+    afpkt_worker_t *worker;
+    const afpkt_fanout_t *fg;
+    app_context_t *ctx;
+    volatile int *running;
+} in_arg_t;
+
+static void *in_fn(void *a) {
+    in_arg_t *ina = (in_arg_t *)a;
+    afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->running);
+    return NULL;
+}
+
 /* ---------- worker thread arg ---------- */
 
 typedef struct
@@ -64,15 +109,15 @@ typedef struct
     int is_outbound;
 } worker_thread_arg_t;
 
-static void *worker_fn(void *arg)
-{
-    worker_thread_arg_t *a = (worker_thread_arg_t *)arg;
-    if (a->is_outbound)
-        afpkt_worker_loop_outbound(a->worker, a->fg, a->ctx, a->running);
-    else
-        afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running);
-    return NULL;
-}
+// static void *worker_fn(void *arg)
+// {
+//     worker_thread_arg_t *a = (worker_thread_arg_t *)arg;
+//     if (a->is_outbound)
+//         afpkt_worker_loop_outbound(a->worker, a->fg, a->ctx, a->running);
+//     else
+//         afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running);
+//     return NULL;
+// }
 
 static void *gc_worker_fn(void *arg)
 {
@@ -285,15 +330,6 @@ int main(int argc, char **argv)
     pthread_t *threads = calloc(max_threads, sizeof(pthread_t));
     int tidx = 0;
 
-    /* ---- Pipeline RX thread arg ---- */
-    typedef struct {
-        afpkt_worker_t *rx;
-        const afpkt_fanout_t *fg;
-        struct pkt_queue **queues;
-        int num_queues;
-        volatile int *running;
-    } rx_arg_t;
-
     rx_arg_t rx_arg = {
         .rx = &pipeline.rx,
         .fg = &fg_out,
@@ -301,12 +337,6 @@ int main(int argc, char **argv)
         .num_queues = pipeline.num_tx_workers,
         .running = &running,
     };
-
-    static void *rx_fn(void *a) {
-        rx_arg_t *r = (rx_arg_t *)a;
-        afpkt_rx_distribute_loop(r->rx, r->fg, r->queues, r->num_queues, r->running);
-        return NULL;
-    }
 
     if (pthread_create(&threads[tidx], NULL, rx_fn, &rx_arg) != 0) {
         log_error("Failed to create RX thread");
@@ -319,23 +349,7 @@ int main(int argc, char **argv)
     current_core_idx++;
     tidx++;
 
-    /* ---- Pipeline TX worker thread args ---- */
-    typedef struct {
-        int id;
-        struct pkt_queue *q;
-        int tx_fd;
-        const afpkt_fanout_t *fg;
-        app_context_t *ctx;
-        volatile int *running;
-    } tx_arg_t;
-
     tx_arg_t tx_args[MAX_TX_WORKERS];
-
-    static void *tx_fn(void *a) {
-        tx_arg_t *t = (tx_arg_t *)a;
-        afpkt_tx_worker_loop(t->id, t->q, t->tx_fd, t->fg, t->ctx, t->running);
-        return NULL;
-    }
 
     for (int i = 0; i < pipeline.num_tx_workers; i++) {
         tx_args[i] = (tx_arg_t){
@@ -360,21 +374,7 @@ int main(int argc, char **argv)
         tidx++;
     }
 
-    /* ---- Inbound workers (1 per ne_tunnel, unchanged) ---- */
-    typedef struct {
-        afpkt_worker_t *worker;
-        const afpkt_fanout_t *fg;
-        app_context_t *ctx;
-        volatile int *running;
-    } in_arg_t;
-
     in_arg_t in_args[MAX_NE_TUNNELS];
-
-    static void *in_fn(void *a) {
-        in_arg_t *ina = (in_arg_t *)a;
-        afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->running);
-        return NULL;
-    }
 
     for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++) {
         in_args[w] = (in_arg_t){
