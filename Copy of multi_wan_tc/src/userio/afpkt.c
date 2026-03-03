@@ -703,3 +703,290 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     log_info("Worker inbound[%d] stopped: total=%lu non_mwan=%lu forwarded=%lu",
              w->id, total_pkts, non_mwan, pkt_cnt);
 }
+
+/* ================================================== */
+/* ============ PIPELINE: OPEN / CLOSE ============== */
+/* ================================================== */
+
+int afpkt_pipeline_open(afpkt_pipeline_t *pl, const char *ifname, int num_tx_workers)
+{
+    memset(pl, 0, sizeof(*pl));
+    if (num_tx_workers > MAX_TX_WORKERS)
+        num_tx_workers = MAX_TX_WORKERS;
+    pl->num_tx_workers = num_tx_workers;
+
+    for (int i = 0; i < MAX_TX_WORKERS; i++)
+        pl->tx_fds[i] = -1;
+
+    /* Single RX socket with TPACKET_V3 (no fanout) */
+    if (afpkt_single_open(&pl->rx, ifname) != 0) {
+        log_error("Pipeline: failed to open RX on %s", ifname);
+        return -1;
+    }
+
+    /* Allocate per-worker queues */
+    for (int i = 0; i < num_tx_workers; i++) {
+        pl->queues[i] = malloc(sizeof(struct pkt_queue));
+        if (!pl->queues[i]) {
+            log_error("Pipeline: failed to alloc queue[%d]", i);
+            afpkt_pipeline_close(pl);
+            return -1;
+        }
+        pkt_queue_init(pl->queues[i]);
+    }
+
+    /* Per-worker TX sockets */
+    for (int i = 0; i < num_tx_workers; i++) {
+        pl->tx_fds[i] = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (pl->tx_fds[i] < 0) {
+            log_error("Pipeline: failed to open TX socket[%d]: %s", i, strerror(errno));
+            afpkt_pipeline_close(pl);
+            return -1;
+        }
+    }
+
+    log_info("Pipeline opened: RX on %s, %d TX workers, queue capacity=%d",
+             ifname, num_tx_workers, PKT_QUEUE_CAPACITY);
+    return 0;
+}
+
+void afpkt_pipeline_close(afpkt_pipeline_t *pl)
+{
+    /* Close RX */
+    if (pl->rx.ring) {
+        munmap(pl->rx.ring, pl->rx.ring_size);
+        pl->rx.ring = NULL;
+    }
+    if (pl->rx.rx_fd >= 0) { close(pl->rx.rx_fd); pl->rx.rx_fd = -1; }
+    if (pl->rx.tx_fd >= 0) { close(pl->rx.tx_fd); pl->rx.tx_fd = -1; }
+
+    /* Free queues */
+    for (int i = 0; i < MAX_TX_WORKERS; i++) {
+        free(pl->queues[i]);
+        pl->queues[i] = NULL;
+    }
+
+    /* Close TX sockets */
+    for (int i = 0; i < MAX_TX_WORKERS; i++) {
+        if (pl->tx_fds[i] >= 0) {
+            close(pl->tx_fds[i]);
+            pl->tx_fds[i] = -1;
+        }
+    }
+}
+
+/* ================================================== */
+/* ============ PIPELINE: RX DISTRIBUTE ============= */
+/* ================================================== */
+
+void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
+                               const afpkt_fanout_t *fg,
+                               struct pkt_queue **queues, int num_queues,
+                               volatile int *running)
+{
+    unsigned long total = 0, pushed = 0, dropped = 0;
+    uint32_t rr = 0;
+
+    log_info("Pipeline RX thread started (distributing to %d TX workers)", num_queues);
+
+    while (*running)
+    {
+        struct pollfd pfd = {.fd = rx_w->rx_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 100) <= 0)
+            continue;
+
+        while (*running)
+        {
+            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
+                ((char *)rx_w->ring + (rx_w->current_block * V3_BLOCK_SIZE));
+
+            if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
+                break;
+
+            int num_pkts = bd->hdr.bh1.num_pkts;
+            struct tpacket3_hdr *ppd =
+                (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
+
+            for (int i = 0; i < num_pkts; i++)
+            {
+                unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
+                unsigned int len = ppd->tp_snaplen;
+
+                total++;
+
+                if (len < 14)
+                    goto rx_next;
+
+                struct ethhdr *eth = (struct ethhdr *)frame;
+                uint16_t h_proto = ntohs(eth->h_proto);
+
+                /* Filter: same as outbound */
+                if (h_proto == MWAN_ETHERTYPE)
+                    goto rx_next;
+                if (memcmp(eth->h_source, fg->local.src_mac, 6) == 0)
+                    goto rx_next;
+                if (h_proto != ETH_P_IP && h_proto != ETH_P_IPV6)
+                    goto rx_next;
+                if (len <= 14)
+                    goto rx_next;
+
+                /* Round-robin push to TX worker queues */
+                int q_idx = (int)(rr++ % (uint32_t)num_queues);
+                if (pkt_queue_push(queues[q_idx], frame, len) == 0) {
+                    pushed++;
+                } else {
+                    dropped++;  /* queue full — TX worker can't keep up */
+                }
+
+            rx_next:
+                ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
+            }
+
+            /* Release block immediately so kernel can reuse */
+            bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
+            rx_w->current_block = (rx_w->current_block + 1) % rx_w->block_count;
+        }
+    }
+
+    log_info("Pipeline RX stopped: total=%lu pushed=%lu q_full_drops=%lu", total, pushed, dropped);
+}
+
+/* ================================================== */
+/* ============ PIPELINE: TX WORKER ================= */
+/* ================================================== */
+
+void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
+                           const afpkt_fanout_t *fg,
+                           const app_context_t *ctx,
+                           volatile int *running)
+{
+    unsigned long pkt_cnt = 0;
+    log_info("Pipeline TX worker[%d] started", worker_id);
+
+    size_t tunnel_count = ctx->cfg.ne_tunnel_count;
+    if (tunnel_count == 0) {
+        log_error("TX worker[%d]: no tunnels configured!", worker_id);
+        return;
+    }
+
+    /* Pre-cache sockaddr_ll per tunnel */
+    struct sockaddr_ll cached_sa[MAX_NE_TUNNELS];
+    for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
+        memset(&cached_sa[t], 0, sizeof(cached_sa[t]));
+        cached_sa[t].sll_family   = AF_PACKET;
+        cached_sa[t].sll_protocol = htons(MWAN_ETHERTYPE);
+        cached_sa[t].sll_ifindex  = fg->tunnels[t].ifindex;
+        cached_sa[t].sll_halen    = 6;
+        memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
+    }
+
+    /* Fragment arena + batch structures */
+    #define TX_PIPE_BATCH 256
+    uint8_t *frag_arena = malloc((size_t)TX_PIPE_BATCH * 2048);
+    if (!frag_arena) {
+        log_error("TX worker[%d]: alloc frag_arena failed", worker_id);
+        return;
+    }
+
+    struct mmsghdr tx_batch[TX_PIPE_BATCH];
+    struct iovec   tx_iov[TX_PIPE_BATCH];
+    uint32_t local_rr = (uint32_t)worker_id;
+    uint32_t local_read = atomic_load_explicit(&q->read_idx, memory_order_relaxed);
+
+    while (*running)
+    {
+        uint32_t write_pos = pkt_queue_write_pos(q);
+
+        if (local_read == write_pos) {
+            /* Queue empty — spin briefly */
+            continue;
+        }
+
+        int batch_n = 0;
+        int frag_idx = 0;
+
+        /* Drain available packets from queue into batch */
+        while (local_read != write_pos && batch_n < TX_PIPE_BATCH - 1)
+        {
+            struct pkt_slot *slot = pkt_queue_slot_at(q, local_read);
+            uint8_t *frame = slot->data;
+            uint32_t len = slot->len;
+
+            int tunnel_idx = (int)(local_rr++ % tunnel_count);
+            if (!fg->tunnels[tunnel_idx].valid) {
+                local_read = (local_read + 1) & PKT_QUEUE_MASK;
+                continue;
+            }
+
+            pkt_cnt++;
+
+            if (frag_need_split(len)) {
+                if (batch_n + 2 > TX_PIPE_BATCH || frag_idx + 2 > TX_PIPE_BATCH)
+                    break;  /* flush what we have */
+
+                uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
+                uint8_t *f2 = frag_arena + (size_t)(frag_idx + 1) * 2048;
+                uint32_t f1_len, f2_len;
+
+                if (frag_split(frame, len, f1, &f1_len, f2, &f2_len) == 0) {
+                    struct ethhdr *eh1 = (struct ethhdr *)f1;
+                    memcpy(eh1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                    memcpy(eh1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                    eh1->h_proto = htons(MWAN_ETHERTYPE);
+
+                    struct ethhdr *eh2 = (struct ethhdr *)f2;
+                    memcpy(eh2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                    memcpy(eh2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                    eh2->h_proto = htons(MWAN_ETHERTYPE);
+
+                    tx_iov[batch_n] = (struct iovec){ .iov_base = f1, .iov_len = f1_len };
+                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                    batch_n++;
+
+                    tx_iov[batch_n] = (struct iovec){ .iov_base = f2, .iov_len = f2_len };
+                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                    batch_n++;
+
+                    frag_idx += 2;
+                }
+            } else {
+                if (batch_n >= TX_PIPE_BATCH)
+                    break;
+
+                /* Rewrite ETH in-place on queue slot (safe: we own it) */
+                struct ethhdr *eth_out = (struct ethhdr *)frame;
+                memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                eth_out->h_proto = htons(MWAN_ETHERTYPE);
+
+                tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = len };
+                memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                batch_n++;
+            }
+
+            local_read = (local_read + 1) & PKT_QUEUE_MASK;
+        }
+
+        /* Send batch then release slots */
+        if (batch_n > 0)
+            sendmmsg(tx_fd, tx_batch, batch_n, 0);
+
+        /* Advance read_idx AFTER send — slots are safe to reuse now */
+        pkt_queue_consume_to(q, local_read);
+    }
+
+    free(frag_arena);
+    log_info("Pipeline TX worker[%d] stopped: processed=%lu", worker_id, pkt_cnt);
+}

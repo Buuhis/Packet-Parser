@@ -194,23 +194,26 @@ int main(int argc, char **argv)
     //     return 1;
     // }
 
-    /* ---- STEP 3: Optimize Interfaces ---- */
+    /* ---- STEP 3: Disable offloads + Optimize Interfaces ---- */
+    netdev_disable_offloads(ctx.cfg.local_if);
     netdev_optimize_interface(ctx.cfg.local_if);
     // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
     //     netdev_optimize_interface(ctx.cfg.wans[i].ifname);
 
     /* ===================================================== */
-    /* ==== FANOUT: outbound workers on local_if =========== */
+    /* ==== PIPELINE: outbound on local_if ================= */
     /* ===================================================== */
 
-    afpkt_fanout_t fg_out;
-    memset(&fg_out, 0, sizeof(fg_out));
-
-    if (afpkt_fanout_open(&fg_out, ctx.cfg.local_if, 1) != 0)
+    afpkt_pipeline_t pipeline;
+    if (afpkt_pipeline_open(&pipeline, ctx.cfg.local_if, NUM_TX_WORKERS) != 0)
     {
-        log_error("Failed to open fanout outbound on %s", ctx.cfg.local_if);
+        log_error("Failed to open pipeline on %s", ctx.cfg.local_if);
         goto cleanup_route;
     }
+
+    /* Cache container (fanout struct used for tunnel/local cache only) */
+    afpkt_fanout_t fg_out;
+    memset(&fg_out, 0, sizeof(fg_out));
 
     struct frag_table *ft = malloc(sizeof(struct frag_table));
     if (ft) {
@@ -218,7 +221,7 @@ int main(int argc, char **argv)
         fg_out.frag_tbl = ft;
     } else {
         log_error("Failed to allocate fragment table!");
-        afpkt_fanout_close(&fg_out);
+        afpkt_pipeline_close(&pipeline);
         goto cleanup_route;
     }
 
@@ -247,12 +250,6 @@ int main(int argc, char **argv)
     }
 
     /* ===================================================== */
-    /* ==== TC DROP (Optional) ============================= */
-    /* ===================================================== */
-
-    // tc_ingress_drop_cidr(ctx.cfg.local_if, ctx.cfg.remote_cidr);
-
-    /* ===================================================== */
     /* ==== INIT CACHES ==================================== */
     /* ===================================================== */
 
@@ -270,6 +267,7 @@ int main(int argc, char **argv)
     int num_available_cores = sizeof(available_cores) / sizeof(available_cores[0]);
     int current_core_idx = 0;
 
+    /* ---- GC thread ---- */
     pthread_t gc_thread;
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
@@ -277,89 +275,139 @@ int main(int argc, char **argv)
         goto cleanup_inbound;
     }
     int gc_core = available_cores[current_core_idx % num_available_cores];
-    if (bind_thread_to_core(gc_thread, gc_core) == 0) {
+    if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
-    } else {
-        log_warn("Failed to bind GC thread to core %d", gc_core);
-    }
     current_core_idx++;
 
-    int total_out = NUM_WORKERS;
-    int total_in = (int)ctx.cfg.ne_tunnel_count;
-    int total_threads = total_out + total_in;
-
-    pthread_t threads[NUM_WORKERS + MAX_NE_TUNNELS];
-    worker_thread_arg_t args[NUM_WORKERS + MAX_NE_TUNNELS];
+    /* ---- Thread arrays ---- */
+    /* Max threads: 1 RX + MAX_TX_WORKERS TX + MAX_NE_TUNNELS inbound */
+    int max_threads = 1 + NUM_TX_WORKERS + (int)ctx.cfg.ne_tunnel_count;
+    pthread_t *threads = calloc(max_threads, sizeof(pthread_t));
     int tidx = 0;
 
-    /* Outbound workers (fanout on local_if) */
-    for (int i = 0; i < NUM_WORKERS; i++)
-    {
-        args[tidx] = (worker_thread_arg_t){
-            .worker = &fg_out.workers[i],
+    /* ---- Pipeline RX thread arg ---- */
+    typedef struct {
+        afpkt_worker_t *rx;
+        const afpkt_fanout_t *fg;
+        struct pkt_queue **queues;
+        int num_queues;
+        volatile int *running;
+    } rx_arg_t;
+
+    rx_arg_t rx_arg = {
+        .rx = &pipeline.rx,
+        .fg = &fg_out,
+        .queues = pipeline.queues,
+        .num_queues = pipeline.num_tx_workers,
+        .running = &running,
+    };
+
+    static void *rx_fn(void *a) {
+        rx_arg_t *r = (rx_arg_t *)a;
+        afpkt_rx_distribute_loop(r->rx, r->fg, r->queues, r->num_queues, r->running);
+        return NULL;
+    }
+
+    if (pthread_create(&threads[tidx], NULL, rx_fn, &rx_arg) != 0) {
+        log_error("Failed to create RX thread");
+        running = 0;
+        goto cleanup_inbound;
+    }
+    int rx_core = available_cores[current_core_idx % num_available_cores];
+    if (bind_thread_to_core(threads[tidx], rx_core) == 0)
+        log_info("Bound pipeline RX to core %d", rx_core);
+    current_core_idx++;
+    tidx++;
+
+    /* ---- Pipeline TX worker thread args ---- */
+    typedef struct {
+        int id;
+        struct pkt_queue *q;
+        int tx_fd;
+        const afpkt_fanout_t *fg;
+        app_context_t *ctx;
+        volatile int *running;
+    } tx_arg_t;
+
+    tx_arg_t tx_args[MAX_TX_WORKERS];
+
+    static void *tx_fn(void *a) {
+        tx_arg_t *t = (tx_arg_t *)a;
+        afpkt_tx_worker_loop(t->id, t->q, t->tx_fd, t->fg, t->ctx, t->running);
+        return NULL;
+    }
+
+    for (int i = 0; i < pipeline.num_tx_workers; i++) {
+        tx_args[i] = (tx_arg_t){
+            .id = i,
+            .q = pipeline.queues[i],
+            .tx_fd = pipeline.tx_fds[i],
             .fg = &fg_out,
             .ctx = &ctx,
             .running = &running,
-            .is_outbound = 1,
         };
-        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0)
-        {
-            log_error("Failed to create outbound worker %d", i);
+        if (pthread_create(&threads[tidx], NULL, tx_fn, &tx_args[i]) != 0) {
+            log_error("Failed to create TX worker %d", i);
             running = 0;
             for (int k = 0; k < tidx; k++)
                 pthread_join(threads[k], NULL);
             goto cleanup_inbound;
         }
-
         int core_id = available_cores[current_core_idx % num_available_cores];
-        if (bind_thread_to_core(threads[tidx], core_id) == 0) {
-            log_info("Bound outbound worker %d to core %d", i, core_id);
-        } else {
-            log_warn("Failed to bind outbound worker %d to core %d", i, core_id);
-        }
+        if (bind_thread_to_core(threads[tidx], core_id) == 0)
+            log_info("Bound pipeline TX worker %d to core %d", i, core_id);
         current_core_idx++;
-
         tidx++;
     }
 
-    /* Inbound workers (1 per ne_tunnel) */
-    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-    {
-        args[tidx] = (worker_thread_arg_t){
+    /* ---- Inbound workers (1 per ne_tunnel, unchanged) ---- */
+    typedef struct {
+        afpkt_worker_t *worker;
+        const afpkt_fanout_t *fg;
+        app_context_t *ctx;
+        volatile int *running;
+    } in_arg_t;
+
+    in_arg_t in_args[MAX_NE_TUNNELS];
+
+    static void *in_fn(void *a) {
+        in_arg_t *ina = (in_arg_t *)a;
+        afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->running);
+        return NULL;
+    }
+
+    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++) {
+        in_args[w] = (in_arg_t){
             .worker = &in_workers[w],
-            .fg = &fg_out, /* Needed for local interface cache */
+            .fg = &fg_out,
             .ctx = &ctx,
             .running = &running,
-            .is_outbound = 0,
         };
-        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0)
-        {
+        if (pthread_create(&threads[tidx], NULL, in_fn, &in_args[w]) != 0) {
             log_error("Failed to create inbound worker tunnel[%zu]", w);
             running = 0;
             for (int k = 0; k < tidx; k++)
                 pthread_join(threads[k], NULL);
             goto cleanup_inbound;
         }
-
         int core_id = available_cores[current_core_idx % num_available_cores];
-        if (bind_thread_to_core(threads[tidx], core_id) == 0) {
+        if (bind_thread_to_core(threads[tidx], core_id) == 0)
             log_info("Bound inbound worker %zu to core %d", w, core_id);
-        } else {
-            log_warn("Failed to bind inbound worker %zu to core %d", w, core_id);
-        }
         current_core_idx++;
-
         tidx++;
     }
 
+    int total_threads = tidx;
     log_info("===========================================");
-    log_info("  MWAN Tunnel Forwarding Started");
-    log_info("  Mode: Forwarding (With Fragmentation & Reassembly)");
-    log_info("  Workers: %d outbound + %d inbound = %d total",
-             total_out, total_in, total_threads);
-    log_info("  OUTBOUND: %s -> TUNNEL[0..%zu] (RR)",
-             ctx.cfg.local_if, ctx.cfg.ne_tunnel_count - 1);
-    log_info("  INBOUND:  TUNNEL[0..%zu] -> %s",
+    log_info("  MWAN Pipeline Forwarding Started");
+    log_info("  Mode: Pipeline (RX → Queue → TX Workers)");
+    log_info("  Threads: 1 RX + %d TX + %d inbound + 1 GC = %d total",
+             pipeline.num_tx_workers, (int)ctx.cfg.ne_tunnel_count,
+             1 + pipeline.num_tx_workers + (int)ctx.cfg.ne_tunnel_count + 1);
+    log_info("  OUTBOUND: %s → RX → %d queues → TX → TUNNEL[0..%zu]",
+             ctx.cfg.local_if, pipeline.num_tx_workers,
+             ctx.cfg.ne_tunnel_count - 1);
+    log_info("  INBOUND:  TUNNEL[0..%zu] → %s",
              ctx.cfg.ne_tunnel_count - 1, ctx.cfg.local_if);
     log_info("  Press Ctrl+C to stop.");
     log_info("===========================================");
@@ -369,14 +417,11 @@ int main(int argc, char **argv)
         pthread_join(threads[i], NULL);
 
     pthread_join(gc_thread, NULL);
+    free(threads);
 
     log_info("Cleaning up...");
 
     /* ---------- CLEANUP ---------- */
-
-    // tc_ingress_cleanup(ctx.cfg.local_if);
-    // for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-    //     tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
 
 cleanup_inbound:
     for (size_t w = 0; w < in_worker_count; w++)
@@ -387,17 +432,13 @@ cleanup_inbound:
         fg_out.frag_tbl = NULL;
     }
 
-    afpkt_fanout_close(&fg_out);
+    afpkt_pipeline_close(&pipeline);
 
 cleanup_route:
-    // system_del_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if);
-
-    /* Restore IP forward to original state */
     system_restore_ip_forward();
 
+    netdev_enable_offloads(ctx.cfg.local_if);
     netdev_reset_interface(ctx.cfg.local_if);
-    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-    //     netdev_reset_interface(ctx.cfg.wans[i].ifname);
 
     log_info("Cleanup done.");
     return 0;

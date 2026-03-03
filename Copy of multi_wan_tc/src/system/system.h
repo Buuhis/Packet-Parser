@@ -26,7 +26,8 @@ int system_get_if_hwaddr(const char *ifname, unsigned char mac[6]);
  * aggregating TCP segments into super-packets (64KB) that exceed
  * WAN MTU (1500) and cause sendto() EMSGSIZE errors.
  */
-// int netdev_disable_offloads(const char *ifname);
+int netdev_disable_offloads(const char *ifname);
+int netdev_enable_offloads(const char *ifname);
 
 /*
  * Optimize interface for high packet rate:
