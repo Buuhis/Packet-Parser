@@ -25,8 +25,8 @@
 #define V3_BLOCK_NR 64          /* 64 blocks = 128MB Ring */
 #define V3_FRAME_SIZE 2048
 
-/* Global outbound sequence counter (shared across all outbound workers) */
-static _Atomic uint32_t g_outbound_seq = 0;
+/* Per-worker RR counter eliminates cross-core atomic contention.
+ * Old global atomic was a serialization point at high pps. */
 
 /* ================================================== */
 /* ============ FANOUT OPEN / CLOSE ================= */
@@ -371,15 +371,19 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 
 /*
  * Outbound: capture from local_if → forward to ne_tunnel (Round Robin)
- * No fragmentation, no custom header insertion (except Ethernet rewrite).
+ * Uses batched sendmmsg() to minimize syscall overhead.
+ * Fragment buffer pool allows batching fragmented packets too.
  */
+
+#define TX_BATCH_MAX 256
+
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
     unsigned long captured_cnt = 0;
     unsigned long ip_pkts = 0;
-    log_info("Worker outbound[%d] started (Optimized Outbound)", w->id);
+    log_info("Worker outbound[%d] started (Batched sendmmsg)", w->id);
 
     size_t tunnel_count = ctx->cfg.ne_tunnel_count;
     if (tunnel_count == 0)
@@ -388,7 +392,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
-    /* ---- OPT 1: Pre-cache sockaddr_ll per tunnel (computed ONCE) ---- */
+    /* ---- Pre-cache sockaddr_ll per tunnel (computed ONCE) ---- */
     struct sockaddr_ll cached_sa[MAX_NE_TUNNELS];
     for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
         memset(&cached_sa[t], 0, sizeof(cached_sa[t]));
@@ -399,15 +403,19 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
     }
 
-    /* ---- OPT 2: Heap-allocate frag buffers ONCE (avoid 4KB stack alloc per pkt) ---- */
-    uint8_t *frag1_pkt = malloc(2048);
-    uint8_t *frag2_pkt = malloc(2048);
-    if (!frag1_pkt || !frag2_pkt) {
-        log_error("Worker outbound[%d]: failed to allocate frag buffers", w->id);
-        free(frag1_pkt);
-        free(frag2_pkt);
+    /* ---- Fragment buffer pool (heap, reusable after each flush) ---- */
+    uint8_t *frag_arena = malloc((size_t)TX_BATCH_MAX * 2048);
+    if (!frag_arena) {
+        log_error("Worker outbound[%d]: failed to allocate frag arena", w->id);
         return;
     }
+
+    /* ---- Batch TX structures (stack) ---- */
+    struct mmsghdr tx_batch[TX_BATCH_MAX];
+    struct iovec   tx_iov[TX_BATCH_MAX];
+
+    /* ---- Per-worker Round Robin (no atomic contention) ---- */
+    uint32_t local_rr = (uint32_t)w->id;
 
     while (*running)
     {
@@ -417,7 +425,8 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
         while (*running)
         {
-            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
+            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
+                ((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
 
             if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
                 break;
@@ -426,6 +435,10 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             struct tpacket3_hdr *ppd =
                 (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
 
+            /* ---- Batch state for this block ---- */
+            int batch_n = 0;   /* messages queued */
+            int frag_idx = 0;  /* next free slot in frag_arena */
+
             for (int i = 0; i < num_pkts; i++)
             {
                 unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
@@ -433,99 +446,110 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 captured_cnt++;
 
-                /* Need at least Ethernet header */
                 if (len < 14)
                     goto next_pkt;
 
                 struct ethhdr *eth = (struct ethhdr *)frame;
                 uint16_t h_proto = ntohs(eth->h_proto);
 
-                /* 1. IGNORE MWAN protocol packets to avoid loops */
                 if (h_proto == MWAN_ETHERTYPE)
                     goto next_pkt;
 
-                /* 2. IGNORE packets where source MAC is our own LOCAL MAC */
                 if (memcmp(eth->h_source, fg->local.src_mac, 6) == 0)
                     goto next_pkt;
 
-                /* 3. ONLY process IP packets */
                 if (h_proto != ETH_P_IP && h_proto != ETH_P_IPV6)
                     goto next_pkt;
 
-                /* Extract IP data */
-                uint16_t ip_len = (uint16_t)(len - 14);
-                if (ip_len == 0)
+                if (len <= 14)
                     goto next_pkt;
 
                 ip_pkts++;
 
-                /* Select tunnel Round-Robin */
-                uint32_t seq = atomic_fetch_add(&g_outbound_seq, 1);
-                int tunnel_idx = (int)(seq % tunnel_count);
+                int tunnel_idx = (int)(local_rr++ % tunnel_count);
 
                 if (!fg->tunnels[tunnel_idx].valid)
                     goto next_pkt;
-                
+
                 pkt_cnt++;
 
                 if (frag_need_split((uint32_t)len)) {
-                    uint32_t frag1_len;
-                    uint32_t frag2_len;
+                    /* Need 2 batch slots + 2 frag buffers */
+                    if (batch_n + 2 > TX_BATCH_MAX || frag_idx + 2 > TX_BATCH_MAX) {
+                        if (batch_n > 0)
+                            sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        batch_n = 0;
+                        frag_idx = 0;
+                    }
 
-                    if (frag_split(frame, (uint32_t)len, frag1_pkt, &frag1_len, frag2_pkt, &frag2_len) == 0) {
-                        /* Rewrite ETH headers on both fragments */
-                        struct ethhdr *eth_out1 = (struct ethhdr *)frag1_pkt;
-                        memcpy(eth_out1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                        memcpy(eth_out1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                        eth_out1->h_proto = htons(MWAN_ETHERTYPE);
+                    uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
+                    uint8_t *f2 = frag_arena + (size_t)(frag_idx + 1) * 2048;
+                    uint32_t f1_len, f2_len;
 
-                        struct ethhdr *eth_out2 = (struct ethhdr *)frag2_pkt;
-                        memcpy(eth_out2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                        memcpy(eth_out2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                        eth_out2->h_proto = htons(MWAN_ETHERTYPE);
-                        
-                        /* ---- OPT 3: sendmmsg() — 1 syscall for 2 fragments ---- */
-                        struct iovec iov[2] = {
-                            { .iov_base = frag1_pkt, .iov_len = frag1_len },
-                            { .iov_base = frag2_pkt, .iov_len = frag2_len },
-                        };
-                        struct mmsghdr msgs[2] = {
-                            { .msg_hdr = {
-                                .msg_name    = &cached_sa[tunnel_idx],
-                                .msg_namelen = sizeof(struct sockaddr_ll),
-                                .msg_iov     = &iov[0],
-                                .msg_iovlen  = 1,
-                            }},
-                            { .msg_hdr = {
-                                .msg_name    = &cached_sa[tunnel_idx],
-                                .msg_namelen = sizeof(struct sockaddr_ll),
-                                .msg_iov     = &iov[1],
-                                .msg_iovlen  = 1,
-                            }},
-                        };
-                        sendmmsg(w->tx_fd, msgs, 2, 0);
+                    if (frag_split(frame, (uint32_t)len, f1, &f1_len, f2, &f2_len) == 0) {
+                        struct ethhdr *eh1 = (struct ethhdr *)f1;
+                        memcpy(eh1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                        memcpy(eh1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                        eh1->h_proto = htons(MWAN_ETHERTYPE);
+
+                        struct ethhdr *eh2 = (struct ethhdr *)f2;
+                        memcpy(eh2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
+                        memcpy(eh2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
+                        eh2->h_proto = htons(MWAN_ETHERTYPE);
+
+                        tx_iov[batch_n] = (struct iovec){ .iov_base = f1, .iov_len = f1_len };
+                        memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                        tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                        tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                        batch_n++;
+
+                        tx_iov[batch_n] = (struct iovec){ .iov_base = f2, .iov_len = f2_len };
+                        memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                        tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                        tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                        batch_n++;
+
+                        frag_idx += 2;
                     }
                 } else {
-                    /* ZERO-COPY: Rewrite Ethernet Header directly on the ring buffer frame */
+                    /* Non-fragmented: batch directly from ring buffer (zero-copy) */
+                    if (batch_n >= TX_BATCH_MAX) {
+                        sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        batch_n = 0;
+                        frag_idx = 0;
+                    }
+
                     struct ethhdr *eth_out = (struct ethhdr *)frame;
                     memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                     memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                     eth_out->h_proto = htons(MWAN_ETHERTYPE);
 
-                    sendto(w->tx_fd, frame, 14 + ip_len, 0,
-                           (struct sockaddr *)&cached_sa[tunnel_idx], sizeof(struct sockaddr_ll));
+                    tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = len };
+                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
+                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
+                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                    batch_n++;
                 }
 
             next_pkt:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
+            /* ---- Flush remaining batch BEFORE releasing block ---- */
+            if (batch_n > 0)
+                sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
         }
     }
-    free(frag1_pkt);
-    free(frag2_pkt);
+    free(frag_arena);
     log_info("Worker outbound[%d] stopped: captured=%lu ip_pkts=%lu processed=%lu",
              w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
@@ -588,7 +612,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 struct ethhdr *eth = (struct ethhdr *)frame;
 
-                // --- TRACE TẤT CẢ GÓI TIN ---
+                // --- TRACE ALL PACKET ---
                 log_debug("[INBOUND TRACE] Worker inbound[%d] rcvd len=%u proto=0x%04x MAC dst=%02x:%02x:%02x:%02x:%02x:%02x", 
                           w->id, len, ntohs(eth->h_proto), 
                           eth->h_dest[0], eth->h_dest[1], eth->h_dest[2], 
