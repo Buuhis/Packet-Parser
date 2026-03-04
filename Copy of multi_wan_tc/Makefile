@@ -1,6 +1,6 @@
 CC      := gcc
-CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc
-LDFLAGS := -pthread
+CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql
+LDFLAGS := -pthread -lpq
 
 BIN := mwanc
 

@@ -25,6 +25,11 @@
 #define V3_BLOCK_NR 64          /* 64 blocks = 128MB Ring */
 #define V3_FRAME_SIZE 2048
 
+#define TX_BATCH_MAX 128
+
+/* Fragment arena + batch structures */
+#define TX_PIPE_BATCH 512
+
 /* Per-worker RR counter eliminates cross-core atomic contention.
  * Old global atomic was a serialization point at high pps. */
 
@@ -374,9 +379,6 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
  * Uses batched sendmmsg() to minimize syscall overhead.
  * Fragment buffer pool allows batching fragmented packets too.
  */
-
-#define TX_BATCH_MAX 256
-
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
 {
@@ -913,8 +915,6 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
         memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
     }
 
-    /* Fragment arena + batch structures */
-    #define TX_PIPE_BATCH 256
     uint8_t *frag_arena = malloc((size_t)TX_PIPE_BATCH * 2048);
     if (!frag_arena) {
         log_error("TX worker[%d]: alloc frag_arena failed", worker_id);

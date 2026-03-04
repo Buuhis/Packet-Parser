@@ -15,7 +15,7 @@
  * Capacity must be power of 2 for fast modulo via bitmask.
  */
 
-#define PKT_QUEUE_CAPACITY 4096        /* power of 2, ~62ms buffer at 1Gb/s */
+#define PKT_QUEUE_CAPACITY 32768        /* power of 2, absorbs ~65K packets before drops */
 #define PKT_QUEUE_MASK     (PKT_QUEUE_CAPACITY - 1)
 #define PKT_SLOT_DATA_SIZE 2048
 

@@ -8,6 +8,9 @@
 
 #define NUM_WORKERS 2
 
+#define MAX_TX_WORKERS 8
+#define NUM_TX_WORKERS 4  /* default, adjustable */
+
 /* Each worker owns 1 RX socket (fanout) + 1 TX socket */
 typedef struct {
     int             id;
@@ -51,10 +54,6 @@ typedef struct {
 } afpkt_fanout_t;
 
 /* ============ Pipeline architecture ============ */
-
-#define MAX_TX_WORKERS 8
-#define NUM_TX_WORKERS 2  /* default, adjustable */
-
 typedef struct {
     /* RX: single TPACKET_V3 socket on local_if (no fanout) */
     afpkt_worker_t rx;
