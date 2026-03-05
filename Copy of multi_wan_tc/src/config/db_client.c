@@ -16,11 +16,10 @@ static int parse_mac(const char *mac_str, unsigned char mac_bytes[6])
 
 int db_client_connect(const char *host, const char *port, const char *user, const char *dbname, const char *password)
 {
-    char conninfo[512];
-    snprintf(conninfo, sizeof(conninfo), "host=%s port=%s user=%s dbname=%s password=%s connect_timeout=10",
-             host, port, user, dbname, password);
-    
-    g_db_conn = PQconnectdb(conninfo);
+    const char *keywords[] = {"host", "port", "user", "dbname", "password", "connect_timeout", NULL};
+    const char *values[]   = {host, port, user, dbname, password, "10", NULL};
+
+    g_db_conn = PQconnectdbParams(keywords, values, 0);
     if (PQstatus(g_db_conn) != CONNECTION_OK) {
         log_error("Connection to database failed: %s", PQerrorMessage(g_db_conn));
         PQfinish(g_db_conn);

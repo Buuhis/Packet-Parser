@@ -346,11 +346,11 @@ cleanup_route:
 
 int main(int argc, char **argv)
 {
-    const char *db_host = "127.0.0.1";
-    const char *db_port = "5432";
-    const char *db_user = "postgres";
-    const char *db_name = "mwandb";
-    int listen_port = 8080;
+    const char *db_host = NULL;
+    const char *db_port = NULL;
+    const char *db_user = NULL;
+    const char *db_name = NULL;
+    int listen_port = 0;
 
     log_set_level(LOG_INFO);
 
@@ -370,6 +370,12 @@ int main(int argc, char **argv)
             usage(argv[0]);
             return 0;
         }
+    }
+
+    if (!db_host || !db_port || !db_user || !db_name || listen_port <= 0) {
+        log_error("Missing required arguments.");
+        usage(argv[0]);
+        return 1;
     }
 
     char password[256] = {0};
