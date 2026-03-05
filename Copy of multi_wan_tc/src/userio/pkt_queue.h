@@ -15,9 +15,9 @@
  * Capacity must be power of 2 for fast modulo via bitmask.
  */
 
-#define PKT_QUEUE_CAPACITY 32768        /* power of 2, absorbs ~65K packets before drops */
+#define PKT_QUEUE_CAPACITY 524288        /* ~1GB RAM - Khong lo de hold packets! */
 #define PKT_QUEUE_MASK     (PKT_QUEUE_CAPACITY - 1)
-#define PKT_SLOT_DATA_SIZE 2048
+#define PKT_SLOT_DATA_SIZE 1522        /* Small better for typical MTU, saves memory vs 2048 */
 
 struct pkt_slot {
     uint8_t  data[PKT_SLOT_DATA_SIZE];
@@ -53,11 +53,11 @@ static inline int pkt_queue_push(struct pkt_queue *q,
     uint32_t next_w = (w + 1) & PKT_QUEUE_MASK;
 
     /* Check if full (next write position == read position) */
-    if (next_w == atomic_load_explicit(&q->read_idx, memory_order_acquire))
+    if (__builtin_expect(next_w == atomic_load_explicit(&q->read_idx, memory_order_acquire), 0))
         return -1;
 
     struct pkt_slot *slot = &q->slots[w];
-    if (len > PKT_SLOT_DATA_SIZE) len = PKT_SLOT_DATA_SIZE;
+    if (__builtin_expect(len > PKT_SLOT_DATA_SIZE, 0)) len = PKT_SLOT_DATA_SIZE;
     memcpy(slot->data, data, len);
     slot->len = len;
 

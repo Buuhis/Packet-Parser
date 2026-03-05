@@ -6,9 +6,9 @@
 #include "proto/fragment.h"
 #include "userio/pkt_queue.h"
 
-#define NUM_WORKERS 2
+#define NUM_WORKERS 3
 
-#define MAX_TX_WORKERS 8
+#define MAX_TX_WORKERS 4
 #define NUM_TX_WORKERS 4  /* default, adjustable */
 
 /* Each worker owns 1 RX socket (fanout) + 1 TX socket */
