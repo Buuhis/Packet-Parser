@@ -80,7 +80,7 @@ int netdev_disable_offloads(const char *ifname)
 {
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
-             "ethtool -K %s gro off gso off tso off lro off2>/dev/null",
+             "ethtool -K %s gro off gso off tso off lro off 2>/dev/null",
              ifname);
 
     int ret = system(cmd);
@@ -90,7 +90,25 @@ int netdev_disable_offloads(const char *ifname)
         return -1;
     }
 
-    log_info("Disabled GRO/GSO/TSO on %s", ifname);
+    log_info("Disabled GRO/GSO/TSO/LRO on %s", ifname);
+    return 0;
+}
+
+int netdev_enable_offloads(const char *ifname)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd),
+             "ethtool -K %s gro on gso on tso on lro on 2>/dev/null",
+             ifname);
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        log_error("Failed to enable offloads on %s (ethtool not available?)",
+                  ifname);
+        return -1;
+    }
+
+    log_info("Restored GRO/GSO/TSO/LRO on %s", ifname);
     return 0;
 }
 

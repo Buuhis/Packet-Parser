@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "app_context.h"
 #include "system/system.h"
 #include "tc/tc.h"
@@ -5,12 +6,14 @@
 #include "userio/afpkt.h"
 #include "proto/mwan_proto.h"
 #include "proto/fragment.h"
+#include "config/db_client.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sched.h>
 #include <pthread.h>
 #include <errno.h>
 
@@ -23,14 +26,44 @@
 
 /* ---------- global state ---------- */
 
-static volatile int running = 1;
+static volatile int running_server = 1;
+static volatile int running_dataplane = 0;
+
+static int tcp_server_fd = -1;
+
+static afpkt_pipeline_t pipeline;
+static afpkt_fanout_t fg_out;
+static afpkt_worker_t in_workers[MAX_NE_TUNNELS];
+static size_t in_worker_count = 0;
+
+static pthread_t gc_thread;
+static pthread_t *worker_threads = NULL;
+static int total_worker_threads = 0;
+
+static app_context_t running_ctx;
+static int is_dataplane_active = 0;
+
+/* ---------- thread affinity ---------- */
+
+static int bind_thread_to_core(pthread_t thread, int core_id)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+}
 
 /* ---------- signal handler ---------- */
 
 static void handle_signal(int sig)
 {
     (void)sig;
-    running = 0;
+    running_server = 0;
+    running_dataplane = 0;
+    if (tcp_server_fd >= 0) {
+        close(tcp_server_fd);
+        tcp_server_fd = -1;
+    }
 }
 
 /* ---------- usage ---------- */
@@ -38,34 +71,58 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --config <file> --node <id> [--dump-config]\n", prog);
+            "Usage: %s --db-host <host> --db-port <port> --db-user <user> --db-name <name> --listen-port <port>\n", prog);
 }
 
-/* ---------- worker thread arg ---------- */
+/* ---- Pipeline RX thread arg ---- */
+typedef struct {
+    afpkt_worker_t *rx;
+    const afpkt_fanout_t *fg;
+    struct pkt_queue **queues;
+    int num_queues;
+    volatile int *running;
+} rx_arg_t;
 
-typedef struct
-{
+static void *rx_fn(void *a) {
+    rx_arg_t *r = (rx_arg_t *)a;
+    afpkt_rx_distribute_loop(r->rx, r->fg, r->queues, r->num_queues, r->running);
+    return NULL;
+}
+
+/* ---- Pipeline TX worker thread args ---- */
+typedef struct {
+    int id;
+    struct pkt_queue *q;
+    int tx_fd;
+    const afpkt_fanout_t *fg;
+    app_context_t *ctx;
+    volatile int *running;
+} tx_arg_t;
+
+static void *tx_fn(void *a) {
+    tx_arg_t *t = (tx_arg_t *)a;
+    afpkt_tx_worker_loop(t->id, t->q, t->tx_fd, t->fg, t->ctx, t->running);
+    return NULL;
+}
+
+/* ---- Inbound workers (1 per ne_tunnel, unchanged) ---- */
+typedef struct {
     afpkt_worker_t *worker;
     const afpkt_fanout_t *fg;
     app_context_t *ctx;
     volatile int *running;
-    int is_outbound;
-} worker_thread_arg_t;
+} in_arg_t;
 
-static void *worker_fn(void *arg)
-{
-    worker_thread_arg_t *a = (worker_thread_arg_t *)arg;
-    if (a->is_outbound)
-        afpkt_worker_loop_outbound(a->worker, a->fg, a->ctx, a->running);
-    else
-        afpkt_worker_loop_inbound(a->worker, a->fg, a->ctx, a->running);
+static void *in_fn(void *a) {
+    in_arg_t *ina = (in_arg_t *)a;
+    afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->running);
     return NULL;
 }
 
 static void *gc_worker_fn(void *arg)
 {
     struct frag_table *ft = (struct frag_table *)arg;
-    while (running) {
+    while (running_dataplane) {
         frag_table_gc(ft);
         usleep(100000); /* 100ms */
     }
@@ -93,270 +150,321 @@ static void worker_close(afpkt_worker_t *w)
     }
 }
 
-/* ---------- main ---------- */
+/* ========================================================================= */
+/* DATAPLANE START / STOP */
+/* ========================================================================= */
 
-int main(int argc, char **argv)
-{
-    const char *config_path = NULL;
-    const char *node_id = NULL;
-    int dump = 0;
+static rx_arg_t g_rx_arg;
+static tx_arg_t g_tx_args[MAX_TX_WORKERS];
+static in_arg_t g_in_args[MAX_NE_TUNNELS];
 
-    log_set_level(LOG_DEBUG);
-
-    /* ---- parse args ---- */
-    for (int i = 1; i < argc; i++)
-    {
-        if (strcmp(argv[i], "--config") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                usage(argv[0]);
-                return 2;
-            }
-            config_path = argv[++i];
+static void stop_dataplane(void) {
+    if (!is_dataplane_active) return;
+    
+    log_info("Stopping Dataplane...");
+    running_dataplane = 0;
+    
+    if (worker_threads) {
+        for (int i = 0; i < total_worker_threads; i++) {
+            pthread_join(worker_threads[i], NULL);
         }
-        else if (strcmp(argv[i], "--node") == 0)
-        {
-            if (i + 1 >= argc)
-            {
-                usage(argv[0]);
-                return 2;
-            }
-            node_id = argv[++i];
-        }
-        else if (strcmp(argv[i], "--dump-config") == 0)
-        {
-            dump = 1;
-        }
-        else if (strcmp(argv[i], "--help") == 0)
-        {
-            usage(argv[0]);
-            return 0;
-        }
-        else
-        {
-            log_error("Unknown argument: %s", argv[i]);
-            usage(argv[0]);
-            return 2;
-        }
+        free(worker_threads);
+        worker_threads = NULL;
     }
-
-    if (!config_path || !node_id)
-    {
-        usage(argv[0]);
-        return 2;
+    pthread_join(gc_thread, NULL);
+    
+    for (size_t w = 0; w < in_worker_count; w++) {
+        worker_close(&in_workers[w]);
     }
-
-    /* ---- load config ---- */
-    app_context_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
-
-    if (app_context_init(&ctx, config_path, node_id) != 0)
-    {
-        log_error("Failed to load config");
-        return 1;
+    
+    if (fg_out.frag_tbl) {
+        free(fg_out.frag_tbl);
+        fg_out.frag_tbl = NULL;
     }
+    
+    afpkt_pipeline_close(&pipeline);
+    
+    system_restore_ip_forward();
+    netdev_enable_offloads(running_ctx.cfg.local_if);
+    netdev_reset_interface(running_ctx.cfg.local_if);
+    
+    is_dataplane_active = 0;
+    in_worker_count = 0;
+    total_worker_threads = 0;
+    log_info("Dataplane stopped cleanly.");
+}
 
-    if (dump)
-        app_context_dump(&ctx);
-
-    if (ctx.cfg.ne_tunnel_count == 0)
-    {
-        log_error("No ne_tunnel defined for node %s", node_id);
-        return 1;
+static int start_dataplane(app_context_t *ctx) {
+    if (is_dataplane_active) {
+        stop_dataplane();
     }
-
+    
+    log_info("Starting Dataplane for node: %s", ctx->cfg.node_id);
+    running_dataplane = 1;
+    
     /* ---- STEP 1: enable ip_forward ---- */
-    if (system_disable_ip_forward() != 0)
-    {
+    if (system_disable_ip_forward() != 0) {
         log_error("Failed to enable IP forwarding");
-        return 1;
+        return -1;
     }
 
-    // /* ---- STEP 2: force routing into TC ---- */
-    // if (system_add_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if) != 0)
-    // {
-    //     log_error("Failed to add route for %s via %s",
-    //               ctx.cfg.remote_cidr, ctx.cfg.local_if);
-    //     return 1;
-    // }
+    /* ---- STEP 2: Disable offloads + Optimize Interfaces ---- */
+    netdev_disable_offloads(ctx->cfg.local_if);
+    netdev_optimize_interface(ctx->cfg.local_if);
 
-    /* ---- STEP 3: Optimize Interfaces ---- */
-    netdev_optimize_interface(ctx.cfg.local_if);
-    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-    //     netdev_optimize_interface(ctx.cfg.wans[i].ifname);
-
-    /* ===================================================== */
-    /* ==== FANOUT: outbound workers on local_if =========== */
-    /* ===================================================== */
-
-    afpkt_fanout_t fg_out;
-    memset(&fg_out, 0, sizeof(fg_out));
-
-    if (afpkt_fanout_open(&fg_out, ctx.cfg.local_if, 1) != 0)
-    {
-        log_error("Failed to open fanout outbound on %s", ctx.cfg.local_if);
+    if (afpkt_pipeline_open(&pipeline, ctx->cfg.local_if, NUM_TX_WORKERS) != 0) {
+        log_error("Failed to open pipeline on %s", ctx->cfg.local_if);
         goto cleanup_route;
     }
 
+    memset(&fg_out, 0, sizeof(fg_out));
     struct frag_table *ft = malloc(sizeof(struct frag_table));
     if (ft) {
         frag_table_init(ft);
         fg_out.frag_tbl = ft;
     } else {
         log_error("Failed to allocate fragment table!");
-        afpkt_fanout_close(&fg_out);
-        goto cleanup_route;
+        goto cleanup_pl;
     }
 
-    /* ===================================================== */
-    /* ==== INBOUND: 1 single socket per ne_tunnel ========= */
-    /* ===================================================== */
-
-    afpkt_worker_t in_workers[MAX_NE_TUNNELS];
-    size_t in_worker_count = 0;
-    memset(in_workers, 0, sizeof(in_workers));
-    for (size_t i = 0; i < MAX_NE_TUNNELS; i++)
-    {
-        in_workers[i].rx_fd = -1;
-        in_workers[i].tx_fd = -1;
-    }
-
-    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-    {
+    in_worker_count = 0;
+    for (size_t w = 0; w < ctx->cfg.ne_tunnel_count; w++) {
         in_workers[w].id = (int)w;
-        if (afpkt_single_open(&in_workers[w], ctx.cfg.ne_tunnels[w].ifname) != 0)
-        {
-            log_error("Failed to open inbound on %s", ctx.cfg.ne_tunnels[w].ifname);
+        if (afpkt_single_open(&in_workers[w], ctx->cfg.ne_tunnels[w].ifname) != 0) {
+            log_error("Failed to open inbound on %s", ctx->cfg.ne_tunnels[w].ifname);
             goto cleanup_inbound;
         }
         in_worker_count++;
     }
 
-    /* ===================================================== */
-    /* ==== TC DROP (Optional) ============================= */
-    /* ===================================================== */
+    afpkt_fanout_init_cache_outbound(&fg_out, ctx);
+    afpkt_fanout_init_cache_inbound(&fg_out, ctx);
 
-    // tc_ingress_drop_cidr(ctx.cfg.local_if, ctx.cfg.remote_cidr);
+    int available_cores[] = {1, 3, 5, 7, 9, 11};
+    int num_available_cores = sizeof(available_cores) / sizeof(available_cores[0]);
+    int current_core_idx = 0;
 
-    /* ===================================================== */
-    /* ==== INIT CACHES ==================================== */
-    /* ===================================================== */
+    if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
+        log_error("Failed to create GC thread");
+        goto cleanup_inbound;
+    }
+    int gc_core = available_cores[current_core_idx % num_available_cores];
+    if (bind_thread_to_core(gc_thread, gc_core) == 0)
+        log_info("Bound GC thread to core %d", gc_core);
+    current_core_idx++;
 
-    afpkt_fanout_init_cache_outbound(&fg_out, &ctx);
-    afpkt_fanout_init_cache_inbound(&fg_out, &ctx);
+    int max_threads = 1 + pipeline.num_tx_workers + (int)ctx->cfg.ne_tunnel_count;
+    worker_threads = calloc(max_threads, sizeof(pthread_t));
+    total_worker_threads = 0;
 
-    /* ===================================================== */
-    /* ==== START THREADS ================================== */
-    /* ===================================================== */
+    g_rx_arg = (rx_arg_t){
+        .rx = &pipeline.rx,
+        .fg = &fg_out,
+        .queues = pipeline.queues,
+        .num_queues = pipeline.num_tx_workers,
+        .running = &running_dataplane,
+    };
+    if (pthread_create(&worker_threads[total_worker_threads], NULL, rx_fn, &g_rx_arg) != 0) {
+        log_error("Failed to create RX thread");
+        goto cleanup_threads;
+    }
+    int rx_core = available_cores[current_core_idx % num_available_cores];
+    if (bind_thread_to_core(worker_threads[total_worker_threads], rx_core) == 0)
+        log_info("Bound pipeline RX to core %d", rx_core);
+    current_core_idx++;
+    total_worker_threads++;
+
+    for (int i = 0; i < pipeline.num_tx_workers; i++) {
+        g_tx_args[i] = (tx_arg_t){
+            .id = i,
+            .q = pipeline.queues[i],
+            .tx_fd = pipeline.tx_fds[i],
+            .fg = &fg_out,
+            .ctx = ctx,
+            .running = &running_dataplane,
+        };
+        if (pthread_create(&worker_threads[total_worker_threads], NULL, tx_fn, &g_tx_args[i]) != 0) {
+            log_error("Failed to create TX worker %d", i);
+            goto cleanup_threads;
+        }
+        int core_id = available_cores[current_core_idx % num_available_cores];
+        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
+            log_info("Bound pipeline TX worker %d to core %d", i, core_id);
+        current_core_idx++;
+        total_worker_threads++;
+    }
+
+    for (size_t w = 0; w < ctx->cfg.ne_tunnel_count; w++) {
+        g_in_args[w] = (in_arg_t){
+            .worker = &in_workers[w],
+            .fg = &fg_out,
+            .ctx = ctx,
+            .running = &running_dataplane,
+        };
+        if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[w]) != 0) {
+            log_error("Failed to create inbound worker tunnel[%zu]", w);
+            goto cleanup_threads;
+        }
+        int core_id = available_cores[current_core_idx % num_available_cores];
+        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
+            log_info("Bound inbound worker %zu to core %d", w, core_id);
+        current_core_idx++;
+        total_worker_threads++;
+    }
+
+    log_info("===========================================");
+    log_info("  MWAN Pipeline Forwarding Started");
+    log_info("  Threads: 1 RX + %d TX + %d inbound + 1 GC",
+             pipeline.num_tx_workers, (int)ctx->cfg.ne_tunnel_count);
+    log_info("===========================================");
+    is_dataplane_active = 1;
+    return 0;
+
+cleanup_threads:
+    running_dataplane = 0;
+    for (int k = 0; k < total_worker_threads; k++) {
+        pthread_join(worker_threads[k], NULL);
+    }
+    pthread_join(gc_thread, NULL);
+    free(worker_threads);
+    worker_threads = NULL;
+
+cleanup_inbound:
+    for (size_t w = 0; w < in_worker_count; w++) worker_close(&in_workers[w]);
+    if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
+cleanup_pl:
+    afpkt_pipeline_close(&pipeline);
+cleanup_route:
+    system_restore_ip_forward();
+    netdev_enable_offloads(ctx->cfg.local_if);
+    netdev_reset_interface(ctx->cfg.local_if);
+    is_dataplane_active = 0;
+    return -1;
+}
+
+/* ---------- main ---------- */
+
+int main(int argc, char **argv)
+{
+    const char *db_host = NULL;
+    const char *db_port = NULL;
+    const char *db_user = NULL;
+    const char *db_name = NULL;
+    int listen_port = 0;
+
+    log_set_level(LOG_INFO);
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--db-host") == 0 && i + 1 < argc) {
+            db_host = argv[++i];
+        } else if (strcmp(argv[i], "--db-port") == 0 && i + 1 < argc) {
+            db_port = argv[++i];
+        } else if (strcmp(argv[i], "--db-user") == 0 && i + 1 < argc) {
+            db_user = argv[++i];
+        } else if (strcmp(argv[i], "--db-name") == 0 && i + 1 < argc) {
+            db_name = argv[++i];
+        } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
+            listen_port = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--help") == 0) {
+            usage(argv[0]);
+            return 0;
+        }
+    }
+
+    if (!db_host || !db_port || !db_user || !db_name || listen_port <= 0) {
+        log_error("Missing required arguments.");
+        usage(argv[0]);
+        return 1;
+    }
+
+    char password[256] = {0};
+    int attempts = 0;
+    while(attempts < 3) {
+        char *p = getpass("Enter DB password: ");
+        if (p) {
+            strncpy(password, p, sizeof(password)-1);
+            if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
+                log_info("Successfully connected to Database.");
+                break;
+            }
+        }
+        attempts++;
+        if (attempts < 3) {
+            printf("Connection failed. Attempt %d of 3. Please try again.\n", attempts + 1);
+        }
+    }
+    
+    if (attempts >= 3) {
+        log_error("Failed to connect to DB after 3 attempts. Exiting.");
+        return 1;
+    }
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
-
-    pthread_t gc_thread;
-    if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
-        log_error("Failed to create GC thread");
-        running = 0;
-        goto cleanup_inbound;
+    
+    tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in saddr;
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    saddr.sin_port = htons(listen_port);
+    
+    if (bind(tcp_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
+        log_error("bind on port %d failed: %s", listen_port, strerror(errno));
+        db_client_disconnect();
+        return 1;
     }
+    
+    if (listen(tcp_server_fd, 5) < 0) {
+        log_error("listen failed: %s", strerror(errno));
+        db_client_disconnect();
+        return 1;
+    }
+    
+    log_info("==================================================");
+    log_info("Control Plane Ready!");
+    log_info("Waiting for node_id on TCP Port %d...", listen_port);
+    log_info("==================================================");
 
-    int total_out = NUM_WORKERS;
-    int total_in = (int)ctx.cfg.ne_tunnel_count;
-    int total_threads = total_out + total_in;
-
-    pthread_t threads[NUM_WORKERS + MAX_NE_TUNNELS];
-    worker_thread_arg_t args[NUM_WORKERS + MAX_NE_TUNNELS];
-    int tidx = 0;
-
-    /* Outbound workers (fanout on local_if) */
-    for (int i = 0; i < NUM_WORKERS; i++)
-    {
-        args[tidx] = (worker_thread_arg_t){
-            .worker = &fg_out.workers[i],
-            .fg = &fg_out,
-            .ctx = &ctx,
-            .running = &running,
-            .is_outbound = 1,
-        };
-        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0)
-        {
-            log_error("Failed to create outbound worker %d", i);
-            running = 0;
-            for (int k = 0; k < tidx; k++)
-                pthread_join(threads[k], NULL);
-            goto cleanup_inbound;
+    while(running_server) {
+        int client_fd = accept(tcp_server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (running_server) log_error("accept failed: %s", strerror(errno));
+            continue;
         }
-        tidx++;
-    }
-
-    /* Inbound workers (1 per ne_tunnel) */
-    for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-    {
-        args[tidx] = (worker_thread_arg_t){
-            .worker = &in_workers[w],
-            .fg = &fg_out, /* Needed for local interface cache */
-            .ctx = &ctx,
-            .running = &running,
-            .is_outbound = 0,
-        };
-        if (pthread_create(&threads[tidx], NULL, worker_fn, &args[tidx]) != 0)
-        {
-            log_error("Failed to create inbound worker tunnel[%zu]", w);
-            running = 0;
-            for (int k = 0; k < tidx; k++)
-                pthread_join(threads[k], NULL);
-            goto cleanup_inbound;
+        
+        char buf[128] = {0};
+        int n = recv(client_fd, buf, sizeof(buf)-1, 0);
+        close(client_fd);
+        if (n <= 0) continue;
+        
+        while(n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
+        
+        log_info(">>> Received configure request for node_id: '%s'", buf);
+        
+        app_config_t new_cfg;
+        if (db_client_load_config(buf, &new_cfg) == 0) {
+            app_context_dump(&(app_context_t){new_cfg});
+            
+            log_info("Applying new config...");
+            memset(&running_ctx, 0, sizeof(running_ctx));
+            running_ctx.cfg = new_cfg;
+            
+            if (start_dataplane(&running_ctx) != 0) {
+                log_error("Failed to start dataplane for node: %s", buf);
+            }
+        } else {
+            log_error("Config load failed. Skipping this node_id.");
         }
-        tidx++;
     }
-
-    log_info("===========================================");
-    log_info("  MWAN Tunnel Forwarding Started");
-    log_info("  Mode: Forwarding (With Fragmentation & Reassembly)");
-    log_info("  Workers: %d outbound + %d inbound = %d total",
-             total_out, total_in, total_threads);
-    log_info("  OUTBOUND: %s -> TUNNEL[0..%zu] (RR)",
-             ctx.cfg.local_if, ctx.cfg.ne_tunnel_count - 1);
-    log_info("  INBOUND:  TUNNEL[0..%zu] -> %s",
-             ctx.cfg.ne_tunnel_count - 1, ctx.cfg.local_if);
-    log_info("  Press Ctrl+C to stop.");
-    log_info("===========================================");
-
-    /* Wait for all threads */
-    for (int i = 0; i < total_threads; i++)
-        pthread_join(threads[i], NULL);
-
-    pthread_join(gc_thread, NULL);
-
-    log_info("Cleaning up...");
-
-    /* ---------- CLEANUP ---------- */
-
-    // tc_ingress_cleanup(ctx.cfg.local_if);
-    // for (size_t w = 0; w < ctx.cfg.ne_tunnel_count; w++)
-    //     tc_wan_ingress_cleanup(ctx.cfg.ne_tunnels[w].ifname);
-
-cleanup_inbound:
-    for (size_t w = 0; w < in_worker_count; w++)
-        worker_close(&in_workers[w]);
-
-    if (fg_out.frag_tbl) {
-        free(fg_out.frag_tbl);
-        fg_out.frag_tbl = NULL;
-    }
-
-    afpkt_fanout_close(&fg_out);
-
-cleanup_route:
-    // system_del_route_dev(ctx.cfg.remote_cidr, ctx.cfg.local_if);
-
-    /* Restore IP forward to original state */
-    system_restore_ip_forward();
-
-    netdev_reset_interface(ctx.cfg.local_if);
-    // for (size_t i = 0; i < ctx.cfg.wan_count; i++)
-    //     netdev_reset_interface(ctx.cfg.wans[i].ifname);
-
-    log_info("Cleanup done.");
+    
+    log_info("Server shutting down...");
+    stop_dataplane();
+    db_client_disconnect();
+    
     return 0;
 }

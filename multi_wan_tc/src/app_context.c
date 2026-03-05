@@ -18,29 +18,29 @@ int app_context_init(app_context_t *ctx,
     strncpy(ctx->cfg.node_id, node_id, sizeof(ctx->cfg.node_id) - 1);
 
     /* basic validation */
-    if (ctx->cfg.wan_count == 0) {
-        log_error("No WAN defined for node %s", node_id);
-        return -1;
-    }
+    // if (ctx->cfg.wan_count == 0) {
+    //     log_error("No WAN defined for node %s", node_id);
+    //     return -1;
+    // }
     
     if(ctx->cfg.local_if[0] == '\0') {
         log_error("LOCAL_IF not defined for node %s (check config prefix %s_LOCAL_IF)", node_id, node_id);
         return -1;
     }
 
-    if (ctx->cfg.dataplane.veth_in[0] == '\0' ||
-        ctx->cfg.dataplane.veth_out[0] == '\0') {
-        log_error("Dataplane veth not defined");
-        return -1;
-    }
+    // if (ctx->cfg.dataplane.veth_in[0] == '\0' ||
+    //     ctx->cfg.dataplane.veth_out[0] == '\0') {
+    //     log_error("Dataplane veth not defined");
+    //     return -1;
+    // }
 
     /* Log WAN configuration for debugging */
-    for (size_t i = 0; i < ctx->cfg.wan_count; i++) {
-        log_info("WAN[%zu]: ifname=%s, dst_mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                 i, ctx->cfg.wans[i].ifname,
-                 ctx->cfg.wans[i].dst_mac[0], ctx->cfg.wans[i].dst_mac[1],
-                 ctx->cfg.wans[i].dst_mac[2], ctx->cfg.wans[i].dst_mac[3],
-                 ctx->cfg.wans[i].dst_mac[4], ctx->cfg.wans[i].dst_mac[5]);
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
+        log_info("NE_TUNNEL[%zu]: ifname=%s, dst_mac=%02x:%02x:%02x:%02x:%02x:%02x",
+                 i, ctx->cfg.ne_tunnels[i].ifname,
+                 ctx->cfg.ne_tunnels[i].dst_mac[0], ctx->cfg.ne_tunnels[i].dst_mac[1],
+                 ctx->cfg.ne_tunnels[i].dst_mac[2], ctx->cfg.ne_tunnels[i].dst_mac[3],
+                 ctx->cfg.ne_tunnels[i].dst_mac[4], ctx->cfg.ne_tunnels[i].dst_mac[5]);
     }
 
     return 0;
@@ -51,5 +51,5 @@ void app_context_dump(const app_context_t *ctx)
     log_info("Node: %s", ctx->cfg.node_id);
     log_info("Local IF: %s", ctx->cfg.local_if);
     log_info("Remote CIDR: %s", ctx->cfg.remote_cidr);
-    log_info("WAN count: %zu", ctx->cfg.wan_count);
+    log_info("NE_TUNNEL count: %zu", ctx->cfg.ne_tunnel_count);
 }
