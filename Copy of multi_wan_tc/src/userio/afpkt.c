@@ -902,14 +902,28 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
                     goto rx_next;
 
                 uint32_t hash = calculate_5tuple_hash(frame, len);
-                int q_idx = hash % num_queues;
+                int start_q_idx = hash % num_queues;
+                int q_idx = start_q_idx;
 
-                /* BACKPRESSURE - HOLD PACKET: If queue full, spin wait instead of dropping */
-                while (pkt_queue_push(queues[q_idx], frame, len, hash) != 0) {
-                    if (!*running) break;
-                    sched_yield(); /* Yield to consumers */
+                /* SPILLOVER FAILOVER / BACKPRESSURE:
+                 * If the target queue is full, try the next queue (spillover to another worker)
+                 * to prevent 100% Core bottleneck on a single TX worker. */
+                int pushed_ok = 0;
+                while (*running) {
+                    if (pkt_queue_push(queues[q_idx], frame, len, hash) == 0) {
+                        pushed_ok = 1;
+                        break;
+                    }
+                    
+                    /* Queue full -> Spillover to the next worker's queue */
+                    q_idx = (q_idx + 1) % num_queues;
+                    
+                    /* If we have checked all queues and ALL are full, yield CPU and retry */
+                    if (q_idx == start_q_idx) {
+                        sched_yield(); /* Yield to consumers */
+                    }
                 }
-                if (*running) pushed++;
+                if (pushed_ok) pushed++;
 
             rx_next:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
