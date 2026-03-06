@@ -53,6 +53,20 @@ static int bind_thread_to_core(pthread_t thread, int core_id)
     return pthread_setaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
 }
 
+static inline int get_next_odd_core(int *current_idx, int max_cores) {
+    if (max_cores <= 1) return 0;
+    
+    int core = *current_idx;
+    if (core % 2 == 0) core++; 
+    
+    if (core >= max_cores) {
+        core = 1;
+    }
+    
+    *current_idx = core + 2;
+    return core;
+}
+
 /* ---------- signal handler ---------- */
 
 static void handle_signal(int sig)
@@ -248,10 +262,9 @@ static int start_dataplane(app_context_t *ctx) {
         log_error("Failed to create GC thread");
         goto cleanup_inbound;
     }
-    int gc_core = current_core_idx % num_available_cores;
+    int gc_core = get_next_odd_core(&current_core_idx, num_available_cores);
     if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
-    current_core_idx++;
 
     int max_threads = 1 + pipeline.num_tx_workers + (int)ctx->cfg.ne_tunnel_count;
     worker_threads = calloc(max_threads, sizeof(pthread_t));
@@ -268,10 +281,9 @@ static int start_dataplane(app_context_t *ctx) {
         log_error("Failed to create RX thread");
         goto cleanup_threads;
     }
-    int rx_core = current_core_idx % num_available_cores;
+    int rx_core = get_next_odd_core(&current_core_idx, num_available_cores);
     if (bind_thread_to_core(worker_threads[total_worker_threads], rx_core) == 0)
         log_info("Bound pipeline RX to core %d", rx_core);
-    current_core_idx++;
     total_worker_threads++;
 
     for (int i = 0; i < pipeline.num_tx_workers; i++) {
@@ -287,10 +299,9 @@ static int start_dataplane(app_context_t *ctx) {
             log_error("Failed to create TX worker %d", i);
             goto cleanup_threads;
         }
-        int core_id = current_core_idx % num_available_cores;
+        int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
         if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
             log_info("Bound pipeline TX worker %d to core %d", i, core_id);
-        current_core_idx++;
         total_worker_threads++;
     }
 
@@ -305,10 +316,9 @@ static int start_dataplane(app_context_t *ctx) {
             log_error("Failed to create inbound worker tunnel[%zu]", w);
             goto cleanup_threads;
         }
-        int core_id = current_core_idx % num_available_cores;
+        int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
         if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
             log_info("Bound inbound worker %zu to core %d", w, core_id);
-        current_core_idx++;
         total_worker_threads++;
     }
 
