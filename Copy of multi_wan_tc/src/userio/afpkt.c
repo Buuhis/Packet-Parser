@@ -87,6 +87,35 @@ static inline uint32_t calculate_5tuple_hash(const uint8_t *frame, uint32_t len)
     return hash;
 }
 
+/* Yeu cau OS cap phat them do lon bo dem cho tung socket de khong rot goi cuc bo */
+static void afpkt_set_socket_buffer(int fd) {
+    int buf_size = 50 * 1024 * 1024; /* 50MB */
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) < 0) {
+        log_warn("Failed to set SO_RCVBUF on fd %d: %s", fd, strerror(errno));
+    }
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) < 0) {
+        log_warn("Failed to set SO_SNDBUF on fd %d: %s", fd, strerror(errno));
+    }
+}
+
+/* Gui batch voi tinh nang tu dong thu lai neu Kernel day bo dem chan lai */
+static inline void afpkt_tx_send_batch(int fd, struct mmsghdr *batch, int batch_n) {
+    int sent = 0;
+    int retries = 0;
+    while (sent < batch_n && retries < 3) {
+        int ret = sendmmsg(fd, &batch[sent], batch_n - sent, 0);
+        if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                usleep(5); /* Nghỉ 5 micro giây cho driver tháo bớt hàng chờ */
+                retries++;
+                continue;
+            }
+            break; /* Loi khac khong the phuc hoi (vd EBADF) thi thoat thu lai */
+        }
+        sent += ret;
+    }
+}
+
 int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id)
 {
     memset(fg, 0, sizeof(*fg));
@@ -113,6 +142,7 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
                       fanout_group_id, i, strerror(errno));
             return -1;
         }
+        afpkt_set_socket_buffer(w->rx_fd);
 
         /* 2. Set TPACKET_V3 version */
         int version = TPACKET_V3;
@@ -210,6 +240,7 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
             w->rx_fd = -1;
             return -1;
         }
+        afpkt_set_socket_buffer(w->tx_fd);
 
         log_info("Fanout[%d] worker %d: rx_fd=%d tx_fd=%d V3_Blocks=%u",
                  fanout_group_id, i, w->rx_fd, w->tx_fd, w->block_count);
@@ -239,6 +270,7 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
         log_error("afpkt_single_open(%s): socket(RX) failed: %s", ifname, strerror(errno));
         return -1;
     }
+    afpkt_set_socket_buffer(w->rx_fd);
 
     /* TPACKET_V3 */
     int version = TPACKET_V3;
@@ -316,6 +348,7 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
         w->rx_fd = -1;
         return -1;
     }
+    afpkt_set_socket_buffer(w->tx_fd);
 
     log_info("afpkt_single_open(%s): rx_fd=%d tx_fd=%d V3_Blocks=%u",
              ifname, w->rx_fd, w->tx_fd, w->block_count);
@@ -530,7 +563,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     /* Need 2 batch slots + 2 frag buffers */
                     if (batch_n + 2 > TX_BATCH_SIZE || frag_idx + 2 > TX_BATCH_SIZE) {
                         if (batch_n > 0)
-                            sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                            afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                     }
@@ -571,7 +604,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 } else {
                     /* Non-fragmented: batch directly from ring buffer (zero-copy) */
                     if (batch_n >= TX_BATCH_SIZE) {
-                        sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                     }
@@ -596,7 +629,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             /* ---- Flush remaining batch BEFORE releasing block ---- */
             if (batch_n > 0)
-                sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
 
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
@@ -707,7 +740,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     if (fg->frag_tbl) {
                         /* Dam bao dung luong batch truoc khi goi reassemble */
                         if (batch_n >= TX_BATCH_SIZE || frag_idx >= TX_BATCH_SIZE) {
-                            sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                            afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
                             batch_n = 0;
                             frag_idx = 0;
                         }
@@ -740,7 +773,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     }
                 } else {
                     if (batch_n >= TX_BATCH_SIZE) {
-                        sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                     }
@@ -767,7 +800,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             }
 
             if (batch_n > 0) {
-                sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                afpkt_tx_send_batch(w->tx_fd, tx_batch, batch_n);
             }
 
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
@@ -819,6 +852,7 @@ int afpkt_pipeline_open(afpkt_pipeline_t *pl, const char *ifname, int num_tx_wor
             afpkt_pipeline_close(pl);
             return -1;
         }
+        afpkt_set_socket_buffer(pl->tx_fds[i]);
     }
 
     log_info("Pipeline opened: RX on %s, %d TX workers, queue capacity=%d",
@@ -1093,7 +1127,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
         }
 
         if (batch_n > 0) {
-            sendmmsg(tx_fd, tx_batch, batch_n, 0);
+            afpkt_tx_send_batch(tx_fd, tx_batch, batch_n);
             send_calls++;
         }
 
