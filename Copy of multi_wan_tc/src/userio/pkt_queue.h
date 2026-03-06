@@ -22,6 +22,7 @@
 struct pkt_slot {
     uint8_t  data[PKT_SLOT_DATA_SIZE];
     uint32_t len;
+    uint32_t hash;
 };
 
 struct pkt_queue {
@@ -47,7 +48,7 @@ static inline void pkt_queue_init(struct pkt_queue *q)
  * Returns 0 on success, -1 if queue is full.
  */
 static inline int pkt_queue_push(struct pkt_queue *q,
-                                  const uint8_t *data, uint32_t len)
+                                  const uint8_t *data, uint32_t len, uint32_t hash)
 {
     uint32_t w = atomic_load_explicit(&q->write_idx, memory_order_relaxed);
     uint32_t next_w = (w + 1) & PKT_QUEUE_MASK;
@@ -60,6 +61,7 @@ static inline int pkt_queue_push(struct pkt_queue *q,
     if (__builtin_expect(len > PKT_SLOT_DATA_SIZE, 0)) len = PKT_SLOT_DATA_SIZE;
     memcpy(slot->data, data, len);
     slot->len = len;
+    slot->hash = hash;
 
     /* Release: ensure memcpy is visible before advancing write_idx */
     atomic_store_explicit(&q->write_idx, next_w, memory_order_release);

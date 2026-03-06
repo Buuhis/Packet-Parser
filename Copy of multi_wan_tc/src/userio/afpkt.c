@@ -19,6 +19,11 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <net/if.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 
 /* TPACKET_V3 constants */
 #define V3_BLOCK_SIZE (1 << 21) /* 2MB Blocks */
@@ -33,6 +38,54 @@
 /* ================================================== */
 /* ============ FANOUT OPEN / CLOSE ================= */
 /* ================================================== */
+
+static inline uint32_t calculate_5tuple_hash(const uint8_t *frame, uint32_t len) {
+    if (len < 14) return 0;
+    
+    struct ethhdr *eth = (struct ethhdr *)frame;
+    uint16_t h_proto = ntohs(eth->h_proto);
+    uint32_t hash = 0;
+
+    if (h_proto == ETH_P_IP) {
+        if (len < 14 + sizeof(struct iphdr)) return 0;
+        struct iphdr *iph = (struct iphdr *)(frame + 14);
+        uint32_t sip = iph->saddr;
+        uint32_t dip = iph->daddr;
+        uint8_t proto = iph->protocol;
+        
+        uint16_t sport = 0, dport = 0;
+        int iph_len = iph->ihl * 4;
+        
+        if (proto == IPPROTO_TCP && len >= 14 + iph_len + sizeof(struct tcphdr)) {
+            struct tcphdr *tcph = (struct tcphdr *)(frame + 14 + iph_len);
+            sport = tcph->source;
+            dport = tcph->dest;
+        } else if (proto == IPPROTO_UDP && len >= 14 + iph_len + sizeof(struct udphdr)) {
+            struct udphdr *udph = (struct udphdr *)(frame + 14 + iph_len);
+            sport = udph->source;
+            dport = udph->dest;
+        }
+        
+        hash = sip ^ dip ^ ((uint32_t)sport << 16 | dport) ^ proto;
+    } else if (h_proto == ETH_P_IPV6) {
+        if (len < 14 + sizeof(struct ip6_hdr)) return 0;
+        struct ip6_hdr *ip6h = (struct ip6_hdr *)(frame + 14);
+        uint32_t *s = (uint32_t *)ip6h->ip6_src.s6_addr;
+        uint32_t *d = (uint32_t *)ip6h->ip6_dst.s6_addr;
+        uint8_t proto = ip6h->ip6_nxt;
+        hash = s[3] ^ d[3] ^ proto;
+    } else {
+        return 0;
+    }
+    
+    hash ^= hash >> 16;
+    hash *= 0x85ebca6b;
+    hash ^= hash >> 13;
+    hash *= 0xc2b2ae35;
+    hash ^= hash >> 16;
+    
+    return hash;
+}
 
 int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id)
 {
@@ -74,9 +127,11 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         int ignore_out = 1;
         setsockopt(w->rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
 
-        /* 2b. Enable Busy Poll on Socket */
-        int busy_poll_us = 50;
-        setsockopt(w->rx_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+        /* 2b. (REMOVED) Enable Busy Poll on Socket
+         * We let NIC interrupt CPU naturally to avoid 100% spin
+         */
+        // int busy_poll_us = 50;
+        // setsockopt(w->rx_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
 
         /* 3. Bind to interface */
         struct sockaddr_ll sll = {
@@ -198,8 +253,9 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
     int ignore_out = 1;
     setsockopt(w->rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
 
-    int busy_poll_us = 50;
-    setsockopt(w->rx_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
+    /* We let NIC interrupt CPU naturally to avoid 100% spin */
+    // int busy_poll_us = 50;
+    // setsockopt(w->rx_fd, SOL_SOCKET, SO_BUSY_POLL, &busy_poll_us, sizeof(busy_poll_us));
 
     /* Bind */
     struct sockaddr_ll sll = {
@@ -413,9 +469,6 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     struct mmsghdr tx_batch[TX_BATCH_SIZE];
     struct iovec   tx_iov[TX_BATCH_SIZE];
 
-    /* ---- Per-worker Round Robin (no atomic contention) ---- */
-    uint32_t local_rr = (uint32_t)w->id;
-
     while (*running)
     {
         struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
@@ -465,9 +518,8 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 ip_pkts++;
 
-                int tunnel_idx = (int)local_rr;
-                local_rr++;
-                if (local_rr >= tunnel_count) local_rr = 0;
+                uint32_t hash = calculate_5tuple_hash(frame, len);
+                int tunnel_idx = hash % tunnel_count;
 
                 if (!fg->tunnels[tunnel_idx].valid)
                     goto next_pkt;
@@ -600,9 +652,11 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
     while (*running)
     {
+        /* BLOCKING POLL with TIMEOUT: Đợi ngắt từ NIC nhưng timeout mỗi 100ms
+         * Để luồng có cơ hội thức dậy và kiểm tra biến *running khi có lệnh tắt (Ctrl+C)
+         */
         struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 0) == 0) {
-            usleep(1); // Nhuong CPU khi ranh
+        if (poll(&pfd, 1, 100) <= 0) {
             continue;
         }
 
@@ -808,7 +862,6 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
 {
     unsigned long total = 0, pushed = 0, dropped = 0;
     // unsigned long prev_pushed = 0, prev_dropped = 0;
-    uint32_t rr = 0;
     struct timespec ts_start, ts_now;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
@@ -816,6 +869,9 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
 
     while (*running)
     {
+        /* BLOCKING POLL with TIMEOUT: Đợi ngắt từ NIC nhưng timeout mỗi 100ms
+         * Để luồng có cơ hội thức dậy và kiểm tra biến *running khi có lệnh tắt (Ctrl+C)
+         */
         struct pollfd pfd = {.fd = rx_w->rx_fd, .events = POLLIN};
         if (poll(&pfd, 1, 100) <= 0) {
             /* Periodic stats even when idle */
@@ -868,12 +924,11 @@ void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
                 if (len <= 14)
                     goto rx_next;
 
-                int q_idx = (int)rr;
-                rr++;
-                if (rr >= (uint32_t)num_queues) rr = 0;
+                uint32_t hash = calculate_5tuple_hash(frame, len);
+                int q_idx = hash % num_queues;
 
                 /* BACKPRESSURE - HOLD PACKET: If queue full, spin wait instead of dropping */
-                while (pkt_queue_push(queues[q_idx], frame, len) != 0) {
+                while (pkt_queue_push(queues[q_idx], frame, len, hash) != 0) {
                     if (!*running) break;
                     usleep(1); /* Yield to consumers */
                 }
@@ -917,7 +972,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
     unsigned long pkt_cnt = 0;
     // unsigned long prev_pkt_cnt = 0;
     unsigned long send_calls = 0;
-    struct timespec ts_start, ts_now;
+    struct timespec ts_start;
     clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     log_info("Pipeline TX worker[%d] started", worker_id);
@@ -947,7 +1002,6 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
 
     struct mmsghdr tx_batch[TX_BATCH_SIZE];
     struct iovec   tx_iov[TX_BATCH_SIZE];
-    uint32_t local_rr = (uint32_t)worker_id;
     uint32_t local_read = atomic_load_explicit(&q->read_idx, memory_order_relaxed);
 
     while (*running)
@@ -969,10 +1023,9 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
             struct pkt_slot *slot = pkt_queue_slot_at(q, local_read);
             uint8_t *frame = slot->data;
             uint32_t len = slot->len;
+            uint32_t hash = slot->hash;
 
-            int tunnel_idx = (int)local_rr;
-            local_rr++;
-            if (local_rr >= tunnel_count) local_rr = 0;
+            int tunnel_idx = hash % tunnel_count;
 
             if (!fg->tunnels[tunnel_idx].valid) {
                 local_read = (local_read + 1) & PKT_QUEUE_MASK;
