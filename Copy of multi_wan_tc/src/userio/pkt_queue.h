@@ -15,7 +15,7 @@
  * Capacity must be power of 2 for fast modulo via bitmask.
  */
 
-#define PKT_QUEUE_CAPACITY 524288        /* ~1GB RAM - Khong lo de hold packets! */
+#define PKT_QUEUE_CAPACITY 65536        /* Improved cache locality (was 524288) */
 #define PKT_QUEUE_MASK     (PKT_QUEUE_CAPACITY - 1)
 #define PKT_SLOT_DATA_SIZE 1522        /* Small better for typical MTU, saves memory vs 2048 */
 

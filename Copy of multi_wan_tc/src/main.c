@@ -240,15 +240,15 @@ static int start_dataplane(app_context_t *ctx) {
     afpkt_fanout_init_cache_outbound(&fg_out, ctx);
     afpkt_fanout_init_cache_inbound(&fg_out, ctx);
 
-    int available_cores[] = {1, 3, 5, 7, 9, 11};
-    int num_available_cores = sizeof(available_cores) / sizeof(available_cores[0]);
-    int current_core_idx = 0;
+    int num_available_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (num_available_cores <= 0) num_available_cores = 1; /* Fallback */
+    int current_core_idx = 1; /* Start from 1 to leave CPU 0 for OS */
 
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
         goto cleanup_inbound;
     }
-    int gc_core = available_cores[current_core_idx % num_available_cores];
+    int gc_core = current_core_idx % num_available_cores;
     if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
     current_core_idx++;
@@ -268,7 +268,7 @@ static int start_dataplane(app_context_t *ctx) {
         log_error("Failed to create RX thread");
         goto cleanup_threads;
     }
-    int rx_core = available_cores[current_core_idx % num_available_cores];
+    int rx_core = current_core_idx % num_available_cores;
     if (bind_thread_to_core(worker_threads[total_worker_threads], rx_core) == 0)
         log_info("Bound pipeline RX to core %d", rx_core);
     current_core_idx++;
@@ -287,7 +287,7 @@ static int start_dataplane(app_context_t *ctx) {
             log_error("Failed to create TX worker %d", i);
             goto cleanup_threads;
         }
-        int core_id = available_cores[current_core_idx % num_available_cores];
+        int core_id = current_core_idx % num_available_cores;
         if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
             log_info("Bound pipeline TX worker %d to core %d", i, core_id);
         current_core_idx++;
@@ -305,7 +305,7 @@ static int start_dataplane(app_context_t *ctx) {
             log_error("Failed to create inbound worker tunnel[%zu]", w);
             goto cleanup_threads;
         }
-        int core_id = available_cores[current_core_idx % num_available_cores];
+        int core_id = current_core_idx % num_available_cores;
         if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
             log_info("Bound inbound worker %zu to core %d", w, core_id);
         current_core_idx++;

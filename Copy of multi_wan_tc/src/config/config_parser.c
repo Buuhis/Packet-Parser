@@ -90,38 +90,6 @@ int config_load_env(const char *path,
         } else if (!strcmp(key, "DATAPLANE_MTU")) {
             cfg->dataplane.mtu = atoi(val);
 
-        /* ---- WAN COUNT ---- */
-        } else if (!strcmp(key, "WANS_COUNT")) {
-            cfg->wan_count = atoi(val);
-
-        /* ---- WAN ARRAY ---- */
-        } else if (!strncmp(key, "WANS_", 5)) {
-            int idx;
-            char field[32];
-            if (sscanf(key, "WANS_%d_%31s", &idx, field) == 2 &&
-                idx < MAX_WANS) {
-
-                wan_cfg_t *w = &cfg->wans[idx];
-
-                if (!strcmp(field, "NAME"))
-                    strncpy(w->name, val, sizeof(w->name)-1);
-                else if (!strcmp(field, "IFNAME"))
-                    strncpy(w->ifname, val, sizeof(w->ifname)-1);
-                else if (!strcmp(field, "GATEWAY"))
-                    strncpy(w->gateway, val, sizeof(w->gateway)-1);
-                else if (!strcmp(field, "WEIGHT"))
-                    w->weight = atoi(val);
-                else if (!strcmp(field, "DST_MAC")) {
-                    if (parse_mac(val, w->dst_mac) != 0) {
-                        log_error("Failed to parse DST_MAC for WAN[%d]: '%s'", idx, val);
-                    } else {
-                        log_debug("WAN[%d] DST_MAC = %02x:%02x:%02x:%02x:%02x:%02x",
-                                  idx, w->dst_mac[0], w->dst_mac[1], w->dst_mac[2],
-                                  w->dst_mac[3], w->dst_mac[4], w->dst_mac[5]);
-                    }
-                }
-            }
-
         /* ---- NE_TUNNEL COUNT ---- */
         } else if (!strcmp(key, "NE_TUNNEL_COUNT")) {
             cfg->ne_tunnel_count = atoi(val);
