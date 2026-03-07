@@ -6,8 +6,7 @@
 #include "proto/fragment.h"
 #include "userio/pkt_queue.h"
 
-#define NUM_WORKERS 3
-
+#define MAX_FANOUT_WORKERS 8
 #define MAX_TX_WORKERS 4
 #define NUM_TX_WORKERS 4  /* default, adjustable */
 
@@ -28,7 +27,7 @@ typedef struct {
 typedef struct {
     int              num_workers;
     int              fanout_group_id;
-    afpkt_worker_t   workers[NUM_WORKERS];
+    afpkt_worker_t   workers[MAX_FANOUT_WORKERS];
 
     /* Cached MAC/ifindex (written once before threads start, read-only after) */
     struct {
@@ -69,7 +68,7 @@ typedef struct {
 
 /* ============ Fanout API (legacy, still used for inbound) ============ */
 
-int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id);
+int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id, int num_workers);
 int  afpkt_single_open(afpkt_worker_t *w, const char *ifname);
 void afpkt_fanout_close(afpkt_fanout_t *fg);
 

@@ -31,7 +31,6 @@ static volatile int running_dataplane = 0;
 
 static int tcp_server_fd = -1;
 
-static afpkt_pipeline_t pipeline;
 static afpkt_fanout_t fg_out;
 static afpkt_worker_t in_workers[MAX_NE_TUNNELS];
 static size_t in_worker_count = 0;
@@ -88,34 +87,17 @@ static void usage(const char *prog)
             "Usage: %s --db-host <host> --db-port <port> --db-user <user> --db-name <name> --listen-port <port>\n", prog);
 }
 
-/* ---- Pipeline RX thread arg ---- */
+/* ---- Outbound worker thread args ---- */
 typedef struct {
-    afpkt_worker_t *rx;
-    const afpkt_fanout_t *fg;
-    struct pkt_queue **queues;
-    int num_queues;
-    volatile int *running;
-} rx_arg_t;
-
-static void *rx_fn(void *a) {
-    rx_arg_t *r = (rx_arg_t *)a;
-    afpkt_rx_distribute_loop(r->rx, r->fg, r->queues, r->num_queues, r->running);
-    return NULL;
-}
-
-/* ---- Pipeline TX worker thread args ---- */
-typedef struct {
-    int id;
-    struct pkt_queue *q;
-    int tx_fd;
+    afpkt_worker_t *worker;
     const afpkt_fanout_t *fg;
     app_context_t *ctx;
     volatile int *running;
-} tx_arg_t;
+} out_arg_t;
 
-static void *tx_fn(void *a) {
-    tx_arg_t *t = (tx_arg_t *)a;
-    afpkt_tx_worker_loop(t->id, t->q, t->tx_fd, t->fg, t->ctx, t->running);
+static void *out_fn(void *a) {
+    out_arg_t *o = (out_arg_t *)a;
+    afpkt_worker_loop_outbound(o->worker, o->fg, o->ctx, o->running);
     return NULL;
 }
 
@@ -168,8 +150,7 @@ static void worker_close(afpkt_worker_t *w)
 /* DATAPLANE START / STOP */
 /* ========================================================================= */
 
-static rx_arg_t g_rx_arg;
-static tx_arg_t g_tx_args[MAX_TX_WORKERS];
+static out_arg_t g_out_args[MAX_FANOUT_WORKERS];
 static in_arg_t g_in_args[MAX_NE_TUNNELS];
 
 static void stop_dataplane(void) {
@@ -196,7 +177,7 @@ static void stop_dataplane(void) {
         fg_out.frag_tbl = NULL;
     }
     
-    afpkt_pipeline_close(&pipeline);
+    afpkt_fanout_close(&fg_out);
     
     system_restore_ip_forward();
     netdev_enable_offloads(running_ctx.cfg.local_if);
@@ -226,12 +207,11 @@ static int start_dataplane(app_context_t *ctx) {
     netdev_disable_offloads(ctx->cfg.local_if);
     netdev_optimize_interface(ctx->cfg.local_if);
 
-    if (afpkt_pipeline_open(&pipeline, ctx->cfg.local_if, NUM_TX_WORKERS) != 0) {
-        log_error("Failed to open pipeline on %s", ctx->cfg.local_if);
+    if (afpkt_fanout_open(&fg_out, ctx->cfg.local_if, 1, NUM_TX_WORKERS) != 0) {
+        log_error("Failed to open fanout outbound on %s", ctx->cfg.local_if);
         goto cleanup_route;
     }
 
-    memset(&fg_out, 0, sizeof(fg_out));
     struct frag_table *ft = malloc(sizeof(struct frag_table));
     if (ft) {
         frag_table_init(ft);
@@ -266,42 +246,24 @@ static int start_dataplane(app_context_t *ctx) {
     if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
 
-    int max_threads = 1 + pipeline.num_tx_workers + (int)ctx->cfg.ne_tunnel_count;
+    int max_threads = 1 + fg_out.num_workers + (int)ctx->cfg.ne_tunnel_count;
     worker_threads = calloc(max_threads, sizeof(pthread_t));
     total_worker_threads = 0;
 
-    g_rx_arg = (rx_arg_t){
-        .rx = &pipeline.rx,
-        .fg = &fg_out,
-        .queues = pipeline.queues,
-        .num_queues = pipeline.num_tx_workers,
-        .running = &running_dataplane,
-    };
-    if (pthread_create(&worker_threads[total_worker_threads], NULL, rx_fn, &g_rx_arg) != 0) {
-        log_error("Failed to create RX thread");
-        goto cleanup_threads;
-    }
-    int rx_core = get_next_odd_core(&current_core_idx, num_available_cores);
-    if (bind_thread_to_core(worker_threads[total_worker_threads], rx_core) == 0)
-        log_info("Bound pipeline RX to core %d", rx_core);
-    total_worker_threads++;
-
-    for (int i = 0; i < pipeline.num_tx_workers; i++) {
-        g_tx_args[i] = (tx_arg_t){
-            .id = i,
-            .q = pipeline.queues[i],
-            .tx_fd = pipeline.tx_fds[i],
+    for (int i = 0; i < fg_out.num_workers; i++) {
+        g_out_args[i] = (out_arg_t){
+            .worker = &fg_out.workers[i],
             .fg = &fg_out,
             .ctx = ctx,
             .running = &running_dataplane,
         };
-        if (pthread_create(&worker_threads[total_worker_threads], NULL, tx_fn, &g_tx_args[i]) != 0) {
-            log_error("Failed to create TX worker %d", i);
+        if (pthread_create(&worker_threads[total_worker_threads], NULL, out_fn, &g_out_args[i]) != 0) {
+            log_error("Failed to create Outbound worker %d", i);
             goto cleanup_threads;
         }
         int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
         if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
-            log_info("Bound pipeline TX worker %d to core %d", i, core_id);
+            log_info("Bound Outbound worker %d to core %d", i, core_id);
         total_worker_threads++;
     }
 
@@ -324,8 +286,8 @@ static int start_dataplane(app_context_t *ctx) {
 
     log_info("===========================================");
     log_info("  MWAN Pipeline Forwarding Started");
-    log_info("  Threads: 1 RX + %d TX + %d inbound + 1 GC",
-             pipeline.num_tx_workers, (int)ctx->cfg.ne_tunnel_count);
+    log_info("  Threads: %d outbound + %d inbound + 1 GC",
+             fg_out.num_workers, (int)ctx->cfg.ne_tunnel_count);
     log_info("===========================================");
     is_dataplane_active = 1;
     return 0;
@@ -343,7 +305,7 @@ cleanup_inbound:
     for (size_t w = 0; w < in_worker_count; w++) worker_close(&in_workers[w]);
     if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
 cleanup_pl:
-    afpkt_pipeline_close(&pipeline);
+    afpkt_fanout_close(&fg_out);
 cleanup_route:
     system_restore_ip_forward();
     netdev_enable_offloads(ctx->cfg.local_if);

@@ -87,10 +87,11 @@ static inline uint32_t calculate_5tuple_hash(const uint8_t *frame, uint32_t len)
     return hash;
 }
 
-int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id)
+int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id, int num_workers)
 {
     memset(fg, 0, sizeof(*fg));
-    fg->num_workers = NUM_WORKERS;
+    if (num_workers > MAX_FANOUT_WORKERS) num_workers = MAX_FANOUT_WORKERS;
+    fg->num_workers = num_workers;
     fg->fanout_group_id = fanout_group_id;
 
     int ifidx = if_nametoindex(ifname);
@@ -100,7 +101,7 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         return -1;
     }
 
-    for (int i = 0; i < NUM_WORKERS; i++)
+    for (int i = 0; i < num_workers; i++)
     {
         afpkt_worker_t *w = &fg->workers[i];
         w->id = i;
@@ -449,7 +450,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     while (*running)
     {
         struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 0) == 0)
+        if (poll(&pfd, 1, 100) <= 0)
             continue;
 
         while (*running)
