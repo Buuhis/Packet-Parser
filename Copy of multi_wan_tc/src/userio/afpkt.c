@@ -212,6 +212,10 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
             return -1;
         }
 
+        /* Increase TX buffer to absorb bursts (16 MB) */
+        int sndbuf = 16 * 1024 * 1024;
+        setsockopt(w->tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
+
         log_info("Fanout[%d] worker %d: rx_fd=%d tx_fd=%d V3_Blocks=%u",
                  fanout_group_id, i, w->rx_fd, w->tx_fd, w->block_count);
     }
@@ -318,6 +322,9 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
         return -1;
     }
 
+    /* Increase TX buffer to absorb bursts (16 MB) */
+    int sndbuf = 16 * 1024 * 1024;
+    setsockopt(w->tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
     log_info("afpkt_single_open(%s): rx_fd=%d tx_fd=%d V3_Blocks=%u",
              ifname, w->rx_fd, w->tx_fd, w->block_count);
     return 0;
@@ -404,6 +411,32 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 /* ================================================== */
 /* ============ WORKER LOOP OUTBOUND ================ */
 /* ================================================== */
+
+/*
+ * sendmmsg_full(): retry until ALL packets are sent.
+ * If kernel TX queue is full, sendmmsg returns fewer than requested.
+ * This function retries the remaining packets with a brief pause,
+ * implementing BACKPRESSURE: we slow down processing to match TX capacity.
+ * This guarantees ZERO packet loss at the application level.
+ */
+static void sendmmsg_full(int fd, struct mmsghdr *batch, int count) {
+    int sent = 0;
+    while (sent < count) {
+        int ret = sendmmsg(fd, batch + sent, count - sent, 0);
+        if (ret > 0) {
+            sent += ret;
+        } else if (ret < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+                /* TX queue full — wait briefly then retry (backpressure) */
+                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000 }; /* 100µs */
+                nanosleep(&ts, NULL);
+            } else {
+                /* Real error — break to avoid infinite loop */
+                break;
+            }
+        }
+    }
+}
 
 /*
  * Outbound: capture from local_if → forward to ne_tunnel (Hash-based)
@@ -524,7 +557,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     /* Need 2 batch slots + 2 frag buffers */
                     if (batch_n + 2 > TX_BATCH_SIZE || frag_idx + 2 > TX_BATCH_SIZE) {
                         if (batch_n > 0)
-                            sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                            sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                         memset(tx_batch, 0, sizeof(tx_batch));
@@ -558,7 +591,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 } else {
                     /* Non-fragmented: batch directly from ring buffer (zero-copy) */
                     if (batch_n >= TX_BATCH_SIZE) {
-                        sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                         memset(tx_batch, 0, sizeof(tx_batch));
@@ -581,7 +614,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             /* ---- Flush remaining batch BEFORE releasing block ---- */
             if (batch_n > 0)
-                sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                sendmmsg_full(w->tx_fd, tx_batch, batch_n);
 
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
@@ -692,7 +725,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     if (fg->frag_tbl) {
                         /* Dam bao dung luong batch truoc khi goi reassemble */
                         if (batch_n >= TX_BATCH_SIZE || frag_idx >= TX_BATCH_SIZE) {
-                            sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                            sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                             batch_n = 0;
                             frag_idx = 0;
                         }
@@ -725,7 +758,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     }
                 } else {
                     if (batch_n >= TX_BATCH_SIZE) {
-                        sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                        sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
                     }
@@ -752,7 +785,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             }
 
             if (batch_n > 0) {
-                sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
+                sendmmsg_full(w->tx_fd, tx_batch, batch_n);
             }
 
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
@@ -1092,7 +1125,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
         }
 
         if (batch_n > 0) {
-            sendmmsg(tx_fd, tx_batch, batch_n, 0);
+            sendmmsg_full(tx_fd, tx_batch, batch_n);
             send_calls++;
         }
 

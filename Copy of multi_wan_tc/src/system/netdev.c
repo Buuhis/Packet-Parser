@@ -155,10 +155,14 @@ int netdev_optimize_interface(const char *ifname)
         log_info("Maximized RX Ring Buffer on %s to 4096", ifname);
     }
 
-    /* Disable Flow Control (Reduce rx_fifo_errors caused by pause frames) */
-    snprintf(cmd, sizeof(cmd), "ethtool -A %s rx off tx off 2>/dev/null", ifname);
+    /* Enable Flow Control (IEEE 802.3x Pause Frames)
+     * When RX buffer fills up, NIC sends PAUSE to upstream switch/client
+     * This provides hardware-level backpressure → zero packet loss */
+    snprintf(cmd, sizeof(cmd), "ethtool -A %s rx on tx on 2>/dev/null", ifname);
     if (system(cmd) != 0) {
-        log_error("Failed to set flow control on %s (ethtool failed?)", ifname);
+        log_error("Failed to enable flow control on %s (ethtool failed?)", ifname);
+    } else {
+        log_info("Enabled Flow Control (Pause Frames) on %s", ifname);
     }
 
     return ret;
