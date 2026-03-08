@@ -406,9 +406,11 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 /* ================================================== */
 
 /*
- * Outbound: capture from local_if → forward to ne_tunnel (Round Robin)
+ * Outbound: capture from local_if → forward to ne_tunnel (Hash-based)
  * Uses batched sendmmsg() to minimize syscall overhead.
- * Fragment buffer pool allows batching fragmented packets too.
+ * Optimizations:
+ *   - Pre-cached 14-byte ETH header per tunnel (1 memcpy instead of 2+assign)
+ *   - memset tx_batch ONCE per block instead of per-packet
  */
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
@@ -416,7 +418,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long pkt_cnt = 0;
     unsigned long captured_cnt = 0;
     unsigned long ip_pkts = 0;
-    log_info("Worker outbound[%d] started (Batched sendmmsg)", w->id);
+    log_info("Worker outbound[%d] started (Batched sendmmsg + FastMAC)", w->id);
 
     size_t tunnel_count = ctx->cfg.ne_tunnel_count;
     if (tunnel_count == 0)
@@ -434,6 +436,17 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         cached_sa[t].sll_ifindex  = fg->tunnels[t].ifindex;
         cached_sa[t].sll_halen    = 6;
         memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
+    }
+
+    /* ---- Pre-cache full 14-byte Ethernet header per tunnel ----
+     * Layout: [dst_mac (6)] [src_mac (6)] [ethertype (2)]
+     * One 14-byte memcpy replaces 2x 6-byte memcpy + 1 ethertype assign */
+    uint8_t cached_eth[MAX_NE_TUNNELS][14];
+    for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
+        memcpy(cached_eth[t] + 0, ctx->cfg.ne_tunnels[t].dst_mac, 6);    /* h_dest */
+        memcpy(cached_eth[t] + 6, fg->tunnels[t].src_mac, 6);            /* h_source */
+        cached_eth[t][12] = (uint8_t)(MWAN_ETHERTYPE >> 8);              /* h_proto (BE) */
+        cached_eth[t][13] = (uint8_t)(MWAN_ETHERTYPE & 0xFF);
     }
 
     /* ---- Fragment buffer pool (heap, reusable after each flush) ---- */
@@ -468,6 +481,9 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             /* ---- Batch state for this block ---- */
             int batch_n = 0;   /* messages queued */
             int frag_idx = 0;  /* next free slot in frag_arena */
+
+            /* OPT: Clear batch array ONCE per block instead of per-packet */
+            memset(tx_batch, 0, sizeof(tx_batch));
 
             for (int i = 0; i < num_pkts; i++)
             {
@@ -511,6 +527,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                             sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
                         batch_n = 0;
                         frag_idx = 0;
+                        memset(tx_batch, 0, sizeof(tx_batch));
                     }
 
                     uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
@@ -518,18 +535,11 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     uint32_t f1_len, f2_len;
 
                     if (frag_split(frame, (uint32_t)len, f1, &f1_len, f2, &f2_len) == 0) {
-                        struct ethhdr *eh1 = (struct ethhdr *)f1;
-                        memcpy(eh1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                        memcpy(eh1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                        eh1->h_proto = htons(MWAN_ETHERTYPE);
-
-                        struct ethhdr *eh2 = (struct ethhdr *)f2;
-                        memcpy(eh2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                        memcpy(eh2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                        eh2->h_proto = htons(MWAN_ETHERTYPE);
+                        /* OPT: Single 14-byte copy for entire ETH header */
+                        memcpy(f1, cached_eth[tunnel_idx], 14);
+                        memcpy(f2, cached_eth[tunnel_idx], 14);
 
                         tx_iov[batch_n] = (struct iovec){ .iov_base = f1, .iov_len = f1_len };
-                        memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                         tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                         tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
                         tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
@@ -537,7 +547,6 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                         batch_n++;
 
                         tx_iov[batch_n] = (struct iovec){ .iov_base = f2, .iov_len = f2_len };
-                        memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                         tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                         tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
                         tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
@@ -552,15 +561,13 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                         sendmmsg(w->tx_fd, tx_batch, batch_n, 0);
                         batch_n = 0;
                         frag_idx = 0;
+                        memset(tx_batch, 0, sizeof(tx_batch));
                     }
 
-                    struct ethhdr *eth_out = (struct ethhdr *)frame;
-                    memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                    memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                    eth_out->h_proto = htons(MWAN_ETHERTYPE);
+                    /* OPT: Single 14-byte copy for entire ETH header */
+                    memcpy(frame, cached_eth[tunnel_idx], 14);
 
                     tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = len };
-                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                     tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                     tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
                     tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
