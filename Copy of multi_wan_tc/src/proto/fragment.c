@@ -41,14 +41,26 @@ void frag_table_gc(struct frag_table *ft) {
     }
 }
 
-static uint16_t calc_ip_checksum(const uint8_t *hdr, int len) {
-    uint32_t sum = 0;
-    for (int i = 0; i < len; i += 2) {
-        uint16_t word = ((uint16_t)hdr[i] << 8);
-        if (i + 1 < len)
-            word |= hdr[i + 1];
-        sum += word;
+/* calc_ip_checksum removed: replaced by cksum_incremental (RFC 1624) */
+
+/*
+ * RFC 1624 Incremental Checksum Update.
+ * Given old checksum, update it after changing N 16-bit words.
+ * old_words[] = original values, new_words[] = replacement values.
+ * This avoids re-scanning the entire IP header from scratch.
+ *
+ * Cost: ~3 additions per changed word vs 10 additions for full 20-byte header.
+ */
+static inline uint16_t cksum_incremental(uint16_t old_cksum,
+                                         const uint16_t *old_words,
+                                         const uint16_t *new_words,
+                                         int n) {
+    uint32_t sum = (uint16_t)~old_cksum;  /* HC' complement */
+    for (int i = 0; i < n; i++) {
+        sum += (uint16_t)~old_words[i];    /* subtract old */
+        sum += new_words[i];               /* add new */
     }
+    /* Fold carry */
     while (sum >> 16)
         sum = (sum & 0xFFFF) + (sum >> 16);
     return (uint16_t)(~sum & 0xFFFF);
@@ -95,20 +107,30 @@ static int build_fragment(const uint8_t *eth_hdr,
     memcpy(out_buf + offset, payload, payload_len);
     offset += payload_len;
 
-    /* Update IP total length */
-    uint16_t ip_total = (uint16_t)(ip_hdr_len + FRAG_PLAIN_HDR_SIZE + payload_len);
-    out_buf[14 + 2] = (uint8_t)(ip_total >> 8);
-    out_buf[14 + 3] = (uint8_t)(ip_total & 0xFF);
+    /* ---- Incremental Checksum (RFC 1624) ----
+     * Only 2 fields changed: total_length (offset 2-3) and protocol (offset 8-9 word).
+     * Instead of recalculating over all 20 bytes, just update the delta. */
 
-    /* Set protocol to FRAG_PROTOCOL (253) */
+    /* Read OLD values from the copied IP header (before modification) */
+    uint16_t old_totlen = ((uint16_t)out_buf[14 + 2] << 8) | out_buf[14 + 3];
+    uint16_t old_ttl_proto = ((uint16_t)out_buf[14 + 8] << 8) | out_buf[14 + 9];
+    uint16_t old_cksum = ((uint16_t)out_buf[14 + 10] << 8) | out_buf[14 + 11];
+
+    /* Write NEW values */
+    uint16_t new_totlen = (uint16_t)(ip_hdr_len + FRAG_PLAIN_HDR_SIZE + payload_len);
+    out_buf[14 + 2] = (uint8_t)(new_totlen >> 8);
+    out_buf[14 + 3] = (uint8_t)(new_totlen & 0xFF);
+
     out_buf[14 + 9] = FRAG_PROTOCOL;
+    uint16_t new_ttl_proto = ((uint16_t)out_buf[14 + 8] << 8) | FRAG_PROTOCOL;
 
-    /* Recalculate IP checksum */
-    out_buf[14 + 10] = 0;
-    out_buf[14 + 11] = 0;
-    uint16_t cksum = calc_ip_checksum(out_buf + 14, ip_hdr_len);
-    out_buf[14 + 10] = (uint8_t)(cksum >> 8);
-    out_buf[14 + 11] = (uint8_t)(cksum & 0xFF);
+    /* Incremental update: 2 word changes, ~6 additions total */
+    uint16_t old_words[2] = { old_totlen, old_ttl_proto };
+    uint16_t new_words[2] = { new_totlen, new_ttl_proto };
+    uint16_t new_cksum = cksum_incremental(old_cksum, old_words, new_words, 2);
+
+    out_buf[14 + 10] = (uint8_t)(new_cksum >> 8);
+    out_buf[14 + 11] = (uint8_t)(new_cksum & 0xFF);
 
     *out_len = (uint32_t)offset;
     return 0;
@@ -246,17 +268,24 @@ int frag_defragment(uint8_t *packet, size_t pkt_len,
 
     /* Restore original protocol */
     if (is_ipv4) {
-        packet[14 + 9] = orig_proto;
-        uint16_t old_totlen = ((uint16_t)packet[14 + 2] << 8) | packet[14 + 3];
-        uint16_t new_totlen = old_totlen - FRAG_PLAIN_HDR_SIZE;
-        packet[14 + 2] = (uint8_t)(new_totlen >> 8);
-        packet[14 + 3] = (uint8_t)(new_totlen & 0xFF);
+        /* Read OLD values before modification */
+        uint16_t old_totlen_w = ((uint16_t)packet[14 + 2] << 8) | packet[14 + 3];
+        uint16_t old_ttl_proto = ((uint16_t)packet[14 + 8] << 8) | packet[14 + 9];
+        uint16_t old_cksum = ((uint16_t)packet[14 + 10] << 8) | packet[14 + 11];
 
-        packet[14 + 10] = 0;
-        packet[14 + 11] = 0;
-        uint16_t cksum = calc_ip_checksum(packet + 14, ip_hdr_len);
-        packet[14 + 10] = (uint8_t)(cksum >> 8);
-        packet[14 + 11] = (uint8_t)(cksum & 0xFF);
+        /* Write NEW values */
+        packet[14 + 9] = orig_proto;
+        uint16_t new_totlen_w = old_totlen_w - FRAG_PLAIN_HDR_SIZE;
+        packet[14 + 2] = (uint8_t)(new_totlen_w >> 8);
+        packet[14 + 3] = (uint8_t)(new_totlen_w & 0xFF);
+        uint16_t new_ttl_proto = ((uint16_t)packet[14 + 8] << 8) | orig_proto;
+
+        /* Incremental checksum update */
+        uint16_t old_w[2] = { old_totlen_w, old_ttl_proto };
+        uint16_t new_w[2] = { new_totlen_w, new_ttl_proto };
+        uint16_t new_cksum = cksum_incremental(old_cksum, old_w, new_w, 2);
+        packet[14 + 10] = (uint8_t)(new_cksum >> 8);
+        packet[14 + 11] = (uint8_t)(new_cksum & 0xFF);
     } else {
         packet[14 + 6] = orig_proto;
         uint16_t old_paylen = ((uint16_t)packet[14 + 4] << 8) | packet[14 + 5];
@@ -380,17 +409,25 @@ int frag_try_reassemble(struct frag_table *ft,
         off += entry->data1_len;
 
         if (is_ipv4) {
-            uint16_t ip_total = (uint16_t)(entry->ip_hdr_len + total_payload);
-            out_buf[14 + 2] = (uint8_t)(ip_total >> 8);
-            out_buf[14 + 3] = (uint8_t)(ip_total & 0xFF);
+            /* Read OLD values from the stored IP header */
+            uint16_t old_totlen_r = ((uint16_t)out_buf[14 + 2] << 8) | out_buf[14 + 3];
+            uint16_t old_ttl_proto_r = ((uint16_t)out_buf[14 + 8] << 8) | out_buf[14 + 9];
+            uint16_t old_cksum_r = ((uint16_t)out_buf[14 + 10] << 8) | out_buf[14 + 11];
+
+            /* Write NEW values */
+            uint16_t new_totlen_r = (uint16_t)(entry->ip_hdr_len + total_payload);
+            out_buf[14 + 2] = (uint8_t)(new_totlen_r >> 8);
+            out_buf[14 + 3] = (uint8_t)(new_totlen_r & 0xFF);
             
             out_buf[14 + 9] = entry->orig_proto;
+            uint16_t new_ttl_proto_r = ((uint16_t)out_buf[14 + 8] << 8) | entry->orig_proto;
 
-            out_buf[14 + 10] = 0;
-            out_buf[14 + 11] = 0;
-            uint16_t cksum = calc_ip_checksum(out_buf + 14, entry->ip_hdr_len);
-            out_buf[14 + 10] = (uint8_t)(cksum >> 8);
-            out_buf[14 + 11] = (uint8_t)(cksum & 0xFF);
+            /* Incremental checksum update */
+            uint16_t old_wr[2] = { old_totlen_r, old_ttl_proto_r };
+            uint16_t new_wr[2] = { new_totlen_r, new_ttl_proto_r };
+            uint16_t new_cksum_r = cksum_incremental(old_cksum_r, old_wr, new_wr, 2);
+            out_buf[14 + 10] = (uint8_t)(new_cksum_r >> 8);
+            out_buf[14 + 11] = (uint8_t)(new_cksum_r & 0xFF);
         } else {
             out_buf[14 + 6] = entry->orig_proto;
             uint16_t ipv6_paylen = (uint16_t)total_payload;
