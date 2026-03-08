@@ -657,6 +657,19 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     sa.sll_halen = 6;
     memcpy(sa.sll_addr, ctx->cfg.lan.dst_mac, 6);
 
+    /* ---- Pre-cache full 14-byte Ethernet headers for LOCAL ---- */
+    uint8_t cached_eth_ipv4[14];
+    memcpy(cached_eth_ipv4 + 0, ctx->cfg.lan.dst_mac, 6);
+    memcpy(cached_eth_ipv4 + 6, fg->local.src_mac, 6);
+    cached_eth_ipv4[12] = (uint8_t)((ETH_P_IP) >> 8);
+    cached_eth_ipv4[13] = (uint8_t)((ETH_P_IP) & 0xFF);
+
+    uint8_t cached_eth_ipv6[14];
+    memcpy(cached_eth_ipv6 + 0, ctx->cfg.lan.dst_mac, 6);
+    memcpy(cached_eth_ipv6 + 6, fg->local.src_mac, 6);
+    cached_eth_ipv6[12] = (uint8_t)((ETH_P_IPV6) >> 8);
+    cached_eth_ipv6[13] = (uint8_t)((ETH_P_IPV6) & 0xFF);
+
     /* ---- Fragment buffer pool cho inbound ---- */
     uint8_t *frag_arena = malloc((size_t)TX_BATCH_SIZE * 2048);
     if (!frag_arena) {
@@ -691,6 +704,9 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             int batch_n = 0;
             int frag_idx = 0;
+
+            /* OPT: Clear batch array ONCE per block */
+            memset(tx_batch, 0, sizeof(tx_batch));
 
             for (int i = 0; i < num_pkts; i++)
             {
@@ -728,6 +744,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                             sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                             batch_n = 0;
                             frag_idx = 0;
+                            memset(tx_batch, 0, sizeof(tx_batch));
                         }
 
                         uint8_t *reassembled = frag_arena + (size_t)frag_idx * 2048;
@@ -739,15 +756,17 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                             ip_data = reassembled + 14;
                             ip_len = reassem_len - 14;
                             
-                            struct ethhdr *eth_out = (struct ethhdr *)reassembled;
-                            memcpy(eth_out->h_source, fg->local.src_mac, 6);
-                            memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
-                            eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
-
-                            sa.sll_protocol = eth_out->h_proto;
+                            /* OPT: Fast 14-byte MAC rewrite */
+                            int is_ipv4 = ((ip_data[0] >> 4) == 4);
+                            if (is_ipv4) {
+                                memcpy(reassembled, cached_eth_ipv4, 14);
+                                sa.sll_protocol = htons(ETH_P_IP);
+                            } else {
+                                memcpy(reassembled, cached_eth_ipv6, 14);
+                                sa.sll_protocol = htons(ETH_P_IPV6);
+                            }
 
                             tx_iov[batch_n] = (struct iovec){ .iov_base = reassembled, .iov_len = reassem_len };
-                            memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                             tx_batch[batch_n].msg_hdr.msg_name    = &sa;
                             tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
                             tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
@@ -761,24 +780,27 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                         sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
                         frag_idx = 0;
+                        memset(tx_batch, 0, sizeof(tx_batch));
                     }
 
-                    /* ZERO-COPY: Rewrite Ethernet Header directly on the ring buffer frame */
-                    struct ethhdr *eth_out = (struct ethhdr *)frame;
-                    memcpy(eth_out->h_source, fg->local.src_mac, 6);
-                    memcpy(eth_out->h_dest, ctx->cfg.lan.dst_mac, 6);
-                    eth_out->h_proto = ((ip_data[0] >> 4) == 4) ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
-
-                    sa.sll_protocol = eth_out->h_proto;
+                    /* ZERO-COPY OPT: Rewrite Ethernet Header directly on the ring buffer frame */
+                    int is_ipv4 = ((ip_data[0] >> 4) == 4);
+                    if (is_ipv4) {
+                        memcpy(frame, cached_eth_ipv4, 14);
+                        sa.sll_protocol = htons(ETH_P_IP);
+                    } else {
+                        memcpy(frame, cached_eth_ipv6, 14);
+                        sa.sll_protocol = htons(ETH_P_IPV6);
+                    }
 
                     tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = 14 + ip_len };
-                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                     tx_batch[batch_n].msg_hdr.msg_name    = &sa;
                     tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
                     tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
                     tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
                     batch_n++;
                 }
+
 
             next_in:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
