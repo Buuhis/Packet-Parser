@@ -1,0 +1,134 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\geometry{a4paper, margin=1in}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{blue},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+\lstset{style=mystyle}
+
+\title{\textbf{User Manual: Multi-WAN Packet Forwarder}}
+\author{Hoang Buu}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\section{Introduction}
+This document provides a comprehensive guide to the \textbf{Multi-WAN Packet Forwarder} project. The application is a user-space dataplane built using \texttt{AF\_PACKET (TPACKET\_V3)}. It is designed to receive, modify, fragment, and load-balance IP packets across multiple WAN interfaces or tunnels using a lock-free, run-to-completion worker model.
+
+Key features include:
+\begin{itemize}
+    \item \textbf{High Performance:} Bypasses the Linux kernel TCP/IP stack to forward packets efficiently with memory-mapped RX/TX rings.
+    \item \textbf{Zero-Lock Reassembly \& Fragmentation:} Fragments oversized packets dynamically based on tunnel MTU without relying on complex locking mechanisms. Uses incremental checksum generation (RFC 1624) to reduce CPU overhead.
+    \item \textbf{Load Balancing:} Uses a 5-tuple hash algorithm to evenly distribute traffic across available tunnel interfaces.
+    \item \textbf{Dynamic Control Plane:} Connects to a PostgreSQL database to fetch node configurations automatically (e.g., interfaces, MAC addresses, routing).
+\end{itemize}
+
+\section{Architecture Overview}
+The system is divided into two main planes:
+\begin{enumerate}
+    \item \textbf{Control Plane (\texttt{main.c}, \texttt{db\_client.c}):} A control thread that listens on a TCP port. Upon receiving a \texttt{node\_id}, it fetches the network topology from PostgreSQL and initializes the dataplane.
+    \item \textbf{Data Plane (\texttt{afpkt.c}):} Multiple Omni-Worker threads bound to specific CPU cores. Each worker pulls packets from \texttt{AF\_PACKET\_FANOUT} rings, modifies Ethernet headers, optionally fragments packets, and pushes them out via \texttt{sendmmsg()} batching.
+\end{enumerate}
+
+\section{Prerequisites}
+Ensure your system meets the following requirements:
+\begin{itemize}
+    \item \textbf{OS:} Linux OS with a kernel supporting \texttt{TPACKET\_V3} and \texttt{PACKET\_FANOUT}.
+    \item \textbf{Compiler \& Tools:} \texttt{gcc}, \texttt{make}.
+    \item \textbf{Libraries:} \texttt{libpq-dev} (PostgreSQL C client library).
+    \item \textbf{Privileges:} \texttt{root} access (sudo) is required to bind raw sockets and interact with \texttt{ethtool} and \texttt{sysctl}.
+\end{itemize}
+
+\section{Build Instructions}
+To compile the project, navigate to the source directory and run \texttt{make}.
+
+\begin{lstlisting}[language=bash]
+# Install PostgreSQL library dependencies (Ubuntu/Debian)
+sudo apt-get update
+sudo apt-get install libpq-dev
+
+# Compile the source code
+make clean
+make
+\end{lstlisting}
+This will generate the \texttt{mwanc} executable.
+
+\section{Database Setup}
+The control plane depends on a PostgreSQL database. A SQL script is provided to initialize the schema and insert mock topology data for testing.
+
+\begin{lstlisting}[language=bash]
+# Execute the SQL script to create tables and insert data
+psql -U <username> -d <database_name> -W -f test_connect_db/init_db.sql
+\end{lstlisting}
+
+\section{User Guide}
+Follow these steps to run the application.
+
+\subsection{Starting the Application}
+Run the \texttt{mwanc} daemon with your database credentials and the desired listening port for the control plane.
+\begin{lstlisting}[language=bash]
+sudo ./mwanc --db-host 127.0.0.1 \
+             --db-port 5432 \
+             --db-user postgres \
+             --db-name mydb \
+             --listen-port 8080
+\end{lstlisting}
+\textit{Note:} You will be prompted to enter the database password securely.
+
+\subsection{Applying Node Configuration}
+Once the daemon is waiting for a \texttt{node\_id}, you can mock the backend controller by sending an ID using the provided bash script.
+
+\begin{lstlisting}[language=bash]
+# Make the script executable
+chmod +x test_connect_db/mock_backend.sh
+
+# Send the ID 'server1' to port 8080
+./test_connect_db/mock_backend.shgia su bay gio toi  server1 8080
+\end{lstlisting}
+
+Upon receiving the ID, the application will:
+\begin{enumerate}
+    \item Start the Omni-Worker threads and bind them to CPU cores (\texttt{sched\_setaffinity}).
+    \item Disable IP forwarding and offloads (TSO, GSO, GRO) on the target interfaces via \texttt{ethtool}.
+    \item Begin capturing, modifying, and forwarding packets on the configured physical and tunnel interfaces.
+\end{enumerate}
+
+\section{Project Directory Structure}
+\begin{itemize}
+    \item \texttt{src/main.c}: Control plane logic and TCP listening loop.
+    \item \texttt{src/config/}: PostgreSQL client configuration and parser.
+    \item \texttt{src/proto/}: Fragmentation, reassembly logic, and IP checksum utility.
+    \item \texttt{src/system/}: OS-level modifications (\texttt{ethtool}, \texttt{sysctl}, network devices).
+    \item \texttt{src/userio/}: High-performance socket logic using \texttt{AF\_PACKET}.
+    \item \texttt{test\_connect\_db/}: Mock scripts and database schemas for testing.
+\end{itemize}
+
+\end{document}
