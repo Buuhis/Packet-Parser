@@ -1,5 +1,6 @@
 \documentclass[12pt,a4paper]{article}
 \usepackage[utf8]{inputenc}
+\usepackage[vietnam]{babel}
 \usepackage[T1]{fontenc}
 \usepackage{geometry}
 \geometry{a4paper, margin=1in}
@@ -7,6 +8,7 @@
 \usepackage{listings}
 \usepackage{xcolor}
 
+% Cấu hình màu sắc cho code
 \definecolor{codegreen}{rgb}{0,0.6,0}
 \definecolor{codegray}{rgb}{0.5,0.5,0.5}
 \definecolor{codepurple}{rgb}{0.58,0,0.82}
@@ -32,68 +34,63 @@
 }
 \lstset{style=mystyle}
 
-\title{\textbf{User Manual: Multi-WAN Packet Forwarder}}
-\author{Hoang Buu}
+\title{\textbf{Tài liệu bàn giao và Hướng dẫn vận hành:\\ Multi-WAN Packet Forwarder}}
+\author{Hoàng Bửu}
 \date{\today}
 
 \begin{document}
 
 \maketitle
 
-\section{Introduction}
-This document provides a comprehensive guide to the \textbf{Multi-WAN Packet Forwarder} project. The application is a user-space dataplane built using \texttt{AF\_PACKET (TPACKET\_V3)}. It is designed to receive, modify, fragment, and load-balance IP packets across multiple WAN interfaces or tunnels using a lock-free, run-to-completion worker model.
+\section{Tổng quan dự án}
+Dự án \textbf{Multi-WAN Packet Forwarder} là giải pháp dataplane chạy trên tầng người dùng (user-space), sử dụng cơ chế \texttt{AF\_PACKET (TPACKET\_V3)}. Mục tiêu chính là xử lý lưu lượng IP tốc độ cao: tiếp nhận, sửa đổi header, phân mảnh gói tin và cân bằng tải qua các đường truyền WAN/Tunnel.
 
-Key features include:
+\subsection{Đặc tính kỹ thuật}
 \begin{itemize}
-    \item \textbf{High Performance:} Bypasses the Linux kernel TCP/IP stack to forward packets efficiently with memory-mapped RX/TX rings.
-    \item \textbf{Zero-Lock Reassembly \& Fragmentation:} Fragments oversized packets dynamically based on tunnel MTU without relying on complex locking mechanisms. Uses incremental checksum generation (RFC 1624) to reduce CPU overhead.
-    \item \textbf{Load Balancing:} Uses a 5-tuple hash algorithm to evenly distribute traffic across available tunnel interfaces.
-    \item \textbf{Dynamic Control Plane:} Connects to a PostgreSQL database to fetch node configurations automatically (e.g., interfaces, MAC addresses, routing).
+    \item \textbf{Tối ưu hóa hiệu năng:} Xử lý gói tin trực tiếp qua memory-mapped ring, giảm thiểu overhead do chuyển đổi ngữ cảnh giữa Kernel và User-space.
+    \item \textbf{Xử lý gói tin:} Hỗ trợ phân mảnh (Fragmentation) động dựa trên MTU của Tunnel. Sử dụng thuật toán RFC 1624 để tính toán lại Checksum nhanh.
+    \item \textbf{Cân bằng tải:} Phân phối lưu lượng dựa trên Hash 5-tuple, đảm bảo tính toàn vẹn thứ tự gói tin cho mỗi luồng (flow).
+    \item \textbf{Quản lý tập trung:} Cấu hình thiết bị (MAC, Interface, Routing) được quản lý qua cơ sở dữ liệu PostgreSQL.
 \end{itemize}
 
-\section{Architecture Overview}
-The system is divided into two main planes:
+\section{Kiến trúc hệ thống}
+Người kế nhiệm cần nắm rõ hai thành phần vận hành song song:
 \begin{enumerate}
-    \item \textbf{Control Plane (\texttt{main.c}, \texttt{db\_client.c}):} A control thread that listens on a TCP port. Upon receiving a \texttt{node\_id}, it fetches the network topology from PostgreSQL and initializes the dataplane.
-    \item \textbf{Data Plane (\texttt{afpkt.c}):} Multiple Omni-Worker threads bound to specific CPU cores. Each worker pulls packets from \texttt{AF\_PACKET\_FANOUT} rings, modifies Ethernet headers, optionally fragments packets, and pushes them out via \texttt{sendmmsg()} batching.
+    \item \textbf{Control Plane (\texttt{main.c}):} Đóng vai trò thực thi lệnh điều khiển. Nó lắng nghe kết nối TCP, truy vấn cấu hình từ DB và điều phối tài nguyên cho Dataplane.
+    \item \textbf{Data Plane (\texttt{afpkt.c}):} Tập hợp các luồng Omni-Worker chạy theo mô hình \textit{run-to-completion}. Mỗi worker được gán cứng vào một lõi CPU (Core Pinning) để tránh tranh chấp tài nguyên.
 \end{enumerate}
 
-\section{Prerequisites}
-Ensure your system meets the following requirements:
+\section{Yêu cầu môi trường}
+Trước khi triển khai, hệ thống cần đáp ứng:
 \begin{itemize}
-    \item \textbf{OS:} Linux OS with a kernel supporting \texttt{TPACKET\_V3} and \texttt{PACKET\_FANOUT}.
-    \item \textbf{Compiler \& Tools:} \texttt{gcc}, \texttt{make}.
-    \item \textbf{Libraries:} \texttt{libpq-dev} (PostgreSQL C client library).
-    \item \textbf{Privileges:} \texttt{root} access (sudo) is required to bind raw sockets and interact with \texttt{ethtool} and \texttt{sysctl}.
+    \item \textbf{Kernel:} Hỗ trợ \texttt{TPACKET\_V3} và \texttt{PACKET\_FANOUT}.
+    \item \textbf{Thư viện:} Cài đặt \texttt{libpq-dev} để kết nối PostgreSQL.
+    \item \textbf{Quyền hạn:} Mọi thao tác vận hành yêu cầu quyền \texttt{root}.
 \end{itemize}
 
-\section{Build Instructions}
-To compile the project, navigate to the source directory and run \texttt{make}.
+\section{Hướng dẫn triển khai (Deployment)}
 
+\subsection{Biên dịch mã nguồn}
+Sử dụng \texttt{make} để đóng gói ứng dụng:
 \begin{lstlisting}[language=bash]
-# Install PostgreSQL library dependencies (Ubuntu/Debian)
-sudo apt-get update
-sudo apt-get install libpq-dev
+# Cài đặt thư viện phát triển PostgreSQL
+sudo apt-get update && sudo apt-get install libpq-dev -y
 
-# Compile the source code
-make clean
-make
+# Biên dịch dự án
+make clean && make
 \end{lstlisting}
-This will generate the \texttt{mwanc} executable.
+Sau khi biên dịch thành công, file thực thi \texttt{mwanc} sẽ xuất hiện trong thư mục gốc.
 
-\section{Database Setup}
-The control plane depends on a PostgreSQL database. A SQL script is provided to initialize the schema and insert mock topology data for testing.
-
+\subsection{Khởi tạo cơ sở dữ liệu}
+Dữ liệu cấu hình mạng phải được nạp trước vào PostgreSQL:
 \begin{lstlisting}[language=bash]
-# Execute the SQL script to create tables and insert data
-psql -U <username> -d <database_name> -W -f test_connect_db/init_db.sql
+psql -U [user] -d [database] -f test_connect_db/init_db.sql
 \end{lstlisting}
 
-\section{User Guide}
-Follow these steps to run the application.
+\section{Vận hành ứng dụng}
 
-\subsection{Starting the Application}
-Run the \texttt{mwanc} daemon with your database credentials and the desired listening port for the control plane.
+\subsection{Bước 1: Khởi chạy Daemon}
+Kích hoạt ứng dụng và kết nối tới DB:
 \begin{lstlisting}[language=bash]
 sudo ./mwanc --db-host 127.0.0.1 \
              --db-port 5432 \
@@ -101,34 +98,24 @@ sudo ./mwanc --db-host 127.0.0.1 \
              --db-name mydb \
              --listen-port 8080
 \end{lstlisting}
-\textit{Note:} You will be prompted to enter the database password securely.
 
-\subsection{Applying Node Configuration}
-Once the daemon is waiting for a \texttt{node\_id}, you can mock the backend controller by sending an ID using the provided bash script.
-
+\subsection{Bước 2: Nạp cấu hình từ Backend}
+Để kích hoạt dataplane cho một node cụ thể (ví dụ \texttt{server1}), sử dụng script giả lập:
 \begin{lstlisting}[language=bash]
-# Make the script executable
-chmod +x test_connect_db/mock_backend.sh
-
-# Send the ID 'server1' to port 8080
-./test_connect_db/mock_backend.shgia su bay gio toi  server1 8080
+# Cú pháp: ./script [node_id] [port]
+./test_connect_db/mock_backend.sh server1 8080
 \end{lstlisting}
 
-Upon receiving the ID, the application will:
-\begin{enumerate}
-    \item Start the Omni-Worker threads and bind them to CPU cores (\texttt{sched\_setaffinity}).
-    \item Disable IP forwarding and offloads (TSO, GSO, GRO) on the target interfaces via \texttt{ethtool}.
-    \item Begin capturing, modifying, and forwarding packets on the configured physical and tunnel interfaces.
-\end{enumerate}
-
-\section{Project Directory Structure}
+\section{Cấu trúc mã nguồn (Dành cho nhà phát triển)}
+Khi cần bảo trì hoặc nâng cấp, hãy lưu ý các thư mục sau:
 \begin{itemize}
-    \item \texttt{src/main.c}: Control plane logic and TCP listening loop.
-    \item \texttt{src/config/}: PostgreSQL client configuration and parser.
-    \item \texttt{src/proto/}: Fragmentation, reassembly logic, and IP checksum utility.
-    \item \texttt{src/system/}: OS-level modifications (\texttt{ethtool}, \texttt{sysctl}, network devices).
-    \item \texttt{src/userio/}: High-performance socket logic using \texttt{AF\_PACKET}.
-    \item \texttt{test\_connect\_db/}: Mock scripts and database schemas for testing.
+    \item \texttt{src/proto/}: Chứa logic quan trọng nhất về phân mảnh gói tin và tính toán checksum.
+    \item \texttt{src/userio/}: Quản lý vòng lặp thu thập gói tin (Packet RX/TX) hiệu suất cao.
+    \item \texttt{src/system/}: Các hàm can thiệp hệ thống như tắt tính năng Offload của card mạng (TSO, GSO) để tránh xung đột với User-space Dataplane.
+    \item \texttt{src/config/}: Logic giao tiếp và parse dữ liệu từ PostgreSQL.
 \end{itemize}
+
+---
+\textit{Tài liệu này được biên soạn để phục vụ việc bàn giao. Mọi thay đổi về kiến trúc sau này cần được cập nhật vào mục 2 và 6.}
 
 \end{document}
