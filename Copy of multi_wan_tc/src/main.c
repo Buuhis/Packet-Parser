@@ -19,8 +19,7 @@
 
 #include <sys/mman.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
+#include <sys/un.h>
 #include <net/ethernet.h>
 #include <features.h>
 
@@ -29,7 +28,8 @@
 static volatile int running_server = 1;
 static volatile int running_dataplane = 0;
 
-static int tcp_server_fd = -1;
+static int unix_server_fd = -1;
+static char socket_path[256] = "/var/run/sep-wan.sock";
 
 static afpkt_fanout_t fg_out;
 static afpkt_worker_t in_workers[MAX_NE_TUNNELS];
@@ -73,9 +73,10 @@ static void handle_signal(int sig)
     (void)sig;
     running_server = 0;
     running_dataplane = 0;
-    if (tcp_server_fd >= 0) {
-        close(tcp_server_fd);
-        tcp_server_fd = -1;
+    if (unix_server_fd >= 0) {
+        close(unix_server_fd);
+        unix_server_fd = -1;
+        unlink(socket_path);
     }
 }
 
@@ -84,7 +85,8 @@ static void handle_signal(int sig)
 static void usage(const char *prog)
 {
     fprintf(stderr,
-            "Usage: %s --db-host <host> --db-port <port> --db-user <user> --db-name <name> --listen-port <port>\n", prog);
+            "Usage: %s\n"
+            "Configure via ENV vars: DB_HOST, DB_PORT, DB_USER, DB_NAME, [DB_PASS], [MWAN_SOCKET_PATH]\n", prog);
 }
 
 /* ---- Outbound worker thread args ---- */
@@ -318,56 +320,67 @@ cleanup_route:
 
 int main(int argc, char **argv)
 {
-    const char *db_host = NULL;
-    const char *db_port = NULL;
-    const char *db_user = NULL;
-    const char *db_name = NULL;
-    int listen_port = 0;
+    const char *db_host = getenv("DB_HOST");
+    const char *db_port = getenv("DB_PORT");
+    const char *db_user = getenv("DB_USER");
+    const char *db_name = getenv("DB_NAME");
+    const char *db_pass = getenv("DB_PASS");
+    const char *env_sock = getenv("MWAN_SOCKET_PATH");
 
     log_set_level(LOG_INFO);
 
     for (int i = 1; i < argc; i++)
     {
-        if (strcmp(argv[i], "--db-host") == 0 && i + 1 < argc) {
-            db_host = argv[++i];
-        } else if (strcmp(argv[i], "--db-port") == 0 && i + 1 < argc) {
-            db_port = argv[++i];
-        } else if (strcmp(argv[i], "--db-user") == 0 && i + 1 < argc) {
-            db_user = argv[++i];
-        } else if (strcmp(argv[i], "--db-name") == 0 && i + 1 < argc) {
-            db_name = argv[++i];
-        } else if (strcmp(argv[i], "--listen-port") == 0 && i + 1 < argc) {
-            listen_port = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "--help") == 0) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
         }
     }
 
-    if (!db_host || !db_port || !db_user || !db_name || listen_port <= 0) {
-        log_error("Missing required arguments.");
+    if (!db_host || !db_port || !db_user || !db_name) {
+        log_error("Missing ENV: DB_HOST, DB_PORT, DB_USER, or DB_NAME");
         usage(argv[0]);
         return 1;
     }
 
+    if (env_sock) {
+        strncpy(socket_path, env_sock, sizeof(socket_path)-1);
+    } else {
+        strncpy(socket_path, "/var/run/sep-wan.sock", sizeof(socket_path)-1);
+    }
+
     char password[256] = {0};
-    int attempts = 0;
-    while(attempts < 3) {
-        char *p = getpass("Enter DB password: ");
-        if (p) {
-            strncpy(password, p, sizeof(password)-1);
-            if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
-                log_info("Successfully connected to Database.");
-                break;
-            }
+    int connected = 0;
+
+    if (db_pass) {
+        strncpy(password, db_pass, sizeof(password)-1);
+        if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
+            log_info("Successfully connected to Database.");
+            connected = 1;
+        } else {
+            log_error("Failed to connect to DB via ENV DB_PASS. Exiting.");
+            return 1;
         }
-        attempts++;
-        if (attempts < 3) {
-            printf("Connection failed. Attempt %d of 3. Please try again.\n", attempts + 1);
+    } else {
+        int attempts = 0;
+        while(attempts < 3) {
+            char *p = getpass("Enter DB password: ");
+            if (p) {
+                strncpy(password, p, sizeof(password)-1);
+                if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
+                    log_info("Successfully connected to Database.");
+                    connected = 1;
+                    break;
+                }
+            }
+            attempts++;
+            if (attempts < 3) {
+                printf("Connection failed. Attempt %d of 3. Please try again.\n", attempts + 1);
+            }
         }
     }
     
-    if (attempts >= 3) {
+    if (!connected) {
         log_error("Failed to connect to DB after 3 attempts. Exiting.");
         return 1;
     }
@@ -375,23 +388,29 @@ int main(int argc, char **argv)
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     
-    tcp_server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(tcp_server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-    
-    struct sockaddr_in saddr;
-    memset(&saddr, 0, sizeof(saddr));
-    saddr.sin_family = AF_INET;
-    saddr.sin_addr.s_addr = INADDR_ANY;
-    saddr.sin_port = htons(listen_port);
-    
-    if (bind(tcp_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
-        log_error("bind on port %d failed: %s", listen_port, strerror(errno));
+    /* Create Unix Domain Socket */
+    unix_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (unix_server_fd < 0) {
+        log_error("socket(AF_UNIX) failed: %s", strerror(errno));
         db_client_disconnect();
         return 1;
     }
     
-    if (listen(tcp_server_fd, 5) < 0) {
+    /* Remove old socket file if it exists */
+    unlink(socket_path);
+
+    struct sockaddr_un saddr;
+    memset(&saddr, 0, sizeof(saddr));
+    saddr.sun_family = AF_UNIX;
+    strncpy(saddr.sun_path, socket_path, sizeof(saddr.sun_path) - 1);
+    
+    if (bind(unix_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
+        log_error("bind on socket %s failed: %s", socket_path, strerror(errno));
+        db_client_disconnect();
+        return 1;
+    }
+    
+    if (listen(unix_server_fd, 5) < 0) {
         log_error("listen failed: %s", strerror(errno));
         db_client_disconnect();
         return 1;
@@ -399,11 +418,11 @@ int main(int argc, char **argv)
     
     log_info("==================================================");
     log_info("Control Plane Ready!");
-    log_info("Waiting for node_id on TCP Port %d...", listen_port);
+    log_info("Waiting for node_id on UNIX Socket: %s", socket_path);
     log_info("==================================================");
 
     while(running_server) {
-        int client_fd = accept(tcp_server_fd, NULL, NULL);
+        int client_fd = accept(unix_server_fd, NULL, NULL);
         if (client_fd < 0) {
             if (running_server) log_error("accept failed: %s", strerror(errno));
             continue;
@@ -438,5 +457,9 @@ int main(int argc, char **argv)
     stop_dataplane();
     db_client_disconnect();
     
+    if (unix_server_fd >= 0) {
+        close(unix_server_fd);
+        unlink(socket_path);
+    }
     return 0;
 }
