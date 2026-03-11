@@ -84,9 +84,17 @@ static void handle_signal(int sig)
 
 static void usage(const char *prog)
 {
-    fprintf(stderr,
-            "Usage: %s\n"
-            "Configure via ENV vars: DB_HOST, DB_PORT, DB_USER, DB_NAME, [DB_PASS], [MWAN_SOCKET_PATH]\n", prog);
+    printf("=========================================================\n");
+    printf("         MULTI-WAN PACKET FORWARDER (sep-wan)            \n");
+    printf("=========================================================\n");
+    printf("Client Mode (Control running daemon):\n");
+    printf("  %s -id <node_id>    Send config request to the daemon\n", prog);
+    printf("  %s --help | -h      Show this help message and exit\n", prog);
+    printf("\n");
+    printf("Daemon Mode (Start the background service):\n");
+    printf("  Run without arguments to start the daemon.\n");
+    printf("  Requires ENV vars: DB_HOST, DB_PORT, DB_USER, DB_NAME, [DB_PASS]\n");
+    printf("=========================================================\n");
 }
 
 /* ---- Outbound worker thread args ---- */
@@ -320,33 +328,81 @@ cleanup_route:
 
 int main(int argc, char **argv)
 {
-    const char *db_host = getenv("DB_HOST");
-    const char *db_port = getenv("DB_PORT");
-    const char *db_user = getenv("DB_USER");
-    const char *db_name = getenv("DB_NAME");
-    const char *db_pass = getenv("DB_PASS");
     const char *env_sock = getenv("MWAN_SOCKET_PATH");
+    if (env_sock) {
+        strncpy(socket_path, env_sock, sizeof(socket_path)-1);
+    } else {
+        strncpy(socket_path, "/var/run/sep-wan.sock", sizeof(socket_path)-1);
+    }
 
     log_set_level(LOG_INFO);
+
+    int client_mode = 0;
+    const char *node_id = NULL;
 
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]);
             return 0;
+        } else if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
+            client_mode = 1;
+            node_id = argv[++i];
+        } else {
+            fprintf(stderr, "Unknown option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
         }
     }
+
+    if (client_mode) {
+        if (!node_id) {
+            fprintf(stderr, "Error: Missing -id argument.\n");
+            usage(argv[0]);
+            return 1;
+        }
+
+        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) {
+            perror("Error creating socket");
+            return 1;
+        }
+
+        struct sockaddr_un addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sun_family = AF_UNIX;
+        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+
+        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+            fprintf(stderr, "[-] Connection refused!\n");
+            fprintf(stderr, "    Make sure the daemon is currently running.\n");
+            fprintf(stderr, "    (Target socket: %s)\n", socket_path);
+            close(fd);
+            return 1;
+        }
+
+        if (send(fd, node_id, strlen(node_id), 0) < 0) {
+            perror("[-] Failed to send command to daemon");
+            close(fd);
+            return 1;
+        }
+
+        printf("[+] Command sent successfully! Node ID: '%s'\n", node_id);
+        close(fd);
+        return 0;
+    }
+
+    /* DAEMON MODE */
+    const char *db_host = getenv("DB_HOST");
+    const char *db_port = getenv("DB_PORT");
+    const char *db_user = getenv("DB_USER");
+    const char *db_name = getenv("DB_NAME");
+    const char *db_pass = getenv("DB_PASS");
 
     if (!db_host || !db_port || !db_user || !db_name) {
         log_error("Missing ENV: DB_HOST, DB_PORT, DB_USER, or DB_NAME");
         usage(argv[0]);
         return 1;
-    }
-
-    if (env_sock) {
-        strncpy(socket_path, env_sock, sizeof(socket_path)-1);
-    } else {
-        strncpy(socket_path, "/var/run/sep-wan.sock", sizeof(socket_path)-1);
     }
 
     char password[256] = {0};
