@@ -79,21 +79,15 @@ static void frag_read_hdr(const uint8_t *buf, uint8_t *orig_proto, uint16_t *pkt
     *frag_index = buf[3];
 }
 
-static int build_fragment(const uint8_t *eth_hdr,
-                           const uint8_t *ip_hdr,
+static int build_fragment(const uint8_t *ip_hdr,
                            int ip_hdr_len,
-                           const uint8_t *payload,
                            uint32_t payload_len,
                            uint8_t orig_proto,
                            uint16_t pkt_id,
                            uint8_t frag_index,
                            uint8_t *out_buf,
                            uint32_t *out_len) {
-    int offset = 0;
-
-    /* Ethernet header */
-    memcpy(out_buf, eth_hdr, 14);
-    offset += 14;
+    int offset = 14; /* Skip 14-byte Ethernet header (written later by caller) */
 
     /* IP header */
     memcpy(out_buf + offset, ip_hdr, ip_hdr_len);
@@ -102,10 +96,6 @@ static int build_fragment(const uint8_t *eth_hdr,
     /* Fragment header */
     frag_write_hdr(out_buf + offset, orig_proto, pkt_id, frag_index);
     offset += FRAG_PLAIN_HDR_SIZE;
-
-    /* Payload */
-    memcpy(out_buf + offset, payload, payload_len);
-    offset += payload_len;
 
     /* ---- Incremental Checksum (RFC 1624) ----
      * Only 2 fields changed: total_length (offset 2-3) and protocol (offset 8-9 word).
@@ -137,12 +127,11 @@ static int build_fragment(const uint8_t *eth_hdr,
 }
 
 int frag_split(const uint8_t *pkt_data, uint32_t pkt_len,
-               uint8_t *frag1, uint32_t *frag1_len,
-               uint8_t *frag2, uint32_t *frag2_len) {
+               uint8_t *hdr1, uint32_t *hdr1_len, const uint8_t **pay1, uint32_t *pay1_len,
+               uint8_t *hdr2, uint32_t *hdr2_len, const uint8_t **pay2, uint32_t *pay2_len) {
     if (pkt_len < 14 + 20)
         return -1;
 
-    const uint8_t *eth_hdr = pkt_data;
     const uint8_t *ip_hdr = pkt_data + 14;
 
     uint16_t ether_type = ((uint16_t)pkt_data[12] << 8) | pkt_data[13];
@@ -175,19 +164,23 @@ int frag_split(const uint8_t *pkt_data, uint32_t pkt_len,
 
     uint16_t pkt_id = frag_next_pkt_id();
 
-    if (build_fragment(eth_hdr, ip_hdr, ip_hdr_len,
-                       payload, half1, orig_proto,
+    if (build_fragment(ip_hdr, ip_hdr_len,
+                       half1, orig_proto,
                        pkt_id, 0,
-                       frag1, frag1_len) != 0) {
+                       hdr1, hdr1_len) != 0) {
         return -1;
     }
+    *pay1 = payload;
+    *pay1_len = half1;
 
-    if (build_fragment(eth_hdr, ip_hdr, ip_hdr_len,
-                       payload + half1, half2, orig_proto,
+    if (build_fragment(ip_hdr, ip_hdr_len,
+                       half2, orig_proto,
                        pkt_id, 1,
-                       frag2, frag2_len) != 0) {
+                       hdr2, hdr2_len) != 0) {
         return -1;
     }
+    *pay2 = payload + half1;
+    *pay2_len = half2;
 
     return 0;
 }

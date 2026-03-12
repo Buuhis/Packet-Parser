@@ -491,7 +491,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
     /* ---- Batch TX structures (stack) ---- */
     struct mmsghdr tx_batch[TX_BATCH_SIZE];
-    struct iovec   tx_iov[TX_BATCH_SIZE];
+    struct iovec   tx_iov[TX_BATCH_SIZE * 2];
 
     while (*running)
     {
@@ -513,6 +513,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             /* ---- Batch state for this block ---- */
             int batch_n = 0;   /* messages queued */
+            int iov_idx = 0;   /* next free slot in tx_iov */
             int frag_idx = 0;  /* next free slot in frag_arena */
 
             /* OPT: Clear batch array ONCE per block instead of per-packet */
@@ -554,45 +555,53 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 pkt_cnt++;
 
                 if (frag_need_split((uint32_t)len)) {
-                    /* Need 2 batch slots + 2 frag buffers */
-                    if (batch_n + 2 > TX_BATCH_SIZE || frag_idx + 2 > TX_BATCH_SIZE) {
+                    /* Need 2 batch slots + 4 iov buffers + 2 frag hdrs */
+                    if (batch_n + 2 > TX_BATCH_SIZE || iov_idx + 4 > TX_BATCH_SIZE * 2 || frag_idx + 2 > TX_BATCH_SIZE) {
                         if (batch_n > 0)
                             sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
+                        iov_idx = 0;
                         frag_idx = 0;
                         memset(tx_batch, 0, sizeof(tx_batch));
                     }
 
-                    uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
-                    uint8_t *f2 = frag_arena + (size_t)(frag_idx + 1) * 2048;
-                    uint32_t f1_len, f2_len;
+                    uint8_t *h1 = frag_arena + (size_t)frag_idx * 128; /* Header is small */
+                    uint8_t *h2 = frag_arena + (size_t)(frag_idx + 1) * 128;
+                    uint32_t h1_len, h2_len;
+                    const uint8_t *p1, *p2;
+                    uint32_t p1_len, p2_len;
 
-                    if (frag_split(frame, (uint32_t)len, f1, &f1_len, f2, &f2_len) == 0) {
+                    if (frag_split(frame, (uint32_t)len, h1, &h1_len, &p1, &p1_len, h2, &h2_len, &p2, &p2_len) == 0) {
                         /* OPT: Single 14-byte copy for entire ETH header */
-                        memcpy(f1, cached_eth[tunnel_idx], 14);
-                        memcpy(f2, cached_eth[tunnel_idx], 14);
+                        memcpy(h1, cached_eth[tunnel_idx], 14);
+                        memcpy(h2, cached_eth[tunnel_idx], 14);
 
-                        tx_iov[batch_n] = (struct iovec){ .iov_base = f1, .iov_len = f1_len };
+                        tx_iov[iov_idx] = (struct iovec){ .iov_base = h1, .iov_len = h1_len };
+                        tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p1, .iov_len = p1_len };
                         tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                         tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
+                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
                         batch_n++;
+                        iov_idx += 2;
 
-                        tx_iov[batch_n] = (struct iovec){ .iov_base = f2, .iov_len = f2_len };
+                        tx_iov[iov_idx] = (struct iovec){ .iov_base = h2, .iov_len = h2_len };
+                        tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p2, .iov_len = p2_len };
                         tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                         tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
+                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
                         batch_n++;
+                        iov_idx += 2;
 
                         frag_idx += 2;
                     }
                 } else {
                     /* Non-fragmented: batch directly from ring buffer (zero-copy) */
-                    if (batch_n >= TX_BATCH_SIZE) {
+                    if (batch_n >= TX_BATCH_SIZE || iov_idx >= TX_BATCH_SIZE * 2) {
                         sendmmsg_full(w->tx_fd, tx_batch, batch_n);
                         batch_n = 0;
+                        iov_idx = 0;
                         frag_idx = 0;
                         memset(tx_batch, 0, sizeof(tx_batch));
                     }
@@ -600,12 +609,13 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     /* OPT: Single 14-byte copy for entire ETH header */
                     memcpy(frame, cached_eth[tunnel_idx], 14);
 
-                    tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = len };
+                    tx_iov[iov_idx] = (struct iovec){ .iov_base = frame, .iov_len = len };
                     tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                     tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
                     tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
                     batch_n++;
+                    iov_idx++;
                 }
 
             next_pkt:
@@ -1055,7 +1065,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
     }
 
     struct mmsghdr tx_batch[TX_BATCH_SIZE];
-    struct iovec   tx_iov[TX_BATCH_SIZE];
+    struct iovec   tx_iov[TX_BATCH_SIZE * 2];
     uint32_t local_read = atomic_load_explicit(&q->read_idx, memory_order_relaxed);
 
     while (*running)
@@ -1069,6 +1079,7 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
         }
 
         int batch_n = 0;
+        int iov_idx = 0;
         int frag_idx = 0;
 
         /* Drain available packets from queue into batch */
@@ -1089,44 +1100,50 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
             pkt_cnt++;
 
             if (frag_need_split(len)) {
-                if (batch_n + 2 > TX_BATCH_SIZE || frag_idx + 2 > TX_BATCH_SIZE)
+                if (batch_n + 2 > TX_BATCH_SIZE || iov_idx + 4 > TX_BATCH_SIZE * 2 || frag_idx + 2 > TX_BATCH_SIZE)
                     break;
 
-                uint8_t *f1 = frag_arena + (size_t)frag_idx * 2048;
-                uint8_t *f2 = frag_arena + (size_t)(frag_idx + 1) * 2048;
-                uint32_t f1_len, f2_len;
+                uint8_t *h1 = frag_arena + (size_t)frag_idx * 128;
+                uint8_t *h2 = frag_arena + (size_t)(frag_idx + 1) * 128;
+                uint32_t h1_len, h2_len;
+                const uint8_t *p1, *p2;
+                uint32_t p1_len, p2_len;
 
-                if (frag_split(frame, len, f1, &f1_len, f2, &f2_len) == 0) {
-                    struct ethhdr *eh1 = (struct ethhdr *)f1;
+                if (frag_split(frame, len, h1, &h1_len, &p1, &p1_len, h2, &h2_len, &p2, &p2_len) == 0) {
+                    struct ethhdr *eh1 = (struct ethhdr *)h1;
                     memcpy(eh1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                     memcpy(eh1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                     eh1->h_proto = htons(MWAN_ETHERTYPE);
 
-                    struct ethhdr *eh2 = (struct ethhdr *)f2;
+                    struct ethhdr *eh2 = (struct ethhdr *)h2;
                     memcpy(eh2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
                     memcpy(eh2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                     eh2->h_proto = htons(MWAN_ETHERTYPE);
 
-                    tx_iov[batch_n] = (struct iovec){ .iov_base = f1, .iov_len = f1_len };
+                    tx_iov[iov_idx] = (struct iovec){ .iov_base = h1, .iov_len = h1_len };
+                    tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p1, .iov_len = p1_len };
                     memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                     tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                     tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
+                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
                     batch_n++;
+                    iov_idx += 2;
 
-                    tx_iov[batch_n] = (struct iovec){ .iov_base = f2, .iov_len = f2_len };
+                    tx_iov[iov_idx] = (struct iovec){ .iov_base = h2, .iov_len = h2_len };
+                    tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p2, .iov_len = p2_len };
                     memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                     tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                     tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
+                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
+                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
                     batch_n++;
+                    iov_idx += 2;
 
                     frag_idx += 2;
                 }
             } else {
-                if (batch_n >= TX_BATCH_SIZE)
+                if (batch_n >= TX_BATCH_SIZE || iov_idx >= TX_BATCH_SIZE * 2)
                     break;
 
                 struct ethhdr *eth_out = (struct ethhdr *)frame;
@@ -1134,13 +1151,14 @@ void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
                 memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
                 eth_out->h_proto = htons(MWAN_ETHERTYPE);
 
-                tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = len };
+                tx_iov[iov_idx] = (struct iovec){ .iov_base = frame, .iov_len = len };
                 memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
                 tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
                 tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
+                tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
                 tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
                 batch_n++;
+                iov_idx++;
             }
 
             local_read = (local_read + 1) & PKT_QUEUE_MASK;

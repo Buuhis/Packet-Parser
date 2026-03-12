@@ -46,8 +46,8 @@ static inline int frag_need_split(uint32_t pkt_len) {
 }
 
 int frag_split(const uint8_t *pkt_data, uint32_t pkt_len,
-               uint8_t *frag1, uint32_t *frag1_len,
-               uint8_t *frag2, uint32_t *frag2_len);
+               uint8_t *hdr1, uint32_t *hdr1_len, const uint8_t **pay1, uint32_t *pay1_len,
+               uint8_t *hdr2, uint32_t *hdr2_len, const uint8_t **pay2, uint32_t *pay2_len);
 
 int frag_is_fragment(const uint8_t *pkt_data, uint32_t pkt_len,
                      uint16_t *pkt_id, uint8_t *frag_index);

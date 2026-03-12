@@ -371,7 +371,10 @@ int main(int argc, char **argv)
         struct sockaddr_un addr;
         memset(&addr, 0, sizeof(addr));
         addr.sun_family = AF_UNIX;
-        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+        size_t slen = strlen(socket_path);
+        if (slen >= sizeof(addr.sun_path)) slen = sizeof(addr.sun_path) - 1;
+        memcpy(addr.sun_path, socket_path, slen);
+        addr.sun_path[slen] = '\0';
 
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             fprintf(stderr, "[-] Connection refused!\n");
@@ -405,39 +408,10 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    char password[256] = {0};
-    int connected = 0;
-
-    if (db_pass) {
-        strncpy(password, db_pass, sizeof(password)-1);
-        if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
-            log_info("Successfully connected to Database.");
-            connected = 1;
-        } else {
-            log_error("Failed to connect to DB via ENV DB_PASS. Exiting.");
-            return 1;
-        }
+    if (db_client_connect(db_host, db_port, db_user, db_name, db_pass) == 0) {
+        log_info("Successfully connected to Database.");
     } else {
-        int attempts = 0;
-        while(attempts < 3) {
-            char *p = getpass("Enter DB password: ");
-            if (p) {
-                strncpy(password, p, sizeof(password)-1);
-                if (db_client_connect(db_host, db_port, db_user, db_name, password) == 0) {
-                    log_info("Successfully connected to Database.");
-                    connected = 1;
-                    break;
-                }
-            }
-            attempts++;
-            if (attempts < 3) {
-                printf("Connection failed. Attempt %d of 3. Please try again.\n", attempts + 1);
-            }
-        }
-    }
-    
-    if (!connected) {
-        log_error("Failed to connect to DB after 3 attempts. Exiting.");
+        log_error("Failed to connect to DB! Please check DB credentials and DB_PASS env. Exiting.");
         return 1;
     }
 
@@ -458,7 +432,10 @@ int main(int argc, char **argv)
     struct sockaddr_un saddr;
     memset(&saddr, 0, sizeof(saddr));
     saddr.sun_family = AF_UNIX;
-    strncpy(saddr.sun_path, socket_path, sizeof(saddr.sun_path) - 1);
+    size_t slen = strlen(socket_path);
+    if (slen >= sizeof(saddr.sun_path)) slen = sizeof(saddr.sun_path) - 1;
+    memcpy(saddr.sun_path, socket_path, slen);
+    saddr.sun_path[slen] = '\0';
     
     if (bind(unix_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0) {
         log_error("bind on socket %s failed: %s", socket_path, strerror(errno));
