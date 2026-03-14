@@ -188,11 +188,14 @@ static void stop_dataplane(void) {
         fg_out.frag_tbl = NULL;
     }
     
-    /* Close UDP RX socket */
-    if (fg_out.udp_rx_fd >= 0) {
-        close(fg_out.udp_rx_fd);
-        fg_out.udp_rx_fd = -1;
+    /* Close UDP RX sockets */
+    for (size_t i = 0; i < fg_out.udp_rx_count; i++) {
+        if (fg_out.udp_rx_fds[i] >= 0) {
+            close(fg_out.udp_rx_fds[i]);
+            fg_out.udp_rx_fds[i] = -1;
+        }
     }
+    fg_out.udp_rx_count = 0;
 
     /* Close outbound UDP TX sockets per tunnel */
     for (size_t t = 0; t < fg_out.tunnel_count; t++) {
@@ -247,34 +250,43 @@ static int start_dataplane(app_context_t *ctx) {
         goto cleanup_pl;
     }
 
-    /* ---- STEP 4: Open single UDP socket for VXLAN inbound RX ---- */
-    fg_out.udp_rx_fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (fg_out.udp_rx_fd < 0) {
-        log_error("Failed to create UDP RX socket: %s", strerror(errno));
-        goto cleanup_frag;
+    /* ---- STEP 4: Open UDP sockets for VXLAN inbound RX ---- */
+    fg_out.udp_rx_count = 0;
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
+        int port = ctx->cfg.ne_tunnels[i].port;
+        if (port <= 0 || port > 65535) continue;
+        
+        int duplicate = 0;
+        for (size_t j = 0; j < i; j++) {
+            if (ctx->cfg.ne_tunnels[j].port == port) { duplicate = 1; break; }
+        }
+        if (duplicate) continue;
+
+        int fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            log_error("Failed to create UDP RX socket: %s", strerror(errno));
+            goto cleanup_udp;
+        }
+
+        int reuse = 1;
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+        int rcvbuf = 16 * 1024 * 1024;
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
+
+        struct sockaddr_in bind_addr;
+        memset(&bind_addr, 0, sizeof(bind_addr));
+        bind_addr.sin_family = AF_INET;
+        bind_addr.sin_port = htons(port);
+        bind_addr.sin_addr.s_addr = INADDR_ANY;
+
+        if (bind(fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+            log_error("Failed to bind UDP RX socket to port %d: %s", port, strerror(errno));
+            close(fd);
+            goto cleanup_udp;
+        }
+        log_info("UDP RX socket bound to 0.0.0.0:%d (fd=%d)", port, fd);
+        fg_out.udp_rx_fds[fg_out.udp_rx_count++] = fd;
     }
-
-    /* Allow port reuse */
-    int reuse = 1;
-    setsockopt(fg_out.udp_rx_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
-    /* Increase RX buffer (16 MB) */
-    int rcvbuf = 16 * 1024 * 1024;
-    setsockopt(fg_out.udp_rx_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
-
-    struct sockaddr_in bind_addr;
-    memset(&bind_addr, 0, sizeof(bind_addr));
-    bind_addr.sin_family = AF_INET;
-    bind_addr.sin_port = htons(VXLAN_PORT);
-    bind_addr.sin_addr.s_addr = INADDR_ANY;
-
-    if (bind(fg_out.udp_rx_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-        log_error("Failed to bind UDP RX socket to port %d: %s", VXLAN_PORT, strerror(errno));
-        close(fg_out.udp_rx_fd);
-        fg_out.udp_rx_fd = -1;
-        goto cleanup_frag;
-    }
-    log_info("UDP RX socket bound to 0.0.0.0:%d (fd=%d)", VXLAN_PORT, fg_out.udp_rx_fd);
 
     /* ---- STEP 5: Open 1 AF_PACKET TX-only socket for LAN output (inbound path) ---- */
     in_worker_count = 0;
@@ -364,7 +376,10 @@ cleanup_threads:
 cleanup_inbound:
     for (size_t w = 0; w < in_worker_count; w++) worker_close(&in_workers[w]);
 cleanup_udp:
-    if (fg_out.udp_rx_fd >= 0) { close(fg_out.udp_rx_fd); fg_out.udp_rx_fd = -1; }
+    for (size_t i = 0; i < fg_out.udp_rx_count; i++) {
+        if (fg_out.udp_rx_fds[i] >= 0) close(fg_out.udp_rx_fds[i]);
+    }
+    fg_out.udp_rx_count = 0;
 cleanup_frag:
     if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
 cleanup_pl:

@@ -24,6 +24,7 @@ typedef struct {
     char name[16];
     char ifname[16];
     char gateway[32];
+    int  port;
     int  weight;
 } ne_tunnel_cfg_t;
 

@@ -15,6 +15,7 @@ CREATE TABLE IF NOT EXISTS public.ne_tunnels (
     name VARCHAR(50) NOT NULL,
     ifname VARCHAR(20) NOT NULL,
     gateway VARCHAR(50) NOT NULL,
+    port INTEGER NOT NULL,
     weight INTEGER NOT NULL DEFAULT 1
 );
 
@@ -29,10 +30,10 @@ VALUES (
     '192.168.9.1/24', '192.168.9.2', '20:7c:14:f8:0d:08'
 );
 
-INSERT INTO public.ne_tunnels (node_id, name, ifname, gateway, weight)
+INSERT INTO public.ne_tunnels (node_id, name, ifname, gateway, port, weight)
 VALUES 
-    ('server1', 'ne_tunnel1', 'ne_tunnel1', '172.16.23.2', 1),
-    ('server1', 'ne_tunnel2', 'ne_tunnel2', '172.16.25.2', 1);
+    ('server1', 'ne_tunnel1', 'ne_tunnel1', '172.16.23.2', 65001, 1),
+    ('server1', 'ne_tunnel2', 'ne_tunnel2', '172.16.25.2', 65002, 1);
 
 -- Thêm dữ liệu cho server2
 INSERT INTO public.nodes (node_id, role, local_if, remote_cidr, lan_ip, lan_gw, lan_dst_mac)
@@ -41,7 +42,7 @@ VALUES (
     '192.168.182.1/24', '192.168.182.2', '20:7c:14:f8:0c:f6'
 );
 
-INSERT INTO public.ne_tunnels (node_id, name, ifname, gateway, weight)
+INSERT INTO public.ne_tunnels (node_id, name, ifname, gateway, port, weight)
 VALUES 
-    ('server2', 'ne_tunnel1', 'ne_tunnel1', '172.16.23.1', 1),
-    ('server2', 'ne_tunnel2', 'ne_tunnel2', '172.16.25.1', 1);
+    ('server2', 'ne_tunnel1', 'ne_tunnel1', '172.16.23.1', 65001, 1),
+    ('server2', 'ne_tunnel2', 'ne_tunnel2', '172.16.25.1', 65002, 1);

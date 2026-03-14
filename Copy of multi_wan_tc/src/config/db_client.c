@@ -79,7 +79,7 @@ int db_client_load_config(const char *node_id, app_config_t *cfg)
     
     /* 2. Fetch ne_tunnels info */
     res = PQexecParams(g_db_conn,
-        "SELECT name, ifname, gateway, weight FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
+        "SELECT name, ifname, gateway, weight, port FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
         1, NULL, paramValues, NULL, NULL, 0);
         
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -96,6 +96,7 @@ int db_client_load_config(const char *node_id, app_config_t *cfg)
         strncpy(cfg->ne_tunnels[i].ifname, PQgetvalue(res, i, 1), sizeof(cfg->ne_tunnels[i].ifname) - 1);
         strncpy(cfg->ne_tunnels[i].gateway, PQgetvalue(res, i, 2), sizeof(cfg->ne_tunnels[i].gateway) - 1);
         cfg->ne_tunnels[i].weight = atoi(PQgetvalue(res, i, 3));
+        cfg->ne_tunnels[i].port = atoi(PQgetvalue(res, i, 4));
     }
     PQclear(res);
     

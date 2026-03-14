@@ -330,7 +330,7 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
     return 0;
 }
 
-void afpkt_fanout_close(afpkt_fanout_t *)
+void afpkt_fanout_close(afpkt_fanout_t *fg)
 {
     for (int i = 0; i < fg->num_workers; i++)
     {
@@ -381,10 +381,10 @@ void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *c
 
         fg->tunnel_udp_fds[i] = udp_fd;
 
-        /* Cache sockaddr_in with remote IP and VXLAN port */
+        /* Cache sockaddr_in with remote IP and port */
         memset(&fg->tunnel_addrs[i], 0, sizeof(fg->tunnel_addrs[i]));
         fg->tunnel_addrs[i].sin_family = AF_INET;
-        fg->tunnel_addrs[i].sin_port   = htons(VXLAN_PORT);
+        fg->tunnel_addrs[i].sin_port   = htons(ctx->cfg.ne_tunnels[i].port);
         if (inet_pton(AF_INET, ctx->cfg.ne_tunnels[i].gateway,
                       &fg->tunnel_addrs[i].sin_addr) != 1) {
             log_error("Cache outbound: Invalid gateway '%s' for tunnel[%zu]",
@@ -396,7 +396,8 @@ void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *c
 
         log_info("Cache outbound: TUNNEL[%zu] %s -> %s:%d (udp_fd=%d)",
                  i, ctx->cfg.ne_tunnels[i].ifname,
-                 ctx->cfg.ne_tunnels[i].gateway, VXLAN_PORT, udp_fd);
+                 ctx->cfg.ne_tunnels[i].gateway,
+                 ctx->cfg.ne_tunnels[i].port, udp_fd);
     }
 }
 
@@ -636,19 +637,28 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
+    struct pollfd pfds[MAX_NE_TUNNELS];
+
     while (*running)
     {
-        /* Poll the UDP RX socket with timeout */
-        struct pollfd pfd = {.fd = fg->udp_rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 100) <= 0)
+        for (size_t j = 0; j < fg->udp_rx_count; j++) {
+            pfds[j].fd = fg->udp_rx_fds[j];
+            pfds[j].events = POLLIN;
+        }
+
+        if (poll(pfds, fg->udp_rx_count, 100) <= 0)
             continue;
 
-        /* Receive UDP payload (VXLAN Header + Inner L2 Frame) */
-        ssize_t n = recv(fg->udp_rx_fd, rx_buf, 4096, 0);
-        if (n <= (ssize_t)VXLAN_HDR_SIZE)
-            continue;
+        for (size_t j = 0; j < fg->udp_rx_count; j++) {
+            if (!(pfds[j].revents & POLLIN))
+                continue;
 
-        total_pkts++;
+            /* Receive UDP payload (VXLAN Header + Inner L2 Frame) */
+            ssize_t n = recv(pfds[j].fd, rx_buf, 4096, 0);
+            if (n <= (ssize_t)VXLAN_HDR_SIZE)
+                continue;
+
+            total_pkts++;
 
         /* Strip VXLAN header (8 bytes) → inner frame starts at rx_buf + 8 */
         uint8_t *inner_frame = rx_buf + VXLAN_HDR_SIZE;
@@ -707,6 +717,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                    (struct sockaddr *)&sa, sizeof(sa));
             pkt_cnt++;
         }
+        } /* end for j */
     }
 
     free(rx_buf);
