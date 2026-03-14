@@ -4,11 +4,11 @@
 #include "app_context.h"
 #include "proto/mwan_proto.h"
 #include "proto/fragment.h"
-#include "userio/pkt_queue.h"
 
-#define MAX_FANOUT_WORKERS 8
-#define MAX_TX_WORKERS 4
-#define NUM_TX_WORKERS 4  /* default, adjustable */
+#include <netinet/in.h>
+
+#define MAX_FANOUT_WORKERS 6
+#define NUM_TX_WORKERS 3  /* default, adjustable */
 
 /* Each worker owns 1 RX socket (fanout) + 1 TX socket */
 typedef struct {
@@ -29,19 +29,20 @@ typedef struct {
     int              fanout_group_id;
     afpkt_worker_t   workers[MAX_FANOUT_WORKERS];
 
-    /* Cached MAC/ifindex (written once before threads start, read-only after) */
+    /* Cached MAC/ifindex for WAN interfaces (legacy, kept for reference) */
     struct {
         int ifindex;
         unsigned char src_mac[6];
         int valid;
     } wans[MAX_WANS];
 
-    /* Cached ne_tunnel MAC/ifindex for outbound TX */
-    struct {
-        int ifindex;
-        unsigned char src_mac[6];
-        int valid;
-    } tunnels[MAX_NE_TUNNELS];
+    /* Cached UDP socket + sockaddr_in per tunnel for VXLAN outbound TX */
+    int tunnel_udp_fds[MAX_NE_TUNNELS];
+    struct sockaddr_in tunnel_addrs[MAX_NE_TUNNELS];
+    size_t tunnel_count;
+
+    /* Inbound: single UDP socket listening on VXLAN_PORT */
+    int udp_rx_fd;
 
     struct {
         int ifindex;
@@ -52,21 +53,7 @@ typedef struct {
     struct frag_table *frag_tbl;
 } afpkt_fanout_t;
 
-/* ============ Pipeline architecture ============ */
-typedef struct {
-    /* RX: single TPACKET_V3 socket on local_if (no fanout) */
-    afpkt_worker_t rx;
-
-    /* Per-TX-worker packet queue (heap-allocated) */
-    struct pkt_queue *queues[MAX_TX_WORKERS];
-
-    /* Per-TX-worker raw TX socket */
-    int tx_fds[MAX_TX_WORKERS];
-
-    int num_tx_workers;
-} afpkt_pipeline_t;
-
-/* ============ Fanout API (legacy, still used for inbound) ============ */
+/* ============ Fanout API ============ */
 
 int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id, int num_workers);
 int  afpkt_single_open(afpkt_worker_t *w, const char *ifname);
@@ -75,27 +62,12 @@ void afpkt_fanout_close(afpkt_fanout_t *fg);
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx);
 void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ctx);
 
-/* Legacy outbound (single-thread per worker, used before pipeline) */
+/* Outbound: capture from local_if → VXLAN encapsulate → send via UDP */
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                  const app_context_t *ctx, volatile int *running);
+
+/* Inbound: receive VXLAN from UDP → strip → reassemble → forward to LAN */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running);
-
-/* ============ Pipeline API ============ */
-
-int  afpkt_pipeline_open(afpkt_pipeline_t *pl, const char *ifname, int num_tx_workers);
-void afpkt_pipeline_close(afpkt_pipeline_t *pl);
-
-/* RX thread: read from ring → filter → push to TX worker queues (round-robin) */
-void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
-                               const afpkt_fanout_t *fg,
-                               struct pkt_queue **queues, int num_queues,
-                               volatile int *running);
-
-/* TX worker: dequeue → fragment → ETH rewrite → sendmmsg to tunnel */
-void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
-                           const afpkt_fanout_t *fg,
-                           const app_context_t *ctx,
-                           volatile int *running);
 
 #endif /* AFPKT_H */

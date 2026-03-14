@@ -321,7 +321,7 @@ int frag_try_reassemble(struct frag_table *ft,
     const uint8_t *payload = pkt_data + 14 + ip_hdr_len + FRAG_PLAIN_HDR_SIZE;
     uint32_t payload_len = pkt_len - 14 - ip_hdr_len - FRAG_PLAIN_HDR_SIZE;
 
-    int idx = pkt_id % FRAG_TABLE_SIZE;
+    int idx = pkt_id & (FRAG_TABLE_SIZE - 1);
     struct frag_entry *entry = &ft->entries[idx];
     uint64_t now = get_time_ns();
     

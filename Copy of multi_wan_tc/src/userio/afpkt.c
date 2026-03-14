@@ -26,11 +26,11 @@
 #include <netinet/udp.h>
 
 /* TPACKET_V3 constants */
-#define V3_BLOCK_SIZE (1 << 21) /* 2MB Blocks */
-#define V3_BLOCK_NR 64          /* 64 blocks = 128MB Ring */
+#define V3_BLOCK_SIZE (1 << 20) /* 2MB Blocks */
+#define V3_BLOCK_NR 256          /* 256 blocks = 512MB Ring */
 #define V3_FRAME_SIZE 2048
 
-#define TX_BATCH_SIZE 512
+#define TX_BATCH_SIZE 1024
 
 /* Per-worker RR counter eliminates cross-core atomic contention.
  * Old global atomic was a serialization point at high pps. */
@@ -330,7 +330,7 @@ int afpkt_single_open(afpkt_worker_t *w, const char *ifname)
     return 0;
 }
 
-void afpkt_fanout_close(afpkt_fanout_t *fg)
+void afpkt_fanout_close(afpkt_fanout_t *)
 {
     for (int i = 0; i < fg->num_workers; i++)
     {
@@ -362,27 +362,41 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
 
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx)
 {
-    /* Cache ne_tunnel interfaces for TX */
-    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count && i < MAX_NE_TUNNELS; i++)
+    /* Create one UDP socket per tunnel and cache sockaddr_in for VXLAN TX */
+    fg->tunnel_count = ctx->cfg.ne_tunnel_count;
+    for (size_t i = 0; i < fg->tunnel_count && i < MAX_NE_TUNNELS; i++)
     {
-        const char *ifname = ctx->cfg.ne_tunnels[i].ifname;
-        int ifidx = if_nametoindex(ifname);
-        if (ifidx == 0)
-        {
-            log_error("Cache outbound: Failed to get ifindex for TUNNEL '%s'", ifname);
+        /* Create UDP socket for this tunnel */
+        int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (udp_fd < 0) {
+            log_error("Cache outbound: Failed to create UDP socket for tunnel[%zu]: %s",
+                      i, strerror(errno));
+            fg->tunnel_udp_fds[i] = -1;
             continue;
         }
-        unsigned char mac[6];
-        if (system_get_if_hwaddr(ifname, mac) != 0)
-        {
-            log_error("Cache outbound: Failed to get MAC for TUNNEL '%s'", ifname);
+
+        /* Increase TX buffer to absorb bursts (16 MB) */
+        int sndbuf = 16 * 1024 * 1024;
+        setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
+
+        fg->tunnel_udp_fds[i] = udp_fd;
+
+        /* Cache sockaddr_in with remote IP and VXLAN port */
+        memset(&fg->tunnel_addrs[i], 0, sizeof(fg->tunnel_addrs[i]));
+        fg->tunnel_addrs[i].sin_family = AF_INET;
+        fg->tunnel_addrs[i].sin_port   = htons(VXLAN_PORT);
+        if (inet_pton(AF_INET, ctx->cfg.ne_tunnels[i].gateway,
+                      &fg->tunnel_addrs[i].sin_addr) != 1) {
+            log_error("Cache outbound: Invalid gateway '%s' for tunnel[%zu]",
+                      ctx->cfg.ne_tunnels[i].gateway, i);
+            close(udp_fd);
+            fg->tunnel_udp_fds[i] = -1;
             continue;
         }
-        fg->tunnels[i].ifindex = ifidx;
-        memcpy(fg->tunnels[i].src_mac, mac, 6);
-        fg->tunnels[i].valid = 1;
-        log_info("Cache outbound: TUNNEL[%zu] %s: ifindex=%d, mac=%02x:%02x:%02x:%02x:%02x:%02x",
-                 i, ifname, ifidx, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+
+        log_info("Cache outbound: TUNNEL[%zu] %s -> %s:%d (udp_fd=%d)",
+                 i, ctx->cfg.ne_tunnels[i].ifname,
+                 ctx->cfg.ne_tunnels[i].gateway, VXLAN_PORT, udp_fd);
     }
 }
 
@@ -412,38 +426,14 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
 /* ============ WORKER LOOP OUTBOUND ================ */
 /* ================================================== */
 
-/*
- * sendmmsg_full(): retry until ALL packets are sent.
- * If kernel TX queue is full, sendmmsg returns fewer than requested.
- * This function retries the remaining packets with a brief pause,
- * implementing BACKPRESSURE: we slow down processing to match TX capacity.
- * This guarantees ZERO packet loss at the application level.
- */
-static void sendmmsg_full(int fd, struct mmsghdr *batch, int count) {
-    int sent = 0;
-    while (sent < count) {
-        int ret = sendmmsg(fd, batch + sent, count - sent, 0);
-        if (ret > 0) {
-            sent += ret;
-        } else if (ret < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
-                /* TX queue full — wait briefly then retry (backpressure) */
-                struct timespec ts = { .tv_sec = 0, .tv_nsec = 100000 }; /* 100µs */
-                nanosleep(&ts, NULL);
-            } else {
-                /* Real error — break to avoid infinite loop */
-                break;
-            }
-        }
-    }
-}
+
+
 
 /*
- * Outbound: capture from local_if → forward to ne_tunnel (Hash-based)
- * Uses batched sendmmsg() to minimize syscall overhead.
- * Optimizations:
- *   - Pre-cached 14-byte ETH header per tunnel (1 memcpy instead of 2+assign)
- *   - memset tx_batch ONCE per block instead of per-packet
+ * Outbound: capture from local_if → encapsulate in VXLAN → send via UDP
+ * Each original L2 frame gets a VXLAN header prepended, then sent to
+ * the tunnel's remote_ip:4789 via a standard UDP socket.
+ * Kernel handles Outer IP/UDP/MAC headers and checksums automatically.
  */
 void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
@@ -451,7 +441,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long pkt_cnt = 0;
     unsigned long captured_cnt = 0;
     unsigned long ip_pkts = 0;
-    log_info("Worker outbound[%d] started (Batched sendmmsg + FastMAC)", w->id);
+    log_info("Worker outbound[%d] started (VXLAN UDP Encapsulation)", w->id);
 
     size_t tunnel_count = ctx->cfg.ne_tunnel_count;
     if (tunnel_count == 0)
@@ -460,38 +450,25 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
-    /* ---- Pre-cache sockaddr_ll per tunnel (computed ONCE) ---- */
-    struct sockaddr_ll cached_sa[MAX_NE_TUNNELS];
-    for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
-        memset(&cached_sa[t], 0, sizeof(cached_sa[t]));
-        cached_sa[t].sll_family   = AF_PACKET;
-        cached_sa[t].sll_protocol = htons(MWAN_ETHERTYPE);
-        cached_sa[t].sll_ifindex  = fg->tunnels[t].ifindex;
-        cached_sa[t].sll_halen    = 6;
-        memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
-    }
-
-    /* ---- Pre-cache full 14-byte Ethernet header per tunnel ----
-     * Layout: [dst_mac (6)] [src_mac (6)] [ethertype (2)]
-     * One 14-byte memcpy replaces 2x 6-byte memcpy + 1 ethertype assign */
-    uint8_t cached_eth[MAX_NE_TUNNELS][14];
-    for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
-        memcpy(cached_eth[t] + 0, ctx->cfg.ne_tunnels[t].dst_mac, 6);    /* h_dest */
-        memcpy(cached_eth[t] + 6, fg->tunnels[t].src_mac, 6);            /* h_source */
-        cached_eth[t][12] = (uint8_t)(MWAN_ETHERTYPE >> 8);              /* h_proto (BE) */
-        cached_eth[t][13] = (uint8_t)(MWAN_ETHERTYPE & 0xFF);
-    }
+    /* ---- Pre-build a VXLAN header template (8 bytes, reused for every packet) ---- */
+    vxlan_hdr_t vxlan_template;
+    vxlan_hdr_build(&vxlan_template, VXLAN_DEFAULT_VNI);
 
     /* ---- Fragment buffer pool (heap, reusable after each flush) ---- */
+    /* Each frag slot: VXLAN_HDR(8) + frag header area from frag_split (~128 bytes) */
     uint8_t *frag_arena = malloc((size_t)TX_BATCH_SIZE * 2048);
     if (!frag_arena) {
         log_error("Worker outbound[%d]: failed to allocate frag arena", w->id);
         return;
     }
 
-    /* ---- Batch TX structures (stack) ---- */
-    struct mmsghdr tx_batch[TX_BATCH_SIZE];
-    struct iovec   tx_iov[TX_BATCH_SIZE * 2];
+    /* ---- Scratch buffer for VXLAN encapsulation of non-fragmented packets ---- */
+    uint8_t *vxlan_buf = malloc(2048 + VXLAN_HDR_SIZE);
+    if (!vxlan_buf) {
+        log_error("Worker outbound[%d]: failed to allocate vxlan_buf", w->id);
+        free(frag_arena);
+        return;
+    }
 
     while (*running)
     {
@@ -510,14 +487,6 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             int num_pkts = bd->hdr.bh1.num_pkts;
             struct tpacket3_hdr *ppd =
                 (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
-
-            /* ---- Batch state for this block ---- */
-            int batch_n = 0;   /* messages queued */
-            int iov_idx = 0;   /* next free slot in tx_iov */
-            int frag_idx = 0;  /* next free slot in frag_arena */
-
-            /* OPT: Clear batch array ONCE per block instead of per-packet */
-            memset(tx_batch, 0, sizeof(tx_batch));
 
             for (int i = 0; i < num_pkts; i++)
             {
@@ -549,88 +518,63 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 uint32_t hash = calculate_5tuple_hash(frame, len);
                 int tunnel_idx = hash % tunnel_count;
 
-                if (!fg->tunnels[tunnel_idx].valid)
+                if (fg->tunnel_udp_fds[tunnel_idx] < 0)
                     goto next_pkt;
 
                 pkt_cnt++;
 
                 if (frag_need_split((uint32_t)len)) {
-                    /* Need 2 batch slots + 4 iov buffers + 2 frag hdrs */
-                    if (batch_n + 2 > TX_BATCH_SIZE || iov_idx + 4 > TX_BATCH_SIZE * 2 || frag_idx + 2 > TX_BATCH_SIZE) {
-                        if (batch_n > 0)
-                            sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-                        batch_n = 0;
-                        iov_idx = 0;
-                        frag_idx = 0;
-                        memset(tx_batch, 0, sizeof(tx_batch));
-                    }
-
-                    uint8_t *h1 = frag_arena + (size_t)frag_idx * 128; /* Header is small */
-                    uint8_t *h2 = frag_arena + (size_t)(frag_idx + 1) * 128;
+                    /* Fragment the original frame, then VXLAN-encap each piece */
+                    uint8_t *h1 = frag_arena;
+                    uint8_t *h2 = frag_arena + 1024;
                     uint32_t h1_len, h2_len;
                     const uint8_t *p1, *p2;
                     uint32_t p1_len, p2_len;
 
                     if (frag_split(frame, (uint32_t)len, h1, &h1_len, &p1, &p1_len, h2, &h2_len, &p2, &p2_len) == 0) {
-                        /* OPT: Single 14-byte copy for entire ETH header */
-                        memcpy(h1, cached_eth[tunnel_idx], 14);
-                        memcpy(h2, cached_eth[tunnel_idx], 14);
+                        /* Fragment 1: VXLAN + frag_header + payload1 */
+                        uint8_t pkt1[2048 + VXLAN_HDR_SIZE];
+                        memcpy(pkt1, &vxlan_template, VXLAN_HDR_SIZE);
+                        memcpy(pkt1 + VXLAN_HDR_SIZE, h1, h1_len);
+                        memcpy(pkt1 + VXLAN_HDR_SIZE + h1_len, p1, p1_len);
+                        uint32_t total1 = VXLAN_HDR_SIZE + h1_len + p1_len;
 
-                        tx_iov[iov_idx] = (struct iovec){ .iov_base = h1, .iov_len = h1_len };
-                        tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p1, .iov_len = p1_len };
-                        tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                        tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
-                        batch_n++;
-                        iov_idx += 2;
+                        sendto(fg->tunnel_udp_fds[tunnel_idx], pkt1, total1, 0,
+                               (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
+                               sizeof(struct sockaddr_in));
 
-                        tx_iov[iov_idx] = (struct iovec){ .iov_base = h2, .iov_len = h2_len };
-                        tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p2, .iov_len = p2_len };
-                        tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                        tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                        tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                        tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
-                        batch_n++;
-                        iov_idx += 2;
+                        /* Fragment 2: VXLAN + frag_header + payload2 */
+                        uint8_t pkt2[2048 + VXLAN_HDR_SIZE];
+                        memcpy(pkt2, &vxlan_template, VXLAN_HDR_SIZE);
+                        memcpy(pkt2 + VXLAN_HDR_SIZE, h2, h2_len);
+                        memcpy(pkt2 + VXLAN_HDR_SIZE + h2_len, p2, p2_len);
+                        uint32_t total2 = VXLAN_HDR_SIZE + h2_len + p2_len;
 
-                        frag_idx += 2;
+                        sendto(fg->tunnel_udp_fds[tunnel_idx], pkt2, total2, 0,
+                               (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
+                               sizeof(struct sockaddr_in));
                     }
                 } else {
-                    /* Non-fragmented: batch directly from ring buffer (zero-copy) */
-                    if (batch_n >= TX_BATCH_SIZE || iov_idx >= TX_BATCH_SIZE * 2) {
-                        sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-                        batch_n = 0;
-                        iov_idx = 0;
-                        frag_idx = 0;
-                        memset(tx_batch, 0, sizeof(tx_batch));
-                    }
+                    /* Non-fragmented: prepend VXLAN header to original frame */
+                    memcpy(vxlan_buf, &vxlan_template, VXLAN_HDR_SIZE);
+                    memcpy(vxlan_buf + VXLAN_HDR_SIZE, frame, len);
+                    uint32_t total = VXLAN_HDR_SIZE + len;
 
-                    /* OPT: Single 14-byte copy for entire ETH header */
-                    memcpy(frame, cached_eth[tunnel_idx], 14);
-
-                    tx_iov[iov_idx] = (struct iovec){ .iov_base = frame, .iov_len = len };
-                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
-                    batch_n++;
-                    iov_idx++;
+                    sendto(fg->tunnel_udp_fds[tunnel_idx], vxlan_buf, total, 0,
+                           (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
+                           sizeof(struct sockaddr_in));
                 }
 
             next_pkt:
                 ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
             }
 
-            /* ---- Flush remaining batch BEFORE releasing block ---- */
-            if (batch_n > 0)
-                sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-
             bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
             w->current_block = (w->current_block + 1) % w->block_count;
         }
     }
     free(frag_arena);
+    free(vxlan_buf);
     log_info("Worker outbound[%d] stopped: captured=%lu ip_pkts=%lu processed=%lu",
              w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
@@ -640,26 +584,30 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 /* ================================================== */
 
 /*
- * Inbound: capture from ne_tunnel → forward to local_if
- * No reassembly, no reordering.
+ * Inbound: receive VXLAN-encapsulated packets from UDP socket → strip VXLAN →
+ * reassemble fragments → rewrite MAC → forward to local_if via AF_PACKET.
+ *
+ * The UDP socket (fg->udp_rx_fd) is bound to port 4789.
+ * After stripping the 8-byte VXLAN header, we get the Inner L2 Frame
+ * which may or may not be fragmented (Protocol=253 check).
  */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
     unsigned long total_pkts = 0;
-    unsigned long non_mwan = 0;
+    unsigned long non_ip = 0;
 
-    log_info("Worker inbound[%d] started (L3 Forwarding Only)", w->id);
+    log_info("Worker inbound[%d] started (VXLAN UDP Decapsulation)", w->id);
 
-    /* TX Buffer */
-    uint8_t *tx_buf = malloc(2048);
-    if (!tx_buf) {
-        log_error("Worker inbound[%d]: failed to allocate tx_buf", w->id);
+    /* RX buffer for UDP recv */
+    uint8_t *rx_buf = malloc(4096);
+    if (!rx_buf) {
+        log_error("Worker inbound[%d]: failed to allocate rx_buf", w->id);
         return;
     }
 
-    /* ---- Pre-cache sockaddr_ll cho LOCAL ---- */
+    /* ---- Pre-cache sockaddr_ll for LOCAL LAN TX (AF_PACKET) ---- */
     struct sockaddr_ll sa;
     memset(&sa, 0, sizeof(sa));
     sa.sll_family = AF_PACKET;
@@ -680,498 +628,98 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     cached_eth_ipv6[12] = (uint8_t)((ETH_P_IPV6) >> 8);
     cached_eth_ipv6[13] = (uint8_t)((ETH_P_IPV6) & 0xFF);
 
-    /* ---- Fragment buffer pool cho inbound ---- */
-    uint8_t *frag_arena = malloc((size_t)TX_BATCH_SIZE * 2048);
-    if (!frag_arena) {
-        log_error("Worker inbound[%d]: failed to allocate frag arena", w->id);
+    /* Reassembly buffer */
+    uint8_t *reassem_buf = malloc(4096);
+    if (!reassem_buf) {
+        log_error("Worker inbound[%d]: failed to allocate reassem_buf", w->id);
+        free(rx_buf);
         return;
     }
 
-    /* ---- Batch TX structures ---- */
-    struct mmsghdr tx_batch[TX_BATCH_SIZE];
-    struct iovec   tx_iov[TX_BATCH_SIZE];
-
     while (*running)
     {
-        /* BLOCKING POLL with TIMEOUT: Đợi ngắt từ NIC nhưng timeout mỗi 100ms
-         * Để luồng có cơ hội thức dậy và kiểm tra biến *running khi có lệnh tắt (Ctrl+C)
-         */
-        struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 100) <= 0) {
+        /* Poll the UDP RX socket with timeout */
+        struct pollfd pfd = {.fd = fg->udp_rx_fd, .events = POLLIN};
+        if (poll(&pfd, 1, 100) <= 0)
             continue;
-        }
 
-        while (*running)
-        {
-            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
+        /* Receive UDP payload (VXLAN Header + Inner L2 Frame) */
+        ssize_t n = recv(fg->udp_rx_fd, rx_buf, 4096, 0);
+        if (n <= (ssize_t)VXLAN_HDR_SIZE)
+            continue;
 
-            if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
-                break;
+        total_pkts++;
 
-            int num_pkts = bd->hdr.bh1.num_pkts;
-            struct tpacket3_hdr *ppd =
-                (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
+        /* Strip VXLAN header (8 bytes) → inner frame starts at rx_buf + 8 */
+        uint8_t *inner_frame = rx_buf + VXLAN_HDR_SIZE;
+        uint32_t inner_len = (uint32_t)(n - VXLAN_HDR_SIZE);
 
-            int batch_n = 0;
-            int frag_idx = 0;
+        if (inner_len < 14)
+            continue;
 
-            /* OPT: Clear batch array ONCE per block */
-            memset(tx_batch, 0, sizeof(tx_batch));
+        /* The inner frame is an original L2 Ethernet frame */
+        /* Check if it contains our custom fragment (IP Protocol = 253) */
+        uint16_t pkt_id;
+        uint8_t frag_index;
 
-            for (int i = 0; i < num_pkts; i++)
-            {
-                unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
-                unsigned int len = ppd->tp_snaplen;
-
-                total_pkts++;
-                if (len < 14)
-                    goto next_in;
-
-                struct ethhdr *eth = (struct ethhdr *)frame;
-
-                /* Only process our protocol */
-                if (ntohs(eth->h_proto) != MWAN_ETHERTYPE)
-                {
-                    non_mwan++;
-                    goto next_in;
-                }
-
-                /* Extract IP data (Skip Eth header) - Assuming NO mwan_header */
-                uint8_t *ip_data = frame + 14;
-                uint16_t ip_len = (uint16_t)(len - 14);
-                
-                if (ip_len == 0) goto next_in;
-
-                pkt_cnt++;
-
-                uint16_t pkt_id;
-                uint8_t frag_index;
-                
-                if (frag_is_fragment(frame, len, &pkt_id, &frag_index)) {
-                    if (fg->frag_tbl) {
-                        /* Dam bao dung luong batch truoc khi goi reassemble */
-                        if (batch_n >= TX_BATCH_SIZE || frag_idx >= TX_BATCH_SIZE) {
-                            sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-                            batch_n = 0;
-                            frag_idx = 0;
-                            memset(tx_batch, 0, sizeof(tx_batch));
-                        }
-
-                        uint8_t *reassembled = frag_arena + (size_t)frag_idx * 2048;
-                        uint32_t reassem_len = 0;
-
-                        int ret = frag_try_reassemble(fg->frag_tbl, frame, len, pkt_id, frag_index, reassembled, &reassem_len);
-                        if (ret == 1) { // successfully reassembled
-                            // extract new payload size to send
-                            ip_data = reassembled + 14;
-                            ip_len = reassem_len - 14;
-                            
-                            /* OPT: Fast 14-byte MAC rewrite */
-                            int is_ipv4 = ((ip_data[0] >> 4) == 4);
-                            if (is_ipv4) {
-                                memcpy(reassembled, cached_eth_ipv4, 14);
-                                sa.sll_protocol = htons(ETH_P_IP);
-                            } else {
-                                memcpy(reassembled, cached_eth_ipv6, 14);
-                                sa.sll_protocol = htons(ETH_P_IPV6);
-                            }
-
-                            tx_iov[batch_n] = (struct iovec){ .iov_base = reassembled, .iov_len = reassem_len };
-                            tx_batch[batch_n].msg_hdr.msg_name    = &sa;
-                            tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                            tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                            tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
-                            batch_n++;
-                            frag_idx++;
-                        }
-                    }
-                } else {
-                    if (batch_n >= TX_BATCH_SIZE) {
-                        sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-                        batch_n = 0;
-                        frag_idx = 0;
-                        memset(tx_batch, 0, sizeof(tx_batch));
-                    }
-
-                    /* ZERO-COPY OPT: Rewrite Ethernet Header directly on the ring buffer frame */
+        if (frag_is_fragment(inner_frame, inner_len, &pkt_id, &frag_index)) {
+            if (fg->frag_tbl) {
+                uint32_t reassem_len = 0;
+                int ret = frag_try_reassemble(fg->frag_tbl, inner_frame, inner_len,
+                                              pkt_id, frag_index,
+                                              reassem_buf, &reassem_len);
+                if (ret == 1) {
+                    /* Successfully reassembled — rewrite MAC and send to LAN */
+                    uint8_t *ip_data = reassem_buf + 14;
                     int is_ipv4 = ((ip_data[0] >> 4) == 4);
                     if (is_ipv4) {
-                        memcpy(frame, cached_eth_ipv4, 14);
+                        memcpy(reassem_buf, cached_eth_ipv4, 14);
                         sa.sll_protocol = htons(ETH_P_IP);
                     } else {
-                        memcpy(frame, cached_eth_ipv6, 14);
+                        memcpy(reassem_buf, cached_eth_ipv6, 14);
                         sa.sll_protocol = htons(ETH_P_IPV6);
                     }
 
-                    tx_iov[batch_n] = (struct iovec){ .iov_base = frame, .iov_len = 14 + ip_len };
-                    tx_batch[batch_n].msg_hdr.msg_name    = &sa;
-                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[batch_n];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
-                    batch_n++;
+                    sendto(w->tx_fd, reassem_buf, reassem_len, 0,
+                           (struct sockaddr *)&sa, sizeof(sa));
+                    pkt_cnt++;
                 }
-
-
-            next_in:
-                ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
+                /* ret == 0: stored fragment, waiting for pair — do nothing */
             }
-
-            if (batch_n > 0) {
-                sendmmsg_full(w->tx_fd, tx_batch, batch_n);
-            }
-
-            bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
-            w->current_block = (w->current_block + 1) % w->block_count;
-        }
-    }
-    free(tx_buf);
-    free(frag_arena);
-    log_info("Worker inbound[%d] stopped: total=%lu non_mwan=%lu forwarded=%lu",
-             w->id, total_pkts, non_mwan, pkt_cnt);
-}
-
-/* ================================================== */
-/* ============ PIPELINE: OPEN / CLOSE ============== */
-/* ================================================== */
-
-int afpkt_pipeline_open(afpkt_pipeline_t *pl, const char *ifname, int num_tx_workers)
-{
-    memset(pl, 0, sizeof(*pl));
-    if (num_tx_workers > MAX_TX_WORKERS)
-        num_tx_workers = MAX_TX_WORKERS;
-    pl->num_tx_workers = num_tx_workers;
-
-    for (int i = 0; i < MAX_TX_WORKERS; i++)
-        pl->tx_fds[i] = -1;
-
-    /* Single RX socket with TPACKET_V3 (no fanout) */
-    if (afpkt_single_open(&pl->rx, ifname) != 0) {
-        log_error("Pipeline: failed to open RX on %s", ifname);
-        return -1;
-    }
-
-    /* Allocate per-worker queues */
-    for (int i = 0; i < num_tx_workers; i++) {
-        pl->queues[i] = malloc(sizeof(struct pkt_queue));
-        if (!pl->queues[i]) {
-            log_error("Pipeline: failed to alloc queue[%d]", i);
-            afpkt_pipeline_close(pl);
-            return -1;
-        }
-        pkt_queue_init(pl->queues[i]);
-    }
-
-    /* Per-worker TX sockets */
-    for (int i = 0; i < num_tx_workers; i++) {
-        pl->tx_fds[i] = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-        if (pl->tx_fds[i] < 0) {
-            log_error("Pipeline: failed to open TX socket[%d]: %s", i, strerror(errno));
-            afpkt_pipeline_close(pl);
-            return -1;
-        }
-    }
-
-    log_info("Pipeline opened: RX on %s, %d TX workers, queue capacity=%d",
-             ifname, num_tx_workers, PKT_QUEUE_CAPACITY);
-    return 0;
-}
-
-void afpkt_pipeline_close(afpkt_pipeline_t *pl)
-{
-    /* Close RX */
-    if (pl->rx.ring) {
-        munmap(pl->rx.ring, pl->rx.ring_size);
-        pl->rx.ring = NULL;
-    }
-    if (pl->rx.rx_fd >= 0) { close(pl->rx.rx_fd); pl->rx.rx_fd = -1; }
-    if (pl->rx.tx_fd >= 0) { close(pl->rx.tx_fd); pl->rx.tx_fd = -1; }
-
-    /* Free queues */
-    for (int i = 0; i < MAX_TX_WORKERS; i++) {
-        free(pl->queues[i]);
-        pl->queues[i] = NULL;
-    }
-
-    /* Close TX sockets */
-    for (int i = 0; i < MAX_TX_WORKERS; i++) {
-        if (pl->tx_fds[i] >= 0) {
-            close(pl->tx_fds[i]);
-            pl->tx_fds[i] = -1;
-        }
-    }
-}
-
-/* ================================================== */
-/* ============ PIPELINE: RX DISTRIBUTE ============= */
-/* ================================================== */
-
-void afpkt_rx_distribute_loop(afpkt_worker_t *rx_w,
-                               const afpkt_fanout_t *fg,
-                               struct pkt_queue **queues, int num_queues,
-                               volatile int *running)
-{
-    unsigned long total = 0, pushed = 0, dropped = 0;
-    // unsigned long prev_pushed = 0, prev_dropped = 0;
-    struct timespec ts_start, ts_now;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
-
-    log_info("Pipeline RX thread started (distributing to %d TX workers)", num_queues);
-
-    while (*running)
-    {
-        /* BLOCKING POLL with TIMEOUT: Đợi ngắt từ NIC nhưng timeout mỗi 100ms
-         * Để luồng có cơ hội thức dậy và kiểm tra biến *running khi có lệnh tắt (Ctrl+C)
-         */
-        struct pollfd pfd = {.fd = rx_w->rx_fd, .events = POLLIN};
-        if (poll(&pfd, 1, 100) <= 0) {
-            /* Periodic stats even when idle */
-            clock_gettime(CLOCK_MONOTONIC, &ts_now);
-            double elapsed = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
-            if (elapsed >= 2.0) {
-                // unsigned long delta_push = pushed - prev_pushed;
-                // unsigned long delta_drop = dropped - prev_dropped;
-                // log_info("[RX STATS] push_rate=%lu pkt/s | q_full_drops=%lu/s | total_dropped=%lu",
-                //          (unsigned long)(delta_push / elapsed),
-                //          (unsigned long)(delta_drop / elapsed), dropped);
-                // prev_pushed = pushed;
-                // prev_dropped = dropped;
-                clock_gettime(CLOCK_MONOTONIC, &ts_start);
-            }
-            continue;
-        }
-
-        while (*running)
-        {
-            struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
-                ((char *)rx_w->ring + (rx_w->current_block * V3_BLOCK_SIZE));
-
-            if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0)
-                break;
-
-            int num_pkts = bd->hdr.bh1.num_pkts;
-            struct tpacket3_hdr *ppd =
-                (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
-
-            for (int i = 0; i < num_pkts; i++)
-            {
-                unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
-                unsigned int len = ppd->tp_snaplen;
-
-                total++;
-
-                if (len < 14)
-                    goto rx_next;
-
-                struct ethhdr *eth = (struct ethhdr *)frame;
-                uint16_t h_proto = ntohs(eth->h_proto);
-
-                if (h_proto == MWAN_ETHERTYPE)
-                    goto rx_next;
-                if (memcmp(eth->h_source, fg->local.src_mac, 6) == 0)
-                    goto rx_next;
-                if (h_proto != ETH_P_IP && h_proto != ETH_P_IPV6)
-                    goto rx_next;
-                if (len <= 14)
-                    goto rx_next;
-
-                uint32_t hash = calculate_5tuple_hash(frame, len);
-                int start_q_idx = hash % num_queues;
-                int q_idx = start_q_idx;
-
-                /* SPILLOVER FAILOVER / BACKPRESSURE:
-                 * If the target queue is full, try the next queue (spillover to another worker)
-                 * to prevent 100% Core bottleneck on a single TX worker. */
-                int pushed_ok = 0;
-                while (*running) {
-                    if (pkt_queue_push(queues[q_idx], frame, len, hash) == 0) {
-                        pushed_ok = 1;
-                        break;
-                    }
-                    
-                    /* Queue full -> Spillover to the next worker's queue */
-                    q_idx = (q_idx + 1) % num_queues;
-                    
-                    /* If we have checked all queues and ALL are full, yield CPU and retry */
-                    if (q_idx == start_q_idx) {
-                        sched_yield(); /* Yield to consumers */
-                    }
-                }
-                if (pushed_ok) pushed++;
-
-            rx_next:
-                ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
-            }
-
-            bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
-            rx_w->current_block = (rx_w->current_block + 1) % rx_w->block_count;
-        }
-
-        /* Periodic stats under load */
-        clock_gettime(CLOCK_MONOTONIC, &ts_now);
-        double elapsed = (ts_now.tv_sec - ts_start.tv_sec) + (ts_now.tv_nsec - ts_start.tv_nsec) / 1e9;
-        if (elapsed >= 2.0) {
-            // unsigned long delta_push = pushed - prev_pushed;
-            // unsigned long delta_drop = dropped - prev_dropped;
-            // log_info("[RX STATS] push_rate=%lu pkt/s | q_full_drops=%lu/s | total_dropped=%lu",
-            //          (unsigned long)(delta_push / elapsed),
-            //          (unsigned long)(delta_drop / elapsed), dropped);
-            // prev_pushed = pushed;
-            // prev_dropped = dropped;
-            clock_gettime(CLOCK_MONOTONIC, &ts_start);
-        }
-    }
-
-    log_info("Pipeline RX stopped: total=%lu pushed=%lu q_full_drops=%lu", total, pushed, dropped);
-}
-
-/* ================================================== */
-/* ============ PIPELINE: TX WORKER ================= */
-/* ================================================== */
-
-void afpkt_tx_worker_loop(int worker_id, struct pkt_queue *q, int tx_fd,
-                           const afpkt_fanout_t *fg,
-                           const app_context_t *ctx,
-                           volatile int *running)
-{
-    unsigned long pkt_cnt = 0;
-    // unsigned long prev_pkt_cnt = 0;
-    unsigned long send_calls = 0;
-    struct timespec ts_start;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
-
-    log_info("Pipeline TX worker[%d] started", worker_id);
-
-    size_t tunnel_count = ctx->cfg.ne_tunnel_count;
-    if (tunnel_count == 0) {
-        log_error("TX worker[%d]: no tunnels configured!", worker_id);
-        return;
-    }
-
-    /* Pre-cache sockaddr_ll per tunnel */
-    struct sockaddr_ll cached_sa[MAX_NE_TUNNELS];
-    for (size_t t = 0; t < tunnel_count && t < MAX_NE_TUNNELS; t++) {
-        memset(&cached_sa[t], 0, sizeof(cached_sa[t]));
-        cached_sa[t].sll_family   = AF_PACKET;
-        cached_sa[t].sll_protocol = htons(MWAN_ETHERTYPE);
-        cached_sa[t].sll_ifindex  = fg->tunnels[t].ifindex;
-        cached_sa[t].sll_halen    = 6;
-        memcpy(cached_sa[t].sll_addr, ctx->cfg.ne_tunnels[t].dst_mac, 6);
-    }
-
-    uint8_t *frag_arena = malloc((size_t)TX_BATCH_SIZE * 2048);
-    if (!frag_arena) {
-        log_error("TX worker[%d]: alloc frag_arena failed", worker_id);
-        return;
-    }
-
-    struct mmsghdr tx_batch[TX_BATCH_SIZE];
-    struct iovec   tx_iov[TX_BATCH_SIZE * 2];
-    uint32_t local_read = atomic_load_explicit(&q->read_idx, memory_order_relaxed);
-
-    while (*running)
-    {
-        uint32_t write_pos = pkt_queue_write_pos(q);
-
-        if (local_read == write_pos) {
-            /* Nhường thời gian thực thi lại cho hđh tránh bào mòn CPU khi rỗi */
-            usleep(10);
-            continue;
-        }
-
-        int batch_n = 0;
-        int iov_idx = 0;
-        int frag_idx = 0;
-
-        /* Drain available packets from queue into batch */
-        while (local_read != write_pos && batch_n < TX_BATCH_SIZE - 1)
-        {
-            struct pkt_slot *slot = pkt_queue_slot_at(q, local_read);
-            uint8_t *frame = slot->data;
-            uint32_t len = slot->len;
-            uint32_t hash = slot->hash;
-
-            int tunnel_idx = hash % tunnel_count;
-
-            if (!fg->tunnels[tunnel_idx].valid) {
-                local_read = (local_read + 1) & PKT_QUEUE_MASK;
+        } else {
+            /* Non-fragmented inner frame — rewrite MAC and send to LAN */
+            uint8_t *ip_data = inner_frame + 14;
+            if (inner_len <= 14) {
+                non_ip++;
                 continue;
             }
 
-            pkt_cnt++;
-
-            if (frag_need_split(len)) {
-                if (batch_n + 2 > TX_BATCH_SIZE || iov_idx + 4 > TX_BATCH_SIZE * 2 || frag_idx + 2 > TX_BATCH_SIZE)
-                    break;
-
-                uint8_t *h1 = frag_arena + (size_t)frag_idx * 128;
-                uint8_t *h2 = frag_arena + (size_t)(frag_idx + 1) * 128;
-                uint32_t h1_len, h2_len;
-                const uint8_t *p1, *p2;
-                uint32_t p1_len, p2_len;
-
-                if (frag_split(frame, len, h1, &h1_len, &p1, &p1_len, h2, &h2_len, &p2, &p2_len) == 0) {
-                    struct ethhdr *eh1 = (struct ethhdr *)h1;
-                    memcpy(eh1->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                    memcpy(eh1->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                    eh1->h_proto = htons(MWAN_ETHERTYPE);
-
-                    struct ethhdr *eh2 = (struct ethhdr *)h2;
-                    memcpy(eh2->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                    memcpy(eh2->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                    eh2->h_proto = htons(MWAN_ETHERTYPE);
-
-                    tx_iov[iov_idx] = (struct iovec){ .iov_base = h1, .iov_len = h1_len };
-                    tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p1, .iov_len = p1_len };
-                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
-                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
-                    batch_n++;
-                    iov_idx += 2;
-
-                    tx_iov[iov_idx] = (struct iovec){ .iov_base = h2, .iov_len = h2_len };
-                    tx_iov[iov_idx+1] = (struct iovec){ .iov_base = (void *)p2, .iov_len = p2_len };
-                    memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
-                    tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                    tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                    tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                    tx_batch[batch_n].msg_hdr.msg_iovlen  = 2;
-                    batch_n++;
-                    iov_idx += 2;
-
-                    frag_idx += 2;
-                }
+            int is_ipv4 = ((ip_data[0] >> 4) == 4);
+            if (is_ipv4) {
+                memcpy(inner_frame, cached_eth_ipv4, 14);
+                sa.sll_protocol = htons(ETH_P_IP);
             } else {
-                if (batch_n >= TX_BATCH_SIZE || iov_idx >= TX_BATCH_SIZE * 2)
-                    break;
-
-                struct ethhdr *eth_out = (struct ethhdr *)frame;
-                memcpy(eth_out->h_source, fg->tunnels[tunnel_idx].src_mac, 6);
-                memcpy(eth_out->h_dest, ctx->cfg.ne_tunnels[tunnel_idx].dst_mac, 6);
-                eth_out->h_proto = htons(MWAN_ETHERTYPE);
-
-                tx_iov[iov_idx] = (struct iovec){ .iov_base = frame, .iov_len = len };
-                memset(&tx_batch[batch_n], 0, sizeof(tx_batch[batch_n]));
-                tx_batch[batch_n].msg_hdr.msg_name    = &cached_sa[tunnel_idx];
-                tx_batch[batch_n].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
-                tx_batch[batch_n].msg_hdr.msg_iov     = &tx_iov[iov_idx];
-                tx_batch[batch_n].msg_hdr.msg_iovlen  = 1;
-                batch_n++;
-                iov_idx++;
+                memcpy(inner_frame, cached_eth_ipv6, 14);
+                sa.sll_protocol = htons(ETH_P_IPV6);
             }
 
-            local_read = (local_read + 1) & PKT_QUEUE_MASK;
+            sendto(w->tx_fd, inner_frame, inner_len, 0,
+                   (struct sockaddr *)&sa, sizeof(sa));
+            pkt_cnt++;
         }
-
-        if (batch_n > 0) {
-            sendmmsg_full(tx_fd, tx_batch, batch_n);
-            send_calls++;
-        }
-
-        pkt_queue_consume_to(q, local_read);
     }
 
-    free(frag_arena);
-    log_info("Pipeline TX worker[%d] stopped: processed=%lu", worker_id, pkt_cnt);
+    free(rx_buf);
+    free(reassem_buf);
+    log_info("Worker inbound[%d] stopped: total=%lu non_ip=%lu forwarded=%lu",
+             w->id, total_pkts, non_ip, pkt_cnt);
 }
+
+
+
+
+
+
+
+
+

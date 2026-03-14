@@ -178,6 +178,7 @@ static void stop_dataplane(void) {
     }
     pthread_join(gc_thread, NULL);
     
+    /* Close inbound LAN TX worker socket */
     for (size_t w = 0; w < in_worker_count; w++) {
         worker_close(&in_workers[w]);
     }
@@ -185,6 +186,20 @@ static void stop_dataplane(void) {
     if (fg_out.frag_tbl) {
         free(fg_out.frag_tbl);
         fg_out.frag_tbl = NULL;
+    }
+    
+    /* Close UDP RX socket */
+    if (fg_out.udp_rx_fd >= 0) {
+        close(fg_out.udp_rx_fd);
+        fg_out.udp_rx_fd = -1;
+    }
+
+    /* Close outbound UDP TX sockets per tunnel */
+    for (size_t t = 0; t < fg_out.tunnel_count; t++) {
+        if (fg_out.tunnel_udp_fds[t] >= 0) {
+            close(fg_out.tunnel_udp_fds[t]);
+            fg_out.tunnel_udp_fds[t] = -1;
+        }
     }
     
     afpkt_fanout_close(&fg_out);
@@ -207,9 +222,9 @@ static int start_dataplane(app_context_t *ctx) {
     log_info("Starting Dataplane for node: %s", ctx->cfg.node_id);
     running_dataplane = 1;
     
-    /* ---- STEP 1: enable ip_forward ---- */
+    /* ---- STEP 1: disable ip_forward ---- */
     if (system_disable_ip_forward() != 0) {
-        log_error("Failed to enable IP forwarding");
+        log_error("Failed to disable IP forwarding");
         return -1;
     }
 
@@ -217,6 +232,7 @@ static int start_dataplane(app_context_t *ctx) {
     netdev_disable_offloads(ctx->cfg.local_if);
     netdev_optimize_interface(ctx->cfg.local_if);
 
+    /* ---- STEP 3: Open fanout on local_if for outbound RX (capture LAN traffic) ---- */
     if (afpkt_fanout_open(&fg_out, ctx->cfg.local_if, 1, NUM_TX_WORKERS) != 0) {
         log_error("Failed to open fanout outbound on %s", ctx->cfg.local_if);
         goto cleanup_route;
@@ -231,22 +247,56 @@ static int start_dataplane(app_context_t *ctx) {
         goto cleanup_pl;
     }
 
-    in_worker_count = 0;
-    for (size_t w = 0; w < ctx->cfg.ne_tunnel_count; w++) {
-        in_workers[w].id = (int)w;
-        if (afpkt_single_open(&in_workers[w], ctx->cfg.ne_tunnels[w].ifname) != 0) {
-            log_error("Failed to open inbound on %s", ctx->cfg.ne_tunnels[w].ifname);
-            goto cleanup_inbound;
-        }
-        in_worker_count++;
+    /* ---- STEP 4: Open single UDP socket for VXLAN inbound RX ---- */
+    fg_out.udp_rx_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fg_out.udp_rx_fd < 0) {
+        log_error("Failed to create UDP RX socket: %s", strerror(errno));
+        goto cleanup_frag;
     }
 
+    /* Allow port reuse */
+    int reuse = 1;
+    setsockopt(fg_out.udp_rx_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+    /* Increase RX buffer (16 MB) */
+    int rcvbuf = 16 * 1024 * 1024;
+    setsockopt(fg_out.udp_rx_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
+
+    struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
+    bind_addr.sin_family = AF_INET;
+    bind_addr.sin_port = htons(VXLAN_PORT);
+    bind_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(fg_out.udp_rx_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+        log_error("Failed to bind UDP RX socket to port %d: %s", VXLAN_PORT, strerror(errno));
+        close(fg_out.udp_rx_fd);
+        fg_out.udp_rx_fd = -1;
+        goto cleanup_frag;
+    }
+    log_info("UDP RX socket bound to 0.0.0.0:%d (fd=%d)", VXLAN_PORT, fg_out.udp_rx_fd);
+
+    /* ---- STEP 5: Open 1 AF_PACKET TX-only socket for LAN output (inbound path) ---- */
+    in_worker_count = 0;
+    in_workers[0].id = 0;
+    in_workers[0].rx_fd = -1;   /* Not used — we read from UDP */
+    in_workers[0].ring = NULL;
+    in_workers[0].tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (in_workers[0].tx_fd < 0) {
+        log_error("Failed to open AF_PACKET TX socket for LAN: %s", strerror(errno));
+        goto cleanup_udp;
+    }
+    int sndbuf_lan = 16 * 1024 * 1024;
+    setsockopt(in_workers[0].tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf_lan, sizeof(sndbuf_lan));
+    in_worker_count = 1;
+
+    /* ---- STEP 6: Init caches ---- */
     afpkt_fanout_init_cache_outbound(&fg_out, ctx);
     afpkt_fanout_init_cache_inbound(&fg_out, ctx);
 
     int num_available_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
-    if (num_available_cores <= 0) num_available_cores = 1; /* Fallback */
-    int current_core_idx = 1; /* Start from 1 to leave CPU 0 for OS */
+    if (num_available_cores <= 0) num_available_cores = 1;
+    int current_core_idx = 1;
 
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
@@ -256,7 +306,8 @@ static int start_dataplane(app_context_t *ctx) {
     if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
 
-    int max_threads = 1 + fg_out.num_workers + (int)ctx->cfg.ne_tunnel_count;
+    /* Outbound workers + 1 inbound worker */
+    int max_threads = fg_out.num_workers + 1;
     worker_threads = calloc(max_threads, sizeof(pthread_t));
     total_worker_threads = 0;
 
@@ -277,27 +328,26 @@ static int start_dataplane(app_context_t *ctx) {
         total_worker_threads++;
     }
 
-    for (size_t w = 0; w < ctx->cfg.ne_tunnel_count; w++) {
-        g_in_args[w] = (in_arg_t){
-            .worker = &in_workers[w],
-            .fg = &fg_out,
-            .ctx = ctx,
-            .running = &running_dataplane,
-        };
-        if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[w]) != 0) {
-            log_error("Failed to create inbound worker tunnel[%zu]", w);
-            goto cleanup_threads;
-        }
-        int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
-        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
-            log_info("Bound inbound worker %zu to core %d", w, core_id);
-        total_worker_threads++;
+    /* Single inbound worker (reads from UDP, writes to LAN) */
+    g_in_args[0] = (in_arg_t){
+        .worker = &in_workers[0],
+        .fg = &fg_out,
+        .ctx = ctx,
+        .running = &running_dataplane,
+    };
+    if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[0]) != 0) {
+        log_error("Failed to create inbound worker");
+        goto cleanup_threads;
     }
+    int in_core = get_next_odd_core(&current_core_idx, num_available_cores);
+    if (bind_thread_to_core(worker_threads[total_worker_threads], in_core) == 0)
+        log_info("Bound inbound worker to core %d", in_core);
+    total_worker_threads++;
 
     log_info("===========================================");
-    log_info("  MWAN Pipeline Forwarding Started");
-    log_info("  Threads: %d outbound + %d inbound + 1 GC",
-             fg_out.num_workers, (int)ctx->cfg.ne_tunnel_count);
+    log_info("  MWAN VXLAN Pipeline Started");
+    log_info("  Threads: %d outbound + 1 inbound + 1 GC",
+             fg_out.num_workers);
     log_info("===========================================");
     is_dataplane_active = 1;
     return 0;
@@ -313,6 +363,9 @@ cleanup_threads:
 
 cleanup_inbound:
     for (size_t w = 0; w < in_worker_count; w++) worker_close(&in_workers[w]);
+cleanup_udp:
+    if (fg_out.udp_rx_fd >= 0) { close(fg_out.udp_rx_fd); fg_out.udp_rx_fd = -1; }
+cleanup_frag:
     if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
 cleanup_pl:
     afpkt_fanout_close(&fg_out);

@@ -25,7 +25,6 @@ typedef struct {
     char ifname[16];
     char gateway[32];
     int  weight;
-    unsigned char dst_mac[6];
 } ne_tunnel_cfg_t;
 
 typedef struct {
@@ -56,10 +55,6 @@ typedef struct {
 typedef struct {
     app_config_t cfg;
 } app_context_t;
-
-int app_context_init(app_context_t *ctx,
-                     const char *config_path,
-                     const char *node_id);
 
 void app_context_dump(const app_context_t *ctx);
 
