@@ -41,10 +41,6 @@ typedef struct {
     struct sockaddr_in tunnel_addrs[MAX_NE_TUNNELS];
     size_t tunnel_count;
 
-    /* Inbound: UDP sockets listening on various tunnel ports */
-    int udp_rx_fds[MAX_NE_TUNNELS];
-    size_t udp_rx_count;
-
     struct {
         int ifindex;
         unsigned char src_mac[6];
