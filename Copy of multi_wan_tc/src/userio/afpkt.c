@@ -245,9 +245,9 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx)
 {
     /*
-     * Create one UDP socket per tunnel.
-     * Each socket is BOUND to the local port so it can BOTH send and receive.
-     * This eliminates the need for separate UDP Rx sockets.
+     * Create one UDP socket per tunnel for outbound sendto() only.
+     * No bind() — Kernel assigns an ephemeral source port automatically.
+     * The destination address (remote gateway:port) is cached for sendto().
      */
     fg->tunnel_count = ctx->cfg.ne_tunnel_count;
     for (size_t i = 0; i < fg->tunnel_count && i < MAX_NE_TUNNELS; i++)
@@ -260,29 +260,8 @@ void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *c
             continue;
         }
 
-        int reuse = 1;
-        setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-
         int sndbuf = 16 * 1024 * 1024;
         setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
-
-        int rcvbuf = 16 * 1024 * 1024;
-        setsockopt(udp_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
-
-        /* Bind to local port — enables both TX and RX on same socket */
-        struct sockaddr_in bind_addr;
-        memset(&bind_addr, 0, sizeof(bind_addr));
-        bind_addr.sin_family = AF_INET;
-        bind_addr.sin_port = htons(ctx->cfg.ne_tunnels[i].port);
-        bind_addr.sin_addr.s_addr = INADDR_ANY;
-
-        if (bind(udp_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-            log_error("Cache outbound: Failed to bind UDP socket to port %d: %s",
-                      ctx->cfg.ne_tunnels[i].port, strerror(errno));
-            close(udp_fd);
-            fg->tunnel_udp_fds[i] = -1;
-            continue;
-        }
 
         fg->tunnel_udp_fds[i] = udp_fd;
 
@@ -299,11 +278,10 @@ void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *c
             continue;
         }
 
-        log_info("Cache outbound: TUNNEL[%zu] %s -> %s:%d (udp_fd=%d, bound to port %d)",
+        log_info("Cache outbound: TUNNEL[%zu] %s -> %s:%d (udp_fd=%d)",
                  i, ctx->cfg.ne_tunnels[i].ifname,
                  ctx->cfg.ne_tunnels[i].gateway,
-                 ctx->cfg.ne_tunnels[i].port, udp_fd,
-                 ctx->cfg.ne_tunnels[i].port);
+                 ctx->cfg.ne_tunnels[i].port, udp_fd);
     }
 }
 
@@ -481,30 +459,64 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 /* ================================================== */
 
 /*
- * Inbound: receive VXLAN-encapsulated packets from SOCK_DGRAM (tunnel_udp_fds)
- *          → read 8-byte VXLAN header → check frag flag
- *          → if fragmented: reassemble using frag_table
- *          → rewrite MAC → forward to local_if via AF_PACKET
- *
- * Uses the SAME tunnel_udp_fds sockets that outbound uses for sending.
- * These sockets are bound to local ports, so recv() works on them.
+ * Inbound: capture raw frames via AF_PACKET on ALL interfaces
+ *          → filter for IPv4/UDP packets matching tunnel destination ports
+ *          → strip Outer Ethernet(14) + Outer IP(20+) + Outer UDP(8) headers
+ *          → read 8-byte VXLAN header for pkt_id and frag_index
+ *          → reassemble fragments if needed
+ *          → rewrite Inner MAC → forward to local_if via AF_PACKET TX
  */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
     unsigned long total_pkts = 0;
-    unsigned long non_ip = 0;
+    unsigned long filtered = 0;
 
-    log_info("Worker inbound[%d] started (VXLAN UDP Decapsulation)", w->id);
+    log_info("Worker inbound[%d] started (AF_PACKET VXLAN Decapsulation)", w->id);
 
-    uint8_t *rx_buf = malloc(4096);
-    if (!rx_buf) {
-        log_error("Worker inbound[%d]: failed to allocate rx_buf", w->id);
+    /* ---- Build set of tunnel ports to filter for ---- */
+    uint16_t tunnel_ports[MAX_NE_TUNNELS];
+    size_t tunnel_port_count = 0;
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
+        int port = ctx->cfg.ne_tunnels[i].port;
+        int dup = 0;
+        for (size_t j = 0; j < tunnel_port_count; j++) {
+            if (tunnel_ports[j] == (uint16_t)port) { dup = 1; break; }
+        }
+        if (!dup && tunnel_port_count < MAX_NE_TUNNELS) {
+            tunnel_ports[tunnel_port_count++] = (uint16_t)port;
+            log_info("Inbound filter: listening for UDP dst port %d", port);
+        }
+    }
+
+    /* ---- Open AF_PACKET RX socket (all interfaces) ---- */
+    int rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (rx_fd < 0) {
+        log_error("Worker inbound[%d]: cannot create AF_PACKET RX socket: %s",
+                  w->id, strerror(errno));
         return;
     }
 
-    /* Pre-cache sockaddr_ll for LOCAL LAN TX (AF_PACKET) */
+    /* Ignore packets sent by our own machine (avoid loops) */
+    int ignore_out = 1;
+    setsockopt(rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
+
+    int rcvbuf = 16 * 1024 * 1024;
+    setsockopt(rx_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
+
+    /* ---- Allocate buffers ---- */
+    uint8_t *rx_buf = malloc(4096);
+    uint8_t *reassem_buf = malloc(4096);
+    if (!rx_buf || !reassem_buf) {
+        log_error("Worker inbound[%d]: malloc failed", w->id);
+        if (rx_buf) free(rx_buf);
+        if (reassem_buf) free(reassem_buf);
+        close(rx_fd);
+        return;
+    }
+
+    /* ---- Pre-cache sockaddr_ll for LOCAL LAN TX (AF_PACKET) ---- */
     struct sockaddr_ll sa;
     memset(&sa, 0, sizeof(sa));
     sa.sll_family = AF_PACKET;
@@ -525,106 +537,111 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     cached_eth_ipv6[12] = (uint8_t)((ETH_P_IPV6) >> 8);
     cached_eth_ipv6[13] = (uint8_t)((ETH_P_IPV6) & 0xFF);
 
-    /* Reassembly buffer */
-    uint8_t *reassem_buf = malloc(4096);
-    if (!reassem_buf) {
-        log_error("Worker inbound[%d]: failed to allocate reassem_buf", w->id);
-        free(rx_buf);
-        return;
-    }
-
-    struct pollfd pfds[MAX_NE_TUNNELS];
+    struct pollfd pfd = {.fd = rx_fd, .events = POLLIN};
 
     while (*running)
     {
-        /* Poll on the same tunnel UDP sockets used for sending */
-        for (size_t j = 0; j < fg->tunnel_count; j++) {
-            pfds[j].fd = fg->tunnel_udp_fds[j];
-            pfds[j].events = POLLIN;
-        }
-
-        if (poll(pfds, fg->tunnel_count, 100) <= 0)
+        if (poll(&pfd, 1, 100) <= 0)
             continue;
 
-        for (size_t j = 0; j < fg->tunnel_count; j++) {
-            if (!(pfds[j].revents & POLLIN))
-                continue;
+        ssize_t n = recvfrom(rx_fd, rx_buf, 4096, 0, NULL, NULL);
+        if (n <= 0) continue;
 
-            /* Receive UDP payload: VXLAN Header (8 bytes) + Inner data */
-            ssize_t n = recv(pfds[j].fd, rx_buf, 4096, 0);
-            if (n <= (ssize_t)VXLAN_HDR_SIZE)
-                continue;
+        total_pkts++;
 
-            total_pkts++;
+        /* ---- FILTER: Outer Eth(14) + Outer IP(20) + Outer UDP(8) + VXLAN(8) = 50 min ---- */
+        if ((uint32_t)n < 14 + 20 + 8 + VXLAN_HDR_SIZE) continue;
 
-            /* Read VXLAN header (first 8 bytes) */
-            vxlan_hdr_t *vxhdr = (vxlan_hdr_t *)rx_buf;
-            uint16_t pkt_id;
-            uint8_t frag_index;
-            vxlan_hdr_read_frag(vxhdr, &pkt_id, &frag_index);
+        /* Check outer Ethertype = IPv4 (0x0800) */
+        uint16_t outer_ethertype = ((uint16_t)rx_buf[12] << 8) | rx_buf[13];
+        if (outer_ethertype != 0x0800) continue;
 
-            /* Inner data starts after VXLAN header */
-            uint8_t *inner_data = rx_buf + VXLAN_HDR_SIZE;
-            uint32_t inner_len = (uint32_t)(n - VXLAN_HDR_SIZE);
+        /* Check outer IP protocol = UDP (17) */
+        uint8_t outer_ip_proto = rx_buf[14 + 9];
+        if (outer_ip_proto != 17) continue;
 
-            if (frag_index == VXLAN_FRAG_NONE) {
-                /* ---- Unfragmented: inner_data is a complete Ethernet frame ---- */
-                if (inner_len < 14) {
-                    non_ip++;
-                    continue;
-                }
+        /* Get outer IP header length (may have options) */
+        int outer_ihl = (rx_buf[14] & 0x0F) * 4;
+        if (outer_ihl < 20) continue;
+        if ((uint32_t)n < (uint32_t)(14 + outer_ihl + 8 + VXLAN_HDR_SIZE)) continue;
 
-                uint8_t *ip_data = inner_data + 14;
+        /* Check outer UDP destination port matches one of our tunnel ports */
+        int udp_offset = 14 + outer_ihl;
+        uint16_t dst_port = ((uint16_t)rx_buf[udp_offset + 2] << 8) | rx_buf[udp_offset + 3];
+
+        int port_match = 0;
+        for (size_t p = 0; p < tunnel_port_count; p++) {
+            if (dst_port == tunnel_ports[p]) { port_match = 1; break; }
+        }
+        if (!port_match) continue;
+
+        filtered++;
+
+        /* ---- Strip outer headers: Eth(14) + IP(outer_ihl) + UDP(8) ---- */
+        int vxlan_offset = 14 + outer_ihl + 8;
+
+        /* Read VXLAN header */
+        vxlan_hdr_t *vxhdr = (vxlan_hdr_t *)(rx_buf + vxlan_offset);
+        uint16_t pkt_id;
+        uint8_t frag_index;
+        vxlan_hdr_read_frag(vxhdr, &pkt_id, &frag_index);
+
+        /* Inner data starts after VXLAN header */
+        int inner_offset = vxlan_offset + VXLAN_HDR_SIZE;
+        uint8_t *inner_data = rx_buf + inner_offset;
+        uint32_t inner_len = (uint32_t)(n - inner_offset);
+
+        if (frag_index == VXLAN_FRAG_NONE) {
+            /* ---- Unfragmented: inner_data is a complete Ethernet frame ---- */
+            if (inner_len < 14) continue;
+
+            uint8_t *ip_data = inner_data + 14;
+            int is_ipv4 = ((ip_data[0] >> 4) == 4);
+            if (is_ipv4) {
+                memcpy(inner_data, cached_eth_ipv4, 14);
+                sa.sll_protocol = htons(ETH_P_IP);
+            } else {
+                memcpy(inner_data, cached_eth_ipv6, 14);
+                sa.sll_protocol = htons(ETH_P_IPV6);
+            }
+
+            sendto(w->tx_fd, inner_data, inner_len, 0,
+                   (struct sockaddr *)&sa, sizeof(sa));
+            pkt_cnt++;
+        } else {
+            /* ---- Fragmented: store or reassemble ---- */
+            if (!fg->frag_tbl) continue;
+
+            uint32_t reassem_len = 0;
+            int ret = frag_store_or_reassemble(fg->frag_tbl,
+                                               inner_data, inner_len,
+                                               pkt_id, frag_index,
+                                               reassem_buf, &reassem_len);
+            if (ret == 1) {
+                /* Reassembled: complete original Ethernet frame */
+                if (reassem_len < 14) continue;
+
+                uint8_t *ip_data = reassem_buf + 14;
                 int is_ipv4 = ((ip_data[0] >> 4) == 4);
                 if (is_ipv4) {
-                    memcpy(inner_data, cached_eth_ipv4, 14);
+                    memcpy(reassem_buf, cached_eth_ipv4, 14);
                     sa.sll_protocol = htons(ETH_P_IP);
                 } else {
-                    memcpy(inner_data, cached_eth_ipv6, 14);
+                    memcpy(reassem_buf, cached_eth_ipv6, 14);
                     sa.sll_protocol = htons(ETH_P_IPV6);
                 }
 
-                sendto(w->tx_fd, inner_data, inner_len, 0,
+                sendto(w->tx_fd, reassem_buf, reassem_len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
                 pkt_cnt++;
-            } else {
-                /* ---- Fragmented: store or reassemble ---- */
-                if (!fg->frag_tbl)
-                    continue;
-
-                uint32_t reassem_len = 0;
-                int ret = frag_store_or_reassemble(fg->frag_tbl,
-                                                   inner_data, inner_len,
-                                                   pkt_id, frag_index,
-                                                   reassem_buf, &reassem_len);
-                if (ret == 1) {
-                    /* Reassembled: we have the complete original Ethernet frame */
-                    if (reassem_len < 14) {
-                        non_ip++;
-                        continue;
-                    }
-
-                    uint8_t *ip_data = reassem_buf + 14;
-                    int is_ipv4 = ((ip_data[0] >> 4) == 4);
-                    if (is_ipv4) {
-                        memcpy(reassem_buf, cached_eth_ipv4, 14);
-                        sa.sll_protocol = htons(ETH_P_IP);
-                    } else {
-                        memcpy(reassem_buf, cached_eth_ipv6, 14);
-                        sa.sll_protocol = htons(ETH_P_IPV6);
-                    }
-
-                    sendto(w->tx_fd, reassem_buf, reassem_len, 0,
-                           (struct sockaddr *)&sa, sizeof(sa));
-                    pkt_cnt++;
-                }
-                /* ret == 0: stored fragment, waiting for counterpart */
             }
-        } /* end for j */
+            /* ret == 0: stored fragment, waiting for counterpart */
+        }
     }
 
     free(rx_buf);
     free(reassem_buf);
-    log_info("Worker inbound[%d] stopped: total=%lu non_ip=%lu forwarded=%lu",
-             w->id, total_pkts, non_ip, pkt_cnt);
+    close(rx_fd);
+    log_info("Worker inbound[%d] stopped: total=%lu filtered=%lu forwarded=%lu",
+             w->id, total_pkts, filtered, pkt_cnt);
 }
