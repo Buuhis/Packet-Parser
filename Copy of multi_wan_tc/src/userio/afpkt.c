@@ -565,8 +565,13 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         if (poll(&pfd, 1, 100) <= 0)
             continue;
 
-        ssize_t n = recvfrom(rx_fd, rx_buf, 4096, 0, NULL, NULL);
+        struct sockaddr_ll from;
+        socklen_t fromlen = sizeof(from);
+        ssize_t n = recvfrom(rx_fd, rx_buf, 4096, 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0) continue;
+
+        /* Skip if packet is outgoing (sent by us) */
+        if (from.sll_pkttype == PACKET_OUTGOING) continue;
 
         total_pkts++;
 
@@ -583,6 +588,9 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         /* Check outer Ethertype = IPv4 (0x0800) */
         uint16_t outer_ethertype = ((uint16_t)rx_buf[12] << 8) | rx_buf[13];
         if (outer_ethertype != 0x0800) continue;
+
+        /* Filter: ignore if the source MAC is our own (extra safety against loopback) */
+        if (memcmp(rx_buf + 6, fg->local.src_mac, 6) == 0) continue;
 
         /* Check outer IP protocol = UDP (17) */
         uint8_t outer_ip_proto = rx_buf[14 + 9];
@@ -647,12 +655,13 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             ssize_t tx_rc = sendto(w->tx_fd, inner_data, inner_len, 0,
                    (struct sockaddr *)&sa, sizeof(sa));
-            pkt_cnt++;
-            if (pkt_cnt <= 5) {
-                log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd%s",
-                         w->id, pkt_cnt, inner_len, tx_rc,
-                         tx_rc < 0 ? strerror(errno) : "");
-            }
+                if (pkt_cnt <= 5) {
+                    log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                             w->id, pkt_cnt, inner_len, tx_rc,
+                             cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
+                             cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
+                    if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
+                }
         } else {
             /* ---- Fragmented: store or reassemble ---- */
             if (!fg->frag_tbl) continue;
@@ -678,11 +687,12 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 ssize_t tx_rc = sendto(w->tx_fd, reassem_buf, reassem_len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
-                pkt_cnt++;
                 if (pkt_cnt <= 5) {
-                    log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd%s",
+                    log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
                              w->id, pkt_cnt, reassem_len, tx_rc,
-                             tx_rc < 0 ? strerror(errno) : "");
+                             cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
+                             cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
+                    if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
                 }
             }
             /* ret == 0: stored fragment, waiting for counterpart */
