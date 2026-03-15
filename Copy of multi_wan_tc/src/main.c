@@ -116,12 +116,13 @@ typedef struct {
     afpkt_worker_t *worker;
     const afpkt_fanout_t *fg;
     app_context_t *ctx;
+    char           listen_ifname[IF_NAMESIZE]; // Changed from 16 to IF_NAMESIZE
     volatile int *running;
 } in_arg_t;
 
 static void *in_fn(void *a) {
     in_arg_t *ina = (in_arg_t *)a;
-    afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->running);
+    afpkt_worker_loop_inbound(ina->worker, ina->fg, ina->ctx, ina->listen_ifname, ina->running);
     return NULL;
 }
 
@@ -297,12 +298,20 @@ static int start_dataplane(app_context_t *ctx) {
     }
 
     /* Single inbound worker (reads from UDP, writes to LAN) */
+    /* NOTE: We bind to the physical interface (local_if used as WAN placeholder in some setups) 
+       or we should pass the specific WAN interface from config. */
     g_in_args[0] = (in_arg_t){
         .worker = &in_workers[0],
         .fg = &fg_out,
         .ctx = ctx,
         .running = &running_dataplane,
     };
+    /* Change this to the actual WAN ifname (e.g. enp4s0) if known, 
+       for now we try to use the first tunnel gateway's interface if possible, 
+       but here we'll use a placeholder or let user define via env. */
+    strncpy(g_in_args[0].listen_ifname, ctx->cfg.local_if, IF_NAMESIZE - 1); // Changed from 15 to IF_NAMESIZE - 1
+    g_in_args[0].listen_ifname[IF_NAMESIZE - 1] = '\0'; // Ensure null termination
+    
     if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[0]) != 0) {
         log_error("Failed to create inbound worker");
         goto cleanup_threads;

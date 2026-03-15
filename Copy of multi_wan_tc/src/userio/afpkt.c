@@ -391,13 +391,13 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 ip_pkts++;
 
-                /* DEBUG: log first few IP packets */
-                if (ip_pkts <= 5) {
-                    struct iphdr *dbg_ip = (struct iphdr *)(frame + 14);
-                    log_info("OUT[%d] IP pkt #%lu: len=%u proto=0x%04x src=%08x dst=%08x",
-                             w->id, ip_pkts, len, h_proto,
-                             ntohl(dbg_ip->saddr), ntohl(dbg_ip->daddr));
-                }
+                // /* DEBUG: log first few IP packets */
+                // if (ip_pkts <= 5) {
+                //     struct iphdr *dbg_ip = (struct iphdr *)(frame + 14);
+                //     log_info("OUT[%d] IP pkt #%lu: len=%u proto=0x%04x src=%08x dst=%08x",
+                //              w->id, ip_pkts, len, h_proto,
+                //              ntohl(dbg_ip->saddr), ntohl(dbg_ip->daddr));
+                // }
 
                 uint32_t hash = calculate_5tuple_hash(frame, len);
                 int tunnel_idx = hash % tunnel_count;
@@ -407,12 +407,12 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 pkt_cnt++;
 
-                /* DEBUG: log sendto details for first few */
-                if (pkt_cnt <= 5) {
-                    log_info("OUT[%d] sendto tunnel[%d] fd=%d len=%u frag=%s",
-                             w->id, tunnel_idx, fg->tunnel_udp_fds[tunnel_idx], len,
-                             frag_need_split((uint32_t)len) ? "YES" : "NO");
-                }
+                // /* DEBUG: log sendto details for first few */
+                // if (pkt_cnt <= 5) {
+                //     log_info("OUT[%d] sendto tunnel[%d] fd=%d len=%u frag=%s",
+                //              w->id, tunnel_idx, fg->tunnel_udp_fds[tunnel_idx], len,
+                //              frag_need_split((uint32_t)len) ? "YES" : "NO");
+                // }
 
                 if (frag_need_split((uint32_t)len)) {
                     /* Split the raw Ethernet frame into 2 halves */
@@ -449,8 +449,9 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                         log_error("OUT[%d] frag2 sendto failed: %s", w->id, strerror(errno));
                 } else {
                     /* Non-fragmented: VXLAN(frag=NONE) + whole frame */
+                    uint16_t pkt_id = frag_next_pkt_id(); 
                     vxlan_hdr_t vx;
-                    vxlan_hdr_build_frag(&vx, VXLAN_DEFAULT_VNI, 0, VXLAN_FRAG_NONE);
+                    vxlan_hdr_build_frag(&vx, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_NONE);
                     memcpy(vxlan_buf, &vx, VXLAN_HDR_SIZE);
                     memcpy(vxlan_buf + VXLAN_HDR_SIZE, frame, len);
 
@@ -488,7 +489,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
  *          → rewrite Inner MAC → forward to local_if via AF_PACKET TX
  */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
-                                const app_context_t *ctx, volatile int *running)
+                                const app_context_t *ctx, const char *listen_ifname, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
     unsigned long total_pkts = 0;
@@ -511,12 +512,30 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         }
     }
 
-    /* ---- Open AF_PACKET RX socket (all interfaces) ---- */
+    /* ---- Open AF_PACKET RX socket (ONLY on targeted interface) ---- */
     int rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (rx_fd < 0) {
         log_error("Worker inbound[%d]: cannot create AF_PACKET RX socket: %s",
                   w->id, strerror(errno));
         return;
+    }
+
+    if (listen_ifname) {
+        int ifidx = if_nametoindex(listen_ifname);
+        if (ifidx > 0) {
+            struct sockaddr_ll sll = {
+                .sll_family = AF_PACKET,
+                .sll_protocol = htons(ETH_P_ALL),
+                .sll_ifindex = ifidx,
+            };
+            if (bind(rx_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+                log_error("Worker inbound[%d]: bind to %s failed: %s", 
+                          w->id, listen_ifname, strerror(errno));
+            } else {
+                log_info("Worker inbound[%d]: strictly bound to interface %s (index %d)", 
+                         w->id, listen_ifname, ifidx);
+            }
+        }
     }
 
     /* Ignore packets sent by our own machine (avoid loops) */
@@ -573,14 +592,18 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         /* Skip if packet is outgoing (sent by us) */
         if (from.sll_pkttype == PACKET_OUTGOING) continue;
 
+        /* Anti-duplication: Ignore packets captured on the local interface.
+           Inbound VXLAN traffic should only come from WAN or tunnel interfaces. */
+        if (from.sll_ifindex == fg->local.ifindex) continue;
+
         total_pkts++;
 
-        /* DEBUG: log first few raw captures to verify AF_PACKET is working */
-        if (total_pkts <= 3) {
-            log_info("IN[%d] raw capture #%lu: len=%zd ethertype=0x%04x",
-                     w->id, total_pkts, n,
-                     (uint32_t)((rx_buf[12] << 8) | rx_buf[13]));
-        }
+        // /* DEBUG: log first few raw captures to verify AF_PACKET is working */
+        // if (total_pkts <= 3) {
+        //     log_info("IN[%d] raw capture #%lu: len=%zd ethertype=0x%04x",
+        //              w->id, total_pkts, n,
+        //              (uint32_t)((rx_buf[12] << 8) | rx_buf[13]));
+        // }
 
         /* ---- FILTER: Outer Eth(14) + Outer IP(20) + Outer UDP(8) + VXLAN(8) = 50 min ---- */
         if ((uint32_t)n < 14 + 20 + 8 + VXLAN_HDR_SIZE) continue;
@@ -656,10 +679,10 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             ssize_t tx_rc = sendto(w->tx_fd, inner_data, inner_len, 0,
                    (struct sockaddr *)&sa, sizeof(sa));
                 if (pkt_cnt <= 5) {
-                    log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                             w->id, pkt_cnt, inner_len, tx_rc,
-                             cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
-                             cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
+                    // log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                    //          w->id, pkt_cnt, inner_len, tx_rc,
+                    //          cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
+                    //          cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
                     if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
                 }
         } else {
@@ -688,10 +711,10 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 ssize_t tx_rc = sendto(w->tx_fd, reassem_buf, reassem_len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
                 if (pkt_cnt <= 5) {
-                    log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                             w->id, pkt_cnt, reassem_len, tx_rc,
-                             cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
-                             cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
+                    // log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
+                    //          w->id, pkt_cnt, reassem_len, tx_rc,
+                    //          cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
+                    //          cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
                     if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
                 }
             }

@@ -65,6 +65,6 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
 /* Inbound: receive VXLAN from UDP → strip → reassemble → forward to LAN */
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
-                                const app_context_t *ctx, volatile int *running);
+                                const app_context_t *ctx, const char *listen_ifname, volatile int *running);
 
 #endif /* AFPKT_H */
