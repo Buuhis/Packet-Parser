@@ -391,6 +391,14 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 ip_pkts++;
 
+                /* DEBUG: log first few IP packets */
+                if (ip_pkts <= 5) {
+                    struct iphdr *dbg_ip = (struct iphdr *)(frame + 14);
+                    log_info("OUT[%d] IP pkt #%lu: len=%u proto=0x%04x src=%08x dst=%08x",
+                             w->id, ip_pkts, len, h_proto,
+                             ntohl(dbg_ip->saddr), ntohl(dbg_ip->daddr));
+                }
+
                 uint32_t hash = calculate_5tuple_hash(frame, len);
                 int tunnel_idx = hash % tunnel_count;
 
@@ -398,6 +406,13 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     goto next_pkt;
 
                 pkt_cnt++;
+
+                /* DEBUG: log sendto details for first few */
+                if (pkt_cnt <= 5) {
+                    log_info("OUT[%d] sendto tunnel[%d] fd=%d len=%u frag=%s",
+                             w->id, tunnel_idx, fg->tunnel_udp_fds[tunnel_idx], len,
+                             frag_need_split((uint32_t)len) ? "YES" : "NO");
+                }
 
                 if (frag_need_split((uint32_t)len)) {
                     /* Split the raw Ethernet frame into 2 halves */
@@ -412,10 +427,12 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(pkt1, &vx1, VXLAN_HDR_SIZE);
                     memcpy(pkt1 + VXLAN_HDR_SIZE, frame, half1);
 
-                    sendto(fg->tunnel_udp_fds[tunnel_idx], pkt1,
+                    ssize_t rc1 = sendto(fg->tunnel_udp_fds[tunnel_idx], pkt1,
                            VXLAN_HDR_SIZE + half1, 0,
                            (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
                            sizeof(struct sockaddr_in));
+                    if (rc1 < 0 && pkt_cnt <= 5)
+                        log_error("OUT[%d] frag1 sendto failed: %s", w->id, strerror(errno));
 
                     /* Fragment 2: VXLAN(frag=LAST) + second half of frame */
                     vxlan_hdr_t vx2;
@@ -424,10 +441,12 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(pkt2, &vx2, VXLAN_HDR_SIZE);
                     memcpy(pkt2 + VXLAN_HDR_SIZE, frame + half1, half2);
 
-                    sendto(fg->tunnel_udp_fds[tunnel_idx], pkt2,
+                    ssize_t rc2 = sendto(fg->tunnel_udp_fds[tunnel_idx], pkt2,
                            VXLAN_HDR_SIZE + half2, 0,
                            (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
                            sizeof(struct sockaddr_in));
+                    if (rc2 < 0 && pkt_cnt <= 5)
+                        log_error("OUT[%d] frag2 sendto failed: %s", w->id, strerror(errno));
                 } else {
                     /* Non-fragmented: VXLAN(frag=NONE) + whole frame */
                     vxlan_hdr_t vx;
@@ -435,10 +454,12 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(vxlan_buf, &vx, VXLAN_HDR_SIZE);
                     memcpy(vxlan_buf + VXLAN_HDR_SIZE, frame, len);
 
-                    sendto(fg->tunnel_udp_fds[tunnel_idx], vxlan_buf,
+                    ssize_t rc = sendto(fg->tunnel_udp_fds[tunnel_idx], vxlan_buf,
                            VXLAN_HDR_SIZE + len, 0,
                            (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
                            sizeof(struct sockaddr_in));
+                    if (rc < 0 && pkt_cnt <= 5)
+                        log_error("OUT[%d] sendto failed: %s", w->id, strerror(errno));
                 }
 
             next_pkt:
@@ -450,7 +471,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         }
     }
     free(vxlan_buf);
-    log_info("Worker outbound[%d] stopped: captured=%lu ip_pkts=%lu processed=%lu",
+    log_info("OUT[%d] FINAL: captured=%lu ip_pkts=%lu forwarded=%lu",
              w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
 
@@ -549,6 +570,13 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
         total_pkts++;
 
+        /* DEBUG: log first few raw captures to verify AF_PACKET is working */
+        if (total_pkts <= 3) {
+            log_info("IN[%d] raw capture #%lu: len=%zd ethertype=0x%04x",
+                     w->id, total_pkts, n,
+                     (uint32_t)((rx_buf[12] << 8) | rx_buf[13]));
+        }
+
         /* ---- FILTER: Outer Eth(14) + Outer IP(20) + Outer UDP(8) + VXLAN(8) = 50 min ---- */
         if ((uint32_t)n < 14 + 20 + 8 + VXLAN_HDR_SIZE) continue;
 
@@ -577,6 +605,12 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
         filtered++;
 
+        /* DEBUG: log matched VXLAN packets */
+        if (filtered <= 10) {
+            log_info("IN[%d] MATCH #%lu: dst_port=%u outer_len=%zd ihl=%d",
+                     w->id, filtered, dst_port, n, outer_ihl);
+        }
+
         /* ---- Strip outer headers: Eth(14) + IP(outer_ihl) + UDP(8) ---- */
         int vxlan_offset = 14 + outer_ihl + 8;
 
@@ -590,6 +624,12 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         int inner_offset = vxlan_offset + VXLAN_HDR_SIZE;
         uint8_t *inner_data = rx_buf + inner_offset;
         uint32_t inner_len = (uint32_t)(n - inner_offset);
+
+        /* DEBUG: log VXLAN header parse result */
+        if (filtered <= 10) {
+            log_info("IN[%d] VXLAN: frag=%u pkt_id=%u inner_len=%u vxlan_offset=%d",
+                     w->id, frag_index, pkt_id, inner_len, vxlan_offset);
+        }
 
         if (frag_index == VXLAN_FRAG_NONE) {
             /* ---- Unfragmented: inner_data is a complete Ethernet frame ---- */
@@ -605,9 +645,14 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 sa.sll_protocol = htons(ETH_P_IPV6);
             }
 
-            sendto(w->tx_fd, inner_data, inner_len, 0,
+            ssize_t tx_rc = sendto(w->tx_fd, inner_data, inner_len, 0,
                    (struct sockaddr *)&sa, sizeof(sa));
             pkt_cnt++;
+            if (pkt_cnt <= 5) {
+                log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd%s",
+                         w->id, pkt_cnt, inner_len, tx_rc,
+                         tx_rc < 0 ? strerror(errno) : "");
+            }
         } else {
             /* ---- Fragmented: store or reassemble ---- */
             if (!fg->frag_tbl) continue;
@@ -631,9 +676,14 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     sa.sll_protocol = htons(ETH_P_IPV6);
                 }
 
-                sendto(w->tx_fd, reassem_buf, reassem_len, 0,
+                ssize_t tx_rc = sendto(w->tx_fd, reassem_buf, reassem_len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
                 pkt_cnt++;
+                if (pkt_cnt <= 5) {
+                    log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd%s",
+                             w->id, pkt_cnt, reassem_len, tx_rc,
+                             tx_rc < 0 ? strerror(errno) : "");
+                }
             }
             /* ret == 0: stored fragment, waiting for counterpart */
         }
@@ -642,6 +692,6 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     free(rx_buf);
     free(reassem_buf);
     close(rx_fd);
-    log_info("Worker inbound[%d] stopped: total=%lu filtered=%lu forwarded=%lu",
+    log_info("IN[%d] FINAL: total_raw=%lu filtered_vxlan=%lu forwarded=%lu",
              w->id, total_pkts, filtered, pkt_cnt);
 }
