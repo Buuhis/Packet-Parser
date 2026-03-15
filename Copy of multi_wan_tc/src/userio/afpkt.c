@@ -613,10 +613,10 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
         filtered++;
 
-        /* DEBUG: log matched VXLAN packets */
+        /* DEBUG: log matched VXLAN packets + Interface ID to detect Bridge Duplication */
         if (filtered <= 10) {
-            log_info("IN[%d] MATCH #%lu: dst_port=%u outer_len=%zd ihl=%d",
-                     w->id, filtered, dst_port, n, outer_ihl);
+            log_info("IN[%d] MATCH #%lu: ifindex=%d dst_port=%u outer_len=%zd ihl=%d",
+                     w->id, filtered, from.sll_ifindex, dst_port, n, outer_ihl);
         }
 
         /* ---- Strip outer headers: Eth(14) + IP(outer_ihl) + UDP(8) ---- */
