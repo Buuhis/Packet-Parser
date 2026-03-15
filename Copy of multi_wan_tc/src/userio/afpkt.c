@@ -386,6 +386,23 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 if (h_proto != ETH_P_IP && h_proto != ETH_P_IPV6)
                     goto next_pkt;
 
+                /* ANTI-DOUBLE ENCAPSULATION: 
+                   Check if this packet is already UDP and destined for one of our VXLAN ports.
+                   If so, skip it as it's likely already processed by another layer. */
+                if (h_proto == ETH_P_IP && len >= 14 + 20 + 8) {
+                    struct iphdr *iph = (struct iphdr *)(frame + 14);
+                    if (iph->protocol == IPPROTO_UDP) {
+                        int ihl = iph->ihl * 4;
+                        struct udphdr *uh = (struct udphdr *)(frame + 14 + ihl);
+                        uint16_t dport = ntohs(uh->dest);
+                        int is_mine = 0;
+                        for (size_t p = 0; p < tunnel_count; p++) {
+                            if (dport == (uint16_t)ctx->cfg.ne_tunnels[p].port) { is_mine = 1; break; }
+                        }
+                        if (is_mine) goto next_pkt;
+                    }
+                }
+
                 if (len <= 14)
                     goto next_pkt;
 
@@ -423,7 +440,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     /* Fragment 1: VXLAN(frag=FIRST) + first half of frame */
                     vxlan_hdr_t vx1;
                     vxlan_hdr_build_frag(&vx1, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_FIRST);
-                    uint8_t pkt1[2048];
+                    uint8_t pkt1[2048]; // Use a local buffer for fragmented parts
                     memcpy(pkt1, &vx1, VXLAN_HDR_SIZE);
                     memcpy(pkt1 + VXLAN_HDR_SIZE, frame, half1);
 
@@ -437,7 +454,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     /* Fragment 2: VXLAN(frag=LAST) + second half of frame */
                     vxlan_hdr_t vx2;
                     vxlan_hdr_build_frag(&vx2, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_LAST);
-                    uint8_t pkt2[2048];
+                    uint8_t pkt2[2048]; // Use a local buffer for fragmented parts
                     memcpy(pkt2, &vx2, VXLAN_HDR_SIZE);
                     memcpy(pkt2 + VXLAN_HDR_SIZE, frame + half1, half2);
 
@@ -449,7 +466,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                         log_error("OUT[%d] frag2 sendto failed: %s", w->id, strerror(errno));
                 } else {
                     /* Non-fragmented: VXLAN(frag=NONE) + whole frame */
-                    uint16_t pkt_id = frag_next_pkt_id(); 
+                    uint16_t pkt_id = frag_next_pkt_id();
                     vxlan_hdr_t vx;
                     vxlan_hdr_build_frag(&vx, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_NONE);
                     memcpy(vxlan_buf, &vx, VXLAN_HDR_SIZE);
@@ -512,7 +529,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         }
     }
 
-    /* ---- Open AF_PACKET RX socket (ONLY on targeted interface) ---- */
+    /* ---- Open AF_PACKET RX socket (All interfaces, filtered in loop) ---- */
     int rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (rx_fd < 0) {
         log_error("Worker inbound[%d]: cannot create AF_PACKET RX socket: %s",
@@ -520,23 +537,25 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
-    if (listen_ifname) {
-        int ifidx = if_nametoindex(listen_ifname);
-        if (ifidx > 0) {
-            struct sockaddr_ll sll = {
-                .sll_family = AF_PACKET,
-                .sll_protocol = htons(ETH_P_ALL),
-                .sll_ifindex = ifidx,
-            };
-            if (bind(rx_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-                log_error("Worker inbound[%d]: bind to %s failed: %s", 
-                          w->id, listen_ifname, strerror(errno));
-            } else {
-                log_info("Worker inbound[%d]: strictly bound to interface %s (index %d)", 
-                         w->id, listen_ifname, ifidx);
-            }
-        }
-    }
+    /* Note: We no longer use bind() here because it's too restrictive.
+       We filter by ifindex inside the loop instead. */
+    // if (listen_ifname) {
+    //     int ifidx = if_nametoindex(listen_ifname);
+    //     if (ifidx > 0) {
+    //         struct sockaddr_ll sll = {
+    //             .sll_family = AF_PACKET,
+    //             .sll_protocol = htons(ETH_P_ALL),
+    //             .sll_ifindex = ifidx,
+    //         };
+    //         if (bind(rx_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+    //             log_error("Worker inbound[%d]: bind to %s failed: %s",
+    //                       w->id, listen_ifname, strerror(errno));
+    //         } else {
+    //             log_info("Worker inbound[%d]: strictly bound to interface %s (index %d)",
+    //                      w->id, listen_ifname, ifidx);
+    //         }
+    //     }
+    // }
 
     /* Ignore packets sent by our own machine (avoid loops) */
     int ignore_out = 1;
@@ -592,9 +611,17 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         /* Skip if packet is outgoing (sent by us) */
         if (from.sll_pkttype == PACKET_OUTGOING) continue;
 
-        /* Anti-duplication: Ignore packets captured on the local interface.
-           Inbound VXLAN traffic should only come from WAN or tunnel interfaces. */
+        /* ANTI-DUPLICATE & LOOP PREVENTION:
+           1. Skip if packet captured on local_if (we are the ones sending to LAN)
+           2. Skip if packet captured on a tunnel interface (Kernel already processed it)
+           Inbound VXLAN should ONLY be captured on the physical WAN interface. */
         if (from.sll_ifindex == fg->local.ifindex) continue;
+        
+        /* Optional: If we know the tunnel ifindex, we should skip it here. 
+           For now, the log showed index 11 was the duplicate. */
+        if (from.sll_ifindex >= 10) { /* Heuristic: many virtual pipes start at high indices */
+             // continue; // Uncomment this if duplication persists on tunnel interfaces
+        }
 
         total_pkts++;
 

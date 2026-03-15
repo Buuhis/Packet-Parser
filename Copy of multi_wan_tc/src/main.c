@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <net/ethernet.h>
+#include <net/if.h>
 #include <features.h>
 
 /* ---------- global state ---------- */
