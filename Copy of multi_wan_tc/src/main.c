@@ -231,7 +231,7 @@ static int start_dataplane(app_context_t *ctx) {
 
     /* ---- STEP 6: Init caches ---- */
     afpkt_fanout_init_cache_outbound(&fg_out, ctx);
-    /* Note: Inbound workers will use fg_out.local for LAN MAC/ifindex info */
+    afpkt_fanout_init_cache_inbound(&fg_out, ctx); /* Populate LAN info (MAC/ifindex) */
 
     int num_available_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (num_available_cores <= 0) num_available_cores = 1;
