@@ -93,6 +93,25 @@ static inline uint32_t calculate_5tuple_hash(const uint8_t *frame, uint32_t len)
     return hash;
 }
 
+#include <linux/filter.h>
+
+/* BPF Filter for MWAN_ETHERTYPE (0x88B5) */
+static void afpkt_set_mwan_filter(int fd) {
+    struct sock_filter code[] = {
+        { 0x28, 0, 0, 0x0000000c }, /* L0: ldH [12] (EtherType) */
+        { 0x15, 0, 1, 0x000088b5 }, /* L1: if == 0x88B5 goto L2, else goto L3 */
+        { 0x06, 0, 0, 0x0000ffff }, /* L2: ret ALL */
+        { 0x06, 0, 0, 0x00000000 }, /* L3: ret 0 */
+    };
+    struct sock_fprog bpf = {
+        .len = (unsigned short)(sizeof(code)/sizeof(code[0])),
+        .filter = code,
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf)) < 0) {
+        log_warn("Failed to attach BPF filter: %s", strerror(errno));
+    }
+}
+
 int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id, int num_workers)
 {
     memset(fg, 0, sizeof(*fg));
@@ -100,11 +119,13 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
     fg->num_workers = num_workers;
     fg->fanout_group_id = fanout_group_id;
 
-    int ifidx = if_nametoindex(ifname);
-    if (ifidx == 0)
-    {
-        log_error("if_nametoindex(%s) failed", ifname);
-        return -1;
+    int ifidx = 0;
+    if (ifname) {
+        ifidx = if_nametoindex(ifname);
+        if (ifidx == 0) {
+            log_error("if_nametoindex(%s) failed", ifname);
+            return -1;
+        }
     }
 
     for (int i = 0; i < num_workers; i++)
@@ -199,7 +220,12 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
             return -1;
         }
 
-        /* 6. TX socket */
+        /* 6. Apply BPF Filter for Inbound groups (group 2+) */
+        if (fanout_group_id >= 2) {
+            afpkt_set_mwan_filter(w->rx_fd);
+        }
+
+        /* 7. TX socket */
         w->tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
         if (w->tx_fd < 0)
         {
@@ -492,29 +518,15 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long total_raw = 0;
     unsigned long handled = 0;
 
-    log_info("Worker inbound[%d] started (ZeroCopy Forwarding)", w->id);
+    log_info("Worker inbound[%d] started (TPACKET_V3 Batch Forwarding)", w->id);
 
-    int rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (rx_fd < 0) {
-        log_error("Worker inbound[%d]: socket(RX) failed: %s", w->id, strerror(errno));
-        return;
-    }
-    int rcvbuf = 16 * 1024 * 1024;
-    setsockopt(rx_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
-
-    /* Pre-prepare LAN Ethernet header template (Outside Loop) */
+    /* Pre-prepare LAN Ethernet header template */
     struct ethhdr lan_eth;
     memcpy(lan_eth.h_source, fg->local.src_mac, 6);
     memcpy(lan_eth.h_dest, ctx->cfg.lan.dst_mac, 6);
 
-    uint8_t *rx_buf = malloc(4096);
     uint8_t *reassem_buf = malloc(4096);
-    if (!rx_buf || !reassem_buf) {
-        log_error("Worker inbound[%d]: malloc failed", w->id);
-        if (rx_buf) free(rx_buf);
-        if (reassem_buf) free(reassem_buf);
-        close(rx_fd); return;
-    }
+    if (!reassem_buf) return;
 
     struct iovec iov[2];
     struct msghdr msg;
@@ -531,81 +543,80 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     msg.msg_iov = iov;
     msg.msg_iovlen = 2;
 
-    struct pollfd pfd = {.fd = rx_fd, .events = POLLIN};
-
     while (*running)
     {
-        if (poll(&pfd, 1, 100) <= 0) continue;
+        struct tpacket_block_desc *bd = (struct tpacket_block_desc *)
+            ((char *)w->ring + (w->current_block * V3_BLOCK_SIZE));
 
-        struct sockaddr_ll from;
-        socklen_t fromlen = sizeof(from);
-        ssize_t n = recvfrom(rx_fd, rx_buf, 4096, 0, (struct sockaddr *)&from, &fromlen);
-        if (n <= 0) continue;
-        if (from.sll_pkttype == PACKET_OUTGOING) continue;
-
-        /* Filter: Only traffic from our tunnel interfaces */
-        int is_tunnel = 0;
-        for (size_t i = 0; i < fg->tunnel_count; i++) {
-            if (from.sll_ifindex == fg->tunnel_ifindices[i]) {
-                is_tunnel = 1; break;
-            }
+        if ((bd->hdr.bh1.block_status & TP_STATUS_USER) == 0) {
+            struct pollfd pfd = {.fd = w->rx_fd, .events = POLLIN};
+            poll(&pfd, 1, 10);
+            continue;
         }
-        if (!is_tunnel) continue;
 
-        total_raw++;
-        struct ethhdr *eth = (struct ethhdr *)rx_buf;
-        
-        /* Must be our custom EtherType for identification */
-        if (ntohs(eth->h_proto) != MWAN_ETHERTYPE) continue;
-        if (n < (ssize_t)(14 + MWAN_METADATA_SIZE)) continue;
+        int num_pkts = bd->hdr.bh1.num_pkts;
+        struct tpacket3_hdr *ppd =
+            (struct tpacket3_hdr *)((char *)bd + bd->hdr.bh1.offset_to_first_pkt);
 
-        uint16_t pkt_id;
-        uint8_t frag_index;
-        if (mwan_metadata_read(rx_buf + 14, &pkt_id, &frag_index) != 0) continue;
+        for (int i = 0; i < num_pkts; i++)
+        {
+            unsigned char *frame = (unsigned char *)ppd + ppd->tp_mac;
+            unsigned int len = ppd->tp_snaplen;
 
-        uint8_t *ip_data = NULL;
-        uint32_t ip_len = 0;
+            total_raw++;
 
-        if (frag_index == MWAN_FRAG_NONE) {
-            ip_data = rx_buf + 14 + MWAN_METADATA_SIZE;
-            ip_len = (uint32_t)(n - (14 + MWAN_METADATA_SIZE));
-        } else {
-            /* Reassembly case: involves mandatory copy but optimized storage */
-            uint32_t rlen = 0;
-            int ret = frag_store_or_reassemble(fg->frag_tbl,
-                                               rx_buf + 14 + MWAN_METADATA_SIZE,
-                                               (uint32_t)(n - (14 + MWAN_METADATA_SIZE)),
-                                               pkt_id, frag_index,
-                                               reassem_buf, &rlen);
-            if (ret == 1) {
-                ip_data = reassem_buf;
-                ip_len = rlen;
+            /* With BPF attached, we ONLY get MWAN_ETHERTYPE packets here */
+            if (len < (14 + MWAN_METADATA_SIZE)) goto next_pkt;
+            
+            uint16_t pkt_id;
+            uint8_t frag_index;
+            if (mwan_metadata_read(frame + 14, &pkt_id, &frag_index) != 0) goto next_pkt;
+
+            uint8_t *ip_data = NULL;
+            uint32_t ip_len = 0;
+
+            if (frag_index == MWAN_FRAG_NONE) {
+                ip_data = frame + 14 + MWAN_METADATA_SIZE;
+                ip_len = len - (14 + MWAN_METADATA_SIZE);
             } else {
-                continue; /* Stored or error */
+                uint32_t rlen = 0;
+                int ret = frag_store_or_reassemble(fg->frag_tbl,
+                                                   frame + 14 + MWAN_METADATA_SIZE,
+                                                   (uint32_t)(len - (14 + MWAN_METADATA_SIZE)),
+                                                   pkt_id, frag_index,
+                                                   reassem_buf, &rlen);
+                if (ret == 1) {
+                    ip_data = reassem_buf;
+                    ip_len = rlen;
+                } else {
+                    goto next_pkt;
+                }
             }
+
+            if (ip_data && ip_len > 0) {
+                uint8_t ver = (ip_data[0] >> 4);
+                if (ver == 4) lan_eth.h_proto = htons(ETH_P_IP);
+                else if (ver == 6) lan_eth.h_proto = htons(ETH_P_IPV6);
+                else goto next_pkt;
+
+                iov[0].iov_base = &lan_eth;
+                iov[0].iov_len  = 14;
+                iov[1].iov_base = ip_data;
+                iov[1].iov_len  = ip_len;
+                sendmsg(w->tx_fd, &msg, 0);
+                pkt_cnt++;
+            }
+            handled++;
+
+        next_pkt:
+            ppd = (struct tpacket3_hdr *)((char *)ppd + ppd->tp_next_offset);
         }
 
-        if (ip_data && ip_len > 0) {
-            /* Detect Protocol (IPv4/v6) based on IP Header Version byte */
-            uint8_t ver = (ip_data[0] >> 4);
-            if (ver == 4) lan_eth.h_proto = htons(ETH_P_IP);
-            else if (ver == 6) lan_eth.h_proto = htons(ETH_P_IPV6);
-            else continue;
-
-            /* Forward to LAN via Zero-Copy (Template Header + Receive/Reassembly Buffer) */
-            iov[0].iov_base = &lan_eth;
-            iov[0].iov_len  = 14;
-            iov[1].iov_base = ip_data;
-            iov[1].iov_len  = ip_len;
-            sendmsg(w->tx_fd, &msg, 0);
-            pkt_cnt++;
-        }
-        handled++;
+        bd->hdr.bh1.block_status = TP_STATUS_KERNEL;
+        w->current_block = (w->current_block + 1) % w->block_count;
     }
 
-    free(rx_buf);
     free(reassem_buf);
-    close(rx_fd);
     log_info("IN[%d] FINAL: tunnel_raw=%lu handled=%lu forwarded=%lu",
              w->id, total_raw, handled, pkt_cnt);
 }

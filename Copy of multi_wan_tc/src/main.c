@@ -33,12 +33,11 @@ static int unix_server_fd = -1;
 static char socket_path[256] = "/var/run/sep-wan.sock";
 
 static afpkt_fanout_t fg_out;
-static afpkt_worker_t in_workers[MAX_NE_TUNNELS];
-static size_t in_worker_count = 0;
+static afpkt_fanout_t fg_in;
+static int total_worker_threads = 0;
 
 static pthread_t gc_thread;
 static pthread_t *worker_threads = NULL;
-static int total_worker_threads = 0;
 
 static app_context_t running_ctx;
 static int is_dataplane_active = 0;
@@ -137,30 +136,7 @@ static void *gc_worker_fn(void *arg)
     return NULL;
 }
 
-/* ---------- helper: close single worker ---------- */
-
-static void worker_close(afpkt_worker_t *w)
-{
-    if (w->ring)
-    {
-        munmap(w->ring, w->ring_size);
-        w->ring = NULL;
-    }
-    if (w->tx_fd >= 0)
-    {
-        close(w->tx_fd);
-        w->tx_fd = -1;
-    }
-    if (w->rx_fd >= 0)
-    {
-        close(w->rx_fd);
-        w->rx_fd = -1;
-    }
-}
-
-/* ========================================================================= */
-/* DATAPLANE START / STOP */
-/* ========================================================================= */
+/* ---------- Dataplane Start / Stop ---------- */
 
 static out_arg_t g_out_args[MAX_FANOUT_WORKERS];
 static in_arg_t g_in_args[MAX_NE_TUNNELS];
@@ -180,27 +156,21 @@ static void stop_dataplane(void) {
     }
     pthread_join(gc_thread, NULL);
     
-    /* Close inbound LAN TX worker socket */
-    for (size_t w = 0; w < in_worker_count; w++) {
-        worker_close(&in_workers[w]);
-    }
-    
     if (fg_out.frag_tbl) {
+        /* fg_in shares the same frag_tbl, only free once */
         free(fg_out.frag_tbl);
         fg_out.frag_tbl = NULL;
+        fg_in.frag_tbl = NULL;
     }
     
-
-
-    
     afpkt_fanout_close(&fg_out);
+    afpkt_fanout_close(&fg_in);
     
     system_restore_ip_forward();
     netdev_enable_offloads(running_ctx.cfg.local_if);
     netdev_reset_interface(running_ctx.cfg.local_if);
     
     is_dataplane_active = 0;
-    in_worker_count = 0;
     total_worker_threads = 0;
     log_info("Dataplane stopped cleanly.");
 }
@@ -223,39 +193,32 @@ static int start_dataplane(app_context_t *ctx) {
     netdev_disable_offloads(ctx->cfg.local_if);
     netdev_optimize_interface(ctx->cfg.local_if);
 
-    /* ---- STEP 3: Open fanout on local_if for outbound RX (capture LAN traffic) ---- */
+    /* ---- STEP 3: Open fanout on local_if (Capture LAN) ---- */
     if (afpkt_fanout_open(&fg_out, ctx->cfg.local_if, 1, NUM_TX_WORKERS) != 0) {
         log_error("Failed to open fanout outbound on %s", ctx->cfg.local_if);
         goto cleanup_route;
     }
 
+    /* ---- STEP 4: Open fanout on ALL interfaces (Capture Tunnels via BPF) ---- */
+    if (afpkt_fanout_open(&fg_in, NULL, 2, NUM_TX_WORKERS) != 0) {
+        log_error("Failed to open fanout inbound");
+        goto cleanup_pl_out;
+    }
+
+    /* ---- STEP 5: Fragment Table ---- */
     struct frag_table *ft = malloc(sizeof(struct frag_table));
     if (ft) {
         frag_table_init(ft);
         fg_out.frag_tbl = ft;
+        fg_in.frag_tbl = ft;
     } else {
         log_error("Failed to allocate fragment table!");
-        goto cleanup_pl;
+        goto cleanup_pl_in;
     }
-
-
-    /* ---- STEP 5: Open 1 AF_PACKET TX-only socket for LAN output (inbound path) ---- */
-    in_worker_count = 0;
-    in_workers[0].id = 0;
-    in_workers[0].rx_fd = -1;   /* Not used — we read from UDP */
-    in_workers[0].ring = NULL;
-    in_workers[0].tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (in_workers[0].tx_fd < 0) {
-        log_error("Failed to open AF_PACKET TX socket for LAN: %s", strerror(errno));
-        goto cleanup_frag;
-    }
-    int sndbuf_lan = 16 * 1024 * 1024;
-    setsockopt(in_workers[0].tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf_lan, sizeof(sndbuf_lan));
-    in_worker_count = 1;
 
     /* ---- STEP 6: Init caches ---- */
     afpkt_fanout_init_cache_outbound(&fg_out, ctx);
-    afpkt_fanout_init_cache_inbound(&fg_out, ctx);
+    afpkt_fanout_init_cache_inbound(&fg_in, ctx);
 
     int num_available_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (num_available_cores <= 0) num_available_cores = 1;
@@ -263,17 +226,18 @@ static int start_dataplane(app_context_t *ctx) {
 
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
-        goto cleanup_inbound;
+        goto cleanup_pl_in;
     }
     int gc_core = get_next_odd_core(&current_core_idx, num_available_cores);
     if (bind_thread_to_core(gc_thread, gc_core) == 0)
         log_info("Bound GC thread to core %d", gc_core);
 
-    /* Outbound workers + 1 inbound worker */
-    int max_threads = fg_out.num_workers + 1;
+    /* Total Workers: fg_out + fg_in */
+    int max_threads = fg_out.num_workers + fg_in.num_workers;
     worker_threads = calloc(max_threads, sizeof(pthread_t));
     total_worker_threads = 0;
 
+    /* Outbound workers (Group 1) */
     for (int i = 0; i < fg_out.num_workers; i++) {
         g_out_args[i] = (out_arg_t){
             .worker = &fg_out.workers[i],
@@ -291,34 +255,28 @@ static int start_dataplane(app_context_t *ctx) {
         total_worker_threads++;
     }
 
-    /* Single inbound worker (reads from UDP, writes to LAN) */
-    /* NOTE: We bind to the physical interface (local_if used as WAN placeholder in some setups) 
-       or we should pass the specific WAN interface from config. */
-    g_in_args[0] = (in_arg_t){
-        .worker = &in_workers[0],
-        .fg = &fg_out,
-        .ctx = ctx,
-        .running = &running_dataplane,
-    };
-    /* Change this to the actual WAN ifname (e.g. enp4s0) if known, 
-       for now we try to use the first tunnel gateway's interface if possible, 
-       but here we'll use a placeholder or let user define via env. */
-    strncpy(g_in_args[0].listen_ifname, ctx->cfg.local_if, IF_NAMESIZE - 1); // Changed from 15 to IF_NAMESIZE - 1
-    g_in_args[0].listen_ifname[IF_NAMESIZE - 1] = '\0'; // Ensure null termination
-    
-    if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[0]) != 0) {
-        log_error("Failed to create inbound worker");
-        goto cleanup_threads;
+    /* Inbound workers (Group 2 - Parallel Batch RX) */
+    for (int i = 0; i < fg_in.num_workers; i++) {
+        g_in_args[i] = (in_arg_t){
+            .worker = &fg_in.workers[i],
+            .fg = &fg_in,
+            .ctx = ctx,
+            .running = &running_dataplane,
+        };
+        if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[i]) != 0) {
+            log_error("Failed to create Inbound worker %d", i);
+            goto cleanup_threads;
+        }
+        int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
+        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
+            log_info("Bound Inbound worker %d to core %d", i, core_id);
+        total_worker_threads++;
     }
-    int in_core = get_next_odd_core(&current_core_idx, num_available_cores);
-    if (bind_thread_to_core(worker_threads[total_worker_threads], in_core) == 0)
-        log_info("Bound inbound worker to core %d", in_core);
-    total_worker_threads++;
 
     log_info("===========================================");
-    log_info("  MWAN Kernel-VXLAN Pipeline Started");
-    log_info("  Threads: %d outbound + 1 inbound + 1 GC",
-             fg_out.num_workers);
+    log_info("  MWAN Turbo Dual-Fanout Pipeline Started");
+    log_info("  Threads: %d outbound + %d inbound + 1 GC",
+             fg_out.num_workers, fg_in.num_workers);
     log_info("===========================================");
     is_dataplane_active = 1;
     return 0;
@@ -332,12 +290,10 @@ cleanup_threads:
     free(worker_threads);
     worker_threads = NULL;
 
-cleanup_inbound:
-    for (size_t w = 0; w < in_worker_count; w++) worker_close(&in_workers[w]);
-
-cleanup_frag:
+cleanup_pl_in:
     if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
-cleanup_pl:
+    afpkt_fanout_close(&fg_in);
+cleanup_pl_out:
     afpkt_fanout_close(&fg_out);
 cleanup_route:
     system_restore_ip_forward();
