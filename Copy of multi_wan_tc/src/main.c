@@ -33,7 +33,8 @@ static int unix_server_fd = -1;
 static char socket_path[256] = "/var/run/sep-wan.sock";
 
 static afpkt_fanout_t fg_out;
-static afpkt_fanout_t fg_in;
+static afpkt_worker_t in_workers[MAX_NE_TUNNELS];
+static size_t in_worker_count = 0;
 static int total_worker_threads = 0;
 
 static pthread_t gc_thread;
@@ -157,14 +158,22 @@ static void stop_dataplane(void) {
     pthread_join(gc_thread, NULL);
     
     if (fg_out.frag_tbl) {
-        /* fg_in shares the same frag_tbl, only free once */
         free(fg_out.frag_tbl);
         fg_out.frag_tbl = NULL;
-        fg_in.frag_tbl = NULL;
     }
     
     afpkt_fanout_close(&fg_out);
-    afpkt_fanout_close(&fg_in);
+
+    /* Close individual inbound workers */
+    for (size_t i = 0; i < in_worker_count; i++) {
+        if (in_workers[i].ring) {
+            munmap(in_workers[i].ring, in_workers[i].ring_size);
+            in_workers[i].ring = NULL;
+        }
+        if (in_workers[i].rx_fd >= 0) close(in_workers[i].rx_fd);
+        if (in_workers[i].tx_fd >= 0) close(in_workers[i].tx_fd);
+    }
+    in_worker_count = 0;
     
     system_restore_ip_forward();
     netdev_enable_offloads(running_ctx.cfg.local_if);
@@ -199,26 +208,30 @@ static int start_dataplane(app_context_t *ctx) {
         goto cleanup_route;
     }
 
-    /* ---- STEP 4: Open fanout on ALL interfaces (Capture Tunnels via BPF) ---- */
-    if (afpkt_fanout_open(&fg_in, NULL, 2, NUM_TX_WORKERS) != 0) {
-        log_error("Failed to open fanout inbound");
-        goto cleanup_pl_out;
-    }
-
-    /* ---- STEP 5: Fragment Table ---- */
+    /* ---- STEP 4: Fragment Table (Shared across all workers) ---- */
     struct frag_table *ft = malloc(sizeof(struct frag_table));
     if (ft) {
         frag_table_init(ft);
         fg_out.frag_tbl = ft;
-        fg_in.frag_tbl = ft;
     } else {
         log_error("Failed to allocate fragment table!");
-        goto cleanup_pl_in;
+        goto cleanup_pl_out;
+    }
+
+    /* ---- STEP 5: Open 1 Inbound Worker per Tunnel (Bind to specific interface) ---- */
+    in_worker_count = 0;
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count && i < MAX_NE_TUNNELS; i++) {
+        const char *tnl_if = ctx->cfg.ne_tunnels[i].ifname;
+        if (afpkt_single_open_inbound(&in_workers[in_worker_count], tnl_if, (int)i) == 0) {
+            in_worker_count++;
+        } else {
+            log_error("Failed to open inbound worker for tunnel %s", tnl_if);
+        }
     }
 
     /* ---- STEP 6: Init caches ---- */
     afpkt_fanout_init_cache_outbound(&fg_out, ctx);
-    afpkt_fanout_init_cache_inbound(&fg_in, ctx);
+    /* Note: Inbound workers will use fg_out.local for LAN MAC/ifindex info */
 
     int num_available_cores = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (num_available_cores <= 0) num_available_cores = 1;
@@ -226,18 +239,17 @@ static int start_dataplane(app_context_t *ctx) {
 
     if (pthread_create(&gc_thread, NULL, gc_worker_fn, fg_out.frag_tbl) != 0) {
         log_error("Failed to create GC thread");
-        goto cleanup_pl_in;
+        goto cleanup_pl_out;
     }
     int gc_core = get_next_odd_core(&current_core_idx, num_available_cores);
-    if (bind_thread_to_core(gc_thread, gc_core) == 0)
-        log_info("Bound GC thread to core %d", gc_core);
+    bind_thread_to_core(gc_thread, gc_core);
 
-    /* Total Workers: fg_out + fg_in */
-    int max_threads = fg_out.num_workers + fg_in.num_workers;
+    /* Total Workers: fg_out workers + N inbound workers */
+    int max_threads = fg_out.num_workers + (int)in_worker_count;
     worker_threads = calloc(max_threads, sizeof(pthread_t));
     total_worker_threads = 0;
 
-    /* Outbound workers (Group 1) */
+    /* Start Outbound workers */
     for (int i = 0; i < fg_out.num_workers; i++) {
         g_out_args[i] = (out_arg_t){
             .worker = &fg_out.workers[i],
@@ -245,56 +257,48 @@ static int start_dataplane(app_context_t *ctx) {
             .ctx = ctx,
             .running = &running_dataplane,
         };
-        if (pthread_create(&worker_threads[total_worker_threads], NULL, out_fn, &g_out_args[i]) != 0) {
-            log_error("Failed to create Outbound worker %d", i);
-            goto cleanup_threads;
-        }
+        pthread_create(&worker_threads[total_worker_threads], NULL, out_fn, &g_out_args[i]);
         int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
-        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
-            log_info("Bound Outbound worker %d to core %d", i, core_id);
+        bind_thread_to_core(worker_threads[total_worker_threads], core_id);
         total_worker_threads++;
     }
 
-    /* Inbound workers (Group 2 - Parallel Batch RX) */
-    for (int i = 0; i < fg_in.num_workers; i++) {
+    /* Start Inbound workers */
+    for (size_t i = 0; i < in_worker_count; i++) {
         g_in_args[i] = (in_arg_t){
-            .worker = &fg_in.workers[i],
-            .fg = &fg_in,
+            .worker = &in_workers[i],
+            .fg = &fg_out, /* Share local cache and frag_tbl */
             .ctx = ctx,
             .running = &running_dataplane,
         };
-        if (pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[i]) != 0) {
-            log_error("Failed to create Inbound worker %d", i);
-            goto cleanup_threads;
-        }
+        pthread_create(&worker_threads[total_worker_threads], NULL, in_fn, &g_in_args[i]);
         int core_id = get_next_odd_core(&current_core_idx, num_available_cores);
-        if (bind_thread_to_core(worker_threads[total_worker_threads], core_id) == 0)
-            log_info("Bound Inbound worker %d to core %d", i, core_id);
+        bind_thread_to_core(worker_threads[total_worker_threads], core_id);
         total_worker_threads++;
     }
 
     log_info("===========================================");
-    log_info("  MWAN Turbo Dual-Fanout Pipeline Started");
-    log_info("  Threads: %d outbound + %d inbound + 1 GC",
-             fg_out.num_workers, fg_in.num_workers);
+    log_info("  MWAN Turbo Per-Tunnel Pipeline Started");
+    log_info("  Outbound workers: %d, Inbound workers: %zu", fg_out.num_workers, in_worker_count);
     log_info("===========================================");
     is_dataplane_active = 1;
     return 0;
 
 cleanup_threads:
     running_dataplane = 0;
-    for (int k = 0; k < total_worker_threads; k++) {
-        pthread_join(worker_threads[k], NULL);
-    }
+    for (int k = 0; k < total_worker_threads; k++) pthread_join(worker_threads[k], NULL);
     pthread_join(gc_thread, NULL);
-    free(worker_threads);
-    worker_threads = NULL;
+    free(worker_threads); worker_threads = NULL;
 
-cleanup_pl_in:
-    if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
-    afpkt_fanout_close(&fg_in);
 cleanup_pl_out:
+    if (fg_out.frag_tbl) { free(fg_out.frag_tbl); fg_out.frag_tbl = NULL; }
     afpkt_fanout_close(&fg_out);
+    for (size_t i = 0; i < in_worker_count; i++) {
+        if (in_workers[i].ring) munmap(in_workers[i].ring, in_workers[i].ring_size);
+        if (in_workers[i].rx_fd >= 0) close(in_workers[i].rx_fd);
+        if (in_workers[i].tx_fd >= 0) close(in_workers[i].tx_fd);
+    }
+    in_worker_count = 0;
 cleanup_route:
     system_restore_ip_forward();
     netdev_enable_offloads(ctx->cfg.local_if);

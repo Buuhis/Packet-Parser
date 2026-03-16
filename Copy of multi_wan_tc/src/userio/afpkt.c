@@ -95,13 +95,15 @@ static inline uint32_t calculate_5tuple_hash(const uint8_t *frame, uint32_t len)
 
 #include <linux/filter.h>
 
-/* BPF Filter for MWAN_ETHERTYPE (0x88B5) */
+/* BPF Filter for MWAN_ETHERTYPE (0x88B5) and BLOCK PACKET_OUTGOING (Loop prevention) */
 static void afpkt_set_mwan_filter(int fd) {
     struct sock_filter code[] = {
-        { 0x28, 0, 0, 0x0000000c }, /* L0: ldH [12] (EtherType) */
-        { 0x15, 0, 1, 0x000088b5 }, /* L1: if == 0x88B5 goto L2, else goto L3 */
-        { 0x06, 0, 0, 0x0000ffff }, /* L2: ret ALL */
-        { 0x06, 0, 0, 0x00000000 }, /* L3: ret 0 */
+        { 0x20, 0, 0, 0xfffff004 }, /* L0: ld pkt_type (SKF_AD_OFF + SKF_AD_PKTTYPE) */
+        { 0x15, 3, 0, 0x00000004 }, /* L1: if == PACKET_OUTGOING (4) goto L5 (DROP), else next */
+        { 0x28, 0, 0, 0x0000000c }, /* L2: ldH [12] (EtherType) */
+        { 0x15, 0, 1, 0x000088b5 }, /* L3: if == 0x88B5 goto L4, else goto L5 */
+        { 0x06, 0, 0, 0x0000ffff }, /* L4: ret ALL */
+        { 0x06, 0, 0, 0x00000000 }, /* L5: ret 0 */
     };
     struct sock_fprog bpf = {
         .len = (unsigned short)(sizeof(code)/sizeof(code[0])),
@@ -133,8 +135,9 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         afpkt_worker_t *w = &fg->workers[i];
         w->id = i;
 
-        /* 1. RX socket */
-        w->rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        /* 1. RX socket: Use MWAN_ETHERTYPE for Inbound group (2) to filter at kernel level */
+        uint16_t proto = (fanout_group_id >= 2) ? MWAN_ETHERTYPE : ETH_P_ALL;
+        w->rx_fd = socket(AF_PACKET, SOCK_RAW, htons(proto));
         if (w->rx_fd < 0)
         {
             log_error("Fanout[%d] worker %d: socket(RX) failed: %s",
@@ -246,6 +249,93 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
                  fanout_group_id, i, w->rx_fd, w->tx_fd, w->block_count);
     }
 
+    return 0;
+}
+
+/* Open a single TPACKET_V3 RX worker bound to a specific tunnel interface + BPF + TX socket */
+int afpkt_single_open_inbound(afpkt_worker_t *w, const char *tunnel_ifname, int worker_id)
+{
+    memset(w, 0, sizeof(*w));
+    w->id = worker_id;
+    w->rx_fd = -1;
+    w->tx_fd = -1;
+
+    int ifidx = if_nametoindex(tunnel_ifname);
+    if (ifidx == 0) {
+        log_error("InboundSingle[%d]: if_nametoindex(%s) failed", worker_id, tunnel_ifname);
+        return -1;
+    }
+
+    /* 1. RX socket: listen ONLY for MWAN_ETHERTYPE */
+    w->rx_fd = socket(AF_PACKET, SOCK_RAW, htons(MWAN_ETHERTYPE));
+    if (w->rx_fd < 0) {
+        log_error("InboundSingle[%d]: socket(RX) failed: %s", worker_id, strerror(errno));
+        return -1;
+    }
+
+    /* 2. TPACKET_V3 */
+    int version = TPACKET_V3;
+    setsockopt(w->rx_fd, SOL_PACKET, PACKET_VERSION, &version, sizeof(version));
+
+    int ignore_out = 1;
+    setsockopt(w->rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
+
+    /* 3. Bind STRICTLY to this tunnel interface */
+    struct sockaddr_ll sll = {
+        .sll_family   = AF_PACKET,
+        .sll_protocol = htons(MWAN_ETHERTYPE),
+        .sll_ifindex  = ifidx,
+    };
+    if (bind(w->rx_fd, (struct sockaddr *)&sll, sizeof(sll)) != 0) {
+        log_error("InboundSingle[%d]: bind(%s) failed: %s", worker_id, tunnel_ifname, strerror(errno));
+        close(w->rx_fd); w->rx_fd = -1;
+        return -1;
+    }
+
+    /* 4. RX ring */
+    struct tpacket_req3 req;
+    memset(&req, 0, sizeof(req));
+    req.tp_block_size = V3_BLOCK_SIZE;
+    req.tp_frame_size = V3_FRAME_SIZE;
+    req.tp_block_nr   = V3_BLOCK_NR;
+    req.tp_frame_nr   = (V3_BLOCK_SIZE * V3_BLOCK_NR) / V3_FRAME_SIZE;
+    req.tp_retire_blk_tov = 3;
+    req.tp_feature_req_word = TP_FT_REQ_FILL_RXHASH;
+
+    if (setsockopt(w->rx_fd, SOL_PACKET, PACKET_RX_RING, &req, sizeof(req)) != 0) {
+        log_error("InboundSingle[%d]: PACKET_RX_RING failed: %s", worker_id, strerror(errno));
+        close(w->rx_fd); w->rx_fd = -1;
+        return -1;
+    }
+
+    size_t ring_sz = (size_t)req.tp_block_size * req.tp_block_nr;
+    w->ring = mmap(NULL, ring_sz, PROT_READ | PROT_WRITE, MAP_SHARED, w->rx_fd, 0);
+    if (w->ring == MAP_FAILED) {
+        log_error("InboundSingle[%d]: mmap failed: %s", worker_id, strerror(errno));
+        w->ring = NULL;
+        close(w->rx_fd); w->rx_fd = -1;
+        return -1;
+    }
+    w->ring_size = ring_sz;
+    w->block_count = req.tp_block_nr;
+    w->current_block = 0;
+
+    /* 5. Attach BPF (redundant safety — socket already filters by protocol) */
+    afpkt_set_mwan_filter(w->rx_fd);
+
+    /* 6. TX socket for sending to LAN */
+    w->tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (w->tx_fd < 0) {
+        log_error("InboundSingle[%d]: socket(TX) failed: %s", worker_id, strerror(errno));
+        munmap(w->ring, w->ring_size); w->ring = NULL;
+        close(w->rx_fd); w->rx_fd = -1;
+        return -1;
+    }
+    int sndbuf = 16 * 1024 * 1024;
+    setsockopt(w->tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
+
+    log_info("InboundSingle[%d]: %s (ifindex=%d) rx_fd=%d tx_fd=%d V3_Blocks=%u",
+             worker_id, tunnel_ifname, ifidx, w->rx_fd, w->tx_fd, w->block_count);
     return 0;
 }
 

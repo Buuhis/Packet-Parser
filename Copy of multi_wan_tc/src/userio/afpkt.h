@@ -54,6 +54,7 @@ typedef struct {
 
 int  afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_id, int num_workers);
 int  afpkt_single_open(afpkt_worker_t *w, const char *ifname);
+int  afpkt_single_open_inbound(afpkt_worker_t *w, const char *tunnel_ifname, int worker_id);
 void afpkt_fanout_close(afpkt_fanout_t *fg);
 
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx);
