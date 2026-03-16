@@ -11,8 +11,8 @@
 #define FRAG_TABLE_SIZE     65536
 #define FRAG_TIMEOUT_NS     (50ULL * 1000000ULL) /* 50ms */
 
-/* Max inner Ethernet frame that fits in one VXLAN UDP packet */
-#define FRAG_INNER_MAX      (MWAN_NE_TUNNEL_MTU - VXLAN_HDR_SIZE)  /* 1410 */
+/* Max inner Ethernet frame that fits in one fragmented packet */
+#define FRAG_INNER_MAX      (MWAN_NE_TUNNEL_MTU - MWAN_METADATA_SIZE)  /* 1410 if MTU=1418 */
 
 struct frag_entry {
     uint16_t pkt_id;

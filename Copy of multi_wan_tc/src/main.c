@@ -192,13 +192,6 @@ static void stop_dataplane(void) {
     
 
 
-    /* Close outbound UDP TX sockets per tunnel */
-    for (size_t t = 0; t < fg_out.tunnel_count; t++) {
-        if (fg_out.tunnel_udp_fds[t] >= 0) {
-            close(fg_out.tunnel_udp_fds[t]);
-            fg_out.tunnel_udp_fds[t] = -1;
-        }
-    }
     
     afpkt_fanout_close(&fg_out);
     
@@ -323,7 +316,7 @@ static int start_dataplane(app_context_t *ctx) {
     total_worker_threads++;
 
     log_info("===========================================");
-    log_info("  MWAN VXLAN Pipeline Started");
+    log_info("  MWAN Kernel-VXLAN Pipeline Started");
     log_info("  Threads: %d outbound + 1 inbound + 1 GC",
              fg_out.num_workers);
     log_info("===========================================");

@@ -36,9 +36,9 @@ typedef struct {
         int valid;
     } wans[MAX_WANS];
 
-    /* Cached UDP socket + sockaddr_in per tunnel for VXLAN outbound TX */
-    int tunnel_udp_fds[MAX_NE_TUNNELS];
-    struct sockaddr_in tunnel_addrs[MAX_NE_TUNNELS];
+    /* Cached AF_PACKET sockets and metadata per tunnel for outbound TX */
+    int    tunnel_fds[MAX_NE_TUNNELS];
+    int    tunnel_ifindices[MAX_NE_TUNNELS];
     size_t tunnel_count;
 
     struct {

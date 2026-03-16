@@ -54,7 +54,7 @@ int frag_store_or_reassemble(struct frag_table *ft,
         entry->has_frag = 0;
     }
 
-    if (frag_index == VXLAN_FRAG_FIRST) {
+    if (frag_index == MWAN_FRAG_FIRST) {
         /* Store fragment 1 (first half of raw Ethernet frame) */
         if (data_len > sizeof(entry->data)) {
             pthread_spin_unlock(&entry->lock);
@@ -69,7 +69,7 @@ int frag_store_or_reassemble(struct frag_table *ft,
         return 0; /* stored, waiting for frag 2 */
     }
 
-    if (frag_index == VXLAN_FRAG_LAST) {
+    if (frag_index == MWAN_FRAG_LAST) {
         /* Need matching fragment 1 */
         if (!entry->has_frag || entry->pkt_id != pkt_id) {
             pthread_spin_unlock(&entry->lock);

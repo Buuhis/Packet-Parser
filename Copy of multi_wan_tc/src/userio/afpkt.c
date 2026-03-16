@@ -30,6 +30,17 @@
 #define V3_BLOCK_NR 256          /* 256 blocks = 512MB Ring */
 #define V3_FRAME_SIZE 2048
 
+static void log_hex_dump(const char *label, const uint8_t *data, size_t len) {
+    char buf[512];
+    size_t pos = 0;
+    pos += snprintf(buf + pos, sizeof(buf) - pos, "%s (%zu bytes): ", label, len);
+    for (size_t i = 0; i < len && i < 64; i++) {
+        pos += snprintf(buf + pos, sizeof(buf) - pos, "%02x ", data[i]);
+        if (pos > sizeof(buf) - 10) break;
+    }
+    log_info("%s%s", buf, (len > 64) ? "..." : "");
+}
+
 /* ================================================== */
 /* ============ FANOUT OPEN / CLOSE ================= */
 /* ================================================== */
@@ -214,6 +225,13 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
 
 void afpkt_fanout_close(afpkt_fanout_t *fg)
 {
+    for (size_t i = 0; i < fg->tunnel_count; i++) {
+        if (fg->tunnel_fds[i] >= 0) {
+            close(fg->tunnel_fds[i]);
+            fg->tunnel_fds[i] = -1;
+        }
+    }
+
     for (int i = 0; i < fg->num_workers; i++)
     {
         afpkt_worker_t *w = &fg->workers[i];
@@ -244,44 +262,42 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
 
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx)
 {
-    /*
-     * Create one UDP socket per tunnel for outbound sendto() only.
-     * No bind() — Kernel assigns an ephemeral source port automatically.
-     * The destination address (remote gateway:port) is cached for sendto().
-     */
     fg->tunnel_count = ctx->cfg.ne_tunnel_count;
     for (size_t i = 0; i < fg->tunnel_count && i < MAX_NE_TUNNELS; i++)
     {
-        int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_fd < 0) {
-            log_error("Cache outbound: Failed to create UDP socket for tunnel[%zu]: %s",
-                      i, strerror(errno));
-            fg->tunnel_udp_fds[i] = -1;
+        const char *ifname = ctx->cfg.ne_tunnels[i].ifname;
+        int ifidx = if_nametoindex(ifname);
+        if (ifidx == 0) {
+            log_error("Cache outbound: bridge interface %s not found", ifname);
+            fg->tunnel_fds[i] = -1;
+            continue;
+        }
+        fg->tunnel_ifindices[i] = ifidx;
+
+        int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+        if (fd < 0) {
+            log_error("Cache outbound: Failed to create AF_PACKET socket for %s: %s", ifname, strerror(errno));
+            fg->tunnel_fds[i] = -1;
+            continue;
+        }
+        
+        struct sockaddr_ll sll = {
+            .sll_family = AF_PACKET,
+            .sll_protocol = htons(ETH_P_ALL),
+            .sll_ifindex = ifidx,
+        };
+        if (bind(fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+            log_error("Cache outbound: bind to %s failed: %s", ifname, strerror(errno));
+            close(fd);
+            fg->tunnel_fds[i] = -1;
             continue;
         }
 
         int sndbuf = 16 * 1024 * 1024;
-        setsockopt(udp_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
+        setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
+        fg->tunnel_fds[i] = fd;
 
-        fg->tunnel_udp_fds[i] = udp_fd;
-
-        /* Cache sockaddr_in with remote IP and port for sendto() */
-        memset(&fg->tunnel_addrs[i], 0, sizeof(fg->tunnel_addrs[i]));
-        fg->tunnel_addrs[i].sin_family = AF_INET;
-        fg->tunnel_addrs[i].sin_port   = htons(ctx->cfg.ne_tunnels[i].port);
-        if (inet_pton(AF_INET, ctx->cfg.ne_tunnels[i].gateway,
-                      &fg->tunnel_addrs[i].sin_addr) != 1) {
-            log_error("Cache outbound: Invalid gateway '%s' for tunnel[%zu]",
-                      ctx->cfg.ne_tunnels[i].gateway, i);
-            close(udp_fd);
-            fg->tunnel_udp_fds[i] = -1;
-            continue;
-        }
-
-        log_info("Cache outbound: TUNNEL[%zu] %s -> %s:%d (udp_fd=%d)",
-                 i, ctx->cfg.ne_tunnels[i].ifname,
-                 ctx->cfg.ne_tunnels[i].gateway,
-                 ctx->cfg.ne_tunnels[i].port, udp_fd);
+        log_info("Cache outbound: TUNNEL[%zu] %s (ifindex=%d, fd=%d)", i, ifname, ifidx, fd);
     }
 }
 
@@ -339,12 +355,17 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
-    /* Scratch buffer for VXLAN encapsulation */
-    uint8_t *vxlan_buf = malloc(2048 + VXLAN_HDR_SIZE);
-    if (!vxlan_buf) {
-        log_error("Worker outbound[%d]: failed to allocate vxlan_buf", w->id);
+    /* Scratch buffer for metadata encapsulation */
+    uint8_t *frag_buf = malloc(2048 + MWAN_METADATA_SIZE);
+    if (!frag_buf) {
+        log_error("Worker outbound[%d]: failed to allocate frag_buf", w->id);
         return;
     }
+
+    struct sockaddr_ll sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sll_family = AF_PACKET;
+    sa.sll_halen = 6;
 
     while (*running)
     {
@@ -377,6 +398,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 struct ethhdr *eth = (struct ethhdr *)frame;
                 uint16_t h_proto = ntohs(eth->h_proto);
 
+                /* Bỏ qua gói tin nội bộ hoặc do chính ta gửi */
                 if (h_proto == MWAN_ETHERTYPE)
                     goto next_pkt;
 
@@ -386,98 +408,56 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 if (h_proto != ETH_P_IP && h_proto != ETH_P_IPV6)
                     goto next_pkt;
 
-                /* ANTI-DOUBLE ENCAPSULATION: 
-                   Check if this packet is already UDP and destined for one of our VXLAN ports.
-                   If so, skip it as it's likely already processed by another layer. */
-                if (h_proto == ETH_P_IP && len >= 14 + 20 + 8) {
-                    struct iphdr *iph = (struct iphdr *)(frame + 14);
-                    if (iph->protocol == IPPROTO_UDP) {
-                        int ihl = iph->ihl * 4;
-                        struct udphdr *uh = (struct udphdr *)(frame + 14 + ihl);
-                        uint16_t dport = ntohs(uh->dest);
-                        int is_mine = 0;
-                        for (size_t p = 0; p < tunnel_count; p++) {
-                            if (dport == (uint16_t)ctx->cfg.ne_tunnels[p].port) { is_mine = 1; break; }
-                        }
-                        if (is_mine) goto next_pkt;
-                    }
-                }
-
-                if (len <= 14)
-                    goto next_pkt;
-
                 ip_pkts++;
-
-                // /* DEBUG: log first few IP packets */
-                // if (ip_pkts <= 5) {
-                //     struct iphdr *dbg_ip = (struct iphdr *)(frame + 14);
-                //     log_info("OUT[%d] IP pkt #%lu: len=%u proto=0x%04x src=%08x dst=%08x",
-                //              w->id, ip_pkts, len, h_proto,
-                //              ntohl(dbg_ip->saddr), ntohl(dbg_ip->daddr));
-                // }
 
                 uint32_t hash = calculate_5tuple_hash(frame, len);
                 int tunnel_idx = hash % tunnel_count;
 
-                if (fg->tunnel_udp_fds[tunnel_idx] < 0)
+                int tunnel_fd = fg->tunnel_fds[tunnel_idx];
+                if (tunnel_fd < 0)
                     goto next_pkt;
 
                 pkt_cnt++;
 
-                // /* DEBUG: log sendto details for first few */
-                // if (pkt_cnt <= 5) {
-                //     log_info("OUT[%d] sendto tunnel[%d] fd=%d len=%u frag=%s",
-                //              w->id, tunnel_idx, fg->tunnel_udp_fds[tunnel_idx], len,
-                //              frag_need_split((uint32_t)len) ? "YES" : "NO");
-                // }
+                sa.sll_ifindex = fg->tunnel_ifindices[tunnel_idx];
+                memcpy(sa.sll_addr, eth->h_dest, 6);
 
                 if (frag_need_split((uint32_t)len)) {
-                    /* Split the raw Ethernet frame into 2 halves */
                     uint16_t pkt_id = frag_next_pkt_id();
                     uint32_t half1 = len / 2;
                     uint32_t half2 = len - half1;
 
-                    /* Fragment 1: VXLAN(frag=FIRST) + first half of frame */
-                    vxlan_hdr_t vx1;
-                    vxlan_hdr_build_frag(&vx1, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_FIRST);
-                    uint8_t pkt1[2048]; // Use a local buffer for fragmented parts
-                    memcpy(pkt1, &vx1, VXLAN_HDR_SIZE);
-                    memcpy(pkt1 + VXLAN_HDR_SIZE, frame, half1);
+                    /* Fragment 1: Inner Eth (EtherType 0x88B5) + Metadata (FIRST) + half1 payload */
+                    uint8_t pkt1[2048];
+                    struct ethhdr *eth1 = (struct ethhdr *)pkt1;
+                    memcpy(eth1->h_dest, eth->h_dest, 6);
+                    memcpy(eth1->h_source, eth->h_source, 6);
+                    eth1->h_proto = htons(MWAN_ETHERTYPE);
 
-                    ssize_t rc1 = sendto(fg->tunnel_udp_fds[tunnel_idx], pkt1,
-                           VXLAN_HDR_SIZE + half1, 0,
-                           (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
-                           sizeof(struct sockaddr_in));
-                    if (rc1 < 0 && pkt_cnt <= 5)
-                        log_error("OUT[%d] frag1 sendto failed: %s", w->id, strerror(errno));
+                    mwan_metadata_t *meta1 = (mwan_metadata_t *)(pkt1 + 14);
+                    mwan_metadata_build(meta1, pkt_id, MWAN_FRAG_FIRST);
+                    memcpy(pkt1 + 14 + MWAN_METADATA_SIZE, frame, half1);
 
-                    /* Fragment 2: VXLAN(frag=LAST) + second half of frame */
-                    vxlan_hdr_t vx2;
-                    vxlan_hdr_build_frag(&vx2, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_LAST);
-                    uint8_t pkt2[2048]; // Use a local buffer for fragmented parts
-                    memcpy(pkt2, &vx2, VXLAN_HDR_SIZE);
-                    memcpy(pkt2 + VXLAN_HDR_SIZE, frame + half1, half2);
+                    sendto(tunnel_fd, pkt1, 14 + MWAN_METADATA_SIZE + half1, 0,
+                           (struct sockaddr *)&sa, sizeof(sa));
 
-                    ssize_t rc2 = sendto(fg->tunnel_udp_fds[tunnel_idx], pkt2,
-                           VXLAN_HDR_SIZE + half2, 0,
-                           (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
-                           sizeof(struct sockaddr_in));
-                    if (rc2 < 0 && pkt_cnt <= 5)
-                        log_error("OUT[%d] frag2 sendto failed: %s", w->id, strerror(errno));
+                    /* Fragment 2: Inner Eth (EtherType 0x88B5) + Metadata (LAST) + half2 payload */
+                    uint8_t pkt2[2048];
+                    struct ethhdr *eth2 = (struct ethhdr *)pkt2;
+                    memcpy(eth2->h_dest, eth->h_dest, 6);
+                    memcpy(eth2->h_source, eth->h_source, 6);
+                    eth2->h_proto = htons(MWAN_ETHERTYPE);
+
+                    mwan_metadata_t *meta2 = (mwan_metadata_t *)(pkt2 + 14);
+                    mwan_metadata_build(meta2, pkt_id, MWAN_FRAG_LAST);
+                    memcpy(pkt2 + 14 + MWAN_METADATA_SIZE, frame + half1, half2);
+
+                    sendto(tunnel_fd, pkt2, 14 + MWAN_METADATA_SIZE + half2, 0,
+                           (struct sockaddr *)&sa, sizeof(sa));
                 } else {
-                    /* Non-fragmented: VXLAN(frag=NONE) + whole frame */
-                    uint16_t pkt_id = frag_next_pkt_id();
-                    vxlan_hdr_t vx;
-                    vxlan_hdr_build_frag(&vx, VXLAN_DEFAULT_VNI, pkt_id, VXLAN_FRAG_NONE);
-                    memcpy(vxlan_buf, &vx, VXLAN_HDR_SIZE);
-                    memcpy(vxlan_buf + VXLAN_HDR_SIZE, frame, len);
-
-                    ssize_t rc = sendto(fg->tunnel_udp_fds[tunnel_idx], vxlan_buf,
-                           VXLAN_HDR_SIZE + len, 0,
-                           (struct sockaddr *)&fg->tunnel_addrs[tunnel_idx],
-                           sizeof(struct sockaddr_in));
-                    if (rc < 0 && pkt_cnt <= 5)
-                        log_error("OUT[%d] sendto failed: %s", w->id, strerror(errno));
+                    /* Non-fragmented: Push raw frame to tunnel, kernel wraps it */
+                    sendto(tunnel_fd, frame, len, 0,
+                           (struct sockaddr *)&sa, sizeof(sa));
                 }
 
             next_pkt:
@@ -488,7 +468,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
             w->current_block = (w->current_block + 1) % w->block_count;
         }
     }
-    free(vxlan_buf);
+    free(frag_buf);
     log_info("OUT[%d] FINAL: captured=%lu ip_pkts=%lu forwarded=%lu",
              w->id, captured_cnt, ip_pkts, pkt_cnt);
 }
@@ -508,58 +488,19 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                                 const app_context_t *ctx, const char *listen_ifname, volatile int *running)
 {
+    (void)listen_ifname;
     unsigned long pkt_cnt = 0;
-    unsigned long total_pkts = 0;
-    unsigned long filtered = 0;
+    unsigned long total_raw = 0;
+    unsigned long handled = 0;
 
-    log_info("Worker inbound[%d] started (AF_PACKET VXLAN Decapsulation)", w->id);
+    log_info("Worker inbound[%d] started (Capture from Tunnel Interfaces)", w->id);
 
-    /* ---- Build set of tunnel ports to filter for ---- */
-    uint16_t tunnel_ports[MAX_NE_TUNNELS];
-    size_t tunnel_port_count = 0;
-    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
-        int port = ctx->cfg.ne_tunnels[i].port;
-        int dup = 0;
-        for (size_t j = 0; j < tunnel_port_count; j++) {
-            if (tunnel_ports[j] == (uint16_t)port) { dup = 1; break; }
-        }
-        if (!dup && tunnel_port_count < MAX_NE_TUNNELS) {
-            tunnel_ports[tunnel_port_count++] = (uint16_t)port;
-            log_info("Inbound filter: listening for UDP dst port %d", port);
-        }
-    }
-
-    /* ---- Open AF_PACKET RX socket (All interfaces, filtered in loop) ---- */
+    /* ---- Open AF_PACKET RX socket for ALL interfaces ---- */
     int rx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
     if (rx_fd < 0) {
-        log_error("Worker inbound[%d]: cannot create AF_PACKET RX socket: %s",
-                  w->id, strerror(errno));
+        log_error("Worker inbound[%d]: socket(RX) failed: %s", w->id, strerror(errno));
         return;
     }
-
-    /* Note: We no longer use bind() here because it's too restrictive.
-       We filter by ifindex inside the loop instead. */
-    // if (listen_ifname) {
-    //     int ifidx = if_nametoindex(listen_ifname);
-    //     if (ifidx > 0) {
-    //         struct sockaddr_ll sll = {
-    //             .sll_family = AF_PACKET,
-    //             .sll_protocol = htons(ETH_P_ALL),
-    //             .sll_ifindex = ifidx,
-    //         };
-    //         if (bind(rx_fd, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
-    //             log_error("Worker inbound[%d]: bind to %s failed: %s",
-    //                       w->id, listen_ifname, strerror(errno));
-    //         } else {
-    //             log_info("Worker inbound[%d]: strictly bound to interface %s (index %d)",
-    //                      w->id, listen_ifname, ifidx);
-    //         }
-    //     }
-    // }
-
-    /* Ignore packets sent by our own machine (avoid loops) */
-    int ignore_out = 1;
-    setsockopt(rx_fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore_out, sizeof(ignore_out));
 
     int rcvbuf = 16 * 1024 * 1024;
     setsockopt(rx_fd, SOL_SOCKET, SO_RCVBUFFORCE, &rcvbuf, sizeof(rcvbuf));
@@ -575,26 +516,13 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         return;
     }
 
-    /* ---- Pre-cache sockaddr_ll for LOCAL LAN TX (AF_PACKET) ---- */
+    /* ---- Pre-cache sockaddr_ll for LOCAL LAN TX ---- */
     struct sockaddr_ll sa;
     memset(&sa, 0, sizeof(sa));
     sa.sll_family = AF_PACKET;
     sa.sll_ifindex = fg->local.ifindex;
     sa.sll_halen = 6;
     memcpy(sa.sll_addr, ctx->cfg.lan.dst_mac, 6);
-
-    /* Pre-cache full 14-byte Ethernet headers for LOCAL */
-    uint8_t cached_eth_ipv4[14];
-    memcpy(cached_eth_ipv4 + 0, ctx->cfg.lan.dst_mac, 6);
-    memcpy(cached_eth_ipv4 + 6, fg->local.src_mac, 6);
-    cached_eth_ipv4[12] = (uint8_t)((ETH_P_IP) >> 8);
-    cached_eth_ipv4[13] = (uint8_t)((ETH_P_IP) & 0xFF);
-
-    uint8_t cached_eth_ipv6[14];
-    memcpy(cached_eth_ipv6 + 0, ctx->cfg.lan.dst_mac, 6);
-    memcpy(cached_eth_ipv6 + 6, fg->local.src_mac, 6);
-    cached_eth_ipv6[12] = (uint8_t)((ETH_P_IPV6) >> 8);
-    cached_eth_ipv6[13] = (uint8_t)((ETH_P_IPV6) & 0xFF);
 
     struct pollfd pfd = {.fd = rx_fd, .events = POLLIN};
 
@@ -608,150 +536,68 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
         ssize_t n = recvfrom(rx_fd, rx_buf, 4096, 0, (struct sockaddr *)&from, &fromlen);
         if (n <= 0) continue;
 
-        /* Skip if packet is outgoing (sent by us) */
         if (from.sll_pkttype == PACKET_OUTGOING) continue;
 
-        /* ANTI-DUPLICATE & LOOP PREVENTION:
-           1. Skip if packet captured on local_if (we are the ones sending to LAN)
-           2. Skip if packet captured on a tunnel interface (Kernel already processed it)
-           Inbound VXLAN should ONLY be captured on the physical WAN interface. */
-        if (from.sll_ifindex == fg->local.ifindex) continue;
-        
-        /* Optional: If we know the tunnel ifindex, we should skip it here. 
-           For now, the log showed index 11 was the duplicate. */
-        if (from.sll_ifindex >= 10) { /* Heuristic: many virtual pipes start at high indices */
-             // continue; // Uncomment this if duplication persists on tunnel interfaces
-        }
-
-        total_pkts++;
-
-        // /* DEBUG: log first few raw captures to verify AF_PACKET is working */
-        // if (total_pkts <= 3) {
-        //     log_info("IN[%d] raw capture #%lu: len=%zd ethertype=0x%04x",
-        //              w->id, total_pkts, n,
-        //              (uint32_t)((rx_buf[12] << 8) | rx_buf[13]));
-        // }
-
-        /* ---- FILTER: Outer Eth(14) + Outer IP(20) + Outer UDP(8) + VXLAN(8) = 50 min ---- */
-        if ((uint32_t)n < 14 + 20 + 8 + VXLAN_HDR_SIZE) continue;
-
-        /* Check outer Ethertype = IPv4 (0x0800) */
-        uint16_t outer_ethertype = ((uint16_t)rx_buf[12] << 8) | rx_buf[13];
-        if (outer_ethertype != 0x0800) continue;
-
-        /* Filter: ignore if the source MAC is our own (extra safety against loopback) */
-        if (memcmp(rx_buf + 6, fg->local.src_mac, 6) == 0) continue;
-
-        /* Check outer IP protocol = UDP (17) */
-        uint8_t outer_ip_proto = rx_buf[14 + 9];
-        if (outer_ip_proto != 17) continue;
-
-        /* Get outer IP header length (may have options) */
-        int outer_ihl = (rx_buf[14] & 0x0F) * 4;
-        if (outer_ihl < 20) continue;
-        if ((uint32_t)n < (uint32_t)(14 + outer_ihl + 8 + VXLAN_HDR_SIZE)) continue;
-
-        /* Check outer UDP destination port matches one of our tunnel ports */
-        int udp_offset = 14 + outer_ihl;
-        uint16_t dst_port = ((uint16_t)rx_buf[udp_offset + 2] << 8) | rx_buf[udp_offset + 3];
-
-        int port_match = 0;
-        for (size_t p = 0; p < tunnel_port_count; p++) {
-            if (dst_port == tunnel_ports[p]) { port_match = 1; break; }
-        }
-        if (!port_match) continue;
-
-        filtered++;
-
-        /* DEBUG: log matched VXLAN packets + Interface ID to detect Bridge Duplication */
-        if (filtered <= 10) {
-            log_info("IN[%d] MATCH #%lu: ifindex=%d dst_port=%u outer_len=%zd ihl=%d",
-                     w->id, filtered, from.sll_ifindex, dst_port, n, outer_ihl);
-        }
-
-        /* ---- Strip outer headers: Eth(14) + IP(outer_ihl) + UDP(8) ---- */
-        int vxlan_offset = 14 + outer_ihl + 8;
-
-        /* Read VXLAN header */
-        vxlan_hdr_t *vxhdr = (vxlan_hdr_t *)(rx_buf + vxlan_offset);
-        uint16_t pkt_id;
-        uint8_t frag_index;
-        vxlan_hdr_read_frag(vxhdr, &pkt_id, &frag_index);
-
-        /* Inner data starts after VXLAN header */
-        int inner_offset = vxlan_offset + VXLAN_HDR_SIZE;
-        uint8_t *inner_data = rx_buf + inner_offset;
-        uint32_t inner_len = (uint32_t)(n - inner_offset);
-
-        /* DEBUG: log VXLAN header parse result */
-        if (filtered <= 10) {
-            log_info("IN[%d] VXLAN: frag=%u pkt_id=%u inner_len=%u vxlan_offset=%d",
-                     w->id, frag_index, pkt_id, inner_len, vxlan_offset);
-        }
-
-        if (frag_index == VXLAN_FRAG_NONE) {
-            /* ---- Unfragmented: inner_data is a complete Ethernet frame ---- */
-            if (inner_len < 14) continue;
-
-            uint8_t *ip_data = inner_data + 14;
-            int is_ipv4 = ((ip_data[0] >> 4) == 4);
-            if (is_ipv4) {
-                memcpy(inner_data, cached_eth_ipv4, 14);
-                sa.sll_protocol = htons(ETH_P_IP);
-            } else {
-                memcpy(inner_data, cached_eth_ipv6, 14);
-                sa.sll_protocol = htons(ETH_P_IPV6);
+        /* Chỉ xử lý gói tin đến từ các interface tunnel của chúng ta */
+        int is_tunnel = 0;
+        for (size_t i = 0; i < fg->tunnel_count; i++) {
+            if (from.sll_ifindex == fg->tunnel_ifindices[i]) {
+                is_tunnel = 1;
+                break;
             }
+        }
+        if (!is_tunnel) continue;
 
-            ssize_t tx_rc = sendto(w->tx_fd, inner_data, inner_len, 0,
-                   (struct sockaddr *)&sa, sizeof(sa));
-                if (pkt_cnt <= 5) {
-                    // log_info("IN[%d] FWD unfrag #%lu: inner_len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                    //          w->id, pkt_cnt, inner_len, tx_rc,
-                    //          cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
-                    //          cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
-                    if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
-                }
-        } else {
-            /* ---- Fragmented: store or reassemble ---- */
-            if (!fg->frag_tbl) continue;
+        total_raw++;
+
+        struct ethhdr *eth = (struct ethhdr *)rx_buf;
+        uint16_t h_proto = ntohs(eth->h_proto);
+
+        /* Rewrite MAC source/dest cho mạng LAN */
+        memcpy(eth->h_source, fg->local.src_mac, 6);
+        memcpy(eth->h_dest, ctx->cfg.lan.dst_mac, 6);
+
+        if (h_proto == MWAN_ETHERTYPE) {
+            /* Fragmented: Read metadata and reassemble */
+            if (n < (ssize_t)(14 + MWAN_METADATA_SIZE)) continue;
+
+            uint16_t pkt_id;
+            uint8_t frag_index;
+            if (mwan_metadata_read(rx_buf + 14, &pkt_id, &frag_index) != 0) continue;
 
             uint32_t reassem_len = 0;
             int ret = frag_store_or_reassemble(fg->frag_tbl,
-                                               inner_data, inner_len,
+                                               rx_buf + 14 + MWAN_METADATA_SIZE,
+                                               (uint32_t)(n - (14 + MWAN_METADATA_SIZE)),
                                                pkt_id, frag_index,
-                                               reassem_buf, &reassem_len);
+                                               reassem_buf + 14, &reassem_len);
             if (ret == 1) {
-                /* Reassembled: complete original Ethernet frame */
-                if (reassem_len < 14) continue;
+                /* Successfully reassembled. Add Ethernet header back. */
+                struct ethhdr *reth = (struct ethhdr *)reassem_buf;
+                memcpy(reth->h_source, fg->local.src_mac, 6);
+                memcpy(reth->h_dest, ctx->cfg.lan.dst_mac, 6);
+                
+                /* Detect inner protocol (IPv4/IPv6 heuristic) */
+                uint8_t ip_ver = (reassem_buf[14] >> 4);
+                if (ip_ver == 4) reth->h_proto = htons(ETH_P_IP);
+                else if (ip_ver == 6) reth->h_proto = htons(ETH_P_IPV6);
+                else continue;
 
-                uint8_t *ip_data = reassem_buf + 14;
-                int is_ipv4 = ((ip_data[0] >> 4) == 4);
-                if (is_ipv4) {
-                    memcpy(reassem_buf, cached_eth_ipv4, 14);
-                    sa.sll_protocol = htons(ETH_P_IP);
-                } else {
-                    memcpy(reassem_buf, cached_eth_ipv6, 14);
-                    sa.sll_protocol = htons(ETH_P_IPV6);
-                }
-
-                ssize_t tx_rc = sendto(w->tx_fd, reassem_buf, reassem_len, 0,
+                sendto(w->tx_fd, reassem_buf, 14 + reassem_len, 0,
                        (struct sockaddr *)&sa, sizeof(sa));
-                if (pkt_cnt <= 5) {
-                    // log_info("IN[%d] FWD reassembled #%lu: len=%u tx_rc=%zd to MAC: %02x:%02x:%02x:%02x:%02x:%02x",
-                    //          w->id, pkt_cnt, reassem_len, tx_rc,
-                    //          cached_eth_ipv4[0], cached_eth_ipv4[1], cached_eth_ipv4[2],
-                    //          cached_eth_ipv4[3], cached_eth_ipv4[4], cached_eth_ipv4[5]);
-                    if (tx_rc < 0) log_error("  -> Error: %s", strerror(errno));
-                }
+                pkt_cnt++;
             }
-            /* ret == 0: stored fragment, waiting for counterpart */
+        } else {
+            /* Non-fragmented: Forward directly after MAC rewrite */
+            sendto(w->tx_fd, rx_buf, n, 0, (struct sockaddr *)&sa, sizeof(sa));
+            pkt_cnt++;
         }
+        handled++;
     }
 
     free(rx_buf);
     free(reassem_buf);
     close(rx_fd);
-    log_info("IN[%d] FINAL: total_raw=%lu filtered_vxlan=%lu forwarded=%lu",
-             w->id, total_pkts, filtered, pkt_cnt);
+    log_info("IN[%d] FINAL: tunnel_raw=%lu handled=%lu forwarded=%lu",
+             w->id, total_raw, handled, pkt_cnt);
 }
