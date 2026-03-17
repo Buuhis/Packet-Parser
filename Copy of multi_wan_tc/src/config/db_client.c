@@ -37,7 +37,7 @@ void db_client_disconnect(void)
     }
 }
 
-int db_client_load_config(const char *node_id, app_config_t *cfg)
+int db_client_load_config(int node_id, app_config_t *cfg)
 {
     if (!g_db_conn) {
         log_error("Database connection is not open.");
@@ -45,9 +45,12 @@ int db_client_load_config(const char *node_id, app_config_t *cfg)
     }
     
     /* 1. Fetch node info */
-    const char *paramValues[1] = { node_id };
+    char id_str[16];
+    snprintf(id_str, sizeof(id_str), "%d", node_id);
+    const char *paramValues[1] = { id_str };
+    
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT role, local_if, remote_cidr, lan_ip, lan_gw, lan_dst_mac FROM public.nodes WHERE node_id = $1",
+        "SELECT role, local_if, remote_cidr FROM public.nodes WHERE node_id = $1",
         1,       /* nParams */
         NULL,    /* paramTypes */
         paramValues,
@@ -62,19 +65,16 @@ int db_client_load_config(const char *node_id, app_config_t *cfg)
     }
     
     if (PQntuples(res) == 0) {
-        log_error("No node found with id '%s'", node_id);
+        log_error("No node found with id '%d'", node_id);
         PQclear(res);
         return -1;
     }
     
     memset(cfg, 0, sizeof(*cfg));
-    strncpy(cfg->node_id, node_id, sizeof(cfg->node_id) - 1);
+    cfg->node_id = node_id;
     strncpy(cfg->role, PQgetvalue(res, 0, 0), sizeof(cfg->role) - 1);
     strncpy(cfg->local_if, PQgetvalue(res, 0, 1), sizeof(cfg->local_if) - 1);
     strncpy(cfg->remote_cidr, PQgetvalue(res, 0, 2), sizeof(cfg->remote_cidr) - 1);
-    strncpy(cfg->lan.ip, PQgetvalue(res, 0, 3), sizeof(cfg->lan.ip) - 1);
-    strncpy(cfg->lan.gw, PQgetvalue(res, 0, 4), sizeof(cfg->lan.gw) - 1);
-    parse_mac(PQgetvalue(res, 0, 5), cfg->lan.dst_mac);
     PQclear(res);
     
     /* 2. Fetch ne_tunnels info */

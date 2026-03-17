@@ -175,7 +175,11 @@ static void stop_dataplane(void) {
     }
     in_worker_count = 0;
     
-    system_restore_ip_forward();
+    tc_ingress_cleanup(running_ctx.cfg.local_if);
+    for (size_t i = 0; i < running_ctx.cfg.ne_tunnel_count; i++) {
+        tc_ingress_cleanup(running_ctx.cfg.ne_tunnels[i].ifname);
+    }
+    
     netdev_enable_offloads(running_ctx.cfg.local_if);
     netdev_reset_interface(running_ctx.cfg.local_if);
     
@@ -189,13 +193,21 @@ static int start_dataplane(app_context_t *ctx) {
         stop_dataplane();
     }
     
-    log_info("Starting Dataplane for node: %s", ctx->cfg.node_id);
+    log_info("Starting Dataplane for Node ID: %d", ctx->cfg.node_id);
     running_dataplane = 1;
+
+    /* ---- STEP 1: TC Ingress Drop to prevent Kernel duplicate ---- */
+    if (tc_ingress_drop_cidr(ctx->cfg.local_if, ctx->cfg.remote_cidr) != 0) {
+        log_error("Failed to add TC ingress drop on %s", ctx->cfg.local_if);
+    }
     
-    /* ---- STEP 1: disable ip_forward ---- */
-    if (system_disable_ip_forward() != 0) {
-        log_error("Failed to disable IP forwarding");
-        return -1;
+    /* Also drop MWAN traffic on tunnels to avoid inbound duplication in Kernel */
+    /* Since we reuse the same EtherType 0x88B5, we can drop it on tunnel interfaces */
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
+        /* Note: For tunnels, we want to drop MWAN_ETHERTYPE packets from being processed by Kernel */
+        /* Currently tc_ingress_drop_cidr drops by IP, we might want a generic drop by protocol later */
+        /* For now, let's use the remote_cidr logic if applicable, or a broader drop */
+        tc_ingress_drop_cidr(ctx->cfg.ne_tunnels[i].ifname, "0.0.0.0/0"); // Placeholder, drops all on ingress of tunnel
     }
 
     /* ---- STEP 2: Disable offloads + Optimize Interfaces ---- */
@@ -300,7 +312,10 @@ cleanup_pl_out:
     }
     in_worker_count = 0;
 cleanup_route:
-    system_restore_ip_forward();
+    tc_ingress_cleanup(ctx->cfg.local_if);
+    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
+        tc_ingress_cleanup(ctx->cfg.ne_tunnels[i].ifname);
+    }
     netdev_enable_offloads(ctx->cfg.local_if);
     netdev_reset_interface(ctx->cfg.local_if);
     is_dataplane_active = 0;
@@ -321,7 +336,7 @@ int main(int argc, char **argv)
     log_set_level(LOG_INFO);
 
     int client_mode = 0;
-    const char *node_id = NULL;
+    int node_id = 0;
 
     for (int i = 1; i < argc; i++)
     {
@@ -330,7 +345,7 @@ int main(int argc, char **argv)
             return 0;
         } else if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
             client_mode = 1;
-            node_id = argv[++i];
+            node_id = atoi(argv[++i]);
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             usage(argv[0]);
@@ -339,8 +354,8 @@ int main(int argc, char **argv)
     }
 
     if (client_mode) {
-        if (!node_id) {
-            fprintf(stderr, "Error: Missing -id argument.\n");
+        if (node_id <= 0) {
+            fprintf(stderr, "Error: Invalid or missing -id argument. Must be a positive integer.\n");
             usage(argv[0]);
             return 1;
         }
@@ -367,13 +382,15 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (send(fd, node_id, strlen(node_id), 0) < 0) {
+        char id_str[16];
+        snprintf(id_str, sizeof(id_str), "%d", node_id);
+        if (send(fd, id_str, strlen(id_str), 0) < 0) {
             perror("[-] Failed to send command to daemon");
             close(fd);
             return 1;
         }
 
-        printf("[+] Command sent successfully! Node ID: '%s'\n", node_id);
+        printf("[+] Command sent successfully! Node ID: %d\n", node_id);
         close(fd);
         return 0;
     }
@@ -451,10 +468,11 @@ int main(int argc, char **argv)
         
         while(n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
         
-        log_info(">>> Received configure request for node_id: '%s'", buf);
+        int req_id = atoi(buf);
+        log_info(">>> Received configure request for Node ID: %d", req_id);
         
         app_config_t new_cfg;
-        if (db_client_load_config(buf, &new_cfg) == 0) {
+        if (db_client_load_config(req_id, &new_cfg) == 0) {
             app_context_dump(&(app_context_t){new_cfg});
             
             log_info("Applying new config...");
@@ -462,10 +480,10 @@ int main(int argc, char **argv)
             running_ctx.cfg = new_cfg;
             
             if (start_dataplane(&running_ctx) != 0) {
-                log_error("Failed to start dataplane for node: %s", buf);
+                log_error("Failed to start dataplane for Node ID: %d", req_id);
             }
         } else {
-            log_error("Config load failed. Skipping this node_id.");
+            log_error("Config load failed for Node ID: %d. Skipping.", req_id);
         }
     }
     

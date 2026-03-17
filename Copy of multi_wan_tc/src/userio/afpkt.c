@@ -249,6 +249,18 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
                  fanout_group_id, i, w->rx_fd, w->tx_fd, w->block_count);
     }
 
+    /* Open Raw IP socket for inbound forwarding (Kernel handles MAC/ARP) */
+    fg->raw_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+    if (fg->raw_tx_fd < 0) {
+        log_error("Failed to open RAW IP socket: %s", strerror(errno));
+    } else {
+        int one = 1;
+        const int *val = &one;
+        if (setsockopt(fg->raw_tx_fd, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
+            log_error("setsockopt(IP_HDRINCL) failed: %s", strerror(errno));
+        }
+    }
+
     return 0;
 }
 
@@ -367,6 +379,11 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
             close(w->rx_fd);
             w->rx_fd = -1;
         }
+    }
+
+    if (fg->raw_tx_fd >= 0) {
+        close(fg->raw_tx_fd);
+        fg->raw_tx_fd = -1;
     }
 
     memset(fg, 0, sizeof(*fg));
@@ -608,30 +625,14 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     unsigned long total_raw = 0;
     unsigned long handled = 0;
 
-    log_info("Worker inbound[%d] started (TPACKET_V3 Batch Forwarding)", w->id);
-
-    /* Pre-prepare LAN Ethernet header template */
-    struct ethhdr lan_eth;
-    memcpy(lan_eth.h_source, fg->local.src_mac, 6);
-    memcpy(lan_eth.h_dest, ctx->cfg.lan.dst_mac, 6);
+    log_info("Worker inbound[%d] started (TPACKET_V3 -> Raw IP Forwarding)", w->id);
 
     uint8_t *reassem_buf = malloc(4096);
     if (!reassem_buf) return;
 
-    struct iovec iov[2];
-    struct msghdr msg;
-    struct sockaddr_ll sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sll_family = AF_PACKET;
-    sa.sll_ifindex = fg->local.ifindex;
-    sa.sll_halen = 6;
-    memcpy(sa.sll_addr, ctx->cfg.lan.dst_mac, 6);
-
-    memset(&msg, 0, sizeof(msg));
-    msg.msg_name = &sa;
-    msg.msg_namelen = sizeof(sa);
-    msg.msg_iov = iov;
-    msg.msg_iovlen = 2;
+    struct sockaddr_in sin;
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_family = AF_INET;
 
     while (*running)
     {
@@ -685,16 +686,20 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
             if (ip_data && ip_len > 0) {
                 uint8_t ver = (ip_data[0] >> 4);
-                if (ver == 4) lan_eth.h_proto = htons(ETH_P_IP);
-                else if (ver == 6) lan_eth.h_proto = htons(ETH_P_IPV6);
-                else goto next_pkt;
-
-                iov[0].iov_base = &lan_eth;
-                iov[0].iov_len  = 14;
-                iov[1].iov_base = ip_data;
-                iov[1].iov_len  = ip_len;
-                sendmsg(w->tx_fd, &msg, 0);
-                pkt_cnt++;
+                if (ver == 4) {
+                    /* Only handle IPv4 for RAW socket in this implementation */
+                    struct iphdr *iph = (struct iphdr *)ip_data;
+                    sin.sin_addr.s_addr = iph->daddr;
+                    
+                    if (sendto(fg->raw_tx_fd, ip_data, ip_len, 0, 
+                               (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+                        /* Ignore errors like EHOSTUNREACH/ENETUNREACH for now */
+                    }
+                    pkt_cnt++;
+                } else {
+                    /* IPv6 would need a separate AF_INET6 SOCK_RAW */
+                    goto next_pkt;
+                }
             }
             handled++;
 

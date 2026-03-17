@@ -48,6 +48,7 @@ typedef struct {
     } local;
 
     struct frag_table *frag_tbl;
+    int               raw_tx_fd; /* For sending IP packets to LAN via Kernel (ARP handling) */
 } afpkt_fanout_t;
 
 /* ============ Fanout API ============ */

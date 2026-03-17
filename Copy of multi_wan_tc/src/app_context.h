@@ -6,11 +6,6 @@
 #define MAX_WANS       8
 #define MAX_NE_TUNNELS 8
 
-typedef struct {
-    char ip[32];
-    char gw[32];
-    unsigned char dst_mac[6];
-} lan_cfg_t;
 
 typedef struct {
     char name[16];
@@ -28,20 +23,19 @@ typedef struct {
     int  weight;
 } ne_tunnel_cfg_t;
 
-typedef struct {
-    char veth_in[16];
-    char veth_out[16];
-    int  mtu;
-} dataplane_cfg_t;
+// typedef struct {
+//     char veth_in[16];
+//     char veth_out[16];
+//     int  mtu;
+// } dataplane_cfg_t;
 
 typedef struct {
-    char node_id[16];
+    int  node_id;
     char role[16];
 
     char local_if[16];
     char remote_cidr[32];
 
-    lan_cfg_t lan;
 
     size_t wan_count;
     wan_cfg_t wans[MAX_WANS];
@@ -49,7 +43,7 @@ typedef struct {
     size_t ne_tunnel_count;
     ne_tunnel_cfg_t ne_tunnels[MAX_NE_TUNNELS];
 
-    dataplane_cfg_t dataplane;
+    // dataplane_cfg_t dataplane;
 
 } app_config_t;
 

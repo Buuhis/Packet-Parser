@@ -2,7 +2,7 @@
 
 if [ -z "$1" ]; then
     echo "Usage: ./mock_backend.sh <node_id> [port]"
-    echo "Example: ./mock_backend.sh server1 8080"
+    echo "Example: ./mock_backend.sh 1 8080"
     exit 1
 fi
 
