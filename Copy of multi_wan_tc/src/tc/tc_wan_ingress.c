@@ -17,13 +17,13 @@ int tc_wan_ingress_redirect_cidr(const char *wan_if,
     char cmd[512];
 
     /* Delete existing clsact first (cleanup from previous run) */
-    snprintf(cmd, sizeof(cmd),
-             "tc qdisc del dev %s clsact 2>/dev/null",
-             wan_if);
-    if (system(cmd) != 0) {
-        log_error("Failed to delete qdisc on WAN %s", wan_if);
-        return -1;
-    }
+    // snprintf(cmd, sizeof(cmd),
+    //          "tc qdisc del dev %s clsact 2>/dev/null",
+    //          wan_if);
+    // if (system(cmd) != 0) {
+    //     log_error("Failed to delete qdisc on WAN %s", wan_if);
+    //     return -1;
+    // }
 
     /* Add clsact qdisc */
     snprintf(cmd, sizeof(cmd),
@@ -60,13 +60,13 @@ int tc_wan_ingress_redirect(const char *wan_if, const char *dst_if)
     char cmd[512];
 
     /* Delete existing clsact first (cleanup from previous run) */
-    snprintf(cmd, sizeof(cmd),
-             "tc qdisc del dev %s clsact 2>/dev/null",
-             wan_if);
-    if (system(cmd) != 0) {
-        log_error("Failed to delete qdisc dev %s clsact", wan_if);
-        return -1;
-    }
+    // snprintf(cmd, sizeof(cmd),
+    //          "tc qdisc del dev %s clsact 2>/dev/null",
+    //          wan_if);
+    // if (system(cmd) != 0) {
+    //     log_error("Failed to delete qdisc dev %s clsact", wan_if);
+    //     return -1;
+    // }
 
     /* Add clsact qdisc */
     snprintf(cmd, sizeof(cmd),
