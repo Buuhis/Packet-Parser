@@ -18,6 +18,8 @@ int system_del_route_dev(const char *cidr, const char *ifname);
 int netdev_create_veth_pair(const char *if_in, const char *if_out, int mtu);
 int netdev_delete(const char *ifname);
 int netdev_set_up(const char *ifname);
+int netdev_add_loopback_ip(const char *ip);
+int netdev_del_loopback_ip(const char *ip);
 int system_get_if_hwaddr(const char *ifname, unsigned char mac[6]);
 
 /*

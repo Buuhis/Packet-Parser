@@ -31,6 +31,7 @@
 #define V3_BLOCK_NR 256          /* 256 blocks = 512MB Ring */
 #define V3_FRAME_SIZE 2048
 #define OUT_BATCH_SIZE 64
+#define IN_BATCH_SIZE 32
 #define BUSY_WAIT_COUNT 1000
 
 /* BPF Filter for MWAN_ETHERTYPE (0x88B5) and BLOCK PACKET_OUTGOING (Loop prevention) */
@@ -248,6 +249,12 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
 
         log_info("Fanout[%d] worker %d: rx_fd=%d tx_fd=%d V3_Blocks=%u",
                  fanout_group_id, i, w->rx_fd, w->tx_fd, w->block_count);
+        
+        /* Initialize health tracking */
+        fg->tunnel_alive[i] = 1;
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        fg->last_seen_ns[i] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     }
 
     /* Open Raw IP socket for inbound forwarding (Kernel handles MAC/ARP) */
@@ -453,7 +460,7 @@ void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ct
  *
  * The kernel handles Outer IP/UDP/MAC headers automatically via SOCK_DGRAM.
  */
-void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+void afpkt_worker_loop_outbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                                 const app_context_t *ctx, volatile int *running)
 {
     unsigned long pkt_cnt = 0;
@@ -537,6 +544,21 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
 
                 uint32_t hash = calculate_5tuple_hash(frame, len);
                 int t_idx = hash % tunnel_count;
+                
+                /* Failover logic: if selected tunnel is dead, pick next alive one */
+                if (!fg->tunnel_alive[t_idx]) {
+                    int found = 0;
+                    for (size_t k = 1; k < tunnel_count; k++) {
+                        int try_idx = (t_idx + k) % tunnel_count;
+                        if (fg->tunnel_alive[try_idx]) {
+                            t_idx = try_idx;
+                            found = 1;
+                            break;
+                        }
+                    }
+                    if (!found) goto next_pkt; /* All tunnels dead */
+                }
+                
                 int t_ifidx = fg->tunnel_ifindices[t_idx];
 
                 uint32_t ip_len = len - 14;
@@ -556,7 +578,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(eh->h_dest, eth->h_dest, 6);
                     memcpy(eh->h_source, eth->h_source, 6);
 
-                    mwan_metadata_build(&hdrs[batch_idx].meta, p_id, MWAN_FRAG_FIRST);
+                    mwan_metadata_build(&hdrs[batch_idx].meta, p_id, MWAN_FRAG_FIRST, MWAN_TYPE_DATA);
                     iovs[batch_idx][0].iov_base = &hdrs[batch_idx];
                     iovs[batch_idx][0].iov_len  = sizeof(hdrs[0]);
                     iovs[batch_idx][1].iov_base = ip_ptr;
@@ -578,7 +600,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(eh->h_dest, eth->h_dest, 6);
                     memcpy(eh->h_source, eth->h_source, 6);
 
-                    mwan_metadata_build(&hdrs[batch_idx].meta, p_id, MWAN_FRAG_LAST);
+                    mwan_metadata_build(&hdrs[batch_idx].meta, p_id, MWAN_FRAG_LAST, MWAN_TYPE_DATA);
                     iovs[batch_idx][0].iov_base = &hdrs[batch_idx];
                     iovs[batch_idx][0].iov_len  = sizeof(hdrs[0]);
                     iovs[batch_idx][1].iov_base = ip_ptr + half1;
@@ -593,7 +615,7 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                     memcpy(eh->h_dest, eth->h_dest, 6);
                     memcpy(eh->h_source, eth->h_source, 6);
 
-                    mwan_metadata_build(&hdrs[batch_idx].meta, 0, MWAN_FRAG_NONE);
+                    mwan_metadata_build(&hdrs[batch_idx].meta, 0, MWAN_FRAG_NONE, MWAN_TYPE_DATA);
                     iovs[batch_idx][0].iov_base = &hdrs[batch_idx];
                     iovs[batch_idx][0].iov_len  = sizeof(hdrs[0]);
                     iovs[batch_idx][1].iov_base = ip_ptr;
@@ -627,8 +649,8 @@ void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
              w->id, captured_cnt, ip_pkts, pkt_cnt, syscalls);
 }
 
-#define IN_BATCH_SIZE 32
-void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+
+void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                                 const app_context_t *ctx, const char *listen_ifname, volatile int *running)
 {
     (void)listen_ifname;
@@ -695,8 +717,34 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
                 if (len < (14 + MWAN_METADATA_SIZE)) goto next_pkt;
                 
                 uint16_t pkt_id;
-                uint8_t frag_index;
-                if (mwan_metadata_read(frame + 14, &pkt_id, &frag_index) != 0) goto next_pkt;
+                uint8_t frag_index, type;
+                if (mwan_metadata_read(frame + 14, &pkt_id, &frag_index, &type) != 0) goto next_pkt;
+
+                /* Handle Heartbeat */
+                if (type == MWAN_TYPE_HEARTBEAT) {
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    fg->last_seen_ns[w->id] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+                    fg->tunnel_alive[w->id] = 1;
+
+                    /* If it's a request, send back a response */
+                    if (pkt_id == HEARTBEAT_REQ) {
+                        mwan_metadata_t res;
+                        mwan_metadata_build(&res, HEARTBEAT_RES, MWAN_FRAG_NONE, MWAN_TYPE_HEARTBEAT);
+                        
+                        struct iovec hiov[2];
+                        hiov[0].iov_base = frame;     /* reuse Ethernet header */
+                        hiov[0].iov_len  = 14;
+                        hiov[1].iov_base = &res;
+                        hiov[1].iov_len  = sizeof(res);
+
+                        struct msghdr m = {
+                            .msg_iov = hiov, .msg_iovlen = 2,
+                        };
+                        sendmsg(w->tx_fd, &m, 0);
+                    }
+                    goto next_pkt;
+                }
 
                 uint8_t *ip_ptr = NULL;
                 uint32_t ip_len = 0;
@@ -760,3 +808,43 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
     log_info("IN[%d] FINAL: tunnel_raw=%lu handled=%lu forwarded=%lu syscalls=%lu",
              w->id, total_raw, handled, pkt_cnt, syscalls);
 }
+
+void afpkt_fanout_check_health(afpkt_fanout_t *fg) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+
+    for (size_t i = 0; i < fg->tunnel_count; i++) {
+        if (fg->tunnel_alive[i] && (now - fg->last_seen_ns[i]) > 3000000000ULL) {
+            fg->tunnel_alive[i] = 0;
+            log_warn("Tunnel %zu marked DEAD (timeout)", i);
+        }
+    }
+}
+
+void afpkt_fanout_send_heartbeats(afpkt_fanout_t *fg) {
+    mwan_metadata_t req;
+    mwan_metadata_build(&req, HEARTBEAT_REQ, MWAN_FRAG_NONE, MWAN_TYPE_HEARTBEAT);
+
+    for (size_t i = 0; i < fg->tunnel_count; i++) {
+        /* We need a mock Ethernet header to satisfy the receiver's mwan_metadata_read offset (14) */
+        struct {
+            struct ethhdr eth;
+            mwan_metadata_t meta;
+        } __attribute__((packed)) hb_pkt;
+        
+        memset(&hb_pkt.eth, 0, 14);
+        hb_pkt.eth.h_proto = htons(MWAN_ETHERTYPE);
+        hb_pkt.meta = req;
+
+        struct sockaddr_ll sa = {
+            .sll_family = AF_PACKET,
+            .sll_ifindex = fg->tunnel_ifindices[i],
+            .sll_halen = 6,
+        };
+        
+        /* Use the first worker's TX socket to send probes */
+        sendto(fg->workers[0].tx_fd, &hb_pkt, sizeof(hb_pkt), 0, (struct sockaddr *)&sa, sizeof(sa));
+    }
+}
+

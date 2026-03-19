@@ -6,6 +6,7 @@ BIN := sep-wan
 
 SRC := \
     src/main.c \
+    src/dataplane.c \
     src/app_context.c \
     $(wildcard src/config/*.c) \
     $(wildcard src/proto/*.c) \

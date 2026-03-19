@@ -50,7 +50,7 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     const char *paramValues[1] = { id_str };
     
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT role, local_if, remote_cidr FROM public.nodes WHERE node_id = $1",
+        "SELECT local_if, remote_cidr, loopback_ip FROM public.nodes WHERE node_id = $1",
         1,       /* nParams */
         NULL,    /* paramTypes */
         paramValues,
@@ -72,14 +72,14 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     
     memset(cfg, 0, sizeof(*cfg));
     cfg->node_id = node_id;
-    strncpy(cfg->role, PQgetvalue(res, 0, 0), sizeof(cfg->role) - 1);
-    strncpy(cfg->local_if, PQgetvalue(res, 0, 1), sizeof(cfg->local_if) - 1);
-    strncpy(cfg->remote_cidr, PQgetvalue(res, 0, 2), sizeof(cfg->remote_cidr) - 1);
+    strncpy(cfg->local_if, PQgetvalue(res, 0, 0), sizeof(cfg->local_if) - 1);
+    strncpy(cfg->remote_cidr, PQgetvalue(res, 0, 1), sizeof(cfg->remote_cidr) - 1);
+    strncpy(cfg->loopback_ip, PQgetvalue(res, 0, 2), sizeof(cfg->loopback_ip) - 1);
     PQclear(res);
     
     /* 2. Fetch ne_tunnels info */
     res = PQexecParams(g_db_conn,
-        "SELECT name, ifname, gateway, weight, port FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
+        "SELECT ifname, gateway, weight, port FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
         1, NULL, paramValues, NULL, NULL, 0);
         
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -92,11 +92,10 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     cfg->ne_tunnel_count = (num_tunnels < MAX_NE_TUNNELS) ? num_tunnels : MAX_NE_TUNNELS;
     
     for (size_t i = 0; i < cfg->ne_tunnel_count; i++) {
-        strncpy(cfg->ne_tunnels[i].name, PQgetvalue(res, i, 0), sizeof(cfg->ne_tunnels[i].name) - 1);
-        strncpy(cfg->ne_tunnels[i].ifname, PQgetvalue(res, i, 1), sizeof(cfg->ne_tunnels[i].ifname) - 1);
-        strncpy(cfg->ne_tunnels[i].gateway, PQgetvalue(res, i, 2), sizeof(cfg->ne_tunnels[i].gateway) - 1);
-        cfg->ne_tunnels[i].weight = atoi(PQgetvalue(res, i, 3));
-        cfg->ne_tunnels[i].port = atoi(PQgetvalue(res, i, 4));
+        strncpy(cfg->ne_tunnels[i].ifname, PQgetvalue(res, i, 0), sizeof(cfg->ne_tunnels[i].ifname) - 1);
+        strncpy(cfg->ne_tunnels[i].gateway, PQgetvalue(res, i, 1), sizeof(cfg->ne_tunnels[i].gateway) - 1);
+        cfg->ne_tunnels[i].weight = atoi(PQgetvalue(res, i, 2));
+        cfg->ne_tunnels[i].port = atoi(PQgetvalue(res, i, 3));
     }
     PQclear(res);
     

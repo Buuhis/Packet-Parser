@@ -16,7 +16,6 @@ typedef struct {
 } wan_cfg_t;
 
 typedef struct {
-    char name[16];
     char ifname[16];
     char gateway[32];
     int  port;
@@ -31,10 +30,10 @@ typedef struct {
 
 typedef struct {
     int  node_id;
-    char role[16];
 
     char local_if[16];
     char remote_cidr[32];
+    char loopback_ip[32];
 
 
     size_t wan_count;

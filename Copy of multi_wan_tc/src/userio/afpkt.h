@@ -8,7 +8,12 @@
 #include <netinet/in.h>
 
 #define MAX_FANOUT_WORKERS 6
-#define NUM_TX_WORKERS 3  /* default, adjustable */
+#define NUM_TX_WORKERS 3
+
+#define MWAN_TYPE_DATA      0
+#define MWAN_TYPE_HEARTBEAT 1
+#define HEARTBEAT_REQ       0
+#define HEARTBEAT_RES       1
 
 /* Each worker owns 1 RX socket (fanout) + 1 TX socket */
 typedef struct {
@@ -47,6 +52,10 @@ typedef struct {
         int valid;
     } local;
 
+    /* Health Tracking */
+    uint8_t  tunnel_alive[MAX_NE_TUNNELS];
+    uint64_t last_seen_ns[MAX_NE_TUNNELS];
+
     struct frag_table *frag_tbl;
     int               raw_tx_fd; /* For sending IP packets to LAN via Kernel (ARP handling) */
 } afpkt_fanout_t;
@@ -61,12 +70,15 @@ void afpkt_fanout_close(afpkt_fanout_t *fg);
 void afpkt_fanout_init_cache_outbound(afpkt_fanout_t *fg, const app_context_t *ctx);
 void afpkt_fanout_init_cache_inbound(afpkt_fanout_t *fg, const app_context_t *ctx);
 
+void afpkt_fanout_send_heartbeats(afpkt_fanout_t *fg);
+void afpkt_fanout_check_health(afpkt_fanout_t *fg);
+
 /* Outbound: capture from local_if → VXLAN encapsulate → send via UDP */
-void afpkt_worker_loop_outbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+void afpkt_worker_loop_outbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                                  const app_context_t *ctx, volatile int *running);
 
 /* Inbound: receive VXLAN from UDP → strip → reassemble → forward to LAN */
-void afpkt_worker_loop_inbound(afpkt_worker_t *w, const afpkt_fanout_t *fg,
+void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                                 const app_context_t *ctx, const char *listen_ifname, volatile int *running);
 
 #endif /* AFPKT_H */

@@ -200,3 +200,19 @@ int netdev_reset_interface(const char *ifname)
 
     return ret;
 }
+int netdev_add_loopback_ip(const char *ip)
+{
+    char cmd[128];
+    /* Use 'ip addr replace' to be idempotent */
+    snprintf(cmd, sizeof(cmd), "ip addr replace %s/32 dev lo", ip);
+    log_info("EXEC: %s", cmd);
+    return system(cmd);
+}
+
+int netdev_del_loopback_ip(const char *ip)
+{
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ip addr del %s/32 dev lo", ip);
+    log_info("EXEC: %s", cmd);
+    return system(cmd);
+}
