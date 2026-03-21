@@ -57,7 +57,7 @@ typedef struct {
     uint64_t last_seen_ns[MAX_NE_TUNNELS];
 
     struct frag_table *frag_tbl;
-    int               raw_tx_fd; /* For sending IP packets to LAN via Kernel (ARP handling) */
+    int               local_tx_fd; /* For sending Ethernet packets directly to local_if */
 } afpkt_fanout_t;
 
 /* ============ Fanout API ============ */

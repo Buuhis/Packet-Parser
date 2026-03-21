@@ -7,6 +7,7 @@
 #include <sys/socket.h>
 #include <net/if.h>
 #include <linux/if_packet.h>
+#include <netinet/in.h>
 
 #include "system.h"
 #include "../utils/logger.h"
@@ -131,6 +132,36 @@ int system_get_if_hwaddr(const char *ifname, unsigned char mac[6])
     }
 
     memcpy(mac, (unsigned char *)ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
+    return 0;
+}
+
+int system_get_if_ip_and_mask(const char *ifname, uint32_t *ip, uint32_t *mask)
+{
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        log_error("socket(AF_INET) failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFADDR, &ifr) != 0) {
+        log_error("ioctl(SIOCGIFADDR, %s) failed: %s", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    *ip = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+
+    if (ioctl(fd, SIOCGIFNETMASK, &ifr) != 0) {
+        log_error("ioctl(SIOCGIFNETMASK, %s) failed: %s", ifname, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    *mask = ((struct sockaddr_in *)&ifr.ifr_netmask)->sin_addr.s_addr;
+
     close(fd);
     return 0;
 }

@@ -6,6 +6,7 @@
 #include "userio/afpkt.h"
 #include "proto/mwan_proto.h"
 #include "proto/fragment.h"
+#include "system/arp.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -179,6 +180,17 @@ int dataplane_start(app_context_t *ctx) {
     /* ---- STEP 2: Interface Optimizations ---- */
     netdev_disable_offloads(ctx->cfg.local_if);
     netdev_optimize_interface(ctx->cfg.local_if);
+
+    /* ---- STEP 2.5: ARP Cache and Scanning ---- */
+    uint32_t local_ip, local_mask;
+    unsigned char local_mac[6];
+    if (system_get_if_hwaddr(ctx->cfg.local_if, local_mac) == 0 &&
+        system_get_if_ip_and_mask(ctx->cfg.local_if, &local_ip, &local_mask) == 0) {
+        arp_cache_init();
+        arp_scanner_scan_subnet(ctx->cfg.local_if, local_ip, local_mask, local_mac);
+    } else {
+        log_warn("Dataplane: Failed to get IP/MAC for %s, skipping ARP scan", ctx->cfg.local_if);
+    }
 
     /* ---- STEP 3: Fanout & Inbound Workers ---- */
     if (afpkt_fanout_open(&fg_out, ctx->cfg.local_if, 1, NUM_TX_WORKERS) != 0) {

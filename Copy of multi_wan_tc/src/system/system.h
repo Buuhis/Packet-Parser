@@ -1,6 +1,8 @@
 #ifndef SYSTEM_H
 #define SYSTEM_H
 
+#include <stdint.h>
+
 /* ---- IPv4 forwarding ---- */
 
 int system_get_ip_forward(void);
@@ -21,6 +23,7 @@ int netdev_set_up(const char *ifname);
 int netdev_add_loopback_ip(const char *ip);
 int netdev_del_loopback_ip(const char *ip);
 int system_get_if_hwaddr(const char *ifname, unsigned char mac[6]);
+int system_get_if_ip_and_mask(const char *ifname, uint32_t *ip, uint32_t *mask);
 
 /*
  * Disable GRO/GSO/TSO offloads on interface.

@@ -2,6 +2,7 @@
 #include "userio/afpkt.h"
 #include "utils/logger.h"
 #include "system/system.h"
+#include "system/arp.h"
 #include "proto/mwan_proto.h"
 
 #include <stdio.h>
@@ -257,16 +258,13 @@ int afpkt_fanout_open(afpkt_fanout_t *fg, const char *ifname, int fanout_group_i
         fg->last_seen_ns[i] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
     }
 
-    /* Open Raw IP socket for inbound forwarding (Kernel handles MAC/ARP) */
-    fg->raw_tx_fd = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-    if (fg->raw_tx_fd < 0) {
-        log_error("Failed to open RAW IP socket: %s", strerror(errno));
+    /* Open AF_PACKET socket for inbound Ethernet forwarding */
+    fg->local_tx_fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (fg->local_tx_fd < 0) {
+        log_error("Failed to open AF_PACKET TX socket for local_if: %s", strerror(errno));
     } else {
-        int one = 1;
-        const int *val = &one;
-        if (setsockopt(fg->raw_tx_fd, IPPROTO_IP, IP_HDRINCL, val, sizeof(one)) < 0) {
-            log_error("setsockopt(IP_HDRINCL) failed: %s", strerror(errno));
-        }
+        int sndbuf = 16 * 1024 * 1024;
+        setsockopt(fg->local_tx_fd, SOL_SOCKET, SO_SNDBUFFORCE, &sndbuf, sizeof(sndbuf));
     }
 
     return 0;
@@ -389,9 +387,9 @@ void afpkt_fanout_close(afpkt_fanout_t *fg)
         }
     }
 
-    if (fg->raw_tx_fd >= 0) {
-        close(fg->raw_tx_fd);
-        fg->raw_tx_fd = -1;
+    if (fg->local_tx_fd >= 0) {
+        close(fg->local_tx_fd);
+        fg->local_tx_fd = -1;
     }
 
     memset(fg, 0, sizeof(*fg));
@@ -664,8 +662,9 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
 
     /* Batching structures */
     struct mmsghdr msgs[IN_BATCH_SIZE];
-    struct iovec iovs[IN_BATCH_SIZE][1];
-    struct sockaddr_in addrs[IN_BATCH_SIZE];
+    struct iovec iovs[IN_BATCH_SIZE][2];
+    struct sockaddr_ll addrs[IN_BATCH_SIZE];
+    struct ethhdr eth_hdrs[IN_BATCH_SIZE];
     
     /* Pool for reassembled packets (one per batch slot) */
     uint8_t *reassem_pool = malloc(IN_BATCH_SIZE * 4096);
@@ -674,10 +673,16 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
     memset(msgs, 0, sizeof(msgs));
     for (int i = 0; i < IN_BATCH_SIZE; i++) {
         msgs[i].msg_hdr.msg_name = &addrs[i];
-        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_in);
+        msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_ll);
         msgs[i].msg_hdr.msg_iov = iovs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        addrs[i].sin_family = AF_INET;
+        msgs[i].msg_hdr.msg_iovlen = 2;
+        
+        addrs[i].sll_family = AF_PACKET;
+        addrs[i].sll_ifindex = fg->local.ifindex;
+        addrs[i].sll_halen = 6;
+        
+        eth_hdrs[i].h_proto = htons(ETH_P_IP);
+        memcpy(eth_hdrs[i].h_source, fg->local.src_mac, 6);
     }
 
     int batch_idx = 0;
@@ -720,26 +725,39 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                 uint8_t frag_index, type;
                 if (mwan_metadata_read(frame + 14, &pkt_id, &frag_index, &type) != 0) goto next_pkt;
 
-                /* Handle Heartbeat */
-                if (type == MWAN_TYPE_HEARTBEAT) {
-                    struct timespec ts;
-                    clock_gettime(CLOCK_MONOTONIC, &ts);
-                    fg->last_seen_ns[w->id] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-                    fg->tunnel_alive[w->id] = 1;
+                /* Always update health status for ANY valid MWAN packet received on this tunnel */
+                struct timespec ts;
+                clock_gettime(CLOCK_MONOTONIC, &ts);
+                fg->last_seen_ns[w->id] = (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+                fg->tunnel_alive[w->id] = 1;
 
+                /* Handle Heartbeat type-specific logic */
+                if (type == MWAN_TYPE_HEARTBEAT) {
                     /* If it's a request, send back a response */
                     if (pkt_id == HEARTBEAT_REQ) {
                         mwan_metadata_t res;
                         mwan_metadata_build(&res, HEARTBEAT_RES, MWAN_FRAG_NONE, MWAN_TYPE_HEARTBEAT);
                         
-                        struct iovec hiov[2];
+                        uint8_t padding[42] = {0};
+                        struct iovec hiov[3];
                         hiov[0].iov_base = frame;     /* reuse Ethernet header */
                         hiov[0].iov_len  = 14;
                         hiov[1].iov_base = &res;
                         hiov[1].iov_len  = sizeof(res);
+                        hiov[2].iov_base = padding;
+                        hiov[2].iov_len  = sizeof(padding);
+
+                        struct sockaddr_ll sa = {
+                            .sll_family = AF_PACKET,
+                            .sll_ifindex = fg->tunnel_ifindices[w->id],
+                            .sll_halen = 6,
+                        };
+                        struct ethhdr *eth = (struct ethhdr *)frame;
+                        memcpy(sa.sll_addr, eth->h_source, 6); /* Send back to whoever asked */
 
                         struct msghdr m = {
-                            .msg_iov = hiov, .msg_iovlen = 2,
+                            .msg_name = &sa, .msg_namelen = sizeof(sa),
+                            .msg_iov = hiov, .msg_iovlen = 3,
                         };
                         sendmsg(w->tx_fd, &m, 0);
                     }
@@ -772,19 +790,30 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
                     uint8_t ver = (ip_ptr[0] >> 4);
                     if (ver == 4) {
                         struct iphdr *iph = (struct iphdr *)ip_ptr;
-                        struct sockaddr_in *sin = &addrs[batch_idx];
-                        sin->sin_addr.s_addr = iph->daddr;
+                        struct sockaddr_ll *sll = &addrs[batch_idx];
+                        struct ethhdr *eth = &eth_hdrs[batch_idx];
                         
-                        iovs[batch_idx][0].iov_base = ip_ptr;
-                        iovs[batch_idx][0].iov_len  = ip_len;
-                        batch_idx++;
-                        pkt_cnt++;
+                        uint8_t dst_mac[6];
+                        if (arp_cache_lookup(iph->daddr, dst_mac) == 0) {
+                            memcpy(eth->h_dest, dst_mac, 6);
+                            memcpy(sll->sll_addr, dst_mac, 6);
+                            
+                            iovs[batch_idx][0].iov_base = eth;
+                            iovs[batch_idx][0].iov_len  = sizeof(struct ethhdr);
+                            iovs[batch_idx][1].iov_base = ip_ptr;
+                            iovs[batch_idx][1].iov_len  = ip_len;
+                            batch_idx++;
+                            pkt_cnt++;
+                        } else {
+                            /* Fallback to drop */
+                            log_debug("Worker inbound[%d]: No ARP entry for IP %x, dropping", w->id, ntohl(iph->daddr));
+                        }
                     }
                 }
                 handled++;
 
                 if (batch_idx == IN_BATCH_SIZE) {
-                    sendmmsg(fg->raw_tx_fd, msgs, batch_idx, 0);
+                    sendmmsg(fg->local_tx_fd, msgs, batch_idx, 0);
                     batch_idx = 0;
                     syscalls++;
                 }
@@ -798,7 +827,7 @@ void afpkt_worker_loop_inbound(afpkt_worker_t *w, afpkt_fanout_t *fg,
         }
 
         if (batch_idx > 0) {
-            sendmmsg(fg->raw_tx_fd, msgs, batch_idx, 0);
+            sendmmsg(fg->local_tx_fd, msgs, batch_idx, 0);
             batch_idx = 0;
             syscalls++;
         }
@@ -827,13 +856,18 @@ void afpkt_fanout_send_heartbeats(afpkt_fanout_t *fg) {
     mwan_metadata_build(&req, HEARTBEAT_REQ, MWAN_FRAG_NONE, MWAN_TYPE_HEARTBEAT);
 
     for (size_t i = 0; i < fg->tunnel_count; i++) {
-        /* We need a mock Ethernet header to satisfy the receiver's mwan_metadata_read offset (14) */
+        /* We need a valid Ethernet header to satisfy the receiver's offset (14) */
         struct {
             struct ethhdr eth;
             mwan_metadata_t meta;
+            uint8_t padding[42]; /* Ensure 64-byte minimum Ethernet frame size */
         } __attribute__((packed)) hb_pkt;
         
-        memset(&hb_pkt.eth, 0, 14);
+        memset(&hb_pkt, 0, sizeof(hb_pkt));
+        
+        /* Use Broadcast MAC for heartbeats to avoid dropping by simple switches/NICs */
+        memset(hb_pkt.eth.h_dest, 0xFF, 6);
+        memcpy(hb_pkt.eth.h_source, fg->local.src_mac, 6);
         hb_pkt.eth.h_proto = htons(MWAN_ETHERTYPE);
         hb_pkt.meta = req;
 
@@ -842,9 +876,9 @@ void afpkt_fanout_send_heartbeats(afpkt_fanout_t *fg) {
             .sll_ifindex = fg->tunnel_ifindices[i],
             .sll_halen = 6,
         };
+        memset(sa.sll_addr, 0xFF, 6); /* Broadcast dest at link layer */
         
         /* Use the first worker's TX socket to send probes */
         sendto(fg->workers[0].tx_fd, &hb_pkt, sizeof(hb_pkt), 0, (struct sockaddr *)&sa, sizeof(sa));
     }
 }
-
