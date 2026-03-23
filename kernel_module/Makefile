@@ -1,11 +1,45 @@
-obj-m += k_forwarder.o
-k_forwarder-objs := src/main.o src/forwarder.o
+CC      := gcc
+CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql
+LDFLAGS := -pthread -lpq
 
-KDIR := /lib/modules/$(shell uname -r)/build
-PWD := $(shell pwd)
+BIN := sep-wan
 
-all:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+SRC := \
+    src/main.c \
+    src/kernel_sync.c \
+    src/app_context.c \
+    $(wildcard src/config/*.c) \
+    $(wildcard src/proto/*.c) \
+    $(wildcard src/system/*.c) \
+    $(wildcard src/userio/*.c) \
+    $(wildcard src/utils/*.c) \
+    $(wildcard src/tc/*.c)
+
+OBJ := $(SRC:.c=.o)
+
+.PHONY: all clean install kernel-mod
+
+all: $(BIN) kernel-mod
+
+kernel-mod:
+	$(MAKE) -C kernel
+
+$(BIN): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+install: all
+	install -m 755 $(BIN) /usr/local/bin/
+	@echo "Installed $(BIN) to /usr/local/bin/ globally"
+
+install-service:
+	install -m 644 systemd/sep-wan.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "Service installed. You can now use: systemctl enable --now sep-wan"
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f $(BIN) $(OBJ)
+	$(MAKE) -C kernel clean
+
