@@ -25,6 +25,7 @@ enum mwan_tun_attrs {
     MWAN_TUN_UNSPEC = 0,
     MWAN_TUN_IFINDEX,     /* u32 */
     MWAN_TUN_WEIGHT,      /* u32 */
+    MWAN_TUN_GATEWAY,     /* u32 (network byte order) */
     __MWAN_TUN_MAX,
 };
 #define MWAN_TUN_MAX (__MWAN_TUN_MAX - 1)

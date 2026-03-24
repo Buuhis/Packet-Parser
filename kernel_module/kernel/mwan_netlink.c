@@ -49,6 +49,11 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 if (new_cfg->num_tunnels < MAX_MWAN_TUNNELS) {
                     new_cfg->tunnels[new_cfg->num_tunnels].ifindex = nla_get_u32(tb[MWAN_TUN_IFINDEX]);
                     new_cfg->tunnels[new_cfg->num_tunnels].weight  = nla_get_u32(tb[MWAN_TUN_WEIGHT]);
+                    
+                    if (tb[MWAN_TUN_GATEWAY]) {
+                        new_cfg->tunnels[new_cfg->num_tunnels].gateway = (__force __be32)nla_get_u32(tb[MWAN_TUN_GATEWAY]);
+                    }
+                    
                     new_cfg->num_tunnels++;
                 }
             }

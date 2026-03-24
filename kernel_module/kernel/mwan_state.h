@@ -9,6 +9,7 @@
 struct mwan_tunnel {
     u32 ifindex;
     u32 weight;
+    __be32 gateway;
 };
 
 struct mwan_config {

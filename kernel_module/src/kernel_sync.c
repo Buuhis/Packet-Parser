@@ -75,9 +75,16 @@ int kernel_sync_push_config(const app_context_t *ctx) {
         struct nlattr *tun_node = nla_nest_start(msg, i + 1);
         nla_put_u32(msg, MWAN_TUN_IFINDEX, idx);
         nla_put_u32(msg, MWAN_TUN_WEIGHT, tun->weight);
+        
+        struct in_addr gw_addr;
+        if (inet_aton(tun->gateway, &gw_addr)) {
+            nla_put_u32(msg, MWAN_TUN_GATEWAY, gw_addr.s_addr);
+        }
+
         nla_nest_end(msg, tun_node);
         
-        log_info("  [+] Sync Tunnel: %s (idx: %u, weight: %d)", tun->ifname, idx, tun->weight);
+        log_info("  [+] Sync Tunnel: %s (idx: %u, weight: %d, gw: %s)", 
+                 tun->ifname, idx, tun->weight, tun->gateway);
     }
     nla_nest_end(msg, tunnels);
 
