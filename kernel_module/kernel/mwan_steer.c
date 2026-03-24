@@ -39,15 +39,48 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     }
 
     /* 2. Hash: Compute 5-tuple hash to ensure flow affinity
-     * (Simplified here: just IP and protocol)
+     * We include IP addresses, protocol, and Source/Dest Ports (if TCP/UDP)
      */
-    hash = jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, iph->protocol, 0x12345678);
-    
-    /* 3. Steer: Choose a pre-existing tunnel based on the hash */
     {
-        /* TODO: Real implementation should factor in weights. This is Round Robin / Hash Modulo. */
-        u32 idx = hash % cfg->num_tunnels;
-        target_ifindex = cfg->tunnels[idx].ifindex;
+        u32 ports = 0;
+        /* TCP and UDP have Source and Dest ports in the same first 4 bytes */
+        if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
+            unsigned int offset = iph->ihl * 4;
+            /* Ensure we don't read past the linear buffer */
+            if (skb_headlen(skb) >= offset + 4) {
+                ports = *(__be32 *)(skb_network_header(skb) + offset);
+            }
+        }
+        
+        /* 
+         * Combine addresses, protocol and ports into a fast hash.
+         * Using jhash2 for arbitrary length, or just another 3words call.
+         */
+        hash = jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, 
+                            (iph->protocol << 16) | (ports & 0xFFFF), 0x12345678);
+    }
+    
+    /* 3. Steer: Choose a tunnel based on the hash AND Weights */
+    {
+        u32 total_weight = 0;
+        u32 target_slot = 0;
+        int i;
+        
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            total_weight += cfg->tunnels[i].weight;
+        }
+
+        if (total_weight > 0) {
+            target_slot = hash % total_weight;
+            u32 current_sum = 0;
+            for (i = 0; i < cfg->num_tunnels; i++) {
+                current_sum += cfg->tunnels[i].weight;
+                if (target_slot < current_sum) {
+                    target_ifindex = cfg->tunnels[i].ifindex;
+                    break;
+                }
+            }
+        }
     }
     rcu_read_unlock();
 

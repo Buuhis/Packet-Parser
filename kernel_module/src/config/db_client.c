@@ -6,13 +6,13 @@
 
 PGconn *g_db_conn = NULL;
 
-static int parse_mac(const char *mac_str, unsigned char mac_bytes[6])
-{
-    int result = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                        &mac_bytes[0], &mac_bytes[1], &mac_bytes[2],
-                        &mac_bytes[3], &mac_bytes[4], &mac_bytes[5]);
-    return (result == 6) ? 0 : -1;
-}
+// static int parse_mac(const char *mac_str, unsigned char mac_bytes[6])
+// {
+//     int result = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+//                         &mac_bytes[0], &mac_bytes[1], &mac_bytes[2],
+//                         &mac_bytes[3], &mac_bytes[4], &mac_bytes[5]);
+//     return (result == 6) ? 0 : -1;
+// }
 
 int db_client_connect(const char *host, const char *port, const char *user, const char *dbname, const char *password)
 {

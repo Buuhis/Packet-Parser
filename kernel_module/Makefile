@@ -1,6 +1,6 @@
 CC      := gcc
-CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql
-LDFLAGS := -pthread -lpq
+CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql -I/usr/include/libnl3
+LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3
 
 BIN := sep-wan
 
@@ -12,8 +12,7 @@ SRC := \
     $(wildcard src/proto/*.c) \
     $(wildcard src/system/*.c) \
     $(wildcard src/userio/*.c) \
-    $(wildcard src/utils/*.c) \
-    $(wildcard src/tc/*.c)
+    $(wildcard src/utils/*.c)
 
 OBJ := $(SRC:.c=.o)
 
@@ -32,7 +31,9 @@ $(BIN): $(OBJ)
 
 install: all
 	install -m 755 $(BIN) /usr/local/bin/
-	@echo "Installed $(BIN) to /usr/local/bin/ globally"
+	mkdir -p /usr/local/lib/modules/
+	install -m 644 kernel/mwan_kmod.ko /usr/local/lib/modules/
+	@echo "Installed $(BIN) and mwan_kmod.ko globally"
 
 install-service:
 	install -m 644 systemd/sep-wan.service /etc/systemd/system/

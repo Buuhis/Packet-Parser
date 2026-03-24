@@ -93,6 +93,7 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
+    signal(SIGPIPE, SIG_IGN);
     
     unix_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (unix_server_fd < 0) return 1;
