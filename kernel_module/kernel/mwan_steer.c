@@ -14,6 +14,19 @@
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/neighbour.h>
+#include <net/ip.h>
+
+static void log_mac_header(struct sk_buff *skb, const char *prefix)
+{
+    struct ethhdr *eth;
+    if (!skb) return;
+    
+    eth = eth_hdr(skb);
+    if (!eth) return;
+
+    pr_info("mwan_kmod: [%s] SRC_MAC: %pM -> DST_MAC: %pM\n",
+            prefix, eth->h_source, eth->h_dest);
+}
 
 /* Core steering logic used by both FORWARD and LOCAL_OUT */
 static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_state *state)
@@ -24,6 +37,10 @@ static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_stat
     int target_ifindex = 0;
     
     if (!skb) return NF_ACCEPT;
+    
+    /* Log MAC for debugging purposes */
+    log_mac_header(skb, "BEFORE-STEER");
+
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
@@ -142,7 +159,26 @@ static unsigned int mwan_hook_func(void *priv, struct sk_buff *skb, const struct
     return mwan_do_steer(skb, state);
 }
 
-/* Updated Hooks (PRI_MANGLE to run early) */
+static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+{
+    struct iphdr *iph;
+    struct mwan_config *cfg;
+
+    if (!skb) return NF_ACCEPT;
+    iph = ip_hdr(skb);
+    if (!iph) return NF_ACCEPT;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg && (iph->daddr & cfg->cidr_mask) == (cfg->cidr_ip & cfg->cidr_mask)) {
+        log_mac_header(skb, "FINAL-EGRESS");
+    }
+    rcu_read_unlock();
+
+    return NF_ACCEPT;
+}
+
+/* Updated Hooks */
 static struct nf_hook_ops mwan_nf_ops[] = {
     {
         .hook     = mwan_hook_func,
@@ -154,6 +190,12 @@ static struct nf_hook_ops mwan_nf_ops[] = {
         .hook     = mwan_hook_func,
         .pf       = NFPROTO_IPV4,
         .hooknum  = NF_INET_LOCAL_OUT,
+        .priority = NF_IP_PRI_MANGLE,
+    },
+    {
+        .hook     = mwan_hook_post_routing,
+        .pf       = NFPROTO_IPV4,
+        .hooknum  = NF_INET_POST_ROUTING,
         .priority = NF_IP_PRI_LAST,
     },
 };
