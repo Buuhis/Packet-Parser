@@ -90,20 +90,43 @@ static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_stat
                     goto out;
                 }
 
-                /* Clear old route and set new one. 
-                 * Doing this in FORWARD stage allows kernel to build fresh 
-                 * MAC headers later in POSTROUTING/FinishOutput.
-                 */
                 skb_dst_drop(skb);
                 skb_dst_set(skb, &rt->dst);
-                
-                /* In FORWARD/LOCAL_OUT, skb->dev is not the final egress yet, 
-                 * but setting it helps some drivers and metadata.
-                 */
                 skb->dev = rt->dst.dev;
                 skb_clear_hash(skb);
 
-                pr_info("mwan_kmod: [FORWARDED] %pI4 -> %pI4 redirected to %s\n",
+                /*
+                 * If intercepting in PREROUTING, we bypass ip_forward().
+                 * We must decrement TTL manually and inject into the output path 
+                 * to get proper MAC address construction and avoid the destination
+                 * dropping our packet or keeping the ingress MAC header.
+                 */
+                if (state->hook == NF_INET_PRE_ROUTING) {
+                    if (iph->ttl <= 1) {
+                        kfree_skb(skb);
+                        rcu_read_unlock();
+                        return NF_STOLEN;
+                    }
+                    ip_decrease_ttl(iph);
+
+                    /* Clear inner MAC header state so neigh_output rebuilds it */
+                    skb->mac_len = 0;
+                    skb_reset_mac_header(skb);
+
+                    pr_info("mwan_kmod: [STEERED-PRE] %pI4 -> %pI4 via %s\n",
+                            &iph->saddr, &iph->daddr, rt->dst.dev->name);
+                            
+                    /* Reinject to the output path directly */
+                    NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
+                            state->net, state->sk, skb,
+                            NULL, skb->dev,
+                            dst_output);
+
+                    rcu_read_unlock();
+                    return NF_STOLEN;
+                }
+
+                pr_info("mwan_kmod: [STEERED-OUT] %pI4 -> %pI4 via %s\n",
                         &iph->saddr, &iph->daddr, rt->dst.dev->name);
             }
         }
@@ -119,13 +142,13 @@ static unsigned int mwan_hook_func(void *priv, struct sk_buff *skb, const struct
     return mwan_do_steer(skb, state);
 }
 
-/* Updated Hooks (PRI_LAST to run after nftables filter rules) */
+/* Updated Hooks (PRI_MANGLE to run early) */
 static struct nf_hook_ops mwan_nf_ops[] = {
     {
         .hook     = mwan_hook_func,
         .pf       = NFPROTO_IPV4,
-        .hooknum  = NF_INET_FORWARD,
-        .priority = NF_IP_PRI_LAST, 
+        .hooknum  = NF_INET_PRE_ROUTING,
+        .priority = NF_IP_PRI_MANGLE, 
     },
     {
         .hook     = mwan_hook_func,
