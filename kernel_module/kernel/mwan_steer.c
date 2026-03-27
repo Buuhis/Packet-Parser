@@ -5,42 +5,25 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
-#include <linux/tcp.h>
-#include <linux/udp.h>
-#include <linux/icmp.h>
 #include <linux/netdevice.h>
 #include <linux/jhash.h>
 #include <linux/if_ether.h>
+#include <linux/etherdevice.h>
 #include <net/dst.h>
 #include <net/route.h>
-#include <net/neighbour.h>
 #include <net/ip.h>
 
-static void log_mac_header(struct sk_buff *skb, const char *prefix)
-{
-    struct ethhdr *eth;
-    if (!skb) return;
-    
-    eth = eth_hdr(skb);
-    if (!eth) return;
-
-    pr_info("mwan_kmod: [%s] SRC_MAC: %pM -> DST_MAC: %pM\n",
-            prefix, eth->h_source, eth->h_dest);
-}
-
-/* Core steering logic used by both FORWARD and LOCAL_OUT */
-static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_state *state)
+/* The core TX steering logic */
+static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
     struct iphdr *iph;
     struct mwan_config *cfg;
     u32 hash = 0;
     int target_ifindex = 0;
+    struct net_device *target_dev = NULL;
     
     if (!skb) return NF_ACCEPT;
     
-    /* Log MAC for debugging purposes */
-    log_mac_header(skb, "BEFORE-STEER");
-
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
@@ -52,13 +35,13 @@ static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_stat
         return NF_ACCEPT;
     }
 
-    /* Filter Overlay CIDR */
+    /* 1. Filter: Check if Destination IP matches our Overlay CIDR */
     if ((iph->daddr & cfg->cidr_mask) != (cfg->cidr_ip & cfg->cidr_mask)) {
         rcu_read_unlock();
         return NF_ACCEPT;
     }
 
-    /* Compute Flow Hash */
+    /* 2. Hash: Compute 5-tuple hash to ensure flow affinity */
     {
         u32 ports = 0;
         if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
@@ -71,15 +54,19 @@ static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_stat
                             (iph->protocol << 16) | (ports & 0xFFFF), 0x12345678);
     }
     
-    /* Selecting Tunnel */
+    /* 3. Steer: Choose a tunnel based on the hash AND Weights */
     {
         u32 total_weight = 0;
+        u32 target_slot = 0;
         int i;
         __be32 gateway = 0;
-        for (i = 0; i < cfg->num_tunnels; i++) total_weight += cfg->tunnels[i].weight;
+        
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            total_weight += cfg->tunnels[i].weight;
+        }
 
         if (total_weight > 0) {
-            u32 target_slot = hash % total_weight;
+            target_slot = hash % total_weight;
             u32 current_sum = 0;
             for (i = 0; i < cfg->num_tunnels; i++) {
                 current_sum += cfg->tunnels[i].weight;
@@ -91,121 +78,79 @@ static unsigned int mwan_do_steer(struct sk_buff *skb, const struct nf_hook_stat
             }
         }
 
-        /* Forward Re-routing Magic */
+        /* 4. Magic: Re-routing and Hardcode MAC */
         if (target_ifindex != 0) {
-            struct flowi4 fl4 = {
-                .daddr = gateway ? gateway : iph->daddr,
-                .saddr = 0, 
-                .flowi4_oif = target_ifindex,
-            };
-            struct rtable *rt;
-
-            rt = ip_route_output_key(state->net, &fl4);
-            if (!IS_ERR(rt)) {
-                if (rt->dst.error) {
-                    ip_rt_put(rt);
-                    goto out;
-                }
-
-                skb_dst_drop(skb);
-                skb_dst_set(skb, &rt->dst);
-                skb->dev = rt->dst.dev;
-                skb_clear_hash(skb);
-
-                /*
-                 * If intercepting in PREROUTING, we bypass ip_forward().
-                 * We must decrement TTL manually and inject into the output path 
-                 * to get proper MAC address construction and avoid the destination
-                 * dropping our packet or keeping the ingress MAC header.
-                 */
-                if (state->hook == NF_INET_PRE_ROUTING) {
-                    if (iph->ttl <= 1) {
-                        kfree_skb(skb);
-                        rcu_read_unlock();
-                        return NF_STOLEN;
-                    }
-                    ip_decrease_ttl(iph);
-
-                    /* Clear inner MAC header state so neigh_output rebuilds it */
-                    skb->mac_len = 0;
-                    skb_reset_mac_header(skb);
-
-                    pr_info("mwan_kmod: [STEERED-PRE] %pI4 -> %pI4 via %s\n",
-                            &iph->saddr, &iph->daddr, rt->dst.dev->name);
-                            
-                    /* Reinject to the output path directly */
-                    NF_HOOK(NFPROTO_IPV4, NF_INET_LOCAL_OUT,
-                            state->net, state->sk, skb,
-                            NULL, skb->dev,
-                            dst_output);
-
-                    rcu_read_unlock();
-                    return NF_STOLEN;
-                }
-
-                pr_info("mwan_kmod: [STEERED-OUT] %pI4 -> %pI4 via %s\n",
-                        &iph->saddr, &iph->daddr, rt->dst.dev->name);
+            target_dev = dev_get_by_index(state->net, target_ifindex);
+            if (!target_dev) {
+                rcu_read_unlock();
+                return NF_ACCEPT;
             }
+
+            /* Prepare for L2 header manual construction */
+            if (skb_headroom(skb) < ETH_HLEN) {
+                struct sk_buff *new_skb = skb_realloc_headroom(skb, ETH_HLEN);
+                if (!new_skb) {
+                    dev_put(target_dev);
+                    rcu_read_unlock();
+                    return NF_ACCEPT; 
+                }
+                consume_skb(skb);
+                skb = new_skb;
+            }
+
+            /* Build Ethernet Header */
+            skb_push(skb, ETH_HLEN);
+            skb_reset_mac_header(skb);
+            {
+                struct ethhdr *eth = eth_hdr(skb);
+                /* 
+                 * USER: Replace these with your actual simulation MACs 
+                 * For example: Node 1 to Node 2 direct connection
+                 */
+                unsigned char hard_src[ETH_ALEN] = {0x00, 0x0c, 0x29, 0x11, 0x22, 0x33}; // Placeholder
+                unsigned char hard_dst[ETH_ALEN] = {0x00, 0x0c, 0x29, 0x44, 0x55, 0x66}; // Placeholder
+
+                if (target_dev->dev_addr) {
+                    memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
+                } else {
+                    memcpy(eth->h_source, hard_src, ETH_ALEN);
+                }
+                memcpy(eth->h_dest, hard_dst, ETH_ALEN);
+                eth->h_proto = htons(ETH_P_IP);
+
+                /* FINAL LOG before sending to WAN */
+                pr_info("mwan_kmod: [FINAL-OUT] dev: %s | src_mac: %pM | dst_mac: %pM | %pI4 -> %pI4\n",
+                        target_dev->name, eth->h_source, eth->h_dest, &iph->saddr, &iph->daddr);
+            }
+
+            skb->dev = target_dev;
+            dev_queue_xmit(skb);
+
+            dev_put(target_dev);
+            rcu_read_unlock();
+            return NF_STOLEN; /* We handled the packet, don't let kernel continue */
         }
     }
-
-out:
     rcu_read_unlock();
+
     return NF_ACCEPT; 
 }
 
-static unsigned int mwan_hook_func(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
-{
-    return mwan_do_steer(skb, state);
-}
-
-static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
-{
-    struct iphdr *iph;
-    struct mwan_config *cfg;
-
-    if (!skb) return NF_ACCEPT;
-    iph = ip_hdr(skb);
-    if (!iph) return NF_ACCEPT;
-
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
-    if (cfg && (iph->daddr & cfg->cidr_mask) == (cfg->cidr_ip & cfg->cidr_mask)) {
-        log_mac_header(skb, "FINAL-EGRESS");
-    }
-    rcu_read_unlock();
-
-    return NF_ACCEPT;
-}
-
-/* Updated Hooks */
-static struct nf_hook_ops mwan_nf_ops[] = {
-    {
-        .hook     = mwan_hook_func,
-        .pf       = NFPROTO_IPV4,
-        .hooknum  = NF_INET_PRE_ROUTING,
-        .priority = NF_IP_PRI_MANGLE, 
-    },
-    {
-        .hook     = mwan_hook_func,
-        .pf       = NFPROTO_IPV4,
-        .hooknum  = NF_INET_LOCAL_OUT,
-        .priority = NF_IP_PRI_MANGLE,
-    },
-    {
-        .hook     = mwan_hook_post_routing,
-        .pf       = NFPROTO_IPV4,
-        .hooknum  = NF_INET_POST_ROUTING,
-        .priority = NF_IP_PRI_LAST,
-    },
+/* Netfilter Hook Definition */
+static struct nf_hook_ops mwan_nf_ops = {
+    .hook     = mwan_hook_post_routing,
+    .pf       = NFPROTO_IPV4,
+    .hooknum  = NF_INET_POST_ROUTING,
+    .priority = NF_IP_PRI_LAST, 
 };
 
+/* Hook Registration */
 int mwan_steer_init(void) {
-    pr_info("mwan_kmod: Registering FORWARD/LOCAL_OUT hooks (After Firewall)\n");
-    return nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    pr_info("mwan_kmod: Registering POST_ROUTING steering hook\n");
+    return nf_register_net_hook(&init_net, &mwan_nf_ops);
 }
 
 void mwan_steer_cleanup(void) {
-    nf_unregister_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
-    pr_info("mwan_kmod: Unregistered steering\n");
+    pr_info("mwan_kmod: Unregistering steering hook\n");
+    nf_unregister_net_hook(&init_net, &mwan_nf_ops);
 }
