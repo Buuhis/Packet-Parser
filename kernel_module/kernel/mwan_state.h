@@ -10,6 +10,12 @@ struct mwan_tunnel {
     u32 ifindex;
     u32 weight;
     __be32 gateway;
+
+    /* Caching fields for performance */
+    struct net_device *dev;
+    unsigned char gateway_mac[6];
+    bool mac_resolved;
+    bool is_ethernet;
 };
 
 struct mwan_config {
@@ -17,6 +23,7 @@ struct mwan_config {
     __be32 cidr_ip;
     __be32 cidr_mask;
     u32 num_tunnels;
+    u32 total_weight; /* Pre-calculated total weight */
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
     
     struct rcu_head rcu;

@@ -15,51 +15,12 @@
 #include <net/neighbour.h>
 #include <net/arp.h>
 
-/**
- * mwan_get_neigh_mac - Get MAC address for a gateway IP from ARP cache
- * @dev: The egress device
- * @gw_ip: Gateway IP in network byte order
- * @mac: Buffer to store the 6-byte MAC address
- * 
- * Returns 0 if MAC found and valid, -1 otherwise.
- */
-static int mwan_get_neigh_mac(struct net_device *dev, __be32 gw_ip, unsigned char *mac)
-{
-    struct neighbour *n;
-    int ret = -1;
-
-    /* Search for the neighbor in the ARP table (ipv4_neigh_lookup) */
-    n = neigh_lookup(&arp_tbl, &gw_ip, dev);
-    if (n) {
-        if (n->nud_state & NUD_VALID) {
-            read_lock_bh(&n->lock);
-            memcpy(mac, n->ha, ETH_ALEN);
-            read_unlock_bh(&n->lock);
-            ret = 0;
-        } else {
-            /* Trigger ARP request if not valid yet */
-            neigh_event_send(n, NULL);
-        }
-        neigh_release(n);
-    } else {
-        /* Create a new neighbor entry if it doesn't exist to trigger ARP */
-        n = neigh_create(&arp_tbl, &gw_ip, dev);
-        if (!IS_ERR(n)) {
-            neigh_event_send(n, NULL);
-            neigh_release(n);
-        }
-    }
-    return ret;
-}
-
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
     struct iphdr *iph;
     struct mwan_config *cfg;
     u32 hash = 0;
-    int target_ifindex = 0;
-    struct net_device *target_dev = NULL;
     
     if (!skb) return NF_ACCEPT;
     
@@ -80,7 +41,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         return NF_ACCEPT;
     }
 
-    /* 2. Hash: Compute 5-tuple hash to ensure flow affinity */
+    /* 2. Hash: Compute 5-tuple hash for flow affinity */
     {
         u32 ports = 0;
         if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
@@ -94,93 +55,70 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     }
     
     /* 3. Steer: Choose a tunnel based on the hash AND Weights */
-    {
-        u32 total_weight = 0;
-        u32 target_slot = 0;
+    if (cfg->total_weight > 0) {
+        u32 target_slot = hash % cfg->total_weight;
+        u32 current_sum = 0;
         int i;
-        __be32 gateway = 0;
-        
-        for (i = 0; i < cfg->num_tunnels; i++) {
-            total_weight += cfg->tunnels[i].weight;
-        }
 
-        if (total_weight > 0) {
-            target_slot = hash % total_weight;
-            u32 current_sum = 0;
-            for (i = 0; i < cfg->num_tunnels; i++) {
-                current_sum += cfg->tunnels[i].weight;
-                if (target_slot < current_sum) {
-                    target_ifindex = cfg->tunnels[i].ifindex;
-                    gateway = cfg->tunnels[i].gateway;
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            struct mwan_tunnel *tun = &cfg->tunnels[i];
+            current_sum += tun->weight;
+
+            if (target_slot < current_sum) {
+                struct net_device *target_dev = tun->dev;
+                
+                if (unlikely(!target_dev)) {
                     break;
                 }
-            }
-        }
 
-        /* 4. Magic: Re-routing and Dynamic MAC Resolution */
-        if (target_ifindex != 0) {
-            unsigned char resolved_mac[ETH_ALEN];
-            
-            target_dev = dev_get_by_index(state->net, target_ifindex);
-            if (!target_dev) {
-                rcu_read_unlock();
-                return NF_ACCEPT;
-            }
-
-            /* Resolve Gateway MAC from ARP Cache */
-            if (mwan_get_neigh_mac(target_dev, gateway ? gateway : iph->daddr, resolved_mac) != 0) {
-                /* MAC not resolved yet. Fallback to Slow-path to trigger ARP naturally */
-                pr_info_ratelimited("mwan_kmod: ARP miss for %pI4 on %s. Using slow-path.\n",
-                                    &gateway, target_dev->name);
-                dev_put(target_dev);
-                rcu_read_unlock();
-                return NF_ACCEPT;
-            }
-
-            /* Fast-path: We have the MAC, so we manually build Header and XMIT */
-            if (skb_headroom(skb) < ETH_HLEN) {
-                struct sk_buff *new_skb = skb_realloc_headroom(skb, ETH_HLEN);
-                if (!new_skb) {
-                    dev_put(target_dev);
-                    rcu_read_unlock();
-                    return NF_ACCEPT; 
-                }
-                consume_skb(skb);
-                skb = new_skb;
-                /* Re-point pointers after realloc */
-                iph = ip_hdr(skb);
-            }
-
-            /* Build Ethernet Header */
-            skb_push(skb, ETH_HLEN);
-            skb_reset_mac_header(skb);
-            {
-                struct ethhdr *eth = eth_hdr(skb);
+                /* 4. Magic: Re-routing and MAC Injection */
                 
-                if (target_dev->dev_addr) {
-                    memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
+                /* If it's an Ethernet device, we need a resolved MAC */
+                if (tun->is_ethernet) {
+                    if (unlikely(!tun->mac_resolved)) {
+                        /* Trigger ARP naturally by accepting into standard stack 
+                         * OR trigger it manually here if needed. 
+                         * For now, we fall back to standard path to avoid packet loss 
+                         * while waiting for ARP. */
+                        break;
+                    }
+
+                    /* Ensure enough headroom for Ethernet header and alignment */
+                    if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
+                        break;
+                    }
+
+                    /* Prepend Ethernet Header */
+                    skb_push(skb, ETH_HLEN);
+                    skb_reset_mac_header(skb);
+                    {
+                        struct ethhdr *eth = eth_hdr(skb);
+                        if (target_dev->dev_addr)
+                            memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
+                        else
+                            eth_zero_addr(eth->h_source);
+                        
+                        memcpy(eth->h_dest, tun->gateway_mac, ETH_ALEN);
+                        eth->h_proto = htons(ETH_P_IP);
+                    }
                 } else {
-                    eth_zero_addr(eth->h_source);
+                    /* Non-ethernet device (Point-to-Point tunnel) 
+                     * Just ensure we don't have a stale MAC header pointing to wrong memory */
+                    skb_pull(skb, skb_network_offset(skb));
+                    skb_reset_mac_header(skb);
                 }
-                
-                memcpy(eth->h_dest, resolved_mac, ETH_ALEN);
-                eth->h_proto = htons(ETH_P_IP);
 
-                /* Final Egress Log */
-                pr_info("mwan_kmod: [FAST-OUT] %pI4 -> %pI4 via %s | DST_MAC: %pM\n",
-                        &iph->saddr, &iph->daddr, target_dev->name, eth->h_dest);
+                /* Final Egress */
+                skb->dev = target_dev;
+                dev_queue_xmit(skb);
+
+                rcu_read_unlock();
+                return NF_STOLEN;
             }
-
-            skb->dev = target_dev;
-            dev_queue_xmit(skb);
-
-            dev_put(target_dev);
-            rcu_read_unlock();
-            return NF_STOLEN;
         }
     }
+    
     rcu_read_unlock();
-
     return NF_ACCEPT; 
 }
 

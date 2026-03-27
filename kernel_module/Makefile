@@ -1,4 +1,4 @@
-CC      := gcc
+CC      := gcc-12
 CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql -I/usr/include/libnl3
 LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3
 

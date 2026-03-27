@@ -1,12 +1,29 @@
 #include "mwan_state.h"
 #include <linux/slab.h>
 #include <linux/spinlock.h>
+#include <linux/netdevice.h>
+#include <linux/if_arp.h>
+#include <net/neighbour.h>
+#include <net/arp.h>
 
 /* Global Configuration Pointer (RCU Protected) */
 struct mwan_config __rcu *g_mwan_cfg = NULL;
 
 /* Spinlock to protect concurrent updates to the configuration */
 static DEFINE_SPINLOCK(cfg_lock);
+
+/* Internal helper to free config and release device references */
+static void mwan_config_free_rcu(struct rcu_head *rcu) {
+    struct mwan_config *cfg = container_of(rcu, struct mwan_config, rcu);
+    int i;
+
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].dev) {
+            dev_put(cfg->tunnels[i].dev);
+        }
+    }
+    kfree(cfg);
+}
 
 void mwan_state_init(void) {
     /* Optional: allocate an initial empty config if needed */
@@ -19,25 +36,55 @@ void mwan_state_cleanup(void) {
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
     if (old) {
         RCU_INIT_POINTER(g_mwan_cfg, NULL);
-        kfree_rcu(old, rcu);
+        call_rcu(&old->rcu, mwan_config_free_rcu);
     }
     spin_unlock(&cfg_lock);
 }
 
 int mwan_state_update(struct mwan_config *new_cfg) {
     struct mwan_config *old;
+    int i;
     
     if (!new_cfg) return -EINVAL;
 
+    /* Phase 1: Pre-calculate and cache expensive data before publishing */
+    new_cfg->total_weight = 0;
+    for (i = 0; i < new_cfg->num_tunnels; i++) {
+        struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+        new_cfg->total_weight += tun->weight;
+
+        /* Cache net_device */
+        tun->dev = dev_get_by_index(&init_net, tun->ifindex);
+        if (tun->dev) {
+            tun->is_ethernet = (tun->dev->type == ARPHRD_ETHER);
+            
+            /* Attempt to resolve MAC if it's an ethernet device */
+            if (tun->is_ethernet && tun->gateway) {
+                struct neighbour *n;
+                n = neigh_lookup(&arp_tbl, &tun->gateway, tun->dev);
+                if (n) {
+                    if (n->nud_state & NUD_VALID) {
+                        read_lock_bh(&n->lock);
+                        memcpy(tun->gateway_mac, n->ha, 6);
+                        read_unlock_bh(&n->lock);
+                        tun->mac_resolved = true;
+                    }
+                    neigh_release(n);
+                }
+            }
+        }
+    }
+
+    /* Phase 2: Atomic update */
     spin_lock(&cfg_lock);
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
     
     /* Safely publish the new configuration */
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
     
-    /* Defer the freeing of the old configuration until all readers are done */
+    /* Defer the freeing of the old configuration */
     if (old) {
-        kfree_rcu(old, rcu);
+        call_rcu(&old->rcu, mwan_config_free_rcu);
     }
     spin_unlock(&cfg_lock);
     
