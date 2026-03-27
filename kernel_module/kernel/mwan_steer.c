@@ -12,6 +12,45 @@
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/ip.h>
+#include <net/neighbour.h>
+#include <net/arp.h>
+
+/**
+ * mwan_get_neigh_mac - Get MAC address for a gateway IP from ARP cache
+ * @dev: The egress device
+ * @gw_ip: Gateway IP in network byte order
+ * @mac: Buffer to store the 6-byte MAC address
+ * 
+ * Returns 0 if MAC found and valid, -1 otherwise.
+ */
+static int mwan_get_neigh_mac(struct net_device *dev, __be32 gw_ip, unsigned char *mac)
+{
+    struct neighbour *n;
+    int ret = -1;
+
+    /* Search for the neighbor in the ARP table (ipv4_neigh_lookup) */
+    n = neigh_lookup(&arp_tbl, &gw_ip, dev);
+    if (n) {
+        if (n->nud_state & NUD_VALID) {
+            read_lock_bh(&n->lock);
+            memcpy(mac, n->ha, ETH_ALEN);
+            read_unlock_bh(&n->lock);
+            ret = 0;
+        } else {
+            /* Trigger ARP request if not valid yet */
+            neigh_event_send(n, NULL);
+        }
+        neigh_release(n);
+    } else {
+        /* Create a new neighbor entry if it doesn't exist to trigger ARP */
+        n = neigh_create(&arp_tbl, &gw_ip, dev);
+        if (!IS_ERR(n)) {
+            neigh_event_send(n, NULL);
+            neigh_release(n);
+        }
+    }
+    return ret;
+}
 
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
@@ -78,15 +117,27 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             }
         }
 
-        /* 4. Magic: Re-routing and Hardcode MAC */
+        /* 4. Magic: Re-routing and Dynamic MAC Resolution */
         if (target_ifindex != 0) {
+            unsigned char resolved_mac[ETH_ALEN];
+            
             target_dev = dev_get_by_index(state->net, target_ifindex);
             if (!target_dev) {
                 rcu_read_unlock();
                 return NF_ACCEPT;
             }
 
-            /* Prepare for L2 header manual construction */
+            /* Resolve Gateway MAC from ARP Cache */
+            if (mwan_get_neigh_mac(target_dev, gateway ? gateway : iph->daddr, resolved_mac) != 0) {
+                /* MAC not resolved yet. Fallback to Slow-path to trigger ARP naturally */
+                pr_info_ratelimited("mwan_kmod: ARP miss for %pI4 on %s. Using slow-path.\n",
+                                    &gateway, target_dev->name);
+                dev_put(target_dev);
+                rcu_read_unlock();
+                return NF_ACCEPT;
+            }
+
+            /* Fast-path: We have the MAC, so we manually build Header and XMIT */
             if (skb_headroom(skb) < ETH_HLEN) {
                 struct sk_buff *new_skb = skb_realloc_headroom(skb, ETH_HLEN);
                 if (!new_skb) {
@@ -96,6 +147,8 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                 }
                 consume_skb(skb);
                 skb = new_skb;
+                /* Re-point pointers after realloc */
+                iph = ip_hdr(skb);
             }
 
             /* Build Ethernet Header */
@@ -103,24 +156,19 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             skb_reset_mac_header(skb);
             {
                 struct ethhdr *eth = eth_hdr(skb);
-                /* 
-                 * USER: Replace these with your actual simulation MACs 
-                 * For example: Node 1 to Node 2 direct connection
-                 */
-                unsigned char hard_src[ETH_ALEN] = {0x00, 0x0c, 0x29, 0x11, 0x22, 0x33}; // Placeholder
-                unsigned char hard_dst[ETH_ALEN] = {0x00, 0x0c, 0x29, 0x44, 0x55, 0x66}; // Placeholder
-
+                
                 if (target_dev->dev_addr) {
                     memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
                 } else {
-                    memcpy(eth->h_source, hard_src, ETH_ALEN);
+                    eth_zero_addr(eth->h_source);
                 }
-                memcpy(eth->h_dest, hard_dst, ETH_ALEN);
+                
+                memcpy(eth->h_dest, resolved_mac, ETH_ALEN);
                 eth->h_proto = htons(ETH_P_IP);
 
-                /* FINAL LOG before sending to WAN */
-                pr_info("mwan_kmod: [FINAL-OUT] dev: %s | src_mac: %pM | dst_mac: %pM | %pI4 -> %pI4\n",
-                        target_dev->name, eth->h_source, eth->h_dest, &iph->saddr, &iph->daddr);
+                /* Final Egress Log */
+                pr_info("mwan_kmod: [FAST-OUT] %pI4 -> %pI4 via %s | DST_MAC: %pM\n",
+                        &iph->saddr, &iph->daddr, target_dev->name, eth->h_dest);
             }
 
             skb->dev = target_dev;
@@ -128,7 +176,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
 
             dev_put(target_dev);
             rcu_read_unlock();
-            return NF_STOLEN; /* We handled the packet, don't let kernel continue */
+            return NF_STOLEN;
         }
     }
     rcu_read_unlock();
@@ -149,6 +197,7 @@ int mwan_steer_init(void) {
     pr_info("mwan_kmod: Registering POST_ROUTING steering hook\n");
     return nf_register_net_hook(&init_net, &mwan_nf_ops);
 }
+
 
 void mwan_steer_cleanup(void) {
     pr_info("mwan_kmod: Unregistering steering hook\n");
