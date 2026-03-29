@@ -66,16 +66,25 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                 /* If it's an Ethernet device, we need a resolved MAC */
                 if (tun->is_ethernet) {
                     if (unlikely(!tun->mac_resolved)) {
-                        /* Trigger ARP naturally by accepting into standard stack 
-                         * OR trigger it manually here if needed. 
-                         * For now, we fall back to standard path to avoid packet loss 
-                         * while waiting for ARP. */
+                        /* Fallback to standard path if MAC is not resolved */
                         break;
                     }
 
-                    /* Ensure enough headroom for Ethernet header and alignment */
-                    if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
+                    /* --- OPTIMIZATION: MTU Check --- */
+                    if (unlikely(skb->len + ETH_HLEN > target_dev->mtu)) {
+                        /* Packet too large for target MTU, avoid fragmentation slow-path */
                         break;
+                    }
+
+                    /* --- OPTIMIZATION: Selective Headroom Expansion --- 
+                     * skb_cow_head will only reallocate if headroom < needed OR if the skb is cloned. 
+                     * Since we are in Netfilter, clones are common but we must ensure we don't 
+                     * unnecessarily reallocate if headroom is already sufficient for our 14-byte header.
+                     */
+                    if (skb_headroom(skb) < LL_RESERVED_SPACE(target_dev) || skb_header_cloned(skb)) {
+                        if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
+                            break;
+                        }
                     }
 
                     /* Prepend Ethernet Header */
@@ -89,17 +98,29 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                             eth_zero_addr(eth->h_source);
                         
                         memcpy(eth->h_dest, tun->gateway_mac, ETH_ALEN);
-                        eth->h_proto = htons(ETH_P_IP);
+                        eth->h_proto = iph->version == 4 ? htons(ETH_P_IP) : htons(ETH_P_IPV6);
+                    }
+
+                    /* --- OPTIMIZATION: Hardware Checksum Offload --- 
+                     * Tell the NIC to handle the IP/UDP checksums if capable. 
+                     */
+                    if (target_dev->features & (NETIF_F_IP_CSUM | NETIF_F_HW_CSUM)) {
+                        skb->ip_summed = CHECKSUM_PARTIAL;
+                        skb->csum_start = skb_transport_header(skb) - skb->head;
+                        skb->csum_offset = offsetof(struct udphdr, check);
                     }
                 } else {
-                    /* Non-ethernet device (Point-to-Point tunnel) 
-                     * Just ensure we don't have a stale MAC header pointing to wrong memory */
+                    /* Non-ethernet device (Point-to-Point tunnel) */
                     skb_pull(skb, skb_network_offset(skb));
                     skb_reset_mac_header(skb);
                 }
 
                 /* Final Egress */
                 skb->dev = target_dev;
+                
+                /* Reset transport and network header pointers relative to skb->data */
+                skb_set_network_header(skb, (unsigned char *)iph - skb->data);
+                
                 dev_queue_xmit(skb);
 
                 rcu_read_unlock();
