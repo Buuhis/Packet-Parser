@@ -15,16 +15,15 @@
 #include <net/neighbour.h>
 #include <net/arp.h>
 
-/* The core RX/Forwarding steering logic */
-static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+/* The core TX steering logic */
+static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
     struct iphdr *iph;
     struct mwan_config *cfg;
-    u32 hash;
+    u32 hash = 0;
     
     if (!skb) return NF_ACCEPT;
     
-    /* PRE_ROUTING hook: skb->data points to IP header, but MAC header is available */
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
@@ -42,7 +41,7 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
         return NF_ACCEPT;
     }
 
-    /* 2. Hash: Leverage hardware hash or previously computed kernel hash */
+    /* 2. Hash: Use kernel-cached or hardware RSS hash for flow affinity */
     hash = skb_get_hash(skb);
     
     /* 3. Steer: Choose a tunnel based on the hash AND Weights */
@@ -58,47 +57,49 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             if (target_slot < current_sum) {
                 struct net_device *target_dev = tun->dev;
                 
-                if (unlikely(!target_dev)) break;
+                if (unlikely(!target_dev)) {
+                    break;
+                }
 
-                /* 4. Transformation: Zero-copy redirection */
+                /* 4. Magic: Re-routing and MAC Injection */
                 
+                /* If it's an Ethernet device, we need a resolved MAC */
                 if (tun->is_ethernet) {
-                    if (unlikely(!tun->mac_resolved)) break;
+                    if (unlikely(!tun->mac_resolved)) {
+                        /* Trigger ARP naturally by accepting into standard stack 
+                         * OR trigger it manually here if needed. 
+                         * For now, we fall back to standard path to avoid packet loss 
+                         * while waiting for ARP. */
+                        break;
+                    }
 
-                    /* Zero-Copy "MAC Swap": Reuse existing MAC header area.
-                     * We only cow_head if the header is shared to avoid hosing other readers. */
-                    if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) break;
+                    /* Ensure enough headroom for Ethernet header and alignment */
+                    if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
+                        break;
+                    }
 
-                    /* Correct pointers after possible cow */
-                    iph = ip_hdr(skb);
-                    
-                    /* Pointer to existing MAC header */
-                    struct ethhdr *eth = eth_hdr(skb);
-                    if (unlikely(!eth)) break;
-
-                    /* Update Source MAC from Target Device */
-                    if (target_dev->dev_addr)
-                        memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
-                    
-                    /* Update Destination MAC from Gateway Cache */
-                    memcpy(eth->h_dest, tun->gateway_mac, ETH_ALEN);
-                    eth->h_proto = htons(ETH_P_IP);
-
-                    /* Bring skb->data back to the MAC header for dev_queue_xmit */
-                    skb_push(skb, skb_network_offset(skb));
+                    /* Prepend Ethernet Header */
+                    skb_push(skb, ETH_HLEN);
+                    skb_reset_mac_header(skb);
+                    {
+                        struct ethhdr *eth = eth_hdr(skb);
+                        if (target_dev->dev_addr)
+                            memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
+                        else
+                            eth_zero_addr(eth->h_source);
+                        
+                        memcpy(eth->h_dest, tun->gateway_mac, ETH_ALEN);
+                        eth->h_proto = htons(ETH_P_IP);
+                    }
                 } else {
-                    /* Non-ethernet device (Point-to-Point) 
-                     * Ensure skb->data is at network header and metadata is clean */
+                    /* Non-ethernet device (Point-to-Point tunnel) 
+                     * Just ensure we don't have a stale MAC header pointing to wrong memory */
+                    skb_pull(skb, skb_network_offset(skb));
                     skb_reset_mac_header(skb);
                 }
 
                 /* Final Egress */
                 skb->dev = target_dev;
-                
-                /* Decrement TTL as we are bypassing the standard forwarding path */
-                iph = ip_hdr(skb);
-                ip_decrease_ttl(iph);
-
                 dev_queue_xmit(skb);
 
                 rcu_read_unlock();
@@ -113,15 +114,15 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
 
 /* Netfilter Hook Definition */
 static struct nf_hook_ops mwan_nf_ops = {
-    .hook     = mwan_hook_pre_routing,
+    .hook     = mwan_hook_post_routing,
     .pf       = NFPROTO_IPV4,
-    .hooknum  = NF_INET_PRE_ROUTING,
-    .priority = NF_IP_PRI_FIRST, 
+    .hooknum  = NF_INET_POST_ROUTING,
+    .priority = NF_IP_PRI_LAST, 
 };
 
 /* Hook Registration */
 int mwan_steer_init(void) {
-    pr_info("mwan_kmod: Registering PRE_ROUTING steering hook\n");
+    pr_info("mwan_kmod: Registering POST_ROUTING steering hook\n");
     return nf_register_net_hook(&init_net, &mwan_nf_ops);
 }
 
