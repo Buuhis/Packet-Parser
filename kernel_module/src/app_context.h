@@ -32,6 +32,8 @@ typedef struct {
     int  node_id;
 
     char local_if[16];
+    unsigned int local_ip;   /* Network byte order */
+    unsigned int local_mask; /* Network byte order */
     char remote_cidr[32];
     char loopback_ip[32];
 

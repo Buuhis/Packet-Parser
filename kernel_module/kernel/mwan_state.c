@@ -22,6 +22,10 @@ static void mwan_config_free_rcu(struct rcu_head *rcu) {
             dev_put(cfg->tunnels[i].dev);
         }
     }
+
+    if (cfg->local_dev) {
+        dev_put(cfg->local_dev);
+    }
     kfree(cfg);
 }
 
@@ -46,6 +50,11 @@ int mwan_state_update(struct mwan_config *new_cfg) {
     int i;
     
     if (!new_cfg) return -EINVAL;
+    
+    /* Phase 0: Resolve Local Network Interface */
+    if (new_cfg->local_ifindex > 0) {
+        new_cfg->local_dev = dev_get_by_index(&init_net, new_cfg->local_ifindex);
+    }
 
     /* Phase 1: Pre-calculate and cache expensive data before publishing */
     new_cfg->total_weight = 0;

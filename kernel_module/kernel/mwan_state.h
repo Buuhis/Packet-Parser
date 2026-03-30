@@ -25,6 +25,12 @@ struct mwan_config {
     u32 num_tunnels;
     u32 total_weight; /* Pre-calculated total weight */
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
+
+    /* Local network for Inbound Steering */
+    __be32 local_ip;
+    __be32 local_mask;
+    u32 local_ifindex;
+    struct net_device *local_dev;
     
     struct rcu_head rcu;
 };

@@ -17,6 +17,9 @@ enum mwan_genl_attrs {
     MWAN_ATTR_CIDR_IP,    /* u32 (network byte order) */
     MWAN_ATTR_CIDR_MASK,  /* u32 (network byte order) */
     MWAN_ATTR_TUNNELS,    /* Nested array of tunnels */
+    MWAN_ATTR_LOCAL_IP,   /* u32 (network byte order) */
+    MWAN_ATTR_LOCAL_MASK, /* u32 (network byte order) */
+    MWAN_ATTR_LOCAL_IFINDEX, /* u32 */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

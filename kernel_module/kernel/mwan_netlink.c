@@ -11,6 +11,9 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_CIDR_IP]   = { .type = NLA_U32 },
     [MWAN_ATTR_CIDR_MASK] = { .type = NLA_U32 },
     [MWAN_ATTR_TUNNELS]   = { .type = NLA_NESTED },
+    [MWAN_ATTR_LOCAL_IP]   = { .type = NLA_U32 },
+    [MWAN_ATTR_LOCAL_MASK] = { .type = NLA_U32 },
+    [MWAN_ATTR_LOCAL_IFINDEX] = { .type = NLA_U32 },
 };
 
 /* Callback to handle SET_CONFIG message */
@@ -34,6 +37,13 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     new_cfg->cidr_ip   = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_CIDR_IP]);
     new_cfg->cidr_mask = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_CIDR_MASK]);
     new_cfg->num_tunnels = 0;
+
+    if (info->attrs[MWAN_ATTR_LOCAL_IP])
+        new_cfg->local_ip = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_IP]);
+    if (info->attrs[MWAN_ATTR_LOCAL_MASK])
+        new_cfg->local_mask = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_MASK]);
+    if (info->attrs[MWAN_ATTR_LOCAL_IFINDEX])
+        new_cfg->local_ifindex = nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_IFINDEX]);
 
     nla_tunnels = info->attrs[MWAN_ATTR_TUNNELS];
     if (nla_tunnels) {

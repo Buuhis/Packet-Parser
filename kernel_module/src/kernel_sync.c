@@ -65,6 +65,15 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     nla_put_u32(msg, MWAN_ATTR_NODE_ID, ctx->cfg.node_id);
     nla_put_u32(msg, MWAN_ATTR_CIDR_IP, ip);
     nla_put_u32(msg, MWAN_ATTR_CIDR_MASK, mask);
+    
+    /* Sync Local Network for Inbound Steering */
+    if (ctx->cfg.local_ip > 0) {
+        unsigned int local_idx = if_nametoindex(ctx->cfg.local_if);
+        log_info("  [+] Sync Local Net: interface=%s (idx: %u)", ctx->cfg.local_if, local_idx);
+        nla_put_u32(msg, MWAN_ATTR_LOCAL_IP, ctx->cfg.local_ip);
+        nla_put_u32(msg, MWAN_ATTR_LOCAL_MASK, ctx->cfg.local_mask);
+        nla_put_u32(msg, MWAN_ATTR_LOCAL_IFINDEX, local_idx);
+    }
 
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
     for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {

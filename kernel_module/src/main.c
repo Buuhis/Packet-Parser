@@ -12,12 +12,39 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 /* ---------- global state ---------- */
 static volatile int running_server = 1;
 static int unix_server_fd = -1;
 static char socket_path[256] = "/var/run/sep-wan.sock";
 static app_context_t running_ctx;
+
+/* ---------- utilities ---------- */
+static int resolve_local_network(app_config_t *cfg) {
+    struct ifaddrs *ifaddr, *ifa;
+    int found = 0;
+
+    if (getifaddrs(&ifaddr) == -1) return -1;
+
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
+            continue;
+
+        if (strcmp(ifa->ifa_name, cfg->local_if) == 0) {
+            cfg->local_ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
+            cfg->local_mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr;
+            cfg->local_ip &= cfg->local_mask; // Get network address
+            found = 1;
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found ? 0 : -1;
+}
 
 /* ---------- signal handler ---------- */
 static void handle_signal(int sig) {
@@ -119,6 +146,13 @@ int main(int argc, char **argv) {
         
         app_config_t new_cfg;
         if (db_client_load_config(req_id, &new_cfg) == 0) {
+            if (resolve_local_network(&new_cfg) == 0) {
+                struct in_addr addr = { .s_addr = new_cfg.local_ip };
+                log_info("[+] Auto-discovered Local Network: %s", inet_ntoa(addr));
+            } else {
+                log_warn("[-] Could not resolve local network for interface %s", new_cfg.local_if);
+            }
+            
             app_context_dump(&(app_context_t){new_cfg});
             running_ctx.cfg = new_cfg;
             if (kernel_sync_push_config(&running_ctx) != 0) log_error("Failed to push config to kernel");
