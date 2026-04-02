@@ -20,7 +20,7 @@ TRUNCATE TABLE public.nodes RESTART IDENTITY CASCADE;
 
 INSERT INTO public.nodes (node_id, local_if, remote_cidr, loopback_ip)
 VALUES (
-    1, 'enp7s0', '192.168.182.0/24', '10.0.0.1'
+    1, 'enp6s0', '192.168.90.0/24', '10.0.0.1'
 );
 
 INSERT INTO public.ne_tunnels (node_id, ifname, gateway, port, weight)
@@ -30,7 +30,7 @@ VALUES
 
 INSERT INTO public.nodes (node_id, local_if, remote_cidr, loopback_ip)
 VALUES (
-    2, 'enp7s0', '192.168.9.0/24', '10.0.0.2'
+    2, 'enp6s0', '192.168.68.0/24', '10.0.0.2'
 );
 
 INSERT INTO public.ne_tunnels (node_id, ifname, gateway, port, weight)

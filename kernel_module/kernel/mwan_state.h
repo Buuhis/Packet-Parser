@@ -5,6 +5,7 @@
 #include <linux/rcupdate.h>
 
 #define MAX_MWAN_TUNNELS 8
+#define MWAN_LUT_SIZE    256
 
 struct mwan_tunnel {
     u32 ifindex;
@@ -24,6 +25,10 @@ struct mwan_config {
     __be32 cidr_mask;
     u32 num_tunnels;
     u32 total_weight; /* Pre-calculated total weight */
+    
+    /* Lookup table for O(1) weight-proportional tunnel selection */
+    u8  tunnel_idx_lut[MWAN_LUT_SIZE];
+    
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
 
     /* Local network for Inbound Steering */

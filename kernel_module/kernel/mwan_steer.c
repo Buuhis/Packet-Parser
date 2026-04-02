@@ -54,70 +54,62 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     /* 2. Hash: Use kernel-cached or hardware RSS hash for flow affinity */
     hash = skb_get_hash(skb);
     
-    /* 3. Steer: Choose a tunnel based on the hash AND Weights */
-    if (cfg->total_weight > 0) {
-        u32 target_slot = hash % cfg->total_weight;
-        u32 current_sum = 0;
-        int i;
-
-        for (i = 0; i < cfg->num_tunnels; i++) {
-            struct mwan_tunnel *tun = &cfg->tunnels[i];
-            current_sum += tun->weight;
-
-            if (target_slot < current_sum) {
-                struct net_device *target_dev = tun->dev;
-                
-                if (unlikely(!target_dev)) {
-                    break;
-                }
-
-                /* 4. Magic: Re-routing and MAC Injection */
-                
-                /* If it's an Ethernet device, we need a resolved MAC */
-                if (tun->is_ethernet) {
-                    if (unlikely(!tun->mac_resolved)) {
-                        /* Trigger ARP naturally by accepting into standard stack 
-                         * OR trigger it manually here if needed. 
-                         * For now, we fall back to standard path to avoid packet loss 
-                         * while waiting for ARP. */
-                        break;
-                    }
-
-                    /* Ensure enough headroom for Ethernet header and alignment */
-                    if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
-                        break;
-                    }
-
-                    /* Prepend Ethernet Header */
-                    skb_push(skb, ETH_HLEN);
-                    skb_reset_mac_header(skb);
-                    {
-                        struct ethhdr *eth = eth_hdr(skb);
-                        if (target_dev->dev_addr)
-                            memcpy(eth->h_source, target_dev->dev_addr, ETH_ALEN);
-                        else
-                            eth_zero_addr(eth->h_source);
-                        
-                        memcpy(eth->h_dest, tun->gateway_mac, ETH_ALEN);
-                        eth->h_proto = htons(ETH_P_IP);
-                    }
-                } else {
-                    /* Non-ethernet device (Point-to-Point tunnel) 
-                     * Just ensure we don't have a stale MAC header pointing to wrong memory */
-                    skb_pull(skb, skb_network_offset(skb));
-                    skb_reset_mac_header(skb);
-                }
-
-                /* Final Egress */
-                skb->dev = target_dev;
-                dev_queue_xmit(skb);
-
-                rcu_read_unlock();
-                return NF_STOLEN;
-            }
+    /* 3. Steer: Choose a tunnel based on the weight-proportional LUT (O(1)) */
+    if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
+        u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
+        struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
+        struct net_device *target_dev = tun->dev;
+        
+        if (unlikely(!target_dev)) {
+            rcu_read_unlock();
+            return NF_ACCEPT;
         }
+
+        /* 4. Magic: Re-routing and MAC Injection */
+        
+        /* If it's an Ethernet device, we need a resolved MAC */
+        if (tun->is_ethernet) {
+            if (unlikely(!tun->mac_resolved)) {
+                /* Falling back to standard stack to avoid packet loss while waiting for ARP */
+                goto out;
+            }
+
+            /* Ensure enough headroom for Ethernet header and alignment */
+            if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
+                if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
+                    goto out; 
+                }
+            }
+
+            /* Prepend Ethernet Header */
+            skb_push(skb, ETH_HLEN);
+            skb_reset_mac_header(skb);
+            {
+                struct ethhdr *eth = eth_hdr(skb);
+                if (target_dev->dev_addr)
+                    ether_addr_copy(eth->h_source, target_dev->dev_addr);
+                else
+                    eth_zero_addr(eth->h_source);
+                
+                ether_addr_copy(eth->h_dest, tun->gateway_mac);
+                eth->h_proto = htons(ETH_P_IP);
+            }
+        } else {
+            /* Non-ethernet device (Point-to-Point tunnel) 
+             * Just ensure we don't have a stale MAC header pointing to wrong memory */
+            skb_pull(skb, skb_network_offset(skb));
+            skb_reset_mac_header(skb);
+        }
+
+        /* Final Egress */
+        skb->dev = target_dev;
+        dev_queue_xmit(skb);
+
+        rcu_read_unlock();
+        return NF_STOLEN;
     }
-    
+
+out:
     rcu_read_unlock();
     return NF_ACCEPT; 
 }

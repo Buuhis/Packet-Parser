@@ -84,6 +84,22 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         }
     }
 
+    /* Phase 1.5: Populate weight-proportional LUT for O(1) steering */
+    if (new_cfg->total_weight > 0 && new_cfg->num_tunnels > 0) {
+        int current_slot = 0;
+        for (i = 0; i < new_cfg->num_tunnels; i++) {
+            int count = (new_cfg->tunnels[i].weight * MWAN_LUT_SIZE) / new_cfg->total_weight;
+            int j;
+            for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++) {
+                new_cfg->tunnel_idx_lut[current_slot++] = i;
+            }
+        }
+        /* Handle rounding: ensure remaining slots are filled */
+        while (current_slot < MWAN_LUT_SIZE) {
+            new_cfg->tunnel_idx_lut[current_slot++] = new_cfg->num_tunnels - 1;
+        }
+    }
+
     /* Phase 2: Atomic update */
     spin_lock(&cfg_lock);
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
