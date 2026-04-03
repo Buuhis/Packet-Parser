@@ -5,6 +5,7 @@
 #include <linux/if_arp.h>
 #include <net/neighbour.h>
 #include <net/arp.h>
+#include <linux/err.h>
 
 /* Global Configuration Pointer (RCU Protected) */
 struct mwan_config __rcu *g_mwan_cfg = NULL;
@@ -71,12 +72,21 @@ int mwan_state_update(struct mwan_config *new_cfg) {
             if (tun->is_ethernet && tun->gateway) {
                 struct neighbour *n;
                 n = neigh_lookup(&arp_tbl, &tun->gateway, tun->dev);
-                if (n) {
+                if (!n) {
+                    /* Chủ động tạo ô trống nếu Linux lỡ quên */
+                    n = neigh_create(&arp_tbl, &tun->gateway, tun->dev);
+                }
+                
+                if (n && !IS_ERR(n)) {
                     if (n->nud_state & NUD_VALID) {
                         read_lock_bh(&n->lock);
                         memcpy(tun->gateway_mac, n->ha, 6);
                         read_unlock_bh(&n->lock);
                         tun->mac_resolved = true;
+                    } else {
+                        /* POKE Kernel: Bắn Ping Mồi ARP ngay lập tức để lấy MAC về cho Hot-path */
+                        neigh_event_send(n, NULL);
+                        tun->mac_resolved = false;
                     }
                     neigh_release(n);
                 }

@@ -70,8 +70,29 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         /* If it's an Ethernet device, we need a resolved MAC */
         if (tun->is_ethernet) {
             if (unlikely(!tun->mac_resolved)) {
-                /* Falling back to standard stack to avoid packet loss while waiting for ARP */
-                goto out;
+                struct neighbour *n = neigh_lookup(&arp_tbl, &tun->gateway, target_dev);
+                if (!n) {
+                    n = neigh_create(&arp_tbl, &tun->gateway, target_dev);
+                }
+                
+                if (n && !IS_ERR(n)) {
+                    if (n->nud_state & NUD_VALID) {
+                        /* ARP has been resolved by background process! */
+                        read_lock_bh(&n->lock);
+                        ether_addr_copy(tun->gateway_mac, n->ha);
+                        read_unlock_bh(&n->lock);
+                        tun->mac_resolved = true;
+                    } else {
+                        /* Force Kernel to instantly send an ARP Request Broadcast */
+                        neigh_event_send(n, NULL);
+                    }
+                    neigh_release(n);
+                }
+
+                if (!tun->mac_resolved) {
+                    /* Fall back to standard stack while waiting for ARP response */
+                    goto out;
+                }
             }
 
             /* Ensure enough headroom for Ethernet header and alignment */
