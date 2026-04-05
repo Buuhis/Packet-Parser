@@ -122,6 +122,16 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             skb_reset_mac_header(skb);
         }
 
+        /* 5. CPU-Bound TX Queue: Each CPU core transmits through its own
+         * dedicated TX queue. This eliminates Qdisc lock contention —
+         * 4 cores × 4 queues = zero cross-CPU locking.
+         * Requires: tunnel created with numtxqueues >= num_cpus,
+         *           XPS configured by userspace cpu_tune module.
+         */
+        if (likely(target_dev->real_num_tx_queues > 1)) {
+            skb_set_queue_mapping(skb, smp_processor_id() % target_dev->real_num_tx_queues);
+        }
+
         /* Final Egress */
         skb->dev = target_dev;
         dev_queue_xmit(skb);

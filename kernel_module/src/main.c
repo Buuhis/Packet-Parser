@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "app_context.h"
 #include "kernel_sync.h"
+#include "system/cpu_tune.h"
 #include "config/db_client.h"
 #include "utils/logger.h"
 
@@ -50,6 +51,7 @@ static int resolve_local_network(app_config_t *cfg) {
 static void handle_signal(int sig) {
     (void)sig;
     running_server = 0;
+    cpu_tune_restore();
     kernel_sync_cleanup();
     if (unix_server_fd >= 0) {
         close(unix_server_fd);
@@ -155,11 +157,16 @@ int main(int argc, char **argv) {
             
             app_context_dump(&(app_context_t){new_cfg});
             running_ctx.cfg = new_cfg;
-            if (kernel_sync_push_config(&running_ctx) != 0) log_error("Failed to push config to kernel");
+            if (kernel_sync_push_config(&running_ctx) != 0) {
+                log_error("Failed to push config to kernel");
+            } else {
+                cpu_tune_apply(&running_ctx);
+            }
         }
     }
     
     log_info("Server shutting down...");
+    cpu_tune_restore();
     kernel_sync_cleanup();
     db_client_disconnect();
     if (unix_server_fd >= 0) { close(unix_server_fd); unlink(socket_path); }

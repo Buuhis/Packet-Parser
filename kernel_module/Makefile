@@ -9,7 +9,8 @@ SRC := \
     src/kernel_sync.c \
     src/app_context.c \
     $(wildcard src/config/*.c) \
-    $(wildcard src/utils/*.c)
+    $(wildcard src/utils/*.c) \
+    $(wildcard src/system/*.c)
 
 OBJ := $(SRC:.c=.o)
 
