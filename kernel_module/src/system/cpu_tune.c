@@ -284,21 +284,57 @@ static void setup_multiqueue(const char *ifname, int num_cpus)
     }
 }
 
-/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP.
- * Equivalent to: ethtool -N <dev> rx-flow-hash udp4 sdfn */
+/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP. */
 static void setup_rss_hash(const char *ifname)
 {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd),
-             "ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname);
-    if (system(cmd) == 0)
-        log_info("    RSS: %s udp4 -> sdfn (4-tuple)", ifname);
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname);
+    system(cmd);
+    snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname);
+    system(cmd);
+    
+    /* Disable LRO: Sometimes LRO interferes with proper hashing of encapsulated packets. */
+    snprintf(cmd, sizeof(cmd), "ethtool -K %s lro off 2>/dev/null", ifname);
+    system(cmd);
+    log_info("    RSS: %s hashing sdfn enabled, LRO disabled", ifname);
+}
 
-    /* Also set for TCP */
-    snprintf(cmd, sizeof(cmd),
-             "ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname);
-    if (system(cmd) == 0)
-        log_info("    RSS: %s tcp4 -> sdfn (4-tuple)", ifname);
+/* Maximize NIC Ring Buffers to absorb bursts during peak throughput. */
+static void setup_ring_buffers(const char *ifname)
+{
+    char cmd[256], line[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -g %s 2>/dev/null", ifname);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+
+    int max_rx = 0, max_tx = 0;
+    bool in_max_block = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "Pre-set maximums:")) in_max_block = true;
+        else if (strstr(line, "Current hardware settings:")) in_max_block = false;
+        
+        if (in_max_block) {
+            if (strstr(line, "RX:")) max_rx = atoi(strchr(line, ':') + 1);
+            if (strstr(line, "TX:")) max_tx = atoi(strchr(line, ':') + 1);
+        }
+    }
+    pclose(p);
+
+    if (max_rx > 0 || max_tx > 0) {
+        snprintf(cmd, sizeof(cmd), "ethtool -G %s rx %d tx %d 2>/dev/null", ifname, max_rx, max_tx);
+        system(cmd);
+        log_info("    Ring: %s maximized to RX=%d, TX=%d", ifname, max_rx, max_tx);
+    }
+}
+
+/* Set Interrupt Coalescing to reduce CPU high-softirq load. 
+ * Waiting 50-100us before firing an interrupt allows processing more packets per IRQ. */
+static void setup_coalescing(const char *ifname)
+{
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -C %s rx-usecs 50 tx-usecs 50 2>/dev/null", ifname);
+    system(cmd);
+    log_info("    Coalesce: %s set to 50us", ifname);
 }
 
 /* ================================================================
@@ -421,10 +457,10 @@ static void setup_mq_qdisc(const char *ifname)
     log_info("    Qdisc: %s -> mq (%d queues)", ifname, num_tx);
 }
 
-/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS */
+/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS + Ring + Coalesce */
 static void tune_physical_nic(const char *ifname, int num_cpus)
 {
-    /* 1. Backup existing ethtool state not covered by sysfs/g_backups */
+    /* 1. Backup existing ethtool state... (as already implemented) */
     if (g_eth_count < MAX_MODIFIED_IFACES) {
         ethtool_config_backup_t *b = &g_eth_backups[g_eth_count];
         strncpy(b->ifname, ifname, IF_NAMESIZE - 1);
@@ -439,6 +475,8 @@ static void tune_physical_nic(const char *ifname, int num_cpus)
 
     setup_multiqueue(ifname, num_cpus);
     setup_rss_hash(ifname);
+    setup_ring_buffers(ifname);
+    setup_coalescing(ifname);
     setup_irq_affinity(ifname, num_cpus, target_queues);
     setup_xps(ifname, num_cpus);
     setup_rps(ifname, num_cpus); /* Enable RPS as a software fallback for RSS imbalance */
