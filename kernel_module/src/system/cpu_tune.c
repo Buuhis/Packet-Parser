@@ -240,9 +240,6 @@ static void setup_rss_hash(const char *ifname)
  *  Per-interface CPU tuning functions
  * ================================================================ */
 
-/* XPS: Map TX queues to CPUs.
- * If num_queues < num_cpus (like single-queue tunnels), we map ALL CPUs to that queue 
- * to allow distributed parallel transmission without bottlenecking Core 0. */
 static void setup_xps(const char *ifname, int num_cpus)
 {
     int num_tx = count_queues(ifname, "tx-");
@@ -250,25 +247,20 @@ static void setup_xps(const char *ifname, int num_cpus)
 
     char path[256], mask[32];
     
-    /* Optimization: If num_queues is very small (like a 1-queue tunnel),
-     * we limit the XPS mask to a sub-group of CPUs (e.g., first 4 cores).
-     * This balances between parallelism and overhead from spinlock contention. */
+    /* Optimization: Limit the reach for single-queue tunnels. */
     int xps_limit = (num_cpus > 4) ? 4 : num_cpus;
 
     for (int i = 0; i < num_tx; i++) {
         unsigned int cpu_mask = 0;
         
         if (num_tx == 1) {
-            /* Case: Single queue tunnel. Map to a sensible subset (Core 0-3). */
+            /* Case: Single queue tunnel. Map to a subset (Core 0-3). */
             cpu_mask = (1U << xps_limit) - 1;
         } else {
-            /* Case: Multi-queue. Distribute CPUs evenly. */
-            unsigned int cpus_per_queue = (num_tx >= num_cpus) ? 1 : (num_cpus / num_tx);
-            for (unsigned int j = 0; j < cpus_per_queue; j++) {
-                int target_cpu = (i * cpus_per_queue) + j;
-                if (target_cpu < num_cpus) {
-                    cpu_mask |= (1U << target_cpu);
-                }
+            /* Case: Multi-queue. Strict 1-to-1 mapping.
+             * This ensures tx-0/CPU 0, tx-1/CPU 1, etc. */
+            if (i < num_cpus) {
+                cpu_mask = (1U << i);
             }
         }
         
@@ -278,7 +270,7 @@ static void setup_xps(const char *ifname, int num_cpus)
         snprintf(mask, sizeof(mask), "%x", cpu_mask);
         
         if (write_sysfs(path, mask) == 0)
-            log_info("    XPS: %s tx-%d -> CPU Mask %s", ifname, i, mask);
+            log_info("    XPS: %s tx-%d -> CPU Mask %x", ifname, i, cpu_mask);
     }
 }
 
@@ -306,26 +298,22 @@ static void setup_rps(const char *ifname, int num_cpus)
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
  * Improved to avoid pinning management/link interrupts to extra cores. */
-static void setup_irq_affinity(const char *ifname, int num_cpus)
+static void setup_irq_affinity(const char *ifname, int num_cpus, int limit_queues)
 {
     FILE *f = fopen("/proc/interrupts", "r");
     if (!f) return;
 
     char line[1024];
     int data_irq_idx = 0;
+    int limit = (limit_queues > 0 && limit_queues < num_cpus) ? limit_queues : num_cpus;
 
-    while (fgets(line, sizeof(line), f) && data_irq_idx < num_cpus) {
+    while (fgets(line, sizeof(line), f) && data_irq_idx < limit) {
         if (!strstr(line, ifname)) continue;
 
-        /* Skip management/link interrupts if they don't look like data queues.
-         * Data queues usually have labels like eth0-rx-0, eth0-0, or eth0-TxRx-0.
-         * Simple heuristic: if there are multiple interrupts, the ones with numbers are data. */
+        /* Skip management/link interrupts if they don't look like data queues. */
         bool has_digit = false;
         char *suffix = strstr(line, ifname);
         for (char *p = suffix; *p; p++) { if (*p >= '0' && *p <= '9') { has_digit = true; break; } }
-        
-        /* If we found many interrupts but this one has no digit in name, 
-         * it's likely a management interrupt — we'll pin it to CPU0 or skip. */
         if (!has_digit && data_irq_idx > 0) continue;
 
         int irq = 0;
@@ -333,10 +321,10 @@ static void setup_irq_affinity(const char *ifname, int num_cpus)
 
         char path[128], mask[32];
         snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
-        snprintf(mask, sizeof(mask), "%x", 1 << (data_irq_idx % num_cpus));
+        snprintf(mask, sizeof(mask), "%x", 1 << data_irq_idx);
 
         if (write_sysfs(path, mask) == 0)
-            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, data_irq_idx % num_cpus);
+            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, data_irq_idx);
         
         data_irq_idx++;
     }
@@ -364,9 +352,12 @@ static void setup_mq_qdisc(const char *ifname)
 /* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS */
 static void tune_physical_nic(const char *ifname, int num_cpus)
 {
+    ethtool_queues_t q = get_ethtool_queues(ifname);
+    int target_queues = (num_cpus < q.max_combined) ? num_cpus : q.max_combined;
+
     setup_multiqueue(ifname, num_cpus);
     setup_rss_hash(ifname);
-    setup_irq_affinity(ifname, num_cpus);
+    setup_irq_affinity(ifname, num_cpus, target_queues);
     setup_xps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
@@ -376,6 +367,7 @@ static void tune_tunnel(const char *ifname, int num_cpus)
 {
     setup_xps(ifname, num_cpus);
     setup_rps(ifname, num_cpus);
+    setup_irq_affinity(ifname, num_cpus, 1); /* Tunnels usually have 0 or 1 logical IRQ */
     setup_mq_qdisc(ifname);
 }
 
