@@ -141,61 +141,61 @@ static bool is_irqbalance_active(void)
  *  NIC Hardware Setup (ethtool)
  * ================================================================ */
 
-/* Get combined queue capability and current settings for a NIC. */
-static int get_combined_queues(const char *ifname, int *max_q, int *curr_q)
+typedef struct {
+    int max_combined;
+    int cur_combined;
+} ethtool_queues_t;
+
+/* Get both Max and Current combined queue count for a NIC. */
+static ethtool_queues_t get_ethtool_queues(const char *ifname)
 {
+    ethtool_queues_t res = {-1, -1};
     char cmd[256], line[256];
     snprintf(cmd, sizeof(cmd), "ethtool -l %s 2>/dev/null", ifname);
     FILE *p = popen(cmd, "r");
-    if (!p) return -1;
+    if (!p) return res;
 
-    *max_q = 1; 
-    *curr_q = 1;
-    bool in_max_section = false;
-    bool in_curr_section = false;
+    bool in_max_block = false;
+    bool in_cur_block = false;
 
     while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "Preset maximums:")) {
-            in_max_section = true;
-            in_curr_section = false;
+        if (strstr(line, "Pre-set maximums:")) {
+            in_max_block = true; 
+            in_cur_block = false;
             continue;
         }
         if (strstr(line, "Current hardware settings:")) {
-            in_max_section = false;
-            in_curr_section = true;
+            in_max_block = false;
+            in_cur_block = true;
             continue;
         }
-
+        
         char *colon = strchr(line, ':');
-        if (!colon) continue;
-
-        if (strstr(line, "Combined")) {
+        if (colon && strstr(line, "Combined")) {
             int val = atoi(colon + 1);
-            if (val <= 0) continue;
-            if (in_max_section) *max_q = val;
-            else if (in_curr_section) *curr_q = val;
+            if (in_max_block) res.max_combined = val;
+            else if (in_cur_block) res.cur_combined = val;
         }
     }
     pclose(p);
-    return 0;
+    return res;
 }
 
 /* Set combined queue count on a physical NIC.
  * Equivalent to: ethtool -L <dev> combined <n>
- * Saves original value for restore. */
+ * Respects hardware limits to avoid "failed to set" errors. */
 static void setup_multiqueue(const char *ifname, int num_cpus)
 {
-    int max_q = 1, current = 1;
-    if (get_combined_queues(ifname, &max_q, &current) < 0) {
-        log_debug("    MultiQ: %s — cannot read queue count (virtual device?)", ifname);
+    ethtool_queues_t q = get_ethtool_queues(ifname);
+    if (q.max_combined <= 0) {
+        log_debug("    MultiQ: %s — cannot read queue capability (max=%d)", ifname, q.max_combined);
         return;
     }
 
-    /* Use the smaller of: available CPUs OR hardware limit */
-    int target = (num_cpus < max_q) ? num_cpus : max_q;
+    int target = (num_cpus < q.max_combined) ? num_cpus : q.max_combined;
 
-    if (current == target) {
-        log_info("    MultiQ: %s already has %d combined queues (Max: %d)", ifname, current, max_q);
+    if (q.cur_combined == target) {
+        log_info("    MultiQ: %s already has %d combined queues (max is %d)", ifname, target, q.max_combined);
         return;
     }
 
@@ -203,7 +203,7 @@ static void setup_multiqueue(const char *ifname, int num_cpus)
     if (g_mq_count < MAX_MODIFIED_IFACES) {
         multiqueue_backup_t *b = &g_mq_backups[g_mq_count];
         strncpy(b->ifname, ifname, IF_NAMESIZE - 1);
-        b->original_combined = current;
+        b->original_combined = q.cur_combined;
         g_mq_count++;
     }
 
@@ -212,10 +212,10 @@ static void setup_multiqueue(const char *ifname, int num_cpus)
              "ethtool -L %s combined %d 2>/dev/null", ifname, target);
     int ret = system(cmd);
     if (ret == 0) {
-        log_info("    MultiQ: %s %d -> %d combined queues (Hardware limit was %d)", ifname, current, target, max_q);
+        log_info("    MultiQ: %s %d -> %d combined queues (cap at max %d)", ifname, q.cur_combined, target, q.max_combined);
     } else {
-        log_warn("    MultiQ: %s failed to set %d queues (Hardware limit: %d)",
-                 ifname, target, max_q);
+        log_warn("    MultiQ: %s failed to set %d queues (hardware max is %d)",
+                 ifname, target, q.max_combined);
     }
 }
 
@@ -240,35 +240,45 @@ static void setup_rss_hash(const char *ifname)
  *  Per-interface CPU tuning functions
  * ================================================================ */
 
-/* XPS: Map TX queues to CPUs. 
- * For 1-queue devices (like standard tunnels), we map a SUBSET of CPUs (Core Group) 
- * to allow parallel submission while minimizing lock contention between too many cores. 
- * For multi-queue devices, we use 1-to-1 binding for locality. */
-static void setup_xps(const char *ifname, int num_cpus, int group_limit)
+/* XPS: Map TX queues to CPUs.
+ * If num_queues < num_cpus (like single-queue tunnels), we map ALL CPUs to that queue 
+ * to allow distributed parallel transmission without bottlenecking Core 0. */
+static void setup_xps(const char *ifname, int num_cpus)
 {
     int num_tx = count_queues(ifname, "tx-");
     if (num_tx == 0) return;
 
-    char path[256], mask[16];
+    char path[256], mask[32];
     
-    if (num_tx == 1) {
-        /* Optimization for single-queue tunnels: Distributed submission within a group */
-        int limit = (group_limit > 0 && group_limit < num_cpus) ? group_limit : num_cpus;
-        unsigned int group_mask = (1U << limit) - 1;
+    /* Optimization: If num_queues is very small (like a 1-queue tunnel),
+     * we limit the XPS mask to a sub-group of CPUs (e.g., first 4 cores).
+     * This balances between parallelism and overhead from spinlock contention. */
+    int xps_limit = (num_cpus > 4) ? 4 : num_cpus;
+
+    for (int i = 0; i < num_tx; i++) {
+        unsigned int cpu_mask = 0;
         
-        snprintf(path, sizeof(path), "/sys/class/net/%s/queues/tx-0/xps_cpus", ifname);
-        snprintf(mask, sizeof(mask), "%x", group_mask);
-        if (write_sysfs(path, mask) == 0)
-            log_info("    XPS: %s tx-0 -> CPU Group 0-%d (Contention limited)", ifname, limit - 1);
-    } else {
-        /* Standard 1-to-1 binding for multi-queue physical NICs */
-        for (int i = 0; i < num_tx && i < num_cpus; i++) {
-            snprintf(path, sizeof(path),
-                     "/sys/class/net/%s/queues/tx-%d/xps_cpus", ifname, i);
-            snprintf(mask, sizeof(mask), "%x", 1 << i);
-            if (write_sysfs(path, mask) == 0)
-                log_info("    XPS: %s tx-%d -> CPU %d", ifname, i, i);
+        if (num_tx == 1) {
+            /* Case: Single queue tunnel. Map to a sensible subset (Core 0-3). */
+            cpu_mask = (1U << xps_limit) - 1;
+        } else {
+            /* Case: Multi-queue. Distribute CPUs evenly. */
+            unsigned int cpus_per_queue = (num_tx >= num_cpus) ? 1 : (num_cpus / num_tx);
+            for (unsigned int j = 0; j < cpus_per_queue; j++) {
+                int target_cpu = (i * cpus_per_queue) + j;
+                if (target_cpu < num_cpus) {
+                    cpu_mask |= (1U << target_cpu);
+                }
+            }
         }
+        
+        if (cpu_mask == 0) continue;
+
+        snprintf(path, sizeof(path), "/sys/class/net/%s/queues/tx-%d/xps_cpus", ifname, i);
+        snprintf(mask, sizeof(mask), "%x", cpu_mask);
+        
+        if (write_sysfs(path, mask) == 0)
+            log_info("    XPS: %s tx-%d -> CPU Mask %s", ifname, i, mask);
     }
 }
 
@@ -295,28 +305,40 @@ static void setup_rps(const char *ifname, int num_cpus)
 }
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
- * We limit the pinning to target_queues to avoid over-pinning non-data interrupts. */
-static void setup_irq_affinity(const char *ifname, int target_queues)
+ * Improved to avoid pinning management/link interrupts to extra cores. */
+static void setup_irq_affinity(const char *ifname, int num_cpus)
 {
     FILE *f = fopen("/proc/interrupts", "r");
     if (!f) return;
 
     char line[1024];
-    int queue_idx = 0;
+    int data_irq_idx = 0;
 
-    while (fgets(line, sizeof(line), f) && queue_idx < target_queues) {
+    while (fgets(line, sizeof(line), f) && data_irq_idx < num_cpus) {
         if (!strstr(line, ifname)) continue;
+
+        /* Skip management/link interrupts if they don't look like data queues.
+         * Data queues usually have labels like eth0-rx-0, eth0-0, or eth0-TxRx-0.
+         * Simple heuristic: if there are multiple interrupts, the ones with numbers are data. */
+        bool has_digit = false;
+        char *suffix = strstr(line, ifname);
+        for (char *p = suffix; *p; p++) { if (*p >= '0' && *p <= '9') { has_digit = true; break; } }
+        
+        /* If we found many interrupts but this one has no digit in name, 
+         * it's likely a management interrupt — we'll pin it to CPU0 or skip. */
+        if (!has_digit && data_irq_idx > 0) continue;
 
         int irq = 0;
         if (sscanf(line, " %d:", &irq) != 1 || irq <= 0) continue;
 
-        char path[128], mask[16];
+        char path[128], mask[32];
         snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
-        snprintf(mask, sizeof(mask), "%x", 1 << queue_idx);
+        snprintf(mask, sizeof(mask), "%x", 1 << (data_irq_idx % num_cpus));
 
         if (write_sysfs(path, mask) == 0)
-            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, queue_idx);
-        queue_idx++;
+            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, data_irq_idx % num_cpus);
+        
+        data_irq_idx++;
     }
     fclose(f);
 }
@@ -342,23 +364,17 @@ static void setup_mq_qdisc(const char *ifname)
 /* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS */
 static void tune_physical_nic(const char *ifname, int num_cpus)
 {
-    int max_q = 1, curr_q = 1;
-    get_combined_queues(ifname, &max_q, &curr_q);
-    
-    /* Target queues is the bottleneck between CPU count and HW capability */
-    int target_q = (num_cpus < max_q) ? num_cpus : max_q;
-
     setup_multiqueue(ifname, num_cpus);
     setup_rss_hash(ifname);
-    setup_irq_affinity(ifname, target_q);
-    setup_xps(ifname, num_cpus, 0);
+    setup_irq_affinity(ifname, num_cpus);
+    setup_xps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
 
 /* Full setup for a tunnel interface: XPS + RPS + mq qdisc */
 static void tune_tunnel(const char *ifname, int num_cpus)
 {
-    setup_xps(ifname, num_cpus, 4);
+    setup_xps(ifname, num_cpus);
     setup_rps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
