@@ -33,6 +33,14 @@ typedef struct {
     int  original_combined;      /* Original combined queue count */
 } multiqueue_backup_t;
 
+typedef struct {
+    char ifname[IF_NAMESIZE];
+    char udp4_hash[16];
+    char tcp4_hash[16];
+    int  rx_usecs;
+    int  tx_usecs;
+} ethtool_config_backup_t;
+
 static backup_entry_t       g_backups[MAX_BACKUP_ENTRIES];
 static int                  g_backup_count = 0;
 
@@ -42,8 +50,65 @@ static int                  g_qdisc_count = 0;
 static multiqueue_backup_t  g_mq_backups[MAX_MODIFIED_IFACES];
 static int                  g_mq_count = 0;
 
+static ethtool_config_backup_t g_eth_backups[MAX_MODIFIED_IFACES];
+static int                     g_eth_count = 0;
+
 static bool g_irqbalance_was_active = false;
 static bool g_tuning_applied = false;
+
+/* ================================================================
+ *  Low-level ethtool state-sensing
+ * ================================================================ */
+
+/* Parse "ethtool -n <dev> rx-flow-hash <proto>" output to find flags like "sdfn" 
+ * This is hard to do perfectly in C, so we check for common field inclusions. */
+static void get_current_flow_hash(const char *ifname, const char *proto, char *out, size_t len)
+{
+    char cmd[256], line[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -n %s rx-flow-hash %s 2>/dev/null", ifname, proto);
+    FILE *p = popen(cmd, "r");
+    if (!p) { strncpy(out, "sd", len); return; }
+
+    bool sip = false, dip = false, sport = false, dport = false;
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "IP SA")) sip = true;
+        if (strstr(line, "IP DA")) dip = true;
+        if (strstr(line, "L4 bytes 0 & 1")) sport = true;
+        if (strstr(line, "L4 bytes 2 & 3")) dport = true;
+    }
+    pclose(p);
+
+    char temp[16] = {0};
+    if (sip) strcat(temp, "s");
+    if (dip) strcat(temp, "d");
+    if (sport) strcat(temp, "f");
+    if (dport) strcat(temp, "n");
+    
+    if (strlen(temp) == 0) strcpy(temp, "sd");
+    strncpy(out, temp, len);
+}
+
+/* Parse "ethtool -c <dev>" to find interrupt coalescing values. */
+static void get_current_coalesce(const char *ifname, int *rx, int *tx)
+{
+    *rx = 0; *tx = 0;
+    char cmd[256], line[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -c %s 2>/dev/null", ifname);
+    FILE *p = popen(cmd, "r");
+    if (!p) return;
+
+    while (fgets(line, sizeof(line), p)) {
+        if (strstr(line, "rx-usecs:")) {
+            char *colon = strchr(line, ':');
+            if (colon) *rx = atoi(colon + 1);
+        }
+        if (strstr(line, "tx-usecs:")) {
+            char *colon = strchr(line, ':');
+            if (colon) *tx = atoi(colon + 1);
+        }
+    }
+    pclose(p);
+}
 
 /* ================================================================
  *  Low-level helpers
@@ -292,8 +357,15 @@ static void setup_rps(const char *ifname, int num_cpus)
 
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_flow_cnt", ifname, i);
-        write_sysfs(path, "4096");
+        write_sysfs(path, "16384");
     }
+    
+    /* Reset RSS Indirection Table (RETA) to ensure even distribution 
+     * across all hardware queues. Fixes cases where some queues are ignored. */
+    char cmd[256];
+    snprintf(cmd, sizeof(cmd), "ethtool -X %s default 2>/dev/null", ifname);
+    system(cmd);
+    log_info("    RSS: %s indirection table reset to default (balanced)", ifname);
 }
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
@@ -349,9 +421,19 @@ static void setup_mq_qdisc(const char *ifname)
     log_info("    Qdisc: %s -> mq (%d queues)", ifname, num_tx);
 }
 
-/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS */
+/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS */
 static void tune_physical_nic(const char *ifname, int num_cpus)
 {
+    /* 1. Backup existing ethtool state not covered by sysfs/g_backups */
+    if (g_eth_count < MAX_MODIFIED_IFACES) {
+        ethtool_config_backup_t *b = &g_eth_backups[g_eth_count];
+        strncpy(b->ifname, ifname, IF_NAMESIZE - 1);
+        get_current_flow_hash(ifname, "udp4", b->udp4_hash, sizeof(b->udp4_hash));
+        get_current_flow_hash(ifname, "tcp4", b->tcp4_hash, sizeof(b->tcp4_hash));
+        get_current_coalesce(ifname, &b->rx_usecs, &b->tx_usecs);
+        g_eth_count++;
+    }
+
     ethtool_queues_t q = get_ethtool_queues(ifname);
     int target_queues = (num_cpus < q.max_combined) ? num_cpus : q.max_combined;
 
@@ -359,6 +441,7 @@ static void tune_physical_nic(const char *ifname, int num_cpus)
     setup_rss_hash(ifname);
     setup_irq_affinity(ifname, num_cpus, target_queues);
     setup_xps(ifname, num_cpus);
+    setup_rps(ifname, num_cpus); /* Enable RPS as a software fallback for RSS imbalance */
     setup_mq_qdisc(ifname);
 }
 
@@ -391,10 +474,10 @@ int cpu_tune_apply(const app_context_t *ctx)
     }
 
     /* 1. Global settings */
-    write_sysfs("/proc/sys/net/core/rps_sock_flow_entries", "32768");
-    write_sysfs("/proc/sys/net/core/netdev_max_backlog", "10000");
-    write_sysfs("/proc/sys/net/core/netdev_budget", "600");
-    log_info("  [+] Global: rfs=32768, backlog=10000, budget=600");
+    write_sysfs("/proc/sys/net/core/rps_sock_flow_entries", "65536");
+    write_sysfs("/proc/sys/net/core/netdev_max_backlog", "20000");
+    write_sysfs("/proc/sys/net/core/netdev_budget", "2000");
+    log_info("  [+] Global: rfs=65536, backlog=20000, budget=2000");
 
     /* 2. Local interface — physical NIC (e.g. enp6s0) */
     log_info("  [Local NIC: %s]", ctx->cfg.local_if);
@@ -474,7 +557,30 @@ void cpu_tune_restore(void)
     }
     g_mq_count = 0;
 
-    /* 4. Restart irqbalance if it was running before we stopped it */
+    /* 4. Restore original ethtool settings (flow-hash, RETA reset, coalesce) */
+    for (int i = 0; i < g_eth_count; i++) {
+        ethtool_config_backup_t *b = &g_eth_backups[i];
+        char cmd[256];
+
+        /* Restore Flow Hash */
+        snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash udp4 %s 2>/dev/null", b->ifname, b->udp4_hash);
+        system(cmd);
+        snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash tcp4 %s 2>/dev/null", b->ifname, b->tcp4_hash);
+        system(cmd);
+
+        /* Restore Coalesce */
+        snprintf(cmd, sizeof(cmd), "ethtool -C %s rx-usecs %d tx-usecs %d 2>/dev/null", b->ifname, b->rx_usecs, b->tx_usecs);
+        system(cmd);
+        
+        /* Reset RETA back to default (driver default is the safest assume) */
+        snprintf(cmd, sizeof(cmd), "ethtool -X %s default 2>/dev/null", b->ifname);
+        system(cmd);
+
+        log_info("  [+] Ethtool settings restored for %s", b->ifname);
+    }
+    g_eth_count = 0;
+
+    /* 5. Restart irqbalance if it was running before we stopped it */
     if (g_irqbalance_was_active) {
         system("systemctl start irqbalance 2>/dev/null");
         log_info("  [+] Restarted irqbalance");
