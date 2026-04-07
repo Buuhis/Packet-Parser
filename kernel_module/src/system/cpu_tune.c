@@ -341,28 +341,24 @@ static void setup_coalescing(const char *ifname)
  *  Per-interface CPU tuning functions
  * ================================================================ */
 
-static void setup_xps(const char *ifname, int num_cpus)
+static void setup_xps(const char *ifname, int num_cpus, int *cpu_offset_ptr)
 {
     int num_tx = count_queues(ifname, "tx-");
     if (num_tx == 0) return;
 
     char path[256], mask[32];
     
-    /* Optimization: Limit the reach for single-queue tunnels. */
-    int xps_limit = (num_cpus > 4) ? 4 : num_cpus;
-
     for (int i = 0; i < num_tx; i++) {
         unsigned int cpu_mask = 0;
         
         if (num_tx == 1) {
-            /* Case: Single queue tunnel. Map to a subset (Core 0-3). */
-            cpu_mask = (1U << xps_limit) - 1;
+            /* Case: Single queue tunnel. Map to a specific target core based on offset. */
+            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
+            cpu_mask = (1U << target_cpu);
         } else {
-            /* Case: Multi-queue. Strict 1-to-1 mapping.
-             * This ensures tx-0/CPU 0, tx-1/CPU 1, etc. */
-            if (i < num_cpus) {
-                cpu_mask = (1U << i);
-            }
+            /* Case: Multi-queue. Strict 1-to-1 mapping starting from offset. */
+            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
+            cpu_mask = (1U << target_cpu);
         }
         
         if (cpu_mask == 0) continue;
@@ -375,21 +371,31 @@ static void setup_xps(const char *ifname, int num_cpus)
     }
 }
 
-/* RPS: Distribute RX processing across all cores (for single/few-queue devices) */
-static void setup_rps(const char *ifname, int num_cpus)
+/* RPS: Distribute RX processing across target cores */
+static void setup_rps(const char *ifname, int num_cpus, int *cpu_offset_ptr)
 {
     int num_rx = count_queues(ifname, "rx-");
     if (num_rx == 0) return;
 
-    unsigned int all_mask = (1U << num_cpus) - 1;
     char path[256], mask[16];
-    snprintf(mask, sizeof(mask), "%x", all_mask);
 
     for (int i = 0; i < num_rx; i++) {
+        unsigned int cpu_mask = 0;
+        
+        if (num_rx == 1) {
+            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
+            cpu_mask = (1U << target_cpu);
+        } else {
+            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
+            cpu_mask = (1U << target_cpu);
+        }
+        
+        snprintf(mask, sizeof(mask), "%x", cpu_mask);
+        
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_cpus", ifname, i);
         if (write_sysfs(path, mask) == 0)
-            log_info("    RPS: %s rx-%d -> all CPUs (mask %s)", ifname, i, mask);
+            log_info("    RPS: %s rx-%d -> CPU Mask %s", ifname, i, mask);
 
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_flow_cnt", ifname, i);
@@ -406,7 +412,7 @@ static void setup_rps(const char *ifname, int num_cpus)
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
  * Improved to avoid pinning management/link interrupts to extra cores. */
-static void setup_irq_affinity(const char *ifname, int num_cpus, int limit_queues)
+static void setup_irq_affinity(const char *ifname, int num_cpus, int limit_queues, int *cpu_offset_ptr)
 {
     FILE *f = fopen("/proc/interrupts", "r");
     if (!f) return;
@@ -427,16 +433,23 @@ static void setup_irq_affinity(const char *ifname, int num_cpus, int limit_queue
         int irq = 0;
         if (sscanf(line, " %d:", &irq) != 1 || irq <= 0) continue;
 
+        int target_cpu = (*cpu_offset_ptr + data_irq_idx) % num_cpus;
+
         char path[128], mask[32];
         snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
-        snprintf(mask, sizeof(mask), "%x", 1 << data_irq_idx);
+        snprintf(mask, sizeof(mask), "%x", 1 << target_cpu);
 
         if (write_sysfs(path, mask) == 0)
-            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, data_irq_idx);
+            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, target_cpu);
         
         data_irq_idx++;
     }
     fclose(f);
+    
+    /* Update the global offset so the next interface gets different CPUs */
+    if (data_irq_idx > 0) {
+        *cpu_offset_ptr = (*cpu_offset_ptr + data_irq_idx) % num_cpus;
+    }
 }
 
 /* Qdisc: set mq (multi-queue) — each TX queue gets its own independent qdisc */
@@ -458,7 +471,7 @@ static void setup_mq_qdisc(const char *ifname)
 }
 
 /* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS + Ring + Coalesce */
-static void tune_physical_nic(const char *ifname, int num_cpus)
+static void tune_physical_nic(const char *ifname, int num_cpus, int *cpu_offset_ptr)
 {
     /* 1. Backup existing ethtool state... (as already implemented) */
     if (g_eth_count < MAX_MODIFIED_IFACES) {
@@ -477,18 +490,26 @@ static void tune_physical_nic(const char *ifname, int num_cpus)
     setup_rss_hash(ifname);
     setup_ring_buffers(ifname);
     setup_coalescing(ifname);
-    setup_irq_affinity(ifname, num_cpus, target_queues);
-    setup_xps(ifname, num_cpus);
-    setup_rps(ifname, num_cpus); /* Enable RPS as a software fallback for RSS imbalance */
+    
+    // Pass offset state to XPS/RPS before affinity updates the offset
+    int current_offset = *cpu_offset_ptr;
+    setup_xps(ifname, num_cpus, &current_offset);
+    current_offset = *cpu_offset_ptr;
+    setup_rps(ifname, num_cpus, &current_offset); 
+    
+    setup_irq_affinity(ifname, num_cpus, target_queues, cpu_offset_ptr);
     setup_mq_qdisc(ifname);
 }
 
 /* Full setup for a tunnel interface: XPS + RPS + mq qdisc */
-static void tune_tunnel(const char *ifname, int num_cpus)
+static void tune_tunnel(const char *ifname, int num_cpus, int *cpu_offset_ptr)
 {
-    setup_xps(ifname, num_cpus);
-    setup_rps(ifname, num_cpus);
-    setup_irq_affinity(ifname, num_cpus, 1); /* Tunnels usually have 0 or 1 logical IRQ */
+    int current_offset = *cpu_offset_ptr;
+    setup_xps(ifname, num_cpus, &current_offset);
+    current_offset = *cpu_offset_ptr;
+    setup_rps(ifname, num_cpus, &current_offset);
+    
+    setup_irq_affinity(ifname, num_cpus, 1, cpu_offset_ptr); /* Tunnels usually have 0 or 1 logical IRQ */
     setup_mq_qdisc(ifname);
 }
 
@@ -499,6 +520,7 @@ static void tune_tunnel(const char *ifname, int num_cpus)
 int cpu_tune_apply(const app_context_t *ctx)
 {
     int num_cpus = get_num_cpus();
+    int global_cpu_offset = 0;
 
     log_info("========================================");
     log_info("  CPU Tuning: %d cores detected", num_cpus);
@@ -519,7 +541,7 @@ int cpu_tune_apply(const app_context_t *ctx)
 
     /* 2. Local interface — physical NIC (e.g. enp6s0) */
     log_info("  [Local NIC: %s]", ctx->cfg.local_if);
-    tune_physical_nic(ctx->cfg.local_if, num_cpus);
+    tune_physical_nic(ctx->cfg.local_if, num_cpus, &global_cpu_offset);
 
     /* 3. Tunnel interfaces + auto-detect underlying physical NICs */
     char tuned_nics[MAX_NE_TUNNELS][IF_NAMESIZE];
@@ -528,7 +550,7 @@ int cpu_tune_apply(const app_context_t *ctx)
     for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
         const char *tun = ctx->cfg.ne_tunnels[i].ifname;
         log_info("  [Tunnel: %s]", tun);
-        tune_tunnel(tun, num_cpus);
+        tune_tunnel(tun, num_cpus, &global_cpu_offset);
 
         /* Auto-detect and tune the physical NIC underneath the VXLAN */
         char lower[IF_NAMESIZE] = {0};
@@ -541,7 +563,7 @@ int cpu_tune_apply(const app_context_t *ctx)
             /* Also skip if it's the same as local_if (already tuned above) */
             if (!already && strcmp(lower, ctx->cfg.local_if) != 0) {
                 log_info("  [Physical WAN: %s (under %s)]", lower, tun);
-                tune_physical_nic(lower, num_cpus);
+                tune_physical_nic(lower, num_cpus, &global_cpu_offset);
                 strncpy(tuned_nics[tuned_nic_count++], lower, IF_NAMESIZE - 1);
             }
         }
