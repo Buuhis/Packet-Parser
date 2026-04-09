@@ -58,89 +58,29 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
         u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
-        struct net_device *target_dev = tun->dev;
         
-        if (unlikely(!target_dev)) {
-            rcu_read_unlock();
-            return NF_ACCEPT;
-        }
-
-        /* 4. Magic: Re-routing and MAC Injection */
+        unsigned int ret = NF_ACCEPT;
         
-        /* If it's an Ethernet device, we need a resolved MAC */
-        if (tun->is_ethernet) {
-            if (unlikely(!tun->mac_resolved)) {
-                struct neighbour *n = neigh_lookup(&arp_tbl, &tun->gateway, target_dev);
-                if (!n) {
-                    n = neigh_create(&arp_tbl, &tun->gateway, target_dev);
-                }
-                
-                if (n && !IS_ERR(n)) {
-                    if (n->nud_state & NUD_VALID) {
-                        /* ARP has been resolved by background process! */
-                        read_lock_bh(&n->lock);
-                        ether_addr_copy(tun->gateway_mac, n->ha);
-                        read_unlock_bh(&n->lock);
-                        tun->mac_resolved = true;
-                    } else {
-                        /* Force Kernel to instantly send an ARP Request Broadcast */
-                        neigh_event_send(n, NULL);
-                    }
-                    neigh_release(n);
-                }
-
-                if (!tun->mac_resolved) {
-                    /* Fall back to standard stack while waiting for ARP response */
-                    goto out;
-                }
-            }
-
-            /* Ensure enough headroom for Ethernet header and alignment */
-            if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
-                if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
-                    goto out; 
-                }
-            }
-
-            /* Prepend Ethernet Header */
-            skb_push(skb, ETH_HLEN);
-            skb_reset_mac_header(skb);
-            {
-                struct ethhdr *eth = eth_hdr(skb);
-                if (target_dev->dev_addr)
-                    ether_addr_copy(eth->h_source, target_dev->dev_addr);
-                else
-                    eth_zero_addr(eth->h_source);
-                
-                ether_addr_copy(eth->h_dest, tun->gateway_mac);
-                eth->h_proto = htons(ETH_P_IP);
-            }
-        } else {
-            /* Non-ethernet device (Point-to-Point tunnel) 
-             * Just ensure we don't have a stale MAC header pointing to wrong memory */
-            skb_pull(skb, skb_network_offset(skb));
-            skb_reset_mac_header(skb);
+        switch (tun->encap_type) {
+            case MWAN_ENCAP_NONE:
+                ret = mwan_handle_encap_none(skb, tun);
+                break;
+            case MWAN_ENCAP_MACSEC:
+                ret = mwan_handle_encap_macsec(skb, tun);
+                break;
+            case MWAN_ENCAP_L3_CUSTOM:
+                ret = mwan_handle_encap_l3(skb, tun);
+                break;
+            default:
+                ret = mwan_handle_encap_none(skb, tun);
+                break;
         }
-
-        /* 5. CPU-Bound TX Queue: Each CPU core transmits through its own
-         * dedicated TX queue. This eliminates Qdisc lock contention —
-         * 4 cores × 4 queues = zero cross-CPU locking.
-         * Requires: tunnel created with numtxqueues >= num_cpus,
-         *           XPS configured by userspace cpu_tune module.
-         */
-        if (likely(target_dev->real_num_tx_queues > 1)) {
-            skb_set_queue_mapping(skb, smp_processor_id() % target_dev->real_num_tx_queues);
-        }
-
-        /* Final Egress */
-        skb->dev = target_dev;
-        dev_queue_xmit(skb);
-
+        
         rcu_read_unlock();
-        return NF_STOLEN;
+        return ret;
     }
 
-out:
+
     rcu_read_unlock();
     return NF_ACCEPT; 
 }
@@ -172,6 +112,21 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             
             /* We let the kernel handle the L2 (ARP/MAC) for the client 
              * because the user preferred the kernel to handle it. */
+            /* Debug log: Capture info BEFORE switching device */
+            if (skb->dev) {
+                struct iphdr *iph_dbg = ip_hdr(skb);
+                u16 frag_off = ntohs(iph_dbg->frag_off);
+                bool is_frag = (frag_off & IP_MF) || (frag_off & IP_OFFSET);
+
+                pr_info_ratelimited("mwan_kmod: INBOUND [CPU %u] from %s (RXQ: %u) Proto: %u Frag: %s -> To %s\n",
+                                    smp_processor_id(),
+                                    skb->dev->name, 
+                                    skb_rx_queue_recorded(skb) ? skb_get_rx_queue(skb) : 0,
+                                    iph_dbg->protocol,
+                                    is_frag ? "YES" : "NO",
+                                    cfg->local_dev->name);
+            }
+
             skb->dev = cfg->local_dev;
             
             /* Important: Clear any stale L2 header remains to avoid corruption */

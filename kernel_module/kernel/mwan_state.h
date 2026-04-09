@@ -7,6 +7,14 @@
 #define MAX_MWAN_TUNNELS 8
 #define MWAN_LUT_SIZE    256
 
+enum mwan_encap_type {
+    MWAN_ENCAP_NONE = 0,
+    MWAN_ENCAP_MACSEC,
+    MWAN_ENCAP_L3_CUSTOM,
+};
+
+struct mwan_tunnel;
+
 struct mwan_tunnel {
     u32 ifindex;
     u32 weight;
@@ -17,6 +25,7 @@ struct mwan_tunnel {
     unsigned char gateway_mac[6];
     bool mac_resolved;
     bool is_ethernet;
+    enum mwan_encap_type encap_type;
 };
 
 struct mwan_config {

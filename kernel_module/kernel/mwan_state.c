@@ -6,6 +6,7 @@
 #include <net/neighbour.h>
 #include <net/arp.h>
 #include <linux/err.h>
+#include <net/rtnetlink.h>
 
 /* Global Configuration Pointer (RCU Protected) */
 struct mwan_config __rcu *g_mwan_cfg = NULL;
@@ -67,6 +68,13 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         tun->dev = dev_get_by_index(&init_net, tun->ifindex);
         if (tun->dev) {
             tun->is_ethernet = (tun->dev->type == ARPHRD_ETHER);
+            
+            if (tun->dev->rtnl_link_ops && tun->dev->rtnl_link_ops->kind &&
+                strcmp(tun->dev->rtnl_link_ops->kind, "macsec") == 0) {
+                tun->encap_type = MWAN_ENCAP_MACSEC;
+            } else {
+                tun->encap_type = MWAN_ENCAP_NONE;
+            }
             
             /* Attempt to resolve MAC if it's an ethernet device */
             if (tun->is_ethernet && tun->gateway) {
