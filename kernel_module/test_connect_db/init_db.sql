@@ -5,9 +5,9 @@ CREATE TABLE IF NOT EXISTS public.nodes (
     remote_cidr VARCHAR(50) NOT NULL,
     loopback_ip VARCHAR(50) NOT NULL,
     encryption_enabled BOOLEAN DEFAULT FALSE,
-    encrypt_type VARCHAR(32) DEFAULT 'aes-gcm', -- Allow users to choose cipher: 'aes-gcm', 'chacha20-poly1305', etc.
-    encrypt_key INTEGER DEFAULT 128,          -- Hex string for the symmetric key
-    encrypt_nonce INTEGER DEFAULT 12            -- Hex string for Salt/IV generation
+    encrypt_type VARCHAR(32) DEFAULT 'aes-gcm-128', -- 'aes-gcm-128' or 'aes-gcm-256'
+    encrypt_key VARCHAR(64) DEFAULT NULL,            -- Hex string: 32 chars (128-bit) or 64 chars (256-bit)
+    encrypt_nonce VARCHAR(8) DEFAULT NULL             -- Hex string: 8 chars = 4 bytes Salt for IV
 );
 
 CREATE TABLE IF NOT EXISTS public.ne_tunnels (
@@ -25,7 +25,7 @@ TRUNCATE TABLE public.nodes RESTART IDENTITY CASCADE;
 INSERT INTO public.nodes (node_id, local_if, remote_cidr, loopback_ip, encryption_enabled, encrypt_type, encrypt_key, encrypt_nonce)
 VALUES (
     1, 'enp6s0', '192.168.90.0/24', '10.0.0.1', 
-    TRUE, 'gcm(aes)', '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', '12' -- Example 256-bit key & salt
+    TRUE, 'aes-gcm-256', '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', 'deadbeef'
 );
 
 INSERT INTO public.ne_tunnels (node_id, ifname, gateway, port, weight)
@@ -36,7 +36,7 @@ VALUES
 INSERT INTO public.nodes (node_id, local_if, remote_cidr, loopback_ip, encryption_enabled, encrypt_type, encrypt_key, encrypt_nonce)
 VALUES (
     2, 'enp6s0', '192.168.68.0/24', '10.0.0.2',
-    TRUE, 'gcm(aes)', '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', '12'
+    TRUE, 'aes-gcm-256', '00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff', 'deadbeef'
 );
 
 INSERT INTO public.ne_tunnels (node_id, ifname, gateway, port, weight)

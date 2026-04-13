@@ -3,6 +3,9 @@
 
 #include <linux/types.h>
 #include <linux/rcupdate.h>
+#include <linux/atomic.h>
+#include <crypto/aead.h>
+#include "mwan_proto.h"
 
 #define MAX_MWAN_TUNNELS 8
 #define MWAN_LUT_SIZE    256
@@ -45,6 +48,15 @@ struct mwan_config {
     __be32 local_mask;
     u32 local_ifindex;
     struct net_device *local_dev;
+
+    /* Encryption (AES-GCM) */
+    bool encrypt_on;
+    u8   encrypt_type;                    /* enum mwan_crypt_type */
+    u8   encrypt_key[MWAN_MAX_KEY_LEN];
+    u8   encrypt_key_len;                 /* 16 (128-bit) or 32 (256-bit) */
+    u8   encrypt_salt[MWAN_SALT_LEN];
+    struct crypto_aead *tfm;              /* Crypto transform context */
+    atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
     struct rcu_head rcu;
 };

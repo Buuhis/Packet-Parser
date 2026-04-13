@@ -20,7 +20,7 @@
 /* ---------- global state ---------- */
 static volatile int running_server = 1;
 static int unix_server_fd = -1;
-static char socket_path[256] = "/var/run/sep-wan.sock";
+static char socket_path[256] = "/var/run/sd-wan.sock";
 static app_context_t running_ctx;
 
 /* ---------- utilities ---------- */
@@ -63,7 +63,7 @@ static void handle_signal(int sig) {
 /* ---------- usage ---------- */
 static void usage(const char *prog) {
     printf("=========================================================\n");
-    printf("         MULTI-WAN PACKET FORWARDER (sep-wan)            \n");
+    printf("         MULTI-WAN PACKET FORWARDER (sd-wan)            \n");
     printf("=========================================================\n");
     printf("Client Mode (Control running daemon):\n");
     printf("  %s -id <node_id>    Send config request to the daemon\n", prog);

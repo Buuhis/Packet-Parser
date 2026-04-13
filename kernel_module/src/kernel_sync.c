@@ -97,6 +97,20 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     }
     nla_nest_end(msg, tunnels);
 
+    /* Sync Encryption Config */
+    if (ctx->cfg.encrypt.enabled) {
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   1);
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  ctx->cfg.encrypt.type);
+        nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   ctx->cfg.encrypt.key_len, ctx->cfg.encrypt.key);
+        nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     ctx->cfg.encrypt.salt);
+        log_info("  [+] Sync Encryption: ON (type: %s, key_len: %zu)",
+                 ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" : "AES-GCM-256",
+                 ctx->cfg.encrypt.key_len);
+    } else {
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   0);
+        log_info("  [+] Sync Encryption: OFF");
+    }
+
     if (nl_send_auto(sock, msg) < 0) {
         log_error("Failed to send Netlink message");
     } else {

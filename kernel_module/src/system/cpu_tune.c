@@ -33,14 +33,6 @@ typedef struct {
     int  original_combined;      /* Original combined queue count */
 } multiqueue_backup_t;
 
-typedef struct {
-    char ifname[IF_NAMESIZE];
-    char udp4_hash[16];
-    char tcp4_hash[16];
-    int  rx_usecs;
-    int  tx_usecs;
-} ethtool_config_backup_t;
-
 static backup_entry_t       g_backups[MAX_BACKUP_ENTRIES];
 static int                  g_backup_count = 0;
 
@@ -50,65 +42,8 @@ static int                  g_qdisc_count = 0;
 static multiqueue_backup_t  g_mq_backups[MAX_MODIFIED_IFACES];
 static int                  g_mq_count = 0;
 
-static ethtool_config_backup_t g_eth_backups[MAX_MODIFIED_IFACES];
-static int                     g_eth_count = 0;
-
 static bool g_irqbalance_was_active = false;
 static bool g_tuning_applied = false;
-
-/* ================================================================
- *  Low-level ethtool state-sensing
- * ================================================================ */
-
-/* Parse "ethtool -n <dev> rx-flow-hash <proto>" output to find flags like "sdfn" 
- * This is hard to do perfectly in C, so we check for common field inclusions. */
-static void get_current_flow_hash(const char *ifname, const char *proto, char *out, size_t len)
-{
-    char cmd[256], line[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -n %s rx-flow-hash %s 2>/dev/null", ifname, proto);
-    FILE *p = popen(cmd, "r");
-    if (!p) { strncpy(out, "sd", len); return; }
-
-    bool sip = false, dip = false, sport = false, dport = false;
-    while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "IP SA")) sip = true;
-        if (strstr(line, "IP DA")) dip = true;
-        if (strstr(line, "L4 bytes 0 & 1")) sport = true;
-        if (strstr(line, "L4 bytes 2 & 3")) dport = true;
-    }
-    pclose(p);
-
-    char temp[16] = {0};
-    if (sip) strcat(temp, "s");
-    if (dip) strcat(temp, "d");
-    if (sport) strcat(temp, "f");
-    if (dport) strcat(temp, "n");
-    
-    if (strlen(temp) == 0) strcpy(temp, "sd");
-    strncpy(out, temp, len);
-}
-
-/* Parse "ethtool -c <dev>" to find interrupt coalescing values. */
-static void get_current_coalesce(const char *ifname, int *rx, int *tx)
-{
-    *rx = 0; *tx = 0;
-    char cmd[256], line[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -c %s 2>/dev/null", ifname);
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
-
-    while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "rx-usecs:")) {
-            char *colon = strchr(line, ':');
-            if (colon) *rx = atoi(colon + 1);
-        }
-        if (strstr(line, "tx-usecs:")) {
-            char *colon = strchr(line, ':');
-            if (colon) *tx = atoi(colon + 1);
-        }
-    }
-    pclose(p);
-}
 
 /* ================================================================
  *  Low-level helpers
@@ -284,80 +219,50 @@ static void setup_multiqueue(const char *ifname, int num_cpus)
     }
 }
 
-/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP. */
+/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP.
+ * Equivalent to: ethtool -N <dev> rx-flow-hash udp4 sdfn */
 static void setup_rss_hash(const char *ifname)
 {
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname);
-    system(cmd);
-    snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname);
-    system(cmd);
-    
-    /* Disable LRO: Sometimes LRO interferes with proper hashing of encapsulated packets. */
-    snprintf(cmd, sizeof(cmd), "ethtool -K %s lro off 2>/dev/null", ifname);
-    system(cmd);
-    log_info("    RSS: %s hashing sdfn enabled, LRO disabled", ifname);
-}
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd),
+             "ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname);
+    if (system(cmd) == 0)
+        log_info("    RSS: %s udp4 -> sdfn (4-tuple)", ifname);
 
-/* Maximize NIC Ring Buffers to absorb bursts during peak throughput. */
-static void setup_ring_buffers(const char *ifname)
-{
-    char cmd[256], line[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -g %s 2>/dev/null", ifname);
-    FILE *p = popen(cmd, "r");
-    if (!p) return;
-
-    int max_rx = 0, max_tx = 0;
-    bool in_max_block = false;
-    while (fgets(line, sizeof(line), p)) {
-        if (strstr(line, "Pre-set maximums:")) in_max_block = true;
-        else if (strstr(line, "Current hardware settings:")) in_max_block = false;
-        
-        if (in_max_block) {
-            if (strstr(line, "RX:")) max_rx = atoi(strchr(line, ':') + 1);
-            if (strstr(line, "TX:")) max_tx = atoi(strchr(line, ':') + 1);
-        }
-    }
-    pclose(p);
-
-    if (max_rx > 0 || max_tx > 0) {
-        snprintf(cmd, sizeof(cmd), "ethtool -G %s rx %d tx %d 2>/dev/null", ifname, max_rx, max_tx);
-        system(cmd);
-        log_info("    Ring: %s maximized to RX=%d, TX=%d", ifname, max_rx, max_tx);
-    }
-}
-
-/* Set Interrupt Coalescing to reduce CPU high-softirq load. 
- * Waiting 50-100us before firing an interrupt allows processing more packets per IRQ. */
-static void setup_coalescing(const char *ifname)
-{
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -C %s rx-usecs 50 tx-usecs 50 2>/dev/null", ifname);
-    system(cmd);
-    log_info("    Coalesce: %s set to 50us", ifname);
+    /* Also set for TCP */
+    snprintf(cmd, sizeof(cmd),
+             "ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname);
+    if (system(cmd) == 0)
+        log_info("    RSS: %s tcp4 -> sdfn (4-tuple)", ifname);
 }
 
 /* ================================================================
  *  Per-interface CPU tuning functions
  * ================================================================ */
 
-static void setup_xps(const char *ifname, int num_cpus, int *cpu_offset_ptr)
+/* XPS: Map TX queues to CPUs.
+ * If num_queues < num_cpus (like single-queue tunnels), we map ALL CPUs to that queue 
+ * to allow distributed parallel transmission without bottlenecking Core 0. */
+static void setup_xps(const char *ifname, int num_cpus)
 {
     int num_tx = count_queues(ifname, "tx-");
     if (num_tx == 0) return;
 
     char path[256], mask[32];
     
+    /* Optimization: If num_queues is very small (like a 1-queue tunnel),
+     * we limit the XPS mask to a sub-group of CPUs (Hardware Master: Core 0-4). */
+    int xps_limit = 4;
+
     for (int i = 0; i < num_tx; i++) {
         unsigned int cpu_mask = 0;
         
         if (num_tx == 1) {
-            /* Case: Single queue tunnel. Map to a specific target core based on offset. */
-            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
-            cpu_mask = (1U << target_cpu);
+            /* Case: Single queue tunnel. Map to all Master cores (0-4). */
+            cpu_mask = (1U << xps_limit) - 1;
         } else {
-            /* Case: Multi-queue. Strict 1-to-1 mapping starting from offset. */
-            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
+            /* Case: Multi-queue. Distribute evenly across Master cores (0-4). */
+            int target_cpu = i % xps_limit;
             cpu_mask = (1U << target_cpu);
         }
         
@@ -367,89 +272,73 @@ static void setup_xps(const char *ifname, int num_cpus, int *cpu_offset_ptr)
         snprintf(mask, sizeof(mask), "%x", cpu_mask);
         
         if (write_sysfs(path, mask) == 0)
-            log_info("    XPS: %s tx-%d -> CPU Mask %x", ifname, i, cpu_mask);
+            log_info("    XPS: %s tx-%d -> CPU Mask %s", ifname, i, mask);
     }
 }
 
-/* RPS: Distribute RX processing across target cores */
-static void setup_rps(const char *ifname, int num_cpus, int *cpu_offset_ptr)
+/* RPS: Distribute RX processing across Software Worker cores (5-9) */
+static void setup_rps(const char *ifname, int num_cpus)
 {
     int num_rx = count_queues(ifname, "rx-");
     if (num_rx == 0) return;
 
+    /* Worker cores: 5, 6, 7, 8, 9 (5 cores) */
+    unsigned int worker_mask = 0x3ff; 
     char path[256], mask[16];
+    snprintf(mask, sizeof(mask), "%x", worker_mask);
 
     for (int i = 0; i < num_rx; i++) {
-        unsigned int cpu_mask = 0;
-        
-        if (num_rx == 1) {
-            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
-            cpu_mask = (1U << target_cpu);
-        } else {
-            int target_cpu = (*cpu_offset_ptr + i) % num_cpus;
-            cpu_mask = (1U << target_cpu);
-        }
-        
-        snprintf(mask, sizeof(mask), "%x", cpu_mask);
-        
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_cpus", ifname, i);
         if (write_sysfs(path, mask) == 0)
-            log_info("    RPS: %s rx-%d -> CPU Mask %s", ifname, i, mask);
+            log_info("    RPS: %s rx-%d -> Worker CPUs (mask %s)", ifname, i, mask);
 
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_flow_cnt", ifname, i);
-        write_sysfs(path, "16384");
+        write_sysfs(path, "4096");
     }
-    
-    /* Reset RSS Indirection Table (RETA) to ensure even distribution 
-     * across all hardware queues. Fixes cases where some queues are ignored. */
-    char cmd[256];
-    snprintf(cmd, sizeof(cmd), "ethtool -X %s default 2>/dev/null", ifname);
-    system(cmd);
-    log_info("    RSS: %s indirection table reset to default (balanced)", ifname);
 }
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
  * Improved to avoid pinning management/link interrupts to extra cores. */
-static void setup_irq_affinity(const char *ifname, int num_cpus, int limit_queues, int *cpu_offset_ptr)
+static void setup_irq_affinity(const char *ifname, int num_cpus)
 {
     FILE *f = fopen("/proc/interrupts", "r");
     if (!f) return;
 
     char line[1024];
     int data_irq_idx = 0;
-    int limit = (limit_queues > 0 && limit_queues < num_cpus) ? limit_queues : num_cpus;
 
-    while (fgets(line, sizeof(line), f) && data_irq_idx < limit) {
+    while (fgets(line, sizeof(line), f) && data_irq_idx < num_cpus) {
         if (!strstr(line, ifname)) continue;
 
-        /* Skip management/link interrupts if they don't look like data queues. */
+        /* Skip management/link interrupts if they don't look like data queues.
+         * Data queues usually have labels like eth0-rx-0, eth0-0, or eth0-TxRx-0.
+         * Simple heuristic: if there are multiple interrupts, the ones with numbers are data. */
         bool has_digit = false;
         char *suffix = strstr(line, ifname);
         for (char *p = suffix; *p; p++) { if (*p >= '0' && *p <= '9') { has_digit = true; break; } }
+        
+        /* If we found many interrupts but this one has no digit in name, 
+         * it's likely a management interrupt — we'll pin it to CPU0 or skip. */
         if (!has_digit && data_irq_idx > 0) continue;
 
         int irq = 0;
         if (sscanf(line, " %d:", &irq) != 1 || irq <= 0) continue;
 
-        int target_cpu = (*cpu_offset_ptr + data_irq_idx) % num_cpus;
-
         char path[128], mask[32];
         snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
+        
+        /* Pin to Master Cores (0-4) only */
+        int target_cpu = data_irq_idx % 5;
         snprintf(mask, sizeof(mask), "%x", 1 << target_cpu);
 
         if (write_sysfs(path, mask) == 0)
-            log_info("    IRQ: %s irq=%d -> CPU %d", ifname, irq, target_cpu);
+            log_info("    IRQ: %s irq=%d -> Master CPU %d", ifname, irq, target_cpu);
         
         data_irq_idx++;
     }
     fclose(f);
-    
-    /* Update the global offset so the next interface gets different CPUs */
-    if (data_irq_idx > 0) {
-        *cpu_offset_ptr = (*cpu_offset_ptr + data_irq_idx) % num_cpus;
-    }
 }
 
 /* Qdisc: set mq (multi-queue) — each TX queue gets its own independent qdisc */
@@ -470,46 +359,21 @@ static void setup_mq_qdisc(const char *ifname)
     log_info("    Qdisc: %s -> mq (%d queues)", ifname, num_tx);
 }
 
-/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS + Ring + Coalesce */
-static void tune_physical_nic(const char *ifname, int num_cpus, int *cpu_offset_ptr)
+/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS */
+static void tune_physical_nic(const char *ifname, int num_cpus)
 {
-    /* 1. Backup existing ethtool state... (as already implemented) */
-    if (g_eth_count < MAX_MODIFIED_IFACES) {
-        ethtool_config_backup_t *b = &g_eth_backups[g_eth_count];
-        strncpy(b->ifname, ifname, IF_NAMESIZE - 1);
-        get_current_flow_hash(ifname, "udp4", b->udp4_hash, sizeof(b->udp4_hash));
-        get_current_flow_hash(ifname, "tcp4", b->tcp4_hash, sizeof(b->tcp4_hash));
-        get_current_coalesce(ifname, &b->rx_usecs, &b->tx_usecs);
-        g_eth_count++;
-    }
-
-    ethtool_queues_t q = get_ethtool_queues(ifname);
-    int target_queues = (num_cpus < q.max_combined) ? num_cpus : q.max_combined;
-
     setup_multiqueue(ifname, num_cpus);
     setup_rss_hash(ifname);
-    setup_ring_buffers(ifname);
-    setup_coalescing(ifname);
-    
-    // Pass offset state to XPS/RPS before affinity updates the offset
-    int current_offset = *cpu_offset_ptr;
-    setup_xps(ifname, num_cpus, &current_offset);
-    current_offset = *cpu_offset_ptr;
-    setup_rps(ifname, num_cpus, &current_offset); 
-    
-    setup_irq_affinity(ifname, num_cpus, target_queues, cpu_offset_ptr);
+    setup_irq_affinity(ifname, num_cpus);
+    setup_xps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
 
 /* Full setup for a tunnel interface: XPS + RPS + mq qdisc */
-static void tune_tunnel(const char *ifname, int num_cpus, int *cpu_offset_ptr)
+static void tune_tunnel(const char *ifname, int num_cpus)
 {
-    int current_offset = *cpu_offset_ptr;
-    setup_xps(ifname, num_cpus, &current_offset);
-    current_offset = *cpu_offset_ptr;
-    setup_rps(ifname, num_cpus, &current_offset);
-    
-    setup_irq_affinity(ifname, num_cpus, 1, cpu_offset_ptr); /* Tunnels usually have 0 or 1 logical IRQ */
+    setup_xps(ifname, num_cpus);
+    setup_rps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
 
@@ -520,7 +384,6 @@ static void tune_tunnel(const char *ifname, int num_cpus, int *cpu_offset_ptr)
 int cpu_tune_apply(const app_context_t *ctx)
 {
     int num_cpus = get_num_cpus();
-    int global_cpu_offset = 0;
 
     log_info("========================================");
     log_info("  CPU Tuning: %d cores detected", num_cpus);
@@ -534,14 +397,14 @@ int cpu_tune_apply(const app_context_t *ctx)
     }
 
     /* 1. Global settings */
-    write_sysfs("/proc/sys/net/core/rps_sock_flow_entries", "65536");
-    write_sysfs("/proc/sys/net/core/netdev_max_backlog", "20000");
-    write_sysfs("/proc/sys/net/core/netdev_budget", "2000");
-    log_info("  [+] Global: rfs=65536, backlog=20000, budget=2000");
+    write_sysfs("/proc/sys/net/core/rps_sock_flow_entries", "32768");
+    write_sysfs("/proc/sys/net/core/netdev_max_backlog", "10000");
+    write_sysfs("/proc/sys/net/core/netdev_budget", "600");
+    log_info("  [+] Global: rfs=32768, backlog=10000, budget=600");
 
     /* 2. Local interface — physical NIC (e.g. enp6s0) */
     log_info("  [Local NIC: %s]", ctx->cfg.local_if);
-    tune_physical_nic(ctx->cfg.local_if, num_cpus, &global_cpu_offset);
+    tune_physical_nic(ctx->cfg.local_if, num_cpus);
 
     /* 3. Tunnel interfaces + auto-detect underlying physical NICs */
     char tuned_nics[MAX_NE_TUNNELS][IF_NAMESIZE];
@@ -550,7 +413,7 @@ int cpu_tune_apply(const app_context_t *ctx)
     for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
         const char *tun = ctx->cfg.ne_tunnels[i].ifname;
         log_info("  [Tunnel: %s]", tun);
-        tune_tunnel(tun, num_cpus, &global_cpu_offset);
+        tune_tunnel(tun, num_cpus);
 
         /* Auto-detect and tune the physical NIC underneath the VXLAN */
         char lower[IF_NAMESIZE] = {0};
@@ -563,7 +426,7 @@ int cpu_tune_apply(const app_context_t *ctx)
             /* Also skip if it's the same as local_if (already tuned above) */
             if (!already && strcmp(lower, ctx->cfg.local_if) != 0) {
                 log_info("  [Physical WAN: %s (under %s)]", lower, tun);
-                tune_physical_nic(lower, num_cpus, &global_cpu_offset);
+                tune_physical_nic(lower, num_cpus);
                 strncpy(tuned_nics[tuned_nic_count++], lower, IF_NAMESIZE - 1);
             }
         }
@@ -617,30 +480,7 @@ void cpu_tune_restore(void)
     }
     g_mq_count = 0;
 
-    /* 4. Restore original ethtool settings (flow-hash, RETA reset, coalesce) */
-    for (int i = 0; i < g_eth_count; i++) {
-        ethtool_config_backup_t *b = &g_eth_backups[i];
-        char cmd[256];
-
-        /* Restore Flow Hash */
-        snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash udp4 %s 2>/dev/null", b->ifname, b->udp4_hash);
-        system(cmd);
-        snprintf(cmd, sizeof(cmd), "ethtool -N %s rx-flow-hash tcp4 %s 2>/dev/null", b->ifname, b->tcp4_hash);
-        system(cmd);
-
-        /* Restore Coalesce */
-        snprintf(cmd, sizeof(cmd), "ethtool -C %s rx-usecs %d tx-usecs %d 2>/dev/null", b->ifname, b->rx_usecs, b->tx_usecs);
-        system(cmd);
-        
-        /* Reset RETA back to default (driver default is the safest assume) */
-        snprintf(cmd, sizeof(cmd), "ethtool -X %s default 2>/dev/null", b->ifname);
-        system(cmd);
-
-        log_info("  [+] Ethtool settings restored for %s", b->ifname);
-    }
-    g_eth_count = 0;
-
-    /* 5. Restart irqbalance if it was running before we stopped it */
+    /* 4. Restart irqbalance if it was running before we stopped it */
     if (g_irqbalance_was_active) {
         system("systemctl start irqbalance 2>/dev/null");
         log_info("  [+] Restarted irqbalance");

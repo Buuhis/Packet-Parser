@@ -2,7 +2,7 @@ CC      := gcc-12
 CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -I/usr/include/postgresql -I/usr/include/libnl3
 LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3
 
-BIN := sep-wan
+BIN := sd-wan
 
 SRC := \
     src/main.c \
@@ -34,9 +34,9 @@ install: all
 	@echo "Installed $(BIN) and mwan_kmod.ko globally"
 
 install-service:
-	install -m 644 systemd/sep-wan.service /etc/systemd/system/
+	install -m 644 systemd/sd-wan.service /etc/systemd/system/
 	systemctl daemon-reload
-	@echo "Service installed. You can now use: systemctl enable --now sep-wan"
+	@echo "Service installed. You can now use: systemctl enable --now sd-wan"
 
 clean:
 	rm -f $(BIN) $(OBJ)

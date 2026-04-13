@@ -14,6 +14,10 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_LOCAL_IP]   = { .type = NLA_U32 },
     [MWAN_ATTR_LOCAL_MASK] = { .type = NLA_U32 },
     [MWAN_ATTR_LOCAL_IFINDEX] = { .type = NLA_U32 },
+    [MWAN_ATTR_ENCRYPT_ON]   = { .type = NLA_U8 },
+    [MWAN_ATTR_ENCRYPT_TYPE] = { .type = NLA_U8 },
+    [MWAN_ATTR_ENCRYPT_KEY]  = { .type = NLA_BINARY, .len = MWAN_MAX_KEY_LEN },
+    [MWAN_ATTR_ENCRYPT_SALT] = { .type = NLA_BINARY, .len = MWAN_SALT_LEN },
 };
 
 /* Callback to handle SET_CONFIG message */
@@ -67,6 +71,31 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                     new_cfg->num_tunnels++;
                 }
             }
+        }
+    }
+
+    /* Parse encryption config */
+    if (info->attrs[MWAN_ATTR_ENCRYPT_ON]) {
+        new_cfg->encrypt_on = (nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_ON]) != 0);
+        
+        if (new_cfg->encrypt_on) {
+            if (info->attrs[MWAN_ATTR_ENCRYPT_TYPE])
+                new_cfg->encrypt_type = nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_TYPE]);
+            
+            if (info->attrs[MWAN_ATTR_ENCRYPT_KEY]) {
+                int klen = nla_len(info->attrs[MWAN_ATTR_ENCRYPT_KEY]);
+                if (klen > 0 && klen <= MWAN_MAX_KEY_LEN) {
+                    new_cfg->encrypt_key_len = klen;
+                    memcpy(new_cfg->encrypt_key, nla_data(info->attrs[MWAN_ATTR_ENCRYPT_KEY]), klen);
+                }
+            }
+            
+            if (info->attrs[MWAN_ATTR_ENCRYPT_SALT]) {
+                memcpy(new_cfg->encrypt_salt, nla_data(info->attrs[MWAN_ATTR_ENCRYPT_SALT]), MWAN_SALT_LEN);
+            }
+            
+            pr_info("mwan_kmod: Encryption ON (type: %u, key_len: %u)\n",
+                    new_cfg->encrypt_type, new_cfg->encrypt_key_len);
         }
     }
 

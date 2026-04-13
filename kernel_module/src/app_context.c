@@ -15,4 +15,8 @@ void app_context_dump(const app_context_t *ctx)
                  ctx->cfg.ne_tunnels[i].gateway,
                  ctx->cfg.ne_tunnels[i].port);
     }
+    log_info("Encryption: %s (type: %s, key_len: %zu bytes)",
+             ctx->cfg.encrypt.enabled ? "ON" : "OFF",
+             ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" : "AES-GCM-256",
+             ctx->cfg.encrypt.key_len);
 }

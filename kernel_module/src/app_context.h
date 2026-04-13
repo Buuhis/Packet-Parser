@@ -2,10 +2,13 @@
 #define APP_CONTEXT_H
 
 #include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-#define MAX_WANS       8
-#define MAX_NE_TUNNELS 8
-
+#define MAX_WANS           8
+#define MAX_NE_TUNNELS     8
+#define MAX_ENCRYPT_KEY_LEN  32  /* AES-256 = 32 bytes */
+#define MAX_ENCRYPT_SALT_LEN  4  /* 4 bytes static salt */
 
 typedef struct {
     char name[16];
@@ -22,11 +25,13 @@ typedef struct {
     int  weight;
 } ne_tunnel_cfg_t;
 
-// typedef struct {
-//     char veth_in[16];
-//     char veth_out[16];
-//     int  mtu;
-// } dataplane_cfg_t;
+typedef struct {
+    bool     enabled;
+    uint8_t  type;                              /* 0=aes-gcm-128, 1=aes-gcm-256 */
+    uint8_t  key[MAX_ENCRYPT_KEY_LEN];          /* Raw binary key */
+    size_t   key_len;                           /* 16 (128-bit) or 32 (256-bit) */
+    uint8_t  salt[MAX_ENCRYPT_SALT_LEN];        /* 4 bytes static salt */
+} encrypt_cfg_t;
 
 typedef struct {
     int  node_id;
@@ -44,7 +49,7 @@ typedef struct {
     size_t ne_tunnel_count;
     ne_tunnel_cfg_t ne_tunnels[MAX_NE_TUNNELS];
 
-    // dataplane_cfg_t dataplane;
+    encrypt_cfg_t encrypt;
 
 } app_config_t;
 

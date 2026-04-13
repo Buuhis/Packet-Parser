@@ -10,7 +10,7 @@ EnvironmentFile=/opt/.env
 
 # Daemon
 ExecStartPre=/sbin/insmod /usr/local/lib/modules/mwan_kmod.ko
-ExecStart=/usr/local/bin/sep-wan
+ExecStart=/usr/local/bin/sd-wan
 ExecStopPost=-/sbin/rmmod mwan_kmod
 Restart=always
 

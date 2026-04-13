@@ -6,13 +6,24 @@
 
 PGconn *g_db_conn = NULL;
 
-// static int parse_mac(const char *mac_str, unsigned char mac_bytes[6])
-// {
-//     int result = sscanf(mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-//                         &mac_bytes[0], &mac_bytes[1], &mac_bytes[2],
-//                         &mac_bytes[3], &mac_bytes[4], &mac_bytes[5]);
-//     return (result == 6) ? 0 : -1;
-// }
+/* Convert hex string to binary bytes. Returns number of bytes written, or -1 on error. */
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t max_len)
+{
+    if (!hex || !out) return -1;
+    
+    size_t hex_len = strlen(hex);
+    if (hex_len % 2 != 0) return -1;  /* Must be even */
+    
+    size_t byte_len = hex_len / 2;
+    if (byte_len > max_len) return -1;
+    
+    for (size_t i = 0; i < byte_len; i++) {
+        unsigned int byte_val;
+        if (sscanf(hex + (i * 2), "%2x", &byte_val) != 1) return -1;
+        out[i] = (uint8_t)byte_val;
+    }
+    return (int)byte_len;
+}
 
 int db_client_connect(const char *host, const char *port, const char *user, const char *dbname, const char *password)
 {
@@ -44,13 +55,15 @@ int db_client_load_config(int node_id, app_config_t *cfg)
         return -1;
     }
     
-    /* 1. Fetch node info */
+    /* 1. Fetch node info (including encryption config) */
     char id_str[16];
     snprintf(id_str, sizeof(id_str), "%d", node_id);
     const char *paramValues[1] = { id_str };
     
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT local_if, remote_cidr, loopback_ip FROM public.nodes WHERE node_id = $1",
+        "SELECT local_if, remote_cidr, loopback_ip, "
+        "encryption_enabled, encrypt_type, encrypt_key, encrypt_nonce "
+        "FROM public.nodes WHERE node_id = $1",
         1,       /* nParams */
         NULL,    /* paramTypes */
         paramValues,
@@ -75,6 +88,43 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     strncpy(cfg->local_if, PQgetvalue(res, 0, 0), sizeof(cfg->local_if) - 1);
     strncpy(cfg->remote_cidr, PQgetvalue(res, 0, 1), sizeof(cfg->remote_cidr) - 1);
     strncpy(cfg->loopback_ip, PQgetvalue(res, 0, 2), sizeof(cfg->loopback_ip) - 1);
+    
+    /* Parse encryption config */
+    const char *enc_enabled = PQgetvalue(res, 0, 3);
+    const char *enc_type    = PQgetvalue(res, 0, 4);
+    const char *enc_key_hex = PQgetvalue(res, 0, 5);
+    const char *enc_salt_hex = PQgetvalue(res, 0, 6);
+    
+    cfg->encrypt.enabled = (enc_enabled && strcmp(enc_enabled, "t") == 0);
+    
+    if (cfg->encrypt.enabled) {
+        /* Map string type to enum */
+        if (enc_type && strcmp(enc_type, "aes-gcm-256") == 0) {
+            cfg->encrypt.type = 1;  /* MWAN_CRYPT_AES_GCM_256 */
+        } else {
+            cfg->encrypt.type = 0;  /* MWAN_CRYPT_AES_GCM_128 (default) */
+        }
+        
+        /* Convert hex key to binary */
+        if (enc_key_hex && strlen(enc_key_hex) > 0) {
+            int klen = hex_to_bytes(enc_key_hex, cfg->encrypt.key, MAX_ENCRYPT_KEY_LEN);
+            if (klen > 0) {
+                cfg->encrypt.key_len = (size_t)klen;
+            } else {
+                log_error("Invalid encrypt_key hex string");
+                cfg->encrypt.enabled = false;
+            }
+        }
+        
+        /* Convert hex salt to binary */
+        if (enc_salt_hex && strlen(enc_salt_hex) > 0) {
+            int slen = hex_to_bytes(enc_salt_hex, cfg->encrypt.salt, MAX_ENCRYPT_SALT_LEN);
+            if (slen != MAX_ENCRYPT_SALT_LEN) {
+                log_error("Invalid encrypt_nonce: expected %d bytes, got %d", MAX_ENCRYPT_SALT_LEN, slen);
+                cfg->encrypt.enabled = false;
+            }
+        }
+    }
     PQclear(res);
     
     /* 2. Fetch ne_tunnels info */
