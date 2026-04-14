@@ -56,7 +56,6 @@ struct mwan_config {
     u8   encrypt_key_len;                 /* 16 (128-bit) or 32 (256-bit) */
     u8   encrypt_salt[MWAN_SALT_LEN];
     struct crypto_aead *tfm;              /* Crypto transform context */
-    struct aead_request * __percpu *crypto_reqs; /* Per-CPU pre-allocated requests */
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
     struct rcu_head rcu;

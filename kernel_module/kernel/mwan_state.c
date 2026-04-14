@@ -29,15 +29,6 @@ static void mwan_config_free_rcu(struct rcu_head *rcu) {
         dev_put(cfg->local_dev);
     }
     if (cfg->tfm) {
-        if (cfg->crypto_reqs) {
-            int cpu;
-            for_each_possible_cpu(cpu) {
-                struct aead_request *req = *per_cpu_ptr(cfg->crypto_reqs, cpu);
-                if (req)
-                    aead_request_free(req);
-            }
-            free_percpu(cfg->crypto_reqs);
-        }
         crypto_free_aead(cfg->tfm);
     }
     kfree(cfg);
@@ -177,27 +168,8 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         }
 
         new_cfg->tfm = tfm;
-        
-        /* Allocate Per-CPU request pool for maximum performance */
-        new_cfg->crypto_reqs = alloc_percpu(struct aead_request *);
-        if (!new_cfg->crypto_reqs) {
-            pr_err("mwan_kmod: Failed to allocate per-CPU crypto request pointers\n");
-            crypto_free_aead(tfm);
-            /* Skip error return for simplicity in this demo, but real-world should handle */
-        } else {
-            int cpu;
-            for_each_possible_cpu(cpu) {
-                struct aead_request *r = aead_request_alloc(tfm, GFP_KERNEL);
-                if (r) {
-                    *per_cpu_ptr(new_cfg->crypto_reqs, cpu) = r;
-                } else {
-                    pr_err("mwan_kmod: Failed to allocate crypto request for CPU %d\n", cpu);
-                }
-            }
-        }
-
         atomic64_set(&new_cfg->encrypt_seq, 0);
-        pr_info("mwan_kmod: AES-GCM crypto engine initialized with Per-CPU request pool (key_len=%u)\n", new_cfg->encrypt_key_len);
+        pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u)\n", new_cfg->encrypt_key_len);
     }
 
     /* Phase 2: Atomic update */

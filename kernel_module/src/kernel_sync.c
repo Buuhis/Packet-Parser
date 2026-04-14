@@ -13,7 +13,7 @@
 /* Helper to parse CIDR "192.168.182.0/24" into numeric IP and bitmask */
 static void parse_cidr(const char *cidr, uint32_t *ip, uint32_t *mask) {
     char buf[32];
-    snprintf(buf, sizeof(buf), "%s", cidr);
+    strncpy(buf, cidr, sizeof(buf)-1);
     char *slash = strchr(buf, '/');
     int prefix = 24;
     if (slash) {
