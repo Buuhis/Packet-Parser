@@ -21,8 +21,7 @@ static inline void mwan_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, 
                                     csum_partial(tcph, tcplen, 0));
 }
 
-/* Performs TCP MSS Clamping to account for 26-byte encryption overhead.
- * This ensures packets don't exceed MTU after encryption. */
+/* Performs TCP MSS Clamping to account for 26-byte encryption overhead. */
 static void mwan_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 {
     struct iphdr *iph;
@@ -79,13 +78,12 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     struct iphdr *iph;
     struct crypto_aead *tfm;
     struct aead_request *req = NULL;
-    struct scatterlist sg[2];     /* AAD (CryptoHdr) | Ciphertext+Tag */
+    struct scatterlist sg[MAX_SKB_FRAGS + 2];
     u8 iv[MWAN_GCM_IV_LEN];
     struct mwan_crypto_hdr *chdr;
     u64 seq;
-    int payload_len;
-    int iph_len;
-    int err;
+    int payload_len, iph_len;
+    int err, nents;
 
     if (unlikely(!target_dev)) return NF_ACCEPT;
 
@@ -93,7 +91,6 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     if (!cfg || !cfg->encrypt_on || !cfg->tfm)
         return mwan_handle_encap_none(skb, tun);
 
-    /* MTU Protection: Clamp TCP MSS before encryption */
     mwan_clamp_mss(skb, target_dev);
 
     tfm = cfg->tfm;
@@ -103,60 +100,85 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
 
     if (payload_len <= 0) return mwan_handle_encap_none(skb, tun);
 
+    /* Checksum Fix: Resolve partical cs before headers are moved/encrypted */
+    if (skb->ip_summed == CHECKSUM_PARTIAL) {
+        if (unlikely(skb_checksum_help(skb))) return NF_ACCEPT;
+        iph = ip_hdr(skb);
+    }
+
+    /* Optimization Point 4 & 1: Zero-Copy Preparation.
+     * We need 10B headroom to move IP header back, and 16B tailroom for Tag.
+     * skb_cow_data handles fragmented skbs much better than skb_linearize. */
+    if (unlikely(skb_cow_head(skb, 10))) return NF_ACCEPT;
+    {
+        struct sk_buff *trailer;
+        if (unlikely(skb_cow_data(skb, MWAN_GCM_TAG_LEN, &trailer) < 0)) return NF_ACCEPT;
+    }
+
+    /* Reload pointers after potential reallocations */
+    iph = ip_hdr(skb);
+
+    /* Move IP Header 10 bytes back into headroom. 
+     * This is much faster than moving the entire payload forward. */
+    memmove((u8 *)iph - MWAN_CRYPTO_HDR_LEN, iph, iph_len);
+    skb_push(skb, MWAN_CRYPTO_HDR_LEN);
+    skb_reset_network_header(skb);
+    iph = ip_hdr(skb);
+    
+    /* The 10-byte gap between new IP header and payload is where chdr goes */
+    chdr = (struct mwan_crypto_hdr *)((u8 *)iph + iph_len);
+    
     seq = (u64)atomic64_inc_return(&cfg->encrypt_seq);
     memcpy(iv, cfg->encrypt_salt, MWAN_SALT_LEN);
     *(__be64 *)(iv + MWAN_SALT_LEN) = cpu_to_be64(seq);
 
-    if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + MWAN_CRYPTO_HDR_LEN)) return NF_ACCEPT;
-    if (pskb_expand_head(skb, 0, MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN, GFP_ATOMIC)) return NF_ACCEPT;
-    if (skb_linearize(skb)) return NF_ACCEPT;
+    chdr->magic = htons(MWAN_CRYPTO_MAGIC);
+    chdr->seq = cpu_to_be64(seq);
 
-    iph = ip_hdr(skb);
-    {
-        u8 *payload_start = (u8 *)iph + iph_len;
-        skb_put(skb, MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN);
-        memmove(payload_start + MWAN_CRYPTO_HDR_LEN, payload_start, payload_len);
-        chdr = (struct mwan_crypto_hdr *)payload_start;
-        chdr->magic = htons(MWAN_CRYPTO_MAGIC);
-        chdr->seq = cpu_to_be64(seq);
-    }
-
-    /* Finalize IP Header before encryption AAD (though we use CryptoHdr as AAD now) */
-    iph = ip_hdr(skb);
+    /* Update IP Header size and checksum */
     iph->tot_len = htons(iph_len + MWAN_CRYPTO_HDR_LEN + payload_len + MWAN_GCM_TAG_LEN);
     iph->check = 0;
     iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
 
+    /* Extend skb to cover the tag at the end */
+    skb_put(skb, MWAN_GCM_TAG_LEN);
+
+    /* Entropy Fix: Calculate hash based on plaintext (now at chdr + 10) */
+    skb_get_hash(skb);
+
     req = aead_request_alloc(tfm, GFP_ATOMIC);
     if (!req) return NF_ACCEPT;
 
-    {
-        u8 *aad_ptr = (u8 *)chdr;                                 /* AAD = Crypto Header (Immutable) */
-        u8 *pt_ptr  = (u8 *)chdr + MWAN_CRYPTO_HDR_LEN;           /* Plaintext follows AAD */
-        
-        /* SG list: [AAD (10B)] [Plaintext/Ciphertext (payload_len)] [Tag space (16B)] 
-         * Note: We use 2 SG entries here for clarity: AAD and following data. */
-        sg_init_table(sg, 2);
-        sg_set_buf(&sg[0], aad_ptr, MWAN_CRYPTO_HDR_LEN);         /* AAD: Crypto Hdr */
-        sg_set_buf(&sg[1], pt_ptr, payload_len + MWAN_GCM_TAG_LEN); /* Plaintext/Tag space */
+    /* OPTIMIZATION POINT 4: Scatterlist on Non-Linear SKB.
+     * We build the SG table from the data after the IP header.
+     * This avoids expensive skb_linearize()! */
+    sg_init_table(sg, ARRAY_SIZE(sg));
+    nents = skb_to_sgvec(skb, sg, iph_len, MWAN_CRYPTO_HDR_LEN + payload_len + MWAN_GCM_TAG_LEN);
+    if (unlikely(nents < 0)) {
+        aead_request_free(req);
+        return NF_ACCEPT;
+    }
 
-        aead_request_set_crypt(req, sg, sg, payload_len, iv);
-        aead_request_set_ad(req, MWAN_CRYPTO_HDR_LEN);
+    /* AAD is just the 10B Crypto Header which is at the very beginning of our SG list */
+    aead_request_set_crypt(req, sg, sg, payload_len, iv);
+    aead_request_set_ad(req, MWAN_CRYPTO_HDR_LEN);
 
-        err = crypto_aead_encrypt(req);
-        if (unlikely(err == -EINPROGRESS || err == -EBUSY)) {
-            pr_warn_ratelimited("mwan_kmod: Async crypto in TX detected - dropping\n");
-            aead_request_free(req);
-            return NF_ACCEPT;
-        }
+    err = crypto_aead_encrypt(req);
+    if (unlikely(err == -EINPROGRESS || err == -EBUSY)) {
+        pr_warn_ratelimited("mwan_kmod: Async crypto in TX detected - dropping\n");
+        aead_request_free(req);
+        return NF_ACCEPT;
+    }
 
-        if (err) {
-            pr_warn_ratelimited("mwan_kmod: Encrypt failed: %d\n", err);
-            aead_request_free(req);
-            return NF_ACCEPT;
-        }
+    if (err) {
+        pr_warn_ratelimited("mwan_kmod: Encrypt failed: %d\n", err);
+        aead_request_free(req);
+        return NF_ACCEPT;
     }
     aead_request_free(req);
+
+    /* Checksum Fix (Step 2): Inform NIC to skip L4 checksum on ciphertext */
+    skb->ip_summed = CHECKSUM_NONE;
 
     /* Handle L2 injection */
     if (tun->is_ethernet) {
@@ -194,7 +216,7 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     }
 
     if (likely(target_dev->real_num_tx_queues > 1)) {
-        skb_set_queue_mapping(skb, smp_processor_id() % target_dev->real_num_tx_queues);
+        skb_set_queue_mapping(skb, skb_get_hash(skb) % target_dev->real_num_tx_queues);
     }
 
     skb->dev = target_dev;

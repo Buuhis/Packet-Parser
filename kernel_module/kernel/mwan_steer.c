@@ -119,8 +119,8 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             int ciphertext_len;
             u8 iv_buf[MWAN_GCM_IV_LEN];
             struct aead_request *req;
-            struct scatterlist sg_rx[3];
-            int err_dec;
+            struct scatterlist sg_rx[MAX_SKB_FRAGS + 2];
+            int err_dec, nents;
 
             /* Ensure we can read enough for IP + Crypto Header */
             iph = ip_hdr(skb);
@@ -137,14 +137,15 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
                 return NF_ACCEPT;
             }
 
-            /* Linearize for crypto operation */
-            if (skb_linearize(skb)) {
-                rcu_read_unlock();
-                return NF_ACCEPT;
+            /* Ensure header is accessible and writable for IP header shift */
+            if (skb_header_cloned(skb) || skb_is_nonlinear(skb)) {
+                if (unlikely(skb_checksum_help(skb))) {
+                    rcu_read_unlock();
+                    return NF_ACCEPT;
+                }
             }
 
-            /* Make writable */
-            if (skb_ensure_writable(skb, total_len_pre)) {
+            if (unlikely(skb_ensure_writable(skb, iph_len_pre + MWAN_CRYPTO_HDR_LEN))) {
                 rcu_read_unlock();
                 return NF_ACCEPT;
             }
@@ -173,27 +174,28 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
 
             payload_after_chdr = (u8 *)iph + iph_len_pre + MWAN_CRYPTO_HDR_LEN;
 
-            /* Setup scatterlist for decryption
-             * AAD = MWAN Crypto Header (10B) - Immutable and contains sequence.
-             * Ciphertext + Tag follow immediately in memory. */
+            /* Optimization Point 4: Zero-copy scatterlist for decryption */
             req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
             if (!req) {
                 rcu_read_unlock();
                 return NF_ACCEPT;
             }
 
-            sg_init_table(sg_rx, 2);
-            sg_set_buf(&sg_rx[0], (u8 *)chdr, MWAN_CRYPTO_HDR_LEN);       /* AAD */
-            sg_set_buf(&sg_rx[1], payload_after_chdr, ciphertext_len);     /* Ciphertext + Tag */
+            sg_init_table(sg_rx, ARRAY_SIZE(sg_rx));
+            nents = skb_to_sgvec(skb, sg_rx, iph_len_pre, MWAN_CRYPTO_HDR_LEN + ciphertext_len);
+            if (unlikely(nents < 0)) {
+                aead_request_free(req);
+                rcu_read_unlock();
+                return NF_ACCEPT;
+            }
 
             aead_request_set_crypt(req, sg_rx, sg_rx, ciphertext_len, iv_buf);
             aead_request_set_ad(req, MWAN_CRYPTO_HDR_LEN);
 
             err_dec = crypto_aead_decrypt(req);
             
-            if (err_dec == -EINPROGRESS || err_dec == -EBUSY) {
-                /* Driver is async, can't wait in SoftIRQ. Drop to avoid UAF crash. */
-                pr_warn_ratelimited("mwan_kmod: Async crypto detected in RX - dropping packet to avoid crash\n");
+            if (unlikely(err_dec == -EINPROGRESS || err_dec == -EBUSY)) {
+                pr_warn_ratelimited("mwan_kmod: Async crypto in RX - dropping to avoid UAF\n");
                 aead_request_free(req);
                 rcu_read_unlock();
                 return NF_DROP;
@@ -207,22 +209,28 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
                 return NF_DROP;
             }
 
-            /* Decryption success! Remove crypto header and tag:
-             * Shift decrypted payload up to overwrite crypto header */
+            /* Decryption success!
+             * Optimization Point 1: Zero-copy header removal.
+             * Instead of moving payload UP, we move IP Header DOWN by 10 bytes. */
             {
                 int plaintext_len = ciphertext_len - MWAN_GCM_TAG_LEN;
-                u8 *src = (u8 *)iph + iph_len_pre + MWAN_CRYPTO_HDR_LEN;
-                u8 *dst = (u8 *)iph + iph_len_pre;
-                
-                memmove(dst, src, plaintext_len);
 
-                /* Update IP header: remove crypto overhead */
+                /* Move IP header 10 bytes forward to cover crypto header */
+                memmove((u8 *)iph + MWAN_CRYPTO_HDR_LEN, iph, iph_len_pre);
+                skb_pull(skb, MWAN_CRYPTO_HDR_LEN);
+                skb_reset_network_header(skb);
+                
+                iph = ip_hdr(skb);
                 iph->tot_len = htons(iph_len_pre + plaintext_len);
                 iph->check = 0;
                 iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
 
-                /* Trim skb to remove crypto header + tag */
+                /* Remove tag from tail */
                 skb_trim(skb, iph_len_pre + plaintext_len);
+
+                /* Correct metadata for stack */
+                skb_set_transport_header(skb, iph_len_pre);
+                skb->ip_summed = CHECKSUM_UNNECESSARY;
             }
 
             /* Reload iph after modifications */
