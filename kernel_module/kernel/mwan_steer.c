@@ -251,7 +251,7 @@ skip_decrypt:
             if (skb->dev) {
                 struct iphdr *iph_dbg = ip_hdr(skb);
                 u16 frag_off = ntohs(iph_dbg->frag_off);
-                bool is_frag = (frag_off & IP_MF) || (frag_off & IP_OFFSET);
+                /* frag_off & IP_MF || frag_off & IP_OFFSET would indicate a fragment */
 
                 // pr_info_ratelimited("mwan_kmod: INBOUND [CPU %u] from %s (RXQ: %u) Proto: %u Frag: %s -> To %s\n",
                 //                     smp_processor_id(),

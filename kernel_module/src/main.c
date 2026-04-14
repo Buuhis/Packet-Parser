@@ -78,7 +78,7 @@ static void usage(const char *prog) {
 /* ---------- main ---------- */
 int main(int argc, char **argv) {
     const char *env_sock = getenv("MWAN_SOCKET_PATH");
-    if (env_sock) strncpy(socket_path, env_sock, sizeof(socket_path)-1);
+    if (env_sock) snprintf(socket_path, sizeof(socket_path), "%s", env_sock);
     
     log_set_level(LOG_INFO);
 
@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
         int fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return 1;
         struct sockaddr_un addr = {.sun_family = AF_UNIX};
-        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
+        snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
         if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
             fprintf(stderr, "[-] Connection refused! Is daemon running?\n"); close(fd); return 1;
         }
@@ -128,7 +128,7 @@ int main(int argc, char **argv) {
     if (unix_server_fd < 0) return 1;
     unlink(socket_path);
     struct sockaddr_un saddr = {.sun_family = AF_UNIX};
-    strncpy(saddr.sun_path, socket_path, sizeof(saddr.sun_path)-1);
+    snprintf(saddr.sun_path, sizeof(saddr.sun_path), "%s", socket_path);
     if (bind(unix_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0 || listen(unix_server_fd, 5) < 0) {
         log_error("Socket bind/listen failed"); return 1;
     }

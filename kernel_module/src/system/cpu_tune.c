@@ -126,8 +126,8 @@ static int get_lower_ifname(const char *virt_ifname, char *lower_name, size_t le
     char temp[IF_NAMESIZE];
     if (if_indextoname((unsigned)link_idx, temp) == NULL) return -1;
 
-    strncpy(lower_name, temp, len - 1);
-    lower_name[len - 1] = '\0';
+    memset(lower_name, 0, len);
+    snprintf(lower_name, len, "%s", temp);
     return 0;
 }
 
@@ -243,7 +243,7 @@ static void setup_rss_hash(const char *ifname)
 /* XPS: Map TX queues to CPUs.
  * If num_queues < num_cpus (like single-queue tunnels), we map ALL CPUs to that queue 
  * to allow distributed parallel transmission without bottlenecking Core 0. */
-static void setup_xps(const char *ifname, int num_cpus)
+static void setup_xps(const char *ifname, int __attribute__((unused)) num_cpus)
 {
     int num_tx = count_queues(ifname, "tx-");
     if (num_tx == 0) return;
@@ -277,7 +277,7 @@ static void setup_xps(const char *ifname, int num_cpus)
 }
 
 /* RPS: Distribute RX processing across Software Worker cores (5-9) */
-static void setup_rps(const char *ifname, int num_cpus)
+static void setup_rps(const char *ifname, int __attribute__((unused)) num_cpus)
 {
     int num_rx = count_queues(ifname, "rx-");
     if (num_rx == 0) return;
@@ -353,9 +353,9 @@ static void setup_mq_qdisc(const char *ifname)
         g_qdisc_count++;
     }
 
-    char cmd[128];
+    char cmd[512];
     snprintf(cmd, sizeof(cmd), "tc qdisc replace dev %s root mq 2>/dev/null", ifname);
-    system(cmd);
+    if (system(cmd) != 0) { /* ignore */ }
     log_info("    Qdisc: %s -> mq (%d queues)", ifname, num_tx);
 }
 
@@ -392,7 +392,9 @@ int cpu_tune_apply(const app_context_t *ctx)
     /* 0. Stop irqbalance to prevent it from overriding our pinning */
     g_irqbalance_was_active = is_irqbalance_active();
     if (g_irqbalance_was_active) {
-        system("systemctl stop irqbalance 2>/dev/null");
+        if (system("systemctl stop irqbalance 2>/dev/null") != 0) {
+            /* ignore failure */
+        }
         log_info("  [+] Stopped irqbalance (will restart on restore)");
     }
 
@@ -427,7 +429,7 @@ int cpu_tune_apply(const app_context_t *ctx)
             if (!already && strcmp(lower, ctx->cfg.local_if) != 0) {
                 log_info("  [Physical WAN: %s (under %s)]", lower, tun);
                 tune_physical_nic(lower, num_cpus);
-                strncpy(tuned_nics[tuned_nic_count++], lower, IF_NAMESIZE - 1);
+                snprintf(tuned_nics[tuned_nic_count++], IF_NAMESIZE, "%s", lower);
             }
         }
     }
@@ -460,21 +462,21 @@ void cpu_tune_restore(void)
 
     /* 2. Restore qdiscs to kernel default */
     for (int i = 0; i < g_qdisc_count; i++) {
-        char cmd[256];
+        char cmd[512];
         snprintf(cmd, sizeof(cmd),
                  "tc qdisc del dev %s root 2>/dev/null", g_qdisc_backups[i].ifname);
-        system(cmd);
+        if (system(cmd) != 0) { /* ignore */ }
         log_info("  [+] Qdisc restored: %s -> default", g_qdisc_backups[i].ifname);
     }
     g_qdisc_count = 0;
 
     /* 3. Restore original combined queue counts */
     for (int i = 0; i < g_mq_count; i++) {
-        char cmd[256];
+        char cmd[512];
         snprintf(cmd, sizeof(cmd),
                  "ethtool -L %s combined %d 2>/dev/null",
                  g_mq_backups[i].ifname, g_mq_backups[i].original_combined);
-        system(cmd);
+        if (system(cmd) != 0) { /* ignore */ }
         log_info("  [+] MultiQ restored: %s -> %d combined queues",
                  g_mq_backups[i].ifname, g_mq_backups[i].original_combined);
     }
@@ -482,7 +484,9 @@ void cpu_tune_restore(void)
 
     /* 4. Restart irqbalance if it was running before we stopped it */
     if (g_irqbalance_was_active) {
-        system("systemctl start irqbalance 2>/dev/null");
+        if (system("systemctl start irqbalance 2>/dev/null") != 0) {
+            /* ignore */
+        }
         log_info("  [+] Restarted irqbalance");
         g_irqbalance_was_active = false;
     }
