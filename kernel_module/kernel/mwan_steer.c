@@ -175,8 +175,14 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             payload_after_chdr = (u8 *)iph + iph_len_pre + MWAN_CRYPTO_HDR_LEN;
 
             /* Optimization Point 4: Zero-copy scatterlist for decryption */
-            req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
-            if (!req) {
+            /* Optimization Point 2: Use Pre-allocated Per-CPU Request Pool. */
+            if (likely(cfg->crypto_reqs)) {
+                req = *this_cpu_ptr(cfg->crypto_reqs);
+            } else {
+                req = NULL;
+            }
+            
+            if (unlikely(!req)) {
                 rcu_read_unlock();
                 return NF_ACCEPT;
             }
@@ -196,12 +202,9 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             
             if (unlikely(err_dec == -EINPROGRESS || err_dec == -EBUSY)) {
                 pr_warn_ratelimited("mwan_kmod: Async crypto in RX - dropping to avoid UAF\n");
-                aead_request_free(req);
                 rcu_read_unlock();
                 return NF_DROP;
             }
-
-            aead_request_free(req);
 
             if (err_dec) {
                 pr_warn_ratelimited("mwan_kmod: RX decrypt FAILED (auth tag mismatch, err=%d) — DROP\n", err_dec);

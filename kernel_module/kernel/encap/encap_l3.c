@@ -146,8 +146,13 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     /* Entropy Fix: Calculate hash based on plaintext (now at chdr + 10) */
     skb_get_hash(skb);
 
-    req = aead_request_alloc(tfm, GFP_ATOMIC);
-    if (!req) return NF_ACCEPT;
+    /* OPTIMIZATION POINT 2: Use Pre-allocated Per-CPU Request Pool.
+     * This avoids expensive allocation/free overhead for every packet. */
+    if (likely(cfg->crypto_reqs)) {
+        req = *this_cpu_ptr(cfg->crypto_reqs);
+    }
+    
+    if (unlikely(!req)) return NF_ACCEPT;
 
     /* OPTIMIZATION POINT 4: Scatterlist on Non-Linear SKB.
      * We build the SG table from the data after the IP header.
@@ -166,16 +171,13 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     err = crypto_aead_encrypt(req);
     if (unlikely(err == -EINPROGRESS || err == -EBUSY)) {
         pr_warn_ratelimited("mwan_kmod: Async crypto in TX detected - dropping\n");
-        aead_request_free(req);
         return NF_ACCEPT;
     }
 
     if (err) {
         pr_warn_ratelimited("mwan_kmod: Encrypt failed: %d\n", err);
-        aead_request_free(req);
         return NF_ACCEPT;
     }
-    aead_request_free(req);
 
     /* Checksum Fix (Step 2): Inform NIC to skip L4 checksum on ciphertext */
     skb->ip_summed = CHECKSUM_NONE;
