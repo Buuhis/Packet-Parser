@@ -16,12 +16,53 @@
 #include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+
+#define NODE_INFO_DIR "/etc/sd-wan"
+#define NODE_INFO_FILE NODE_INFO_DIR "/node.info"
 
 /* ---------- global state ---------- */
 static volatile int running_server = 1;
 static int unix_server_fd = -1;
 static char socket_path[256] = "/var/run/sd-wan.sock";
 static app_context_t running_ctx;
+
+/* ---------- startup config persistence ---------- */
+static void save_node_id(int node_id) {
+    mkdir(NODE_INFO_DIR, 0755); // Ignore error if exists
+    FILE *f = fopen(NODE_INFO_FILE, "w");
+    if (f) {
+        fprintf(f, "%d\n", node_id);
+        fclose(f);
+        log_info("Saved node_id %d to %s", node_id, NODE_INFO_FILE);
+    } else {
+        log_warn("Failed to write to %s", NODE_INFO_FILE);
+    }
+}
+
+static int load_node_id(void) {
+    FILE *f = fopen(NODE_INFO_FILE, "r");
+    if (!f) return -1;
+    int id = -1;
+    if (fscanf(f, "%d", &id) != 1) {
+        id = -1;
+    }
+    fclose(f);
+    return id;
+}
+
+static void clear_node_id(void) {
+    if (unlink(NODE_INFO_FILE) == 0) {
+         printf("[+] Device has been unprovisioned. Startup config removed.\n");
+    } else {
+         if (errno == ENOENT) {
+             printf("[!] Device is already unprovisioned.\n");
+         } else {
+             perror("[-] Failed to remove config");
+         }
+    }
+}
 
 /* ---------- utilities ---------- */
 static int resolve_local_network(app_config_t *cfg) {
@@ -67,6 +108,7 @@ static void usage(const char *prog) {
     printf("=========================================================\n");
     printf("Client Mode (Control running daemon):\n");
     printf("  %s -id <node_id>    Send config request to the daemon\n", prog);
+    printf("  %s -reset           Clear the node_id startup configuration\n", prog);
     printf("  %s --help | -h      Show this help message and exit\n", prog);
     printf("\n");
     printf("Daemon Mode (Start the background service):\n");
@@ -82,15 +124,22 @@ int main(int argc, char **argv) {
     
     log_set_level(LOG_INFO);
 
-    int client_mode = 0, node_id = 0;
+    int client_mode = 0, node_id = 0, reset_mode = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); return 0;
         } else if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
             client_mode = 1; node_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-reset") == 0) {
+            reset_mode = 1;
         } else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1;
         }
+    }
+
+    if (reset_mode) {
+        clear_node_id();
+        return 0;
     }
 
     if (client_mode) {
@@ -135,6 +184,33 @@ int main(int argc, char **argv) {
     
     log_info("Control Plane Ready! Socket: %s", socket_path);
 
+    /* Auto-load from startup config if exists */
+    int saved_node_id = load_node_id();
+    if (saved_node_id > 0) {
+        log_info(">>> Found startup config! Auto-loading properties for Node ID: %d", saved_node_id);
+        app_config_t new_cfg;
+        if (db_client_load_config(saved_node_id, &new_cfg) == 0) {
+            if (resolve_local_network(&new_cfg) == 0) {
+                struct in_addr addr = { .s_addr = new_cfg.local_ip };
+                log_info("[+] Auto-discovered Local Network: %s", inet_ntoa(addr));
+            } else {
+                log_warn("[-] Could not resolve local network for interface %s", new_cfg.local_if);
+            }
+            app_context_dump(&(app_context_t){new_cfg});
+            running_ctx.cfg = new_cfg;
+            if (kernel_sync_push_config(&running_ctx) != 0) {
+                log_error("Failed to push auto-loaded config to kernel");
+            } else {
+                cpu_tune_apply(&running_ctx);
+                log_info("Startup config successfully restored.");
+            }
+        } else {
+            log_error("Failed to load startup config from DB.");
+        }
+    } else {
+        log_info("No startup config found. Waiting for provisioning (-id) via socket...");
+    }
+
     while(running_server) {
         int client_fd = accept(unix_server_fd, NULL, NULL);
         if (client_fd < 0) continue;
@@ -161,6 +237,7 @@ int main(int argc, char **argv) {
                 log_error("Failed to push config to kernel");
             } else {
                 cpu_tune_apply(&running_ctx);
+                save_node_id(req_id);
             }
         }
     }
