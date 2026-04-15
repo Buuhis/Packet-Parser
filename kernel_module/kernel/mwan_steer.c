@@ -10,8 +10,7 @@
 #include <linux/jhash.h>
 #include <linux/if_ether.h>
 #include <linux/etherdevice.h>
-#include <linux/scatterlist.h>
-#include <crypto/aead.h>
+
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/ip.h>
@@ -112,127 +111,15 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
         
         /* 1.5. Decrypt if encryption is enabled */
         if (cfg->encrypt_on && cfg->tfm) {
-            int iph_len_pre;
-            int total_len_pre;
-            struct mwan_crypto_hdr *chdr;
-            u8 *payload_after_chdr;
-            int ciphertext_len;
-            u8 iv_buf[MWAN_GCM_IV_LEN];
-            struct aead_request *req;
-            struct scatterlist sg_rx[3];
-            int err_dec;
-
-            /* Ensure we can read enough for IP + Crypto Header */
-            iph = ip_hdr(skb);
-            iph_len_pre = iph->ihl * 4;
-            total_len_pre = ntohs(iph->tot_len);
-
-            if (total_len_pre < iph_len_pre + MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN) {
-                /* Packet too small to be encrypted, pass through */
-                goto skip_decrypt;
-            }
-
-            if (!pskb_may_pull(skb, iph_len_pre + MWAN_CRYPTO_HDR_LEN)) {
+            int dec_ret = mwan_handle_decap_l3(skb, cfg);
+            if (dec_ret != MWAN_DECAP_CONTINUE) {
                 rcu_read_unlock();
-                return NF_ACCEPT;
+                return (unsigned int)dec_ret;
             }
-
-            /* Linearize for crypto operation */
-            if (skb_linearize(skb)) {
-                rcu_read_unlock();
-                return NF_ACCEPT;
-            }
-
-            /* Make writable */
-            if (skb_ensure_writable(skb, total_len_pre)) {
-                rcu_read_unlock();
-                return NF_ACCEPT;
-            }
-
-            /* Reload pointers after linearize/writable */
-            iph = ip_hdr(skb);
-            chdr = (struct mwan_crypto_hdr *)((u8 *)iph + iph_len_pre);
-
-            /* Check magic */
-            if (ntohs(chdr->magic) != MWAN_CRYPTO_MAGIC) {
-                /* Not an encrypted MWAN packet, pass through */
-                goto skip_decrypt;
-            }
-
-            /* Build IV from salt + sequence from header */
-            memcpy(iv_buf, cfg->encrypt_salt, MWAN_SALT_LEN);
-            memcpy(iv_buf + MWAN_SALT_LEN, &chdr->seq, 8);
-
-            /* Calculate ciphertext length (includes tag) */
-            ciphertext_len = total_len_pre - iph_len_pre - MWAN_CRYPTO_HDR_LEN;
-            if (ciphertext_len < MWAN_GCM_TAG_LEN) {
-                pr_warn_ratelimited("mwan_kmod: RX decrypt: invalid ciphertext length\n");
-                rcu_read_unlock();
-                return NF_DROP;
-            }
-
-            payload_after_chdr = (u8 *)iph + iph_len_pre + MWAN_CRYPTO_HDR_LEN;
-
-            /* Setup scatterlist for decryption
-             * AAD = MWAN Crypto Header (10B) - Immutable and contains sequence.
-             * Ciphertext + Tag follow immediately in memory. */
-            req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
-            if (!req) {
-                rcu_read_unlock();
-                return NF_ACCEPT;
-            }
-
-            sg_init_table(sg_rx, 2);
-            sg_set_buf(&sg_rx[0], (u8 *)chdr, MWAN_CRYPTO_HDR_LEN);       /* AAD */
-            sg_set_buf(&sg_rx[1], payload_after_chdr, ciphertext_len);     /* Ciphertext + Tag */
-
-            aead_request_set_crypt(req, sg_rx, sg_rx, ciphertext_len, iv_buf);
-            aead_request_set_ad(req, MWAN_CRYPTO_HDR_LEN);
-
-            err_dec = crypto_aead_decrypt(req);
-            
-            if (err_dec == -EINPROGRESS || err_dec == -EBUSY) {
-                /* Driver is async, can't wait in SoftIRQ. Drop to avoid UAF crash. */
-                pr_warn_ratelimited("mwan_kmod: Async crypto detected in RX - dropping packet to avoid crash\n");
-                aead_request_free(req);
-                rcu_read_unlock();
-                return NF_DROP;
-            }
-
-            aead_request_free(req);
-
-            if (err_dec) {
-                pr_warn_ratelimited("mwan_kmod: RX decrypt FAILED (auth tag mismatch, err=%d) — DROP\n", err_dec);
-                rcu_read_unlock();
-                return NF_DROP;
-            }
-
-            /* Decryption success! Remove crypto header and tag:
-             * Shift decrypted payload up to overwrite crypto header */
-            {
-                int plaintext_len = ciphertext_len - MWAN_GCM_TAG_LEN;
-                u8 *src = (u8 *)iph + iph_len_pre + MWAN_CRYPTO_HDR_LEN;
-                u8 *dst = (u8 *)iph + iph_len_pre;
-                
-                memmove(dst, src, plaintext_len);
-
-                /* Update IP header: remove crypto overhead */
-                iph->tot_len = htons(iph_len_pre + plaintext_len);
-                iph->check = 0;
-                iph->check = ip_fast_csum((u8 *)iph, iph->ihl);
-
-                /* Trim skb to remove crypto header + tag */
-                skb_trim(skb, iph_len_pre + plaintext_len);
-
-                skb_set_transport_header(skb, iph_len_pre);
-                skb->ip_summed = CHECKSUM_UNNECESSARY;
-            }
-
-            /* Reload iph after modifications */
+            /* Reload iph after potential decryption modifications */
             iph = ip_hdr(skb);
         }
 
-skip_decrypt:
         /* 2. Check if Destination IP matches our Local CIDR */
         if ((iph->daddr & cfg->local_mask) == (cfg->local_ip & cfg->local_mask)) {
             /* 3. Steering: Route to Local Interface */
