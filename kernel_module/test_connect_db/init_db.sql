@@ -10,6 +10,13 @@ CREATE TABLE IF NOT EXISTS public.nodes (
     encrypt_nonce VARCHAR(8) DEFAULT NULL             -- Hex string: 8 chars = 4 bytes Salt for IV
 );
 
+CREATE TABLE IF NOT EXISTS public.node_status (
+    node_id INTEGER PRIMARY KEY REFERENCES public.nodes(node_id) ON DELETE CASCADE,
+    status VARCHAR(20) NOT NULL DEFAULT 'OFFLINE',
+    error_message TEXT,
+    last_seen TIMESTAMP DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS public.ne_tunnels (
     id SERIAL PRIMARY KEY,
     node_id INTEGER NOT NULL REFERENCES public.nodes(node_id) ON DELETE CASCADE,
@@ -20,6 +27,7 @@ CREATE TABLE IF NOT EXISTS public.ne_tunnels (
 );
 
 TRUNCATE TABLE public.ne_tunnels RESTART IDENTITY CASCADE;
+TRUNCATE TABLE public.node_status RESTART IDENTITY CASCADE;
 TRUNCATE TABLE public.nodes RESTART IDENTITY CASCADE;
 
 INSERT INTO public.nodes (node_id, local_if, remote_cidr, loopback_ip, encryption_enabled, encrypt_type, encrypt_key, encrypt_nonce)

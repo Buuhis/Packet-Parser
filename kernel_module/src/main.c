@@ -94,6 +94,7 @@ static void handle_signal(int sig) {
     running_server = 0;
     cpu_tune_restore();
     kernel_sync_cleanup();
+    db_client_stop_heartbeat();
     if (unix_server_fd >= 0) {
         close(unix_server_fd);
         unix_server_fd = -1;
@@ -119,7 +120,7 @@ static void usage(const char *prog) {
 
 /* ---------- main ---------- */
 int main(int argc, char **argv) {
-    const char *env_sock = getenv("MWAN_SOCKET_PATH");
+    const char *env_sock = getenv("SDWAN_SOCKET_PATH");
     if (env_sock) strncpy(socket_path, env_sock, sizeof(socket_path)-1);
     
     log_set_level(LOG_INFO);
@@ -155,12 +156,26 @@ int main(int argc, char **argv) {
         }
         char id_str[16]; snprintf(id_str, sizeof(id_str), "%d", node_id);
         send(fd, id_str, strlen(id_str), 0);
-        printf("[+] Command sent successfully! Node ID: %d\n", node_id);
-        close(fd); return 0;
+        
+        char reply[512] = {0};
+        int rn = recv(fd, reply, sizeof(reply)-1, 0);
+        if (rn > 0) {
+            printf("%s\n", reply);
+            close(fd);
+            return (strstr(reply, "\"code\": 200") != NULL) ? 0 : 1;
+        } else {
+            printf("[-] No reply from daemon\n");
+            close(fd); 
+            return 1;
+        }
     }
 
     /* DAEMON MODE */
-    const char *db_h = getenv("DB_HOST"), *db_p = getenv("DB_PORT"), *db_u = getenv("DB_USER"), *db_n = getenv("DB_NAME"), *db_pass = getenv("DB_PASS");
+    const char *db_h = getenv("POSTGRES_HOST"); 
+    const char *db_p = getenv("POSTGRES_PORT"); 
+    const char *db_u = getenv("POSTGRES_USER"); 
+    const char *db_n = getenv("POSTGRES_TABLE");
+    const char *db_pass = getenv("POSTGRES_PASS");
     if (!db_h || !db_p || !db_u || !db_n) {
         log_error("Missing DB ENV vars"); usage(argv[0]); return 1;
     }
@@ -200,12 +215,15 @@ int main(int argc, char **argv) {
             running_ctx.cfg = new_cfg;
             if (kernel_sync_push_config(&running_ctx) != 0) {
                 log_error("Failed to push auto-loaded config to kernel");
+                db_client_report_error(saved_node_id, "Startup config Netlink error");
             } else {
                 cpu_tune_apply(&running_ctx);
                 log_info("Startup config successfully restored.");
+                db_client_start_heartbeat(saved_node_id);
             }
         } else {
             log_error("Failed to load startup config from DB.");
+            db_client_report_error(saved_node_id, "Failed to load config from DB");
         }
     } else {
         log_info("No startup config found. Waiting for provisioning (-id) via socket...");
@@ -216,8 +234,8 @@ int main(int argc, char **argv) {
         if (client_fd < 0) continue;
         char buf[128] = {0};
         int n = recv(client_fd, buf, sizeof(buf)-1, 0);
-        close(client_fd);
-        if (n <= 0) continue;
+        if (n <= 0) { close(client_fd); continue; }
+        
         while(n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
         int req_id = atoi(buf);
         log_info(">>> Received configure request for Node ID: %d", req_id);
@@ -235,14 +253,26 @@ int main(int argc, char **argv) {
             running_ctx.cfg = new_cfg;
             if (kernel_sync_push_config(&running_ctx) != 0) {
                 log_error("Failed to push config to kernel");
+                db_client_report_error(req_id, "Netlink push error");
+                char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 500, \"message\": \"Netlink push error\"}");
+                send(client_fd, reply, strlen(reply), 0);
             } else {
                 cpu_tune_apply(&running_ctx);
                 save_node_id(req_id);
+                db_client_start_heartbeat(req_id);
+                char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 200, \"message\": \"Success\"}");
+                send(client_fd, reply, strlen(reply), 0);
             }
+        } else {
+            db_client_report_error(req_id, "Failed to load config from DB");
+            char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 404, \"message\": \"Failed to load config from DB\"}");
+            send(client_fd, reply, strlen(reply), 0);
         }
+        close(client_fd);
     }
     
     log_info("Server shutting down...");
+    db_client_stop_heartbeat();
     cpu_tune_restore();
     kernel_sync_cleanup();
     db_client_disconnect();
