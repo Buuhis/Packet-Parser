@@ -8,6 +8,9 @@
 #define HKDF_SALT "network_encryptor_xdp_salt_v1"
 #define HKDF_INFO "session_key_expansion"
 
+// External declaration for the underlying wolfCrypt symbol found in libscrypt.so
+extern int wc_MlKemKey_SharedSecretSize(void* key_obj);
+
 static int g_pqc_initialized = 0;
 
 int trf_pqc_generate_nonce(byte* out_nonce) {
@@ -55,16 +58,32 @@ void trf_pqc_cleanup() {
 
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
                             byte* data, int len, int* new_len_out) {
-    if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
+    fprintf(stderr, "[DEBUG TRF] trf_encrypt_payload_gcm called! init=%d, data=%p, len=%d\n", g_pqc_initialized, (void*)data, len);
+    if (!g_pqc_initialized || !data || len == 0) {
+        fprintf(stderr, "[DEBUG TRF] Failed fast check: g_pqc_initialized=%d, data=%p, len=%d\n", g_pqc_initialized, (void*)data, len);
+        return TRF_PQC_ERR_CRYPTO;
+    }
 
     SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
-    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+    if (!ctx) {
+        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherCtxNew\n");
+        return TRF_PQC_ERR_CRYPTO;
+    }
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) goto err;
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) {
+        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherInit\n");
+        goto err;
+    }
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) {
+        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherUpdate\n");
+        goto err;
+    }
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
+        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherFinal\n");
+        goto err;
+    }
 
     // Retrieve authentication tag
     byte tag[TAG_SIZE_GCM];
@@ -263,7 +282,7 @@ int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz,
     if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) goto err;
 
     *ctx_sz = scrypt_MlKemCipherTextSize(key_obj);
-    int ss_sz = scrypt_MlKemSharedSecretSize(key_obj);
+    int ss_sz = wc_MlKemKey_SharedSecretSize(key_obj);
 
     if (scrypt_MlKemEncapsulate(key_obj, cipher_capsule_out, *ctx_sz, shared_secret_out, ss_sz) != 0) goto err;
 
@@ -280,7 +299,7 @@ int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz,
     SCryptMlKemKey* key_obj = scrypt_MlKemKeyNew();
     if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) goto err;
 
-    int ss_sz = scrypt_MlKemSharedSecretSize(key_obj);
+    int ss_sz = wc_MlKemKey_SharedSecretSize(key_obj);
 
     if (scrypt_MlKemDecapsulate(key_obj, shared_secret_out, ss_sz, cipher_capsule_in, ctx_sz) != 0) goto err;
 

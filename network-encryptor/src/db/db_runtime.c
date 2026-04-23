@@ -323,9 +323,24 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
 
     append_redirect_from_profiles(&merged);
 
-    merged.crypto_enabled = (merged.policy_count > 0) ? 1 : 0;
+    int has_l2 = 0, has_l3 = 0, has_l4 = 0;
+    int has_pqc = 0;
+    for (int i = 0; i < merged.policy_count; i++) {
+        if (merged.policies[i].action == POLICY_ACTION_ENCRYPT_L2) has_l2 = 1;
+        else if (merged.policies[i].action == POLICY_ACTION_ENCRYPT_L3) has_l3 = 1;
+        else if (merged.policies[i].action == POLICY_ACTION_ENCRYPT_L4) has_l4 = 1;
+
+        if (merged.policies[i].crypto_mode == CRYPTO_MODE_PQC_GCM) {
+            has_pqc = 1;
+        }
+    }
+
+    merged.crypto_enabled = (has_l2 || has_l3 || has_l4) ? 1 : 0;
     if (merged.crypto_enabled) {
-        merged.encrypt_layer = 3;
+        if (has_l2) merged.encrypt_layer = 2;
+        else if (has_l3) merged.encrypt_layer = 3;
+        else if (has_l4) merged.encrypt_layer = 4;
+
         merged.fake_protocol = 99;
         merged.fake_ethertype_ipv4 = 0x88b5;
         merged.fake_ethertype_ipv6 = 0x88b6;

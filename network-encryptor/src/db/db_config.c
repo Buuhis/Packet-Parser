@@ -736,12 +736,17 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg)
     int has_l2 = 0, has_l3 = 0, has_l4 = 0;
     int first_key_pi = -1;
 
+    int has_pqc = 0;
     for (int pi = 0; pi < cfg->policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         const struct crypto_policy *cp = &cfg->policies[pi];
         if (!cp) continue;
         if (cp->action == POLICY_ACTION_ENCRYPT_L2) has_l2 = 1;
         else if (cp->action == POLICY_ACTION_ENCRYPT_L3) has_l3 = 1;
         else if (cp->action == POLICY_ACTION_ENCRYPT_L4) has_l4 = 1;
+
+        if (cp->crypto_mode == CRYPTO_MODE_PQC_GCM) {
+            has_pqc = 1;
+        }
 
         if (cp->action != POLICY_ACTION_BYPASS) {
             int nonzero = 0;
@@ -755,9 +760,9 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg)
 
     cfg->crypto_enabled = (has_l2 || has_l3 || has_l4) ? 1 : 0;
     if (cfg->crypto_enabled) {
-        if (has_l3 || has_l4) cfg->encrypt_layer = 3;
-        else if (has_l2) cfg->encrypt_layer = 2;
-        else cfg->encrypt_layer = 4;
+        if (has_l2) cfg->encrypt_layer = 2;
+        else if (has_l3) cfg->encrypt_layer = 3;
+        else if (has_l4) cfg->encrypt_layer = 4;
     }
 
     if (cfg->crypto_enabled) {

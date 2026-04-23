@@ -1487,6 +1487,10 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         }
 
         packet_crypto_set_aes_bits(cfg->aes_bits);
+        packet_crypto_set_encrypt_layer(cfg->encrypt_layer);
+        packet_crypto_set_mode(cfg->crypto_mode);
+        packet_crypto_set_nonce_size(cfg->nonce_size);
+
         if (packet_crypto_init(&crypto_ctx, cfg->crypto_key) != 0) {
             fprintf(stderr, "Failed to initialize AES-%d encryption\n", cfg->aes_bits);
             return -1;
@@ -1494,10 +1498,6 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
 
 
         rebuild_crypto_runtime(cfg, &has_encrypt_l2);
-
-        packet_crypto_set_encrypt_layer(cfg->encrypt_layer);
-        packet_crypto_set_mode(cfg->crypto_mode);
-        packet_crypto_set_nonce_size(cfg->nonce_size);
         if (has_encrypt_l2) {
             if (cfg->fake_ethertype_ipv4 == 0 && cfg->fake_ethertype_ipv6 == 0) {
 
