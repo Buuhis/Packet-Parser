@@ -3,6 +3,7 @@
 #include "../../inc/fragment.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
 #include <string.h>
+#include <stdio.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
 #define L4_FRAG_MAGIC      (L4_TUNNEL_MAGIC | FRAG_FLAG_BIT)

@@ -58,21 +58,27 @@ void trf_pqc_cleanup() {
 
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
                             byte* data, int len, int* new_len_out) {
-    fprintf(stderr, "[DEBUG TRF] trf_encrypt_payload_gcm called! init=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
+    fprintf(stderr, "[DEBUG TRF V3] trf_encrypt_payload_gcm entry! init=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
+    fflush(stderr);
     if (!g_pqc_initialized || !data || len == 0 || !key || !nonce) {
-        fprintf(stderr, "[DEBUG TRF] Failed fast check: g_pqc_initialized=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
+        fprintf(stderr, "[DEBUG TRF V3] Failed fast check: g_pqc_initialized=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
+        fflush(stderr);
         return TRF_PQC_ERR_CRYPTO;
     }
 
-    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherCtxNew...\n");
+    fprintf(stderr, "[DEBUG TRF V3] Calling scrypt_CipherCtxNew...\n");
+    fflush(stderr);
     SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
     if (!ctx) {
-        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherCtxNew\n");
+        fprintf(stderr, "[DEBUG TRF V3] Failed scrypt_CipherCtxNew\n");
+        fflush(stderr);
         return TRF_PQC_ERR_CRYPTO;
     }
-    fprintf(stderr, "[DEBUG TRF] scrypt_CipherCtxNew success: %p\n", (void*)ctx);
+    fprintf(stderr, "[DEBUG TRF V3] scrypt_CipherCtxNew success: %p\n", (void*)ctx);
+    fflush(stderr);
 
-    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherInit (GCM, key_len=32, nonce_len=%d)...\n", nonce_len);
+    fprintf(stderr, "[DEBUG TRF V3] Calling scrypt_CipherInit (GCM, key_len=32, nonce_len=%d)...\n", nonce_len);
+    fflush(stderr);
     if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) {
         fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherInit\n");
         goto err;
