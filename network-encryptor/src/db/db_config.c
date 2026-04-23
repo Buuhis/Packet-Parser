@@ -94,7 +94,7 @@ static int parse_crypto_mode_name(const char *v) {
     if (!v || v[0] == '\0')            return CRYPTO_MODE_CTR;
     if (strcasecmp(v, "gcm") == 0)     return CRYPTO_MODE_GCM;
     if (strcasecmp(v, "ctr") == 0)     return CRYPTO_MODE_CTR;
-    if (strcasecmp(v, "pqc-gcm") == 0) return CRYPTO_MODE_PQC_GCM;
+    if (strcasecmp(v, "pqc_gcm") == 0) return CRYPTO_MODE_PQC_GCM;
     fprintf(stderr, "[DB CRYPTO] unknown crypto_mode '%s', fallback to CTR\n", v);
     return CRYPTO_MODE_CTR;
 }
@@ -814,10 +814,10 @@ int config_load_from_db(struct app_config *cfg, int config_id, const char *conn_
         return -1;
     }
 
-    const char *db_host = getenv("DB_HOST");
-    const char *db_port = getenv("DB_PORT");
-    const char *db_user = getenv("DB_USER");
-    const char *db_name = getenv("DB_NAME");
+    const char *db_host = getenv("POSTGRES_HOST");
+    const char *db_port = getenv("POSTGRES_PORT");
+    const char *db_user = getenv("POSTGRES_USER");
+    const char *db_name = getenv("POSTGRES_TABLE");
     const char *db_pass = getenv("DB_PASS");
 
     if (!db_host || !db_port || !db_user || !db_name || !db_pass) {
