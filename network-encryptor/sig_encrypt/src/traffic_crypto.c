@@ -58,41 +58,56 @@ void trf_pqc_cleanup() {
 
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
                             byte* data, int len, int* new_len_out) {
-    fprintf(stderr, "[DEBUG TRF] trf_encrypt_payload_gcm called! init=%d, data=%p, len=%d\n", g_pqc_initialized, (void*)data, len);
-    if (!g_pqc_initialized || !data || len == 0) {
-        fprintf(stderr, "[DEBUG TRF] Failed fast check: g_pqc_initialized=%d, data=%p, len=%d\n", g_pqc_initialized, (void*)data, len);
+    fprintf(stderr, "[DEBUG TRF] trf_encrypt_payload_gcm called! init=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
+    if (!g_pqc_initialized || !data || len == 0 || !key || !nonce) {
+        fprintf(stderr, "[DEBUG TRF] Failed fast check: g_pqc_initialized=%d, data=%p, len=%d, key=%p, nonce=%p\n", g_pqc_initialized, (void*)data, len, (void*)key, (void*)nonce);
         return TRF_PQC_ERR_CRYPTO;
     }
 
+    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherCtxNew...\n");
     SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
     if (!ctx) {
         fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherCtxNew\n");
         return TRF_PQC_ERR_CRYPTO;
     }
+    fprintf(stderr, "[DEBUG TRF] scrypt_CipherCtxNew success: %p\n", (void*)ctx);
 
+    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherInit (GCM, key_len=32, nonce_len=%d)...\n", nonce_len);
     if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) {
         fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherInit\n");
         goto err;
     }
+    fprintf(stderr, "[DEBUG TRF] scrypt_CipherInit success\n");
 
     word32 outLen = 0, finalLen = 0;
+    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherUpdate (len=%d)...\n", len);
     if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) {
         fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherUpdate\n");
         goto err;
     }
+    fprintf(stderr, "[DEBUG TRF] scrypt_CipherUpdate success: outLen=%u\n", outLen);
+
+    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherFinal...\n");
     if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
         fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherFinal\n");
         goto err;
     }
+    fprintf(stderr, "[DEBUG TRF] scrypt_CipherFinal success: finalLen=%u\n", finalLen);
 
     // Retrieve authentication tag
     byte tag[TAG_SIZE_GCM];
     word32 tagLen = TAG_SIZE_GCM;
-    if (scrypt_CipherGetTag(ctx, tag, &tagLen) != 0) goto err;
+    fprintf(stderr, "[DEBUG TRF] Calling scrypt_CipherGetTag...\n");
+    if (scrypt_CipherGetTag(ctx, tag, &tagLen) != 0) {
+        fprintf(stderr, "[DEBUG TRF] Failed scrypt_CipherGetTag\n");
+        goto err;
+    }
+    fprintf(stderr, "[DEBUG TRF] scrypt_CipherGetTag success\n");
 
     // Append 16-byte Tag to the end of the packet (In-place Tail Append)
     memcpy(data + outLen + finalLen, tag, TAG_SIZE_GCM);
     *new_len_out = outLen + finalLen + TAG_SIZE_GCM;
+    fprintf(stderr, "[DEBUG TRF] Tag appended, new_len=%d\n", *new_len_out);
 
     scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;

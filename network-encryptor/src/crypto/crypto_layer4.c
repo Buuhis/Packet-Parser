@@ -138,6 +138,10 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(packet + enc_off + tunnel_hdr_size + enc_len, tag, AES128_GCM_TAG_SIZE);
     } else if (mode == CRYPTO_MODE_PQC_GCM) {
         fprintf(stderr, "[DEBUG PQC] Entering PQC_GCM mode. enc_len=%d, tunnel_hdr_size=%d\n", (int)enc_len, tunnel_hdr_size);
+        if (!key) {
+            fprintf(stderr, "[DEBUG PQC] ERROR: key is NULL!\n");
+            return -1;
+        }
         int new_len = 0;
         uint8_t pqc_nonce[12];
         trf_pqc_generate_nonce(pqc_nonce);
