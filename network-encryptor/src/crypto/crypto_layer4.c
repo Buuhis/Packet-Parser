@@ -3,7 +3,6 @@
 #include "../../inc/fragment.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
 #include <string.h>
-#include <stdio.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
 #define L4_FRAG_MAGIC      (L4_TUNNEL_MAGIC | FRAG_FLAG_BIT)
@@ -86,11 +85,8 @@ int crypto_eth_ipv4_offset(const uint8_t *pkt, size_t pkt_len) {
 }
 
 int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t pkt_len) {
-    fprintf(stderr, "[DEBUG L4] crypto_layer4_encrypt called! ctx=%p, ctx->initialized=%d\n", (void*)ctx, ctx ? ctx->initialized : 0);
-    if (!ctx || !ctx->initialized || !packet) {
-        fprintf(stderr, "[DEBUG L4] Aborting! Context not initialized or NULL!\n");
+    if (!ctx || !ctx->initialized || !packet)
         return -1;
-    }
 
     int l3_off = crypto_eth_ipv4_offset(packet, pkt_len);
     if (l3_off < 0)
@@ -138,20 +134,11 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memmove(packet + enc_off + tunnel_hdr_size, packet + enc_off, enc_len);
         memcpy(packet + enc_off + tunnel_hdr_size + enc_len, tag, AES128_GCM_TAG_SIZE);
     } else if (mode == CRYPTO_MODE_PQC_GCM) {
-        fprintf(stderr, "[DEBUG PQC] Entering PQC_GCM mode. enc_len=%d, tunnel_hdr_size=%d\n", (int)enc_len, tunnel_hdr_size);
-        if (!key) {
-            fprintf(stderr, "[DEBUG PQC] ERROR: key is NULL!\n");
-            return -1;
-        }
         int new_len = 0;
         uint8_t pqc_nonce[12];
         trf_pqc_generate_nonce(pqc_nonce);
-        int ret = trf_encrypt_payload_gcm(key, pqc_nonce, 12, packet + enc_off, (int)enc_len, &new_len);
-        if (ret != TRF_PQC_OK) {
-            fprintf(stderr, "[DEBUG PQC] trf_encrypt_payload_gcm failed with code %d\n", ret);
+        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
             return -1;
-        }
-        fprintf(stderr, "[DEBUG PQC] trf_encrypt_payload_gcm success! new_len=%d\n", new_len);
         memmove(packet + enc_off + tunnel_hdr_size, packet + enc_off, new_len);
         l4_write_tunnel_header(packet + enc_off, pqc_nonce, 12); 
     } else {
