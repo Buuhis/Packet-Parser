@@ -52,11 +52,10 @@ int main(int argc, char *argv[]) {
     byte *cipher_capsule = NULL, *s1_shared_secret = NULL, *s2_shared_secret = NULL;
     int pub_sz = 0, priv_sz = 0;
     
-    server_pub = (byte*)malloc(PQC_BUFF_MAX);
-    server_priv = (byte*)malloc(PQC_BUFF_MAX);
-    
-    if (!server_pub || !server_priv) {
+    if (posix_memalign((void**)&server_pub, 64, PQC_BUFF_MAX) != 0 || 
+        posix_memalign((void**)&server_priv, 64, PQC_BUFF_MAX) != 0) {
         printf("%s[FAIL] Memory allocation failed!%s\n", KRED, KNRM);
+        if (server_pub) free(server_pub);
         return 1;
     }
 
@@ -69,19 +68,18 @@ int main(int argc, char *argv[]) {
     printf(" - Generated ML-KEM Keys (Pub: %d, Priv: %d bytes)\n", pub_sz, priv_sz);
 
     // Server 1 thực hiện Encapsulate
-    cipher_capsule = (byte*)malloc(PQC_BUFF_MAX);
-    s1_shared_secret = (byte*)malloc(64);
-    s2_shared_secret = (byte*)malloc(64);
-    int capsule_sz = 0;
-
-    if (!cipher_capsule || !s1_shared_secret || !s2_shared_secret) {
+    if (posix_memalign((void**)&cipher_capsule, 64, PQC_BUFF_MAX) != 0 ||
+        posix_memalign((void**)&s1_shared_secret, 64, 64) != 0 ||
+        posix_memalign((void**)&s2_shared_secret, 64, 64) != 0) {
         printf("%s[FAIL] Memory allocation failed!%s\n", KRED, KNRM);
         free(server_pub); free(server_priv);
         if (cipher_capsule) free(cipher_capsule);
         if (s1_shared_secret) free(s1_shared_secret);
-        if (s2_shared_secret) free(s2_shared_secret);
         return 1;
     }
+    int capsule_sz = 0;
+
+    // Handshake verification starts here
 
     if (trf_kem_encapsulate(server_pub, pub_sz, cipher_capsule, &capsule_sz, s1_shared_secret) != TRF_PQC_OK) {
         printf("%s[FAIL] KEM Encapsulate failed!%s\n", KRED, KNRM);
@@ -102,7 +100,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    byte tx_key[32], rx_key[32];
+    byte tx_key[32] __attribute__((aligned(64))), rx_key[32] __attribute__((aligned(64)));
     trf_derive_session_keys(s1_shared_secret, 32, tx_key, rx_key);
     printf("\n");
 
@@ -111,9 +109,15 @@ int main(int argc, char *argv[]) {
     // ---------------------------------------------------------
     {
         printf("[%sSTEP 3%s] Testing Digital Signature (ML-DSA)...\n", KYEL, KNRM);
-        byte *dsa_pub = (byte*)malloc(PQC_BUFF_MAX);
-        byte *dsa_priv = (byte*)malloc(PQC_BUFF_MAX);
-        byte *sig = (byte*)malloc(PQC_BUFF_MAX);
+        byte *dsa_pub = NULL, *dsa_priv = NULL, *sig = NULL;
+        if (posix_memalign((void**)&dsa_pub, 64, PQC_BUFF_MAX) != 0 ||
+            posix_memalign((void**)&dsa_priv, 64, PQC_BUFF_MAX) != 0 ||
+            posix_memalign((void**)&sig, 64, PQC_BUFF_MAX) != 0) {
+            printf("%s[FAIL] DSA Memory allocation failed!%s\n", KRED, KNRM);
+            if (dsa_pub) free(dsa_pub);
+            if (dsa_priv) free(dsa_priv);
+            return 1;
+        }
         int dsa_pub_sz = 0, dsa_priv_sz = 0, sig_sz = 0;
         const char* msg = "PQC_HANDSHAKE_VERIFICATION";
 
@@ -144,9 +148,10 @@ int main(int argc, char *argv[]) {
     if (strcmp(test_mode, "l4") == 0 || strcmp(test_mode, "all") == 0) {
         printf("[%sSTEP 4%s] Testing Layer 4 Encryption (AES-GCM-256)...\n", KYEL, KNRM);
         const char* data = "PQC_PROTECTED_TCP_PAYLOAD";
-        byte *buf = (byte*)malloc(PQC_BUFF_MAX);
+        byte *buf = NULL;
+        if (posix_memalign((void**)&buf, 64, PQC_BUFF_MAX) != 0) return 1;
         int enc_len, dec_len;
-        byte nonce[12];
+        byte nonce[12] __attribute__((aligned(64)));
         trf_pqc_generate_nonce(nonce);
         
         if (buf) {
@@ -169,12 +174,13 @@ int main(int argc, char *argv[]) {
     // ---------------------------------------------------------
     if (strcmp(test_mode, "l3") == 0 || strcmp(test_mode, "all") == 0) {
         printf("[%sSTEP 5%s] Testing Layer 3 Encryption (CBC+HMAC)...\n", KYEL, KNRM);
-        byte hmac_key[32], iv[16];
+        byte hmac_key[32] __attribute__((aligned(64))), iv[16] __attribute__((aligned(64)));
         trf_pqc_generate_random_key(hmac_key, 32);
         trf_pqc_generate_random_key(iv, 16);
         
         char *l3_data = "IP_PACKET_OVER_PQC_TUNNEL";
-        byte *buf = (byte*)malloc(PQC_BUFF_MAX);
+        byte *buf = NULL;
+        if (posix_memalign((void**)&buf, 64, PQC_BUFF_MAX) != 0) return 1;
         int enc_len, dec_len;
         
         if (buf) {
