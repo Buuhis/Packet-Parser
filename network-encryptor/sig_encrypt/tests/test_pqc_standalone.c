@@ -138,22 +138,24 @@ int main(int argc, char *argv[]) {
     if (strcmp(test_mode, "l4") == 0 || strcmp(test_mode, "all") == 0) {
         printf("[%sSTEP 4%s] Testing Layer 4 Encryption (AES-GCM-256)...\n", KYEL, KNRM);
         const char* data = "PQC_PROTECTED_TCP_PAYLOAD";
-        byte buf[1024];
+        byte *buf = (byte*)malloc(PQC_BUFF_MAX);
         int enc_len, dec_len;
         byte nonce[12];
         trf_pqc_generate_nonce(nonce);
         
-        memcpy(buf, data, strlen(data));
-        if (trf_encrypt_payload_gcm(tx_key, nonce, 12, buf, strlen(data), &enc_len) == TRF_PQC_OK) {
-            printf(" - Encrypted size: %d bytes\n", enc_len);
-            if (trf_decrypt_payload_gcm(tx_key, nonce, 12, buf, enc_len, &dec_len) == TRF_PQC_OK) {
-                buf[dec_len] = '\0';
-                printf("%s[OK] L4 Decrypted: %s%s\n", KGRN, (char*)buf, KNRM);
+        if (buf) {
+            memcpy(buf, data, strlen(data));
+            if (trf_encrypt_payload_gcm(tx_key, nonce, 12, buf, strlen(data), &enc_len) == TRF_PQC_OK) {
+                printf(" - Encrypted size: %d bytes\n", enc_len);
+                if (trf_decrypt_payload_gcm(tx_key, nonce, 12, buf, enc_len, &dec_len) == TRF_PQC_OK) {
+                    buf[dec_len] = '\0';
+                    printf("%s[OK] L4 Decrypted: %s%s\n", KGRN, (char*)buf, KNRM);
+                }
+            } else {
+                printf("%s[FAIL] L4 Encryption error.%s\n", KRED, KNRM);
             }
-        } else {
-            printf("%s[FAIL] L4 Encryption error.%s\n", KRED, KNRM);
+            free(buf);
         }
-        printf("\n");
     }
 
     // ---------------------------------------------------------
@@ -166,15 +168,18 @@ int main(int argc, char *argv[]) {
         trf_pqc_generate_random_key(iv, 16);
         
         char *l3_data = "IP_PACKET_OVER_PQC_TUNNEL";
-        byte buf[1024];
+        byte *buf = (byte*)malloc(PQC_BUFF_MAX);
         int enc_len, dec_len;
-        memcpy(buf, l3_data, strlen(l3_data));
-
-        if (trf_encrypt_cbc_hmac(tx_key, hmac_key, iv, 16, buf, strlen(l3_data), &enc_len) == TRF_PQC_OK) {
-            if (trf_decrypt_cbc_hmac(tx_key, hmac_key, iv, 16, buf, enc_len, &dec_len) == TRF_PQC_OK) {
-                buf[dec_len] = '\0';
-                printf("%s[OK] L3 Decrypted: %s%s\n", KGRN, (char*)buf, KNRM);
+        
+        if (buf) {
+            memcpy(buf, l3_data, strlen(l3_data));
+            if (trf_encrypt_cbc_hmac(tx_key, hmac_key, iv, 16, buf, strlen(l3_data), &enc_len) == TRF_PQC_OK) {
+                if (trf_decrypt_cbc_hmac(tx_key, hmac_key, iv, 16, buf, enc_len, &dec_len) == TRF_PQC_OK) {
+                    buf[dec_len] = '\0';
+                    printf("%s[OK] L3 Decrypted: %s%s\n", KGRN, (char*)buf, KNRM);
+                }
             }
+            free(buf);
         }
     }
 
