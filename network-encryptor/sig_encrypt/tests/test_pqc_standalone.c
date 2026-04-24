@@ -107,14 +107,14 @@ int main(int argc, char *argv[]) {
     printf("\n");
 
     // ---------------------------------------------------------
-    // BƯỚC 3: TEST CHỮ KÝ SỐ (ML-DSA)
+    // BƯỚC 3: TEST CHỮ KÝ SỐ (ML-DSA) - LUÔN CHẠY ĐỂ VERIFY HANDSHAKE
     // ---------------------------------------------------------
-    if (strcmp(test_mode, "all") == 0) {
+    {
         printf("[%sSTEP 3%s] Testing Digital Signature (ML-DSA)...\n", KYEL, KNRM);
         byte *dsa_pub = (byte*)malloc(PQC_BUFF_MAX);
         byte *dsa_priv = (byte*)malloc(PQC_BUFF_MAX);
         byte *sig = (byte*)malloc(PQC_BUFF_MAX);
-        int dsa_pub_sz, dsa_priv_sz, sig_sz;
+        int dsa_pub_sz = 0, dsa_priv_sz = 0, sig_sz = 0;
         const char* msg = "PQC_HANDSHAKE_VERIFICATION";
 
         if (dsa_pub && dsa_priv && sig) {
@@ -122,8 +122,14 @@ int main(int argc, char *argv[]) {
                 if (trf_dsa_sign_payload(dsa_priv, dsa_priv_sz, (byte*)msg, strlen(msg), sig, &sig_sz) == TRF_PQC_OK) {
                     if (trf_dsa_verify_payload(dsa_pub, dsa_pub_sz, (byte*)msg, strlen(msg), sig, sig_sz) == TRF_PQC_OK) {
                         printf("%s[OK] DSA Signing & Verification Success.%s\n", KGRN, KNRM);
+                    } else {
+                        printf("%s[FAIL] DSA Verification failed!%s\n", KRED, KNRM);
                     }
+                } else {
+                    printf("%s[FAIL] DSA Signing failed!%s\n", KRED, KNRM);
                 }
+            } else {
+                printf("%s[FAIL] DSA KeyGen failed!%s\n", KRED, KNRM);
             }
         }
         if (dsa_pub) free(dsa_pub);
@@ -177,7 +183,11 @@ int main(int argc, char *argv[]) {
                 if (trf_decrypt_cbc_hmac(tx_key, hmac_key, iv, 16, buf, enc_len, &dec_len) == TRF_PQC_OK) {
                     buf[dec_len] = '\0';
                     printf("%s[OK] L3 Decrypted: %s%s\n", KGRN, (char*)buf, KNRM);
+                } else {
+                    printf("%s[FAIL] L3 Decryption error.%s\n", KRED, KNRM);
                 }
+            } else {
+                printf("%s[FAIL] L3 Encryption error.%s\n", KRED, KNRM);
             }
             free(buf);
         }

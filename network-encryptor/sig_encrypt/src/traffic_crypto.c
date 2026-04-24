@@ -62,128 +62,125 @@ int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
                             byte* data, int len, int* new_len_out) {
     if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
 
-    void* mem = alloc_pqc_key_mem(); // Reusing the 16KB aligned helper
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptCipherCtx* ctx = (SCryptCipherCtx*)mem;
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) goto err;
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
 
     byte tag[TAG_SIZE_GCM];
     word32 tagLen = TAG_SIZE_GCM;
-    if (scrypt_CipherGetTag(ctx, tag, &tagLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherGetTag(ctx, tag, &tagLen) != 0) goto err;
 
     memcpy(data + outLen + finalLen, tag, TAG_SIZE_GCM);
     *new_len_out = outLen + finalLen + TAG_SIZE_GCM;
 
-    free(mem);
+    scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
+err:
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
 }
 
 int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
                             byte* data, int len, int* orig_len_out) {
     if (!g_pqc_initialized || !data || len <= TAG_SIZE_GCM) return TRF_PQC_ERR_CRYPTO;
 
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptCipherCtx* ctx = (SCryptCipherCtx*)mem;
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_DECRYPTION) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_DECRYPTION) != 0) goto err;
 
     int payload_len = len - TAG_SIZE_GCM;
     byte tag[TAG_SIZE_GCM];
     memcpy(tag, data + payload_len, TAG_SIZE_GCM);
 
-    if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) goto err;
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
 
     *orig_len_out = outLen + finalLen;
 
-    free(mem);
+    scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
+err:
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
 }
 
 // ----- CBC MODE (low-level, used by CBC+HMAC combo) -----
 int trf_encrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
     if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
     
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptCipherCtx* ctx = (SCryptCipherCtx*)mem;
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_ENCRYPTION) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_ENCRYPTION) != 0) goto err;
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
 
-    free(mem);
+    scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
+err:
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
 }
 
 int trf_decrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
     if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
     
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptCipherCtx* ctx = (SCryptCipherCtx*)mem;
+    SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_DECRYPTION) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_CBC, key, 32, iv, iv_len, SCRYPT_DECRYPTION) != 0) goto err;
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
+    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
+    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
 
-    free(mem);
+    scrypt_CipherCtxFree(ctx);
     return TRF_PQC_OK;
+err:
+    scrypt_CipherCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
+}
+
+int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
+    SCryptDigestCtx* ctx = scrypt_DigestCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+
+    if (scrypt_DigestInit(ctx, type, 0) != 0) goto err;
+    if (scrypt_DigestUpdate(ctx, data, len) != 0) goto err;
+    if (scrypt_DigestFinal(ctx, digest_out) != 0) goto err;
+
+    scrypt_DigestCtxFree(ctx);
+    return TRF_PQC_OK;
+err:
+    scrypt_DigestCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
+}
+
+int trf_calculate_hmac(SCryptDigestType type, const byte* key, int key_len, 
+                       const byte* data, int len, byte* mac_out) {
+    SCryptHmacCtx* ctx = scrypt_HmacCtxNew();
+    if (!ctx) return TRF_PQC_ERR_CRYPTO;
+
+    if (scrypt_HmacInit(ctx, key, key_len, type) != 0) goto err;
+    if (scrypt_HmacUpdate(ctx, data, len) != 0) goto err;
+    if (scrypt_HmacFinal(ctx, mac_out, 32) != 0) goto err;
+
+    scrypt_HmacCtxFree(ctx);
+    return TRF_PQC_OK;
+err:
+    scrypt_HmacCtxFree(ctx);
+    return TRF_PQC_ERR_CRYPTO;
 }
 
 // ----- CBC + HMAC Encrypt-then-MAC -----
