@@ -8,9 +8,7 @@
 #define HKDF_SALT "network_encryptor_xdp_salt_v1"
 #define HKDF_INFO "session_key_expansion"
 
-// External declaration for the underlying wolfCrypt symbol found in libscrypt.so
-extern int wc_MlKemKey_SharedSecretSize(void* key_obj);
-
+// External declaration for the underlying symbol is no longer needed
 static int g_pqc_initialized = 0;
 
 int trf_pqc_generate_nonce(byte* out_nonce) {
@@ -242,56 +240,83 @@ err:
 // CONTROL PLANE: PQC KEY EXCHANGE (ML-KEM LEVEL 5)
 // =========================================================
 
+// Helper to allocate aligned memory for PQC keys since the library New() is unstable
+static void* alloc_pqc_key_mem() {
+    void* mem = NULL;
+    // Allocate 16KB to be safe, aligned to 64 bytes
+    if (posix_memalign(&mem, 64, 16384) != 0) return NULL;
+    memset(mem, 0, 16384);
+    return mem;
+}
+
 int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlKemKey* key_obj = scrypt_MlKemKeyNew();
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
+
     if (scrypt_MlKemKeyGen(key_obj, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
+        free(mem);
         return TRF_PQC_ERR_CRYPTO;
     }
 
     *pub_sz = scrypt_MlKemPublicKeySize(key_obj);
-    scrypt_MlKemExportPublicKey(key_obj, pub_key_out, *pub_sz);
-
     *priv_sz = scrypt_MlKemPrivateKeySize(key_obj);
+
+    scrypt_MlKemExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlKemExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    scrypt_MlKemKeyFree(key_obj);
+    free(mem);
     return TRF_PQC_OK;
 }
 
 int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz, 
                         byte* cipher_capsule_out, int* ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = scrypt_MlKemKeyNew();
-    if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) goto err;
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
+
+    if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_CRYPTO;
+    }
 
     *ctx_sz = scrypt_MlKemCipherTextSize(key_obj);
-    int ss_sz = wc_MlKemKey_SharedSecretSize(key_obj);
+    int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
-    if (scrypt_MlKemEncapsulate(key_obj, cipher_capsule_out, *ctx_sz, shared_secret_out, ss_sz) != 0) goto err;
+    if (scrypt_MlKemEncapsulate(key_obj, cipher_capsule_out, *ctx_sz, shared_secret_out, ss_sz) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_CRYPTO;
+    }
 
-    scrypt_MlKemKeyFree(key_obj);
+    free(mem);
     return TRF_PQC_OK;
-err:
-    scrypt_MlKemKeyFree(key_obj);
-    return TRF_PQC_ERR_CRYPTO;
 }
 
 int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz, 
                         const byte* cipher_capsule_in, int ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = scrypt_MlKemKeyNew();
-    if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) goto err;
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
 
-    int ss_sz = wc_MlKemKey_SharedSecretSize(key_obj);
+    if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_CRYPTO;
+    }
 
-    if (scrypt_MlKemDecapsulate(key_obj, shared_secret_out, ss_sz, cipher_capsule_in, ctx_sz) != 0) goto err;
+    int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
-    scrypt_MlKemKeyFree(key_obj);
+    if (scrypt_MlKemDecapsulate(key_obj, shared_secret_out, ss_sz, cipher_capsule_in, ctx_sz) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_CRYPTO;
+    }
+
+    free(mem);
     return TRF_PQC_OK;
-err:
-    scrypt_MlKemKeyFree(key_obj);
-    return TRF_PQC_ERR_CRYPTO;
 }
 
 int trf_derive_session_keys(const byte* shared_secret, int ss_len, 
@@ -318,52 +343,70 @@ int trf_derive_session_keys(const byte* shared_secret, int ss_len,
 // =========================================================
 
 int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlDsaKey* key_obj = scrypt_MlDsaKeyNew();
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
+
     if (scrypt_MlDsaKeyGen(key_obj, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
+        free(mem);
         return TRF_PQC_ERR_SIG;
     }
 
     *pub_sz = scrypt_MlDsaPublicKeySize(key_obj);
-    scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
-
     *priv_sz = scrypt_MlDsaPrivateKeySize(key_obj);
+
+    scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlDsaExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    scrypt_MlDsaKeyFree(key_obj);
+    free(mem);
     return TRF_PQC_OK;
 }
 
 int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz, 
                          const byte* data, int len, 
                          byte* sig_out, int* sig_sz) {
-    SCryptMlDsaKey* key_obj = scrypt_MlDsaKeyNew();
-    if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5) != 0) goto err;
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
 
-    *sig_sz = scrypt_MlDsaSignatureSize(key_obj);
-    if (scrypt_MlDsaSign(key_obj, data, len, sig_out, *sig_sz) != 0) goto err;
+    if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_SIG;
+    }
 
-    scrypt_MlDsaKeyFree(key_obj);
+    int max_sig_sz = scrypt_MlDsaSignatureSize(key_obj);
+    int ret = scrypt_MlDsaSign(key_obj, data, len, sig_out, max_sig_sz);
+    
+    if (ret < 0) {
+        free(mem);
+        return TRF_PQC_ERR_SIG;
+    }
+
+    *sig_sz = ret;
+    free(mem);
     return TRF_PQC_OK;
-err:
-    scrypt_MlDsaKeyFree(key_obj);
-    return TRF_PQC_ERR_SIG;
 }
 
 int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz, 
                            const byte* data, int len, 
                            const byte* sig_in, int sig_sz) {
-    SCryptMlDsaKey* key_obj = scrypt_MlDsaKeyNew();
-    if (scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) goto err;
+    void* mem = alloc_pqc_key_mem();
+    if (!mem) return TRF_PQC_ERR_INIT;
+    
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
 
+    if (scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) {
+        free(mem);
+        return TRF_PQC_ERR_SIG;
+    }
+
+    // Signet PQC scrypt_MlDsaVerify returns 0 on success
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
-    scrypt_MlDsaKeyFree(key_obj);
-
-    if (ret != 0) return TRF_PQC_ERR_SIG;
-    return TRF_PQC_OK;
-err:
-    scrypt_MlDsaKeyFree(key_obj);
-    return TRF_PQC_ERR_SIG;
+    
+    free(mem);
+    return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
 }
 // =========================================================
 // COMPOSITE PQC LOGIC (HANDSHAKE + DERIVATION)
