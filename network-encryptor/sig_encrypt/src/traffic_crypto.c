@@ -263,13 +263,11 @@ static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void
 }
 
 int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
+    SCryptMlKemKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    if (scrypt_MlKemKeyGen(key_obj, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
+    // Attempting the pattern that the USER found successful: passing the address of the pointer
+    if (scrypt_MlKemKeyGen((SCryptMlKemKey*)&key_obj, MLKEM_LEVEL_5) != 0) {
+        if (key_obj) scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -286,13 +284,10 @@ int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
 int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz, 
                         byte* cipher_capsule_out, int* ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
+    SCryptMlKemKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
+    if (scrypt_MlKemImportPublicKey((SCryptMlKemKey*)&key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
+        if (key_obj) scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -311,13 +306,10 @@ int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz,
 int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz, 
                         const byte* cipher_capsule_in, int ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
+    SCryptMlKemKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
+    if (scrypt_MlKemImportPrivateKey((SCryptMlKemKey*)&key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
+        if (key_obj) scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -355,13 +347,10 @@ int trf_derive_session_keys(const byte* shared_secret, int ss_len,
 // =========================================================
 
 int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
+    SCryptMlDsaKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    if (scrypt_MlDsaKeyGen(key_obj, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
+    if (scrypt_MlDsaKeyGen((SCryptMlDsaKey*)&key_obj, MLDSA_LEVEL_5) != 0) {
+        if (key_obj) scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -378,15 +367,13 @@ int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
 int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz, 
                          const byte* data, int len, 
                          byte* sig_out, int* sig_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
+    SCryptMlDsaKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    int ret_import = scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5);
+    // Using the address of the pointer variable to let the library initialize it
+    int ret_import = scrypt_MlDsaImportPrivateKey((SCryptMlDsaKey*)&key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5);
     if (ret_import != 0) {
-        fprintf(stderr, "[DEBUG] DSA Import Private Key failed with code: %d at addr: %p\n", ret_import, key_obj);
-        scrypt_MlDsaKeyFree(key_obj);
+        fprintf(stderr, "[DEBUG] DSA Import Private Key failed with code: %d. KeyPtr: %p\n", ret_import, key_obj);
+        if (key_obj) scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -406,13 +393,10 @@ int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz,
 int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz, 
                            const byte* data, int len, 
                            const byte* sig_in, int sig_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
+    SCryptMlDsaKey* key_obj = NULL;
     
-    if (!key_obj) return TRF_PQC_ERR_INIT;
-
-    if (scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
+    if (scrypt_MlDsaImportPublicKey((SCryptMlDsaKey*)&key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) {
+        if (key_obj) scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
