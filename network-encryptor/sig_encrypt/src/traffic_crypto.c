@@ -55,7 +55,7 @@ void trf_pqc_cleanup() {
 // =========================================================
 
 // =========================================================
-// DATA PLANE: ENCRYPTION
+// DATA PLANE: ENCRYPTION (AES-GCM / AES-CBC)
 // =========================================================
 
 int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
@@ -113,7 +113,6 @@ err:
     return TRF_PQC_ERR_CRYPTO;
 }
 
-// ----- CBC MODE (low-level, used by CBC+HMAC combo) -----
 int trf_encrypt_payload_cbc(const byte* key, const byte* iv, int iv_len, byte* data, int len) {
     if (!g_pqc_initialized || !data || len == 0) return TRF_PQC_ERR_CRYPTO;
     
@@ -152,6 +151,10 @@ err:
     return TRF_PQC_ERR_CRYPTO;
 }
 
+// =========================================================
+// HASHING & MAC (SHA2 / SHA3 / HMAC)
+// =========================================================
+
 int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
     SCryptDigestCtx* ctx = scrypt_DigestCtxNew();
     if (!ctx) return TRF_PQC_ERR_CRYPTO;
@@ -183,22 +186,22 @@ err:
     return TRF_PQC_ERR_CRYPTO;
 }
 
-// ----- CBC + HMAC Encrypt-then-MAC -----
+// =========================================================
+// COMPOSITE ENCRYPTION MODES (CBC + HMAC)
+// =========================================================
+
 #define HMAC_TAG_SIZE 32
 
 int trf_encrypt_cbc_hmac(const byte* enc_key, const byte* hmac_key,
                          const byte* iv, int iv_len,
                          byte* data, int len, int* new_len_out) {
-    // Step 1: Encrypt with CBC
     if (trf_encrypt_payload_cbc(enc_key, iv, iv_len, data, len) != TRF_PQC_OK)
         return TRF_PQC_ERR_CRYPTO;
 
-    // Step 2: Calculate HMAC-SHA256 over ciphertext
     byte mac[HMAC_TAG_SIZE];
     if (trf_calculate_hmac(DIGEST_TYPE_SHA256, hmac_key, 32, data, len, mac) != TRF_PQC_OK)
         return TRF_PQC_ERR_CRYPTO;
 
-    // Step 3: Append MAC to end of ciphertext
     memcpy(data + len, mac, HMAC_TAG_SIZE);
     *new_len_out = len + HMAC_TAG_SIZE;
 
@@ -211,20 +214,16 @@ int trf_decrypt_cbc_hmac(const byte* enc_key, const byte* hmac_key,
     if (len <= HMAC_TAG_SIZE) return TRF_PQC_ERR_CRYPTO;
 
     int cipher_len = len - HMAC_TAG_SIZE;
-
-    // Step 1: Extract MAC from end
     byte received_mac[HMAC_TAG_SIZE];
     memcpy(received_mac, data + cipher_len, HMAC_TAG_SIZE);
 
-    // Step 2: Verify HMAC BEFORE decryption (prevent padding oracle attack)
     byte computed_mac[HMAC_TAG_SIZE];
     if (trf_calculate_hmac(DIGEST_TYPE_SHA256, hmac_key, 32, data, cipher_len, computed_mac) != TRF_PQC_OK)
         return TRF_PQC_ERR_CRYPTO;
 
     if (memcmp(received_mac, computed_mac, HMAC_TAG_SIZE) != 0)
-        return TRF_PQC_ERR_CRYPTO;  // MAC mismatch → tampered data, DROP
+        return TRF_PQC_ERR_CRYPTO;
 
-    // Step 3: MAC valid → safe to decrypt
     if (trf_decrypt_payload_cbc(enc_key, iv, iv_len, data, cipher_len) != TRF_PQC_OK)
         return TRF_PQC_ERR_CRYPTO;
 
@@ -234,76 +233,47 @@ int trf_decrypt_cbc_hmac(const byte* enc_key, const byte* hmac_key,
 
 
 // =========================================================
-// HASHING & MAC (SHA2 / SHA3 / HMAC)
-// =========================================================
-
-int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptDigestCtx* ctx = (SCryptDigestCtx*)mem;
-
-    if (scrypt_DigestInit(ctx, type, 0) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_DigestUpdate(ctx, data, len) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_DigestFinal(ctx, digest_out) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-
-    free(mem);
-    return TRF_PQC_OK;
-}
-
-int trf_calculate_hmac(SCryptDigestType type, const byte* key, int key_len, 
-                       const byte* data, int len, byte* mac_out) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_CRYPTO;
-    SCryptHmacCtx* ctx = (SCryptHmacCtx*)mem;
-
-    if (scrypt_HmacInit(ctx, key, key_len, type) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_HmacUpdate(ctx, data, len) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-    if (scrypt_HmacFinal(ctx, mac_out, 32) != 0) {
-        free(mem);
-        return TRF_PQC_ERR_CRYPTO;
-    }
-
-    free(mem);
-    return TRF_PQC_OK;
-}
-
-
-// =========================================================
 // CONTROL PLANE: PQC KEY EXCHANGE (ML-KEM LEVEL 5)
 // =========================================================
 
-// Helper to allocate aligned memory for PQC keys since the library New() is unstable
-static void* alloc_pqc_key_mem() {
-    void* mem = NULL;
-    // Allocate 16KB to be safe, aligned to 64 bytes
-    if (posix_memalign(&mem, 64, 16384) != 0) return NULL;
-    memset(mem, 0, 16384);
-    return mem;
+// Helper to get an ALIGNED object from the library's own constructor
+// This is necessary because the library's New() might return unaligned memory
+// which crashes the CPU, but manual malloc lacks internal library initialization.
+static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void*)) {
+    void* pool[64]; // Keep track of unaligned pointers to free them later
+    int count = 0;
+    void* aligned_ptr = NULL;
+
+    for (int i = 0; i < 64; i++) {
+        void* ptr = new_func();
+        if (!ptr) break;
+
+        if (((uintptr_t)ptr % 64) == 0) {
+            aligned_ptr = ptr;
+            break;
+        }
+        pool[count++] = ptr;
+    }
+
+    // Free the unaligned ones
+    for (int i = 0; i < count; i++) {
+        free_func(pool[i]);
+    }
+
+    if (!aligned_ptr) {
+        fprintf(stderr, "[PQC] Critical: Failed to get aligned object from library after 64 attempts\n");
+    }
+    return aligned_ptr;
 }
 
 int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlKemKeyGen(key_obj, MLKEM_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -313,20 +283,20 @@ int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     scrypt_MlKemExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlKemExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    free(mem);
+    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz, 
                         byte* cipher_capsule_out, int* ctx_sz, 
                         byte* shared_secret_out) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -334,35 +304,35 @@ int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz,
     int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
     if (scrypt_MlKemEncapsulate(key_obj, cipher_capsule_out, *ctx_sz, shared_secret_out, ss_sz) != 0) {
-        free(mem);
+        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
-    free(mem);
+    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz, 
                         const byte* cipher_capsule_in, int ctx_sz, 
                         byte* shared_secret_out) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
     int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
     if (scrypt_MlKemDecapsulate(key_obj, shared_secret_out, ss_sz, cipher_capsule_in, ctx_sz) != 0) {
-        free(mem);
+        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
-    free(mem);
+    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
@@ -390,13 +360,13 @@ int trf_derive_session_keys(const byte* shared_secret, int ss_len,
 // =========================================================
 
 int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlDsaKeyGen(key_obj, MLDSA_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -406,20 +376,20 @@ int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlDsaExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    free(mem);
+    scrypt_MlDsaKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz, 
                          const byte* data, int len, 
                          byte* sig_out, int* sig_sz) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -427,32 +397,31 @@ int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz,
     int ret = scrypt_MlDsaSign(key_obj, data, len, sig_out, max_sig_sz);
     
     if (ret < 0) {
-        free(mem);
+        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
     *sig_sz = ret;
-    free(mem);
+    scrypt_MlDsaKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz, 
                            const byte* data, int len, 
                            const byte* sig_in, int sig_sz) {
-    void* mem = alloc_pqc_key_mem();
-    if (!mem) return TRF_PQC_ERR_INIT;
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
+        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)mem;
+    if (!key_obj) return TRF_PQC_ERR_INIT;
 
     if (scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) {
-        free(mem);
+        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
-    // Signet PQC scrypt_MlDsaVerify returns 0 on success
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
     
-    free(mem);
+    scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
 }
 // =========================================================
