@@ -236,44 +236,17 @@ int trf_decrypt_cbc_hmac(const byte* enc_key, const byte* hmac_key,
 // CONTROL PLANE: PQC KEY EXCHANGE (ML-KEM LEVEL 5)
 // =========================================================
 
-// Helper to get an ALIGNED object from the library's own constructor
-// This is necessary because the library's New() might return unaligned memory
-// which crashes the CPU, but manual malloc lacks internal library initialization.
-static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void*)) {
-    void* pool[64]; // Keep track of unaligned pointers to free them later
-    int count = 0;
-    void* aligned_ptr = NULL;
-
-    for (int i = 0; i < 64; i++) {
-        void* ptr = new_func();
-        if (!ptr) break;
-
-        if (((uintptr_t)ptr % 64) == 0) {
-            aligned_ptr = ptr;
-            break;
-        }
-        pool[count++] = ptr;
-    }
-
-    // Free the unaligned ones
-    for (int i = 0; i < count; i++) {
-        free_func(pool[i]);
-    }
-
-    if (!aligned_ptr) {
-        fprintf(stderr, "[PQC] Critical: Failed to get aligned object from library after 64 attempts\n");
-    }
-    return aligned_ptr;
-}
+// =========================================================
+// CONTROL PLANE: PQC KEY EXCHANGE (ML-KEM LEVEL 5)
+// =========================================================
 
 int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    // Use aligned stack memory (Proven stable by USER)
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
     if (scrypt_MlKemKeyGen(key_obj, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -283,20 +256,17 @@ int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     scrypt_MlKemExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlKemExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz, 
                         byte* cipher_capsule_out, int* ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
     if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
@@ -304,41 +274,35 @@ int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz,
     int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
     if (scrypt_MlKemEncapsulate(key_obj, cipher_capsule_out, *ctx_sz, shared_secret_out, ss_sz) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
-    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz, 
                         const byte* cipher_capsule_in, int ctx_sz, 
                         byte* shared_secret_out) {
-    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlKemKey* key_obj = (SCryptMlKemKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
     if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
     int ss_sz = scrypt_MlKemShareSecretSize(key_obj);
 
     if (scrypt_MlKemDecapsulate(key_obj, shared_secret_out, ss_sz, cipher_capsule_in, ctx_sz) != 0) {
-        scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
 
-    scrypt_MlKemKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_derive_session_keys(const byte* shared_secret, int ss_len, 
                             byte* tx_key_out, byte* rx_key_out) {
-    byte key_material[64];
+    byte key_material[64] __attribute__((aligned(64)));
     
     int ret = scrypt_HKDF(DIGEST_TYPE_SHA512, shared_secret, ss_len, 
                           (const byte*)HKDF_SALT, strlen(HKDF_SALT), 
@@ -360,13 +324,11 @@ int trf_derive_session_keys(const byte* shared_secret, int ss_len,
 // =========================================================
 
 int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, int* priv_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
     if (scrypt_MlDsaKeyGen(key_obj, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -376,20 +338,19 @@ int trf_dsa_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     scrypt_MlDsaExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlDsaExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
-    scrypt_MlDsaKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz, 
                          const byte* data, int len, 
                          byte* sig_out, int* sig_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
-    if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
+    int ret_import = scrypt_MlDsaImportPrivateKey(key_obj, priv_key_in, priv_sz, MLDSA_LEVEL_5);
+    if (ret_import != 0) {
+        fprintf(stderr, "[DEBUG] DSA Import Private Key failed with code: %d\n", ret_import);
         return TRF_PQC_ERR_SIG;
     }
 
@@ -397,31 +358,25 @@ int trf_dsa_sign_payload(const byte* priv_key_in, int priv_sz,
     int ret = scrypt_MlDsaSign(key_obj, data, len, sig_out, max_sig_sz);
     
     if (ret < 0) {
-        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
     *sig_sz = ret;
-    scrypt_MlDsaKeyFree(key_obj);
     return TRF_PQC_OK;
 }
 
 int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz, 
                            const byte* data, int len, 
                            const byte* sig_in, int sig_sz) {
-    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)get_aligned_library_obj(
-        (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
-    
-    if (!key_obj) return TRF_PQC_ERR_INIT;
+    byte key_mem[16384] __attribute__((aligned(64)));
+    SCryptMlDsaKey* key_obj = (SCryptMlDsaKey*)key_mem;
+    memset(key_mem, 0, sizeof(key_mem));
 
     if (scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5) != 0) {
-        scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_SIG;
     }
 
     int ret = scrypt_MlDsaVerify(key_obj, data, len, sig_in, sig_sz);
-    
-    scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;
 }
 // =========================================================
