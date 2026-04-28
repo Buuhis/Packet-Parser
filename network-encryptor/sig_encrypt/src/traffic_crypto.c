@@ -8,8 +8,8 @@
 // PQC CONSTANTS & CONFIGURATION
 // =========================================================
 
-#define MLKEM_LEVEL_5       SCR_MLKEM_LEVEL_5
-#define MLDSA_LEVEL_1       SCR_MLDSA_LEVEL_1  // Sử dụng Level 1 cho tốc độ handshake nhanh
+#define PQC_MLKEM_LEVEL     MLKEM_LEVEL_5
+#define PQC_MLDSA_LEVEL     MLDSA_LEVEL_3
 
 #define TAG_SIZE_GCM        16
 #define NONCE_SIZE_GCM      12
@@ -54,6 +54,16 @@ int trf_pqc_init() {
 void trf_pqc_cleanup() {
     scrypt_Cleanup();
     g_pqc_initialized = 0;
+}
+
+int trf_pqc_generate_random_key(byte* out, int len) {
+    if (scrypt_RandomBytes(out, len) == 0) return TRF_PQC_OK;
+    return TRF_PQC_ERR_CRYPTO;
+}
+
+int trf_pqc_generate_nonce(byte* out_nonce) {
+    if (scrypt_RandomBytes(out_nonce, NONCE_SIZE_GCM) == 0) return TRF_PQC_OK;
+    return TRF_PQC_ERR_CRYPTO;
 }
 
 // =========================================================
@@ -158,7 +168,7 @@ int trf_kem_generate_keys(byte* pub_out, int* pub_sz, byte* priv_out, int* priv_
         (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlKemKeyGen(key_obj, MLKEM_LEVEL_5) != 0) {
+    if (scrypt_MlKemKeyGen(key_obj, PQC_MLKEM_LEVEL) != 0) {
         scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
@@ -176,7 +186,7 @@ int trf_kem_encapsulate(const byte* pub_key_in, int pub_sz, byte* cipher_capsule
         (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, MLKEM_LEVEL_5) != 0) {
+    if (scrypt_MlKemImportPublicKey(key_obj, pub_key_in, pub_sz, PQC_MLKEM_LEVEL) != 0) {
         scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
@@ -200,7 +210,7 @@ int trf_kem_decapsulate(const byte* priv_key_in, int priv_sz,
         (void*(*)())scrypt_MlKemKeyNew, (void(*)(void*))scrypt_MlKemKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, MLKEM_LEVEL_5) != 0) {
+    if (scrypt_MlKemImportPrivateKey(key_obj, priv_key_in, priv_sz, PQC_MLKEM_LEVEL) != 0) {
         scrypt_MlKemKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
@@ -220,7 +230,7 @@ int trf_dsa_generate_keys(byte* pub_out, int* pub_sz, byte* priv_out, int* priv_
         (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlDsaKeyGen(key_obj, MLDSA_LEVEL_1) != 0) {
+    if (scrypt_MlDsaKeyGen(key_obj, PQC_MLDSA_LEVEL) != 0) {
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
@@ -238,7 +248,7 @@ int trf_dsa_sign_payload(const byte* priv_key, int priv_sz, const byte* msg,
         (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key, priv_sz, MLDSA_LEVEL_1) != 0) {
+    if (scrypt_MlDsaImportPrivateKey(key_obj, priv_key, priv_sz, PQC_MLDSA_LEVEL) != 0) {
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
@@ -259,7 +269,7 @@ int trf_dsa_verify_payload(const byte* pub_key, int pub_sz, const byte* msg,
         (void*(*)())scrypt_MlDsaKeyNew, (void(*)(void*))scrypt_MlDsaKeyFree);
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    if (scrypt_MlDsaImportPublicKey(key_obj, pub_key, pub_sz, MLDSA_LEVEL_1) != 0) {
+    if (scrypt_MlDsaImportPublicKey(key_obj, pub_key, pub_sz, PQC_MLDSA_LEVEL) != 0) {
         scrypt_MlDsaKeyFree(key_obj);
         return TRF_PQC_ERR_CRYPTO;
     }
