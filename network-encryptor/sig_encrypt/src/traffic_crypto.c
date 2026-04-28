@@ -65,15 +65,33 @@ int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
     if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION) != 0) goto err;
+    int ret;
+    if ((ret = scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_ENCRYPTION)) != 0) {
+        fprintf(stderr, "[GCM-ENC] Init failed: %d\n", ret);
+        goto err;
+    }
+
+    // Explicitly set tag size for GCM
+    scrypt_CipherSetTagSize(ctx, TAG_SIZE_GCM);
 
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, len, data, &outLen) != 0) goto err;
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+    if ((ret = scrypt_CipherUpdate(ctx, data, len, data, &outLen)) != 0) {
+        fprintf(stderr, "[GCM-ENC] Update failed: %d\n", ret);
+        goto err;
+    }
+    
+    // GCM Final usually handles authentication tag generation
+    if ((ret = scrypt_CipherFinal(ctx, data + outLen, &finalLen)) != 0) {
+        fprintf(stderr, "[GCM-ENC] Final failed: %d\n", ret);
+        goto err;
+    }
 
     byte tag[TAG_SIZE_GCM];
     word32 tagLen = TAG_SIZE_GCM;
-    if (scrypt_CipherGetTag(ctx, tag, &tagLen) != 0) goto err;
+    if ((ret = scrypt_CipherGetTag(ctx, tag, &tagLen)) != 0) {
+        fprintf(stderr, "[GCM-ENC] GetTag failed: %d\n", ret);
+        goto err;
+    }
 
     memcpy(data + outLen + finalLen, tag, TAG_SIZE_GCM);
     *new_len_out = outLen + finalLen + TAG_SIZE_GCM;
@@ -92,17 +110,33 @@ int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len,
     SCryptCipherCtx* ctx = scrypt_CipherCtxNew();
     if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
-    if (scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_DECRYPTION) != 0) goto err;
+    int ret;
+    if ((ret = scrypt_CipherInit(ctx, CIPHER_TYPE_AES_256_GCM, key, 32, nonce, nonce_len, SCRYPT_DECRYPTION)) != 0) {
+        fprintf(stderr, "[GCM-DEC] Init failed: %d\n", ret);
+        goto err;
+    }
 
     int payload_len = len - TAG_SIZE_GCM;
     byte tag[TAG_SIZE_GCM];
     memcpy(tag, data + payload_len, TAG_SIZE_GCM);
 
-    if (scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM) != 0) goto err;
-
     word32 outLen = 0, finalLen = 0;
-    if (scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen) != 0) goto err;
-    if (scrypt_CipherFinal(ctx, data + outLen, &finalLen) != 0) goto err;
+    // Update with ciphertext first
+    if ((ret = scrypt_CipherUpdate(ctx, data, payload_len, data, &outLen)) != 0) {
+        fprintf(stderr, "[GCM-DEC] Update failed: %d\n", ret);
+        goto err;
+    }
+    
+    // Set tag for verification BEFORE Final
+    if ((ret = scrypt_CipherSetTag(ctx, tag, TAG_SIZE_GCM)) != 0) {
+        fprintf(stderr, "[GCM-DEC] SetTag failed: %d\n", ret);
+        goto err;
+    }
+
+    if ((ret = scrypt_CipherFinal(ctx, data + outLen, &finalLen)) != 0) {
+        fprintf(stderr, "[GCM-DEC] Final (Auth) failed: %d\n", ret);
+        goto err;
+    }
 
     *orig_len_out = outLen + finalLen;
 
@@ -156,7 +190,8 @@ err:
 // =========================================================
 
 int trf_calculate_digest(SCryptDigestType type, const byte* data, int len, byte* digest_out) {
-    SCryptDigestCtx* ctx = scrypt_DigestCtxNew();
+    SCryptDigestCtx* ctx = (SCryptDigestCtx*)get_aligned_library_obj(
+        (void*(*)())scrypt_DigestCtxNew, (void(*)(void*))scrypt_DigestCtxFree);
     if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
     if (scrypt_DigestInit(ctx, type, 0) != 0) goto err;
@@ -172,7 +207,8 @@ err:
 
 int trf_calculate_hmac(SCryptDigestType type, const byte* key, int key_len, 
                        const byte* data, int len, byte* mac_out) {
-    SCryptHmacCtx* ctx = scrypt_HmacCtxNew();
+    SCryptHmacCtx* ctx = (SCryptHmacCtx*)get_aligned_library_obj(
+        (void*(*)())scrypt_HmacCtxNew, (void(*)(void*))scrypt_HmacCtxFree);
     if (!ctx) return TRF_PQC_ERR_CRYPTO;
 
     if (scrypt_HmacInit(ctx, key, key_len, type) != 0) goto err;
