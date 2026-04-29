@@ -137,8 +137,15 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         int new_len = 0;
         uint8_t pqc_nonce[12];
         trf_pqc_generate_nonce(pqc_nonce);
-        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
+
+        // Prepare AAD: IPs (8B) + Ports (4B) = 12B
+        uint8_t aad[12];
+        memcpy(aad, packet + l3_off + 12, 8);      // Src/Dst IP
+        memcpy(aad + 8, packet + transport_off, 4); // Src/Dst Port
+
+        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
             return -1;
+        
         memmove(packet + enc_off + tunnel_hdr_size, packet + enc_off, new_len);
         l4_write_tunnel_header(packet + enc_off, pqc_nonce, 12); 
     } else {
@@ -258,7 +265,12 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                 continue;
         } else if (mode == CRYPTO_MODE_PQC_GCM) {
             int orig_len;
-            if (trf_decrypt_payload_gcm(key, nonce, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            // Prepare AAD matching encryption side
+            uint8_t aad[12];
+            memcpy(aad, packet + l3_off + 12, 8);      // Src/Dst IP
+            memcpy(aad + 8, packet + transport_off, 4); // Src/Dst Port
+
+            if (trf_decrypt_payload_gcm(key, nonce, 12, aad, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
                 continue;
             enc_len = orig_len; 
         } else {
@@ -381,7 +393,12 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         memcpy(out_buf + enc_off + app_payload_len, tag, AES128_GCM_TAG_SIZE);
     } else if (mode == CRYPTO_MODE_PQC_GCM) {
         int new_len;
-        if (trf_encrypt_payload_gcm(key, nonce, nonce_len, out_buf + enc_off, (int)app_payload_len, &new_len) != TRF_PQC_OK)
+        // Prepare AAD for fragment
+        uint8_t aad[12];
+        memcpy(aad, ip_hdr + 12, 8);
+        memcpy(aad + 8, transport_hdr, 4);
+
+        if (trf_encrypt_payload_gcm(key, nonce, nonce_len, aad, 12, out_buf + enc_off, (int)app_payload_len, &new_len) != TRF_PQC_OK)
             return -1;
     } else {
         uint8_t iv[AES128_IV_SIZE];
@@ -489,7 +506,12 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
                 continue;
         } else if (mode == CRYPTO_MODE_PQC_GCM) {
             int orig_len;
-            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, work, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            // Prepare AAD for fragment decryption
+            uint8_t aad[12];
+            memcpy(aad, packet + l3_off + 12, 8);
+            memcpy(aad + 8, packet + transport_off, 4);
+
+            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work, (int)enc_len, &orig_len) != TRF_PQC_OK)
                 continue;
             enc_len = orig_len;
         } else {

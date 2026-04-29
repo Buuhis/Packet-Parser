@@ -59,7 +59,7 @@ SCRYPT_API int scrypt_MlKemPrivateKeySize(SCryptMlKemKey* mlkey);
 SCRYPT_API int scrypt_MlKemEncapsulate(SCryptMlKemKey* mlkey, byte* ct, word32 ctSz, byte* ss, word32 ssSz);
 SCRYPT_API int scrypt_MlKemDecapsulate(SCryptMlKemKey* mlkey, byte* ss, word32 ssSz, const byte* ct, word32 ctSz);
 SCRYPT_API int scrypt_MlKemCipherTextSize(SCryptMlKemKey* mlkey);
-SCRYPT_API int scrypt_MlKemSharedSecretSize(SCryptMlKemKey* mlkey);
+SCRYPT_API int scrypt_MlKemShareSecretSize(SCryptMlKemKey* mlkey);
 
 SCRYPT_API SCryptMlDsaKey* scrypt_MlDsaKeyNew();
 SCRYPT_API void scrypt_MlDsaKeyFree(SCryptMlDsaKey* mlkey);
