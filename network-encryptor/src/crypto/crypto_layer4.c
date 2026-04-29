@@ -3,6 +3,9 @@
 #include "../../inc/fragment.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
 #include <string.h>
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
 #define L4_FRAG_MAGIC      (L4_TUNNEL_MAGIC | FRAG_FLAG_BIT)
@@ -138,15 +141,29 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         uint8_t pqc_nonce[12];
         trf_pqc_generate_nonce(pqc_nonce);
 
-        // Prepare AAD: IPs (8B) + Ports (4B) = 12B
-        uint8_t aad[12];
-        memcpy(aad, packet + l3_off + 12, 8);      // Src/Dst IP
-        memcpy(aad + 8, packet + transport_off, 4); // Src/Dst Port
+        uint8_t aad[12] __attribute__((aligned(64)));
+        struct iphdr *ip = (struct iphdr *)(packet + l3_off);
+        uint16_t src_port = 0, dst_port = 0;
+        
+        if (ip->protocol == IPPROTO_TCP) {
+            struct tcphdr *tcp = (struct tcphdr *)(packet + transport_off);
+            src_port = tcp->source;
+            dst_port = tcp->dest;
+        } else if (ip->protocol == IPPROTO_UDP) {
+            struct udphdr *udp = (struct udphdr *)(packet + transport_off);
+            src_port = udp->source;
+            dst_port = udp->dest;
+        }
+
+        memcpy(aad, &ip->saddr, 4);
+        memcpy(aad + 4, &ip->daddr, 4);
+        memcpy(aad + 8, &src_port, 2);
+        memcpy(aad + 10, &dst_port, 2);
 
         if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
             return -1;
         
-        memmove(packet + enc_off + tunnel_hdr_size, packet + enc_off, new_len);
+        enc_len = (size_t)new_len;
         l4_write_tunnel_header(packet + enc_off, pqc_nonce, 12); 
     } else {
         uint8_t iv[AES128_IV_SIZE];
@@ -238,7 +255,6 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         enc_len = total_after_tunnel - AES128_GCM_TAG_SIZE;
         memcpy(tag, packet + enc_off + enc_len, AES128_GCM_TAG_SIZE);
     } else {
-        // PQC_GCM internally extracts tag from buffer so enc_len includes tag
         enc_len = total_after_tunnel;
     }
 
@@ -265,14 +281,13 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                 continue;
         } else if (mode == CRYPTO_MODE_PQC_GCM) {
             int orig_len;
-            // Prepare AAD matching encryption side
-            uint8_t aad[12];
+            uint8_t aad[12] __attribute__((aligned(64)));
             memcpy(aad, packet + l3_off + 12, 8);      // Src/Dst IP
             memcpy(aad + 8, packet + transport_off, 4); // Src/Dst Port
 
-            if (trf_decrypt_payload_gcm(key, nonce, 12, aad, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
                 continue;
-            enc_len = orig_len; 
+            enc_len = (size_t)orig_len; 
         } else {
             uint8_t iv[AES128_IV_SIZE];
             crypto_nonce_to_iv(nonce, nonce_size, iv);
@@ -506,14 +521,13 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
                 continue;
         } else if (mode == CRYPTO_MODE_PQC_GCM) {
             int orig_len;
-            // Prepare AAD for fragment decryption
-            uint8_t aad[12];
+            uint8_t aad[12] __attribute__((aligned(64)));
             memcpy(aad, packet + l3_off + 12, 8);
             memcpy(aad + 8, packet + transport_off, 4);
 
             if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work, (int)enc_len, &orig_len) != TRF_PQC_OK)
                 continue;
-            enc_len = orig_len;
+            enc_len = (size_t)orig_len;
         } else {
             uint8_t iv[AES128_IV_SIZE];
             crypto_nonce_to_iv(nonce, nonce_size, iv);
