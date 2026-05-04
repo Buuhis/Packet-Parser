@@ -166,30 +166,55 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
          * Identity Keys (DSA) and Public Keys (KEM) for both sites.
          * In a real deployment, these would be separate stored keys.
          */
-        // Derive distinct components for PQC handshake using PQC-native HMAC
-        uint8_t pqc_seed[32], pqc_remote_pk[32], pqc_local_sk[32];
+        // Derive seeds (32 bytes each)
+        uint8_t pqc_seed[32], pqc_remote_pk_seed[32], pqc_local_sk_seed[32];
         uint8_t label_seed = 0xA1, label_pk = 0xA2, label_sk = 0xA3;
         
-        // PQC-native derivation to avoid touching legacy OpenSSL implementation
         trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_seed, 1, pqc_seed);
-        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_pk,   1, pqc_remote_pk);
-        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_sk,   1, pqc_local_sk);
+        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_pk,   1, pqc_remote_pk_seed);
+        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_sk,   1, pqc_local_sk_seed);
 
-        if (trf_pqc_setup_session(pqc_seed, 32, pqc_remote_pk, 32, 
-                                  pqc_local_sk, 32, &session) == TRF_PQC_OK) {
+        // STEP: Generate VALID keys on HEAP (Avoid stack alignment issues)
+        uint8_t *remote_kem_pub = NULL, *remote_kem_priv = NULL;
+        uint8_t *local_dsa_pub = NULL, *local_dsa_priv = NULL;
+        int rkp_sz, rks_sz, ldp_sz, lds_sz;
+
+        if (posix_memalign((void**)&remote_kem_pub, 64, 2048) != 0 ||
+            posix_memalign((void**)&remote_kem_priv, 64, 4096) != 0 ||
+            posix_memalign((void**)&local_dsa_pub, 64, 8192) != 0 ||
+            posix_memalign((void**)&local_dsa_priv, 64, 8192) != 0) {
+            fprintf(stderr, "[PQC-FATAL] Memory allocation failed for PQC keys.\n");
+            goto pqc_cleanup;
+        }
+
+        if (trf_kem_generate_keys(remote_kem_pub, &rkp_sz, remote_kem_priv, &rks_sz) != TRF_PQC_OK ||
+            trf_dsa_generate_keys(local_dsa_pub, &ldp_sz, local_dsa_priv, &lds_sz) != TRF_PQC_OK) {
+            fprintf(stderr, "[PQC-FATAL] Initial key generation failed.\n");
+            goto pqc_cleanup;
+        }
+
+        if (trf_pqc_setup_session(local_dsa_priv, lds_sz, local_dsa_pub, ldp_sz,
+                                  remote_kem_pub, rkp_sz, &session) == TRF_PQC_OK) {
             
-            // Handshake SUCCESS: Injected quantum-safe session keys
+            // Handshake SUCCESS
             memcpy(ctx->keys[KEY_SLOT_CURRENT], session.tx_key, 32);
             memcpy(ctx->keys[KEY_SLOT_PREV], session.rx_key, 32); 
             memcpy(ctx->master_key, session.tx_key, 32);
             
-            fprintf(stderr, "[PQC-HANDSHAKE] Handshake completed successfully.\n");
-            fprintf(stderr, "[PQC-HANDSHAKE] Mode: MLKEM-L5 + MLDSA-L5 + HKDF-SHA512 + AES-GCM-256\n");
-            fprintf(stderr, "[PQC-HANDSHAKE] Status: SECURE / QUANTUM-RESISTANT\n");
+            fprintf(stderr, "[PQC-HANDSHAKE] Handshake completed successfully on heap.\n");
         } else {
-            fprintf(stderr, "[PQC-FATAL] Handshake failed. Dropping to fallback or denial of service.\n");
-            return -1; 
+            fprintf(stderr, "[PQC-FATAL] Handshake failed even on heap.\n");
+            // Flow continues to cleanup
         }
+
+    pqc_cleanup:
+        if (remote_kem_pub) free(remote_kem_pub);
+        if (remote_kem_priv) free(remote_kem_priv);
+        if (local_dsa_pub) free(local_dsa_pub);
+        if (local_dsa_priv) free(local_dsa_priv);
+        
+        if (!ctx->initialized || ctx->keys[KEY_SLOT_CURRENT][0] == 0) return -1;
+
     } else {
         // LEGACY OPENSSL PATH
         memcpy(ctx->master_key, master_key, key_size);

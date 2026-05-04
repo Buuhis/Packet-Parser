@@ -282,6 +282,8 @@ int trf_kem_generate_keys(byte* pub_key_out, int* pub_sz, byte* priv_key_out, in
     *pub_sz = scrypt_MlKemPublicKeySize(key_obj);
     *priv_sz = scrypt_MlKemPrivateKeySize(key_obj);
 
+    printf("[DEBUG-KEM] Generated Keys: Pub=%d, Priv=%d\n", *pub_sz, *priv_sz);
+
     scrypt_MlKemExportPublicKey(key_obj, pub_key_out, *pub_sz);
     scrypt_MlKemExportPrivateKey(key_obj, priv_key_out, *priv_sz);
 
@@ -462,7 +464,7 @@ int trf_pqc_setup_session(const byte* local_priv_dsa, int local_priv_dsa_sz,
     // 1. ML-KEM: Encapsulate to get shared secret and capsule
     ret = trf_kem_encapsulate(remote_pub_kem, remote_pub_kem_sz, capsule, &capsule_sz, shared_secret);
     if (ret != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-KEM] Encapsulation failed: %s\n", scrypt_ErrorString(ret));
+        fprintf(stderr, "[PQC-KEM] Encapsulation failed. Check public key (Size: %d)\n", remote_pub_kem_sz);
         return TRF_PQC_ERR_CRYPTO;
     }
 
