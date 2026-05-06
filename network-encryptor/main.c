@@ -24,6 +24,7 @@ struct runtime_state {
     struct forwarder fwd;
     struct app_config cfg_slots[2];
     int active_slot;
+    int config_id;
 };
 
 static void usage(const char *prog) {
@@ -46,7 +47,7 @@ static int libbpf_print_silent(enum libbpf_print_level level,
 
 static void *forwarder_thread_main(void *arg) {
     struct runtime_state *rt = (struct runtime_state *)arg;
-    if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot]) != 0) {
+    if (forwarder_init(&rt->fwd, &rt->cfg_slots[rt->active_slot], rt->config_id) != 0) {
         fprintf(stderr, "[FATAL] forwarder_init failed for merged active configs\n");
         rt->running = 0;
         return NULL;
@@ -58,9 +59,10 @@ static void *forwarder_thread_main(void *arg) {
     return NULL;
 }
 
-static int runtime_start(struct runtime_state *rt, const struct app_config *cfg) {
+static int runtime_start(struct runtime_state *rt, const struct app_config *cfg, int config_id) {
     rt->active_slot = 0;
     rt->cfg_slots[rt->active_slot] = *cfg;
+    rt->config_id = config_id;
     rt->running = 0;
     if (pthread_create(&rt->thread, NULL, forwarder_thread_main, rt) != 0) {
         fprintf(stderr, "[FATAL] failed to create forwarder thread\n");
@@ -242,7 +244,7 @@ int main(int argc, char **argv) {
             if (build_merged_config(&merged_cfg, active_ids, active_id_count, db_pass) == 0) {
                 main_diag_log_loaded_config(&merged_cfg, id);
                 if (!rt.has_thread) {
-                    if (runtime_start(&rt, &merged_cfg) != 0) {
+                    if (runtime_start(&rt, &merged_cfg, id) != 0) {
                         fprintf(stderr, "[FATAL] failed to start merged runtime\n");
                     } else {
                         fprintf(stderr, "[OK] Applied merged runtime with %d active config(s)\n", active_id_count);

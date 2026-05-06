@@ -120,13 +120,22 @@ int crypto_l4_extract_policy_id_ipv4(uint8_t *pkt,
                 return 0;
             }
         }
-        return -1;
     }
 
     if (ip_proto == 17) {
         int tunnel_off = transport_off + 8;
         if (tunnel_off >= (int)pkt_len)
             return -1;
+        
+        // DEBUG: Print some bytes around where we expect the magic
+        printf("[DEBUG-DISPATCH] WAN UDP packet received. pkt_len=%u, tunnel_off=%d\n", pkt_len, tunnel_off);
+        printf("[DEBUG-DISPATCH] Bytes at tunnel_off+ns+1: [4]:0x%02X, [8]:0x%02X, [12]:0x%02X, [16]:0x%02X (Expected: 0x%02X)\n",
+               (tunnel_off+5 < (int)pkt_len) ? pkt[tunnel_off+5] : 0,
+               (tunnel_off+9 < (int)pkt_len) ? pkt[tunnel_off+9] : 0,
+               (tunnel_off+13 < (int)pkt_len) ? pkt[tunnel_off+13] : 0,
+               (tunnel_off+17 < (int)pkt_len) ? pkt[tunnel_off+17] : 0,
+               L4_TUNNEL_MAGIC);
+
         for (int i = 0; i < 4; i++) {
             int ns = candidates[i];
             if (tunnel_off + ns + 1 >= (int)pkt_len)
@@ -228,10 +237,15 @@ int crypto_decrypt_packet_auto_by_action(
         int nonce_size = 0;
         if (crypto_l4_extract_policy_id_ipv4(pkt, *pkt_len, &policy_id, &nonce_size) != 0)
             return 0;
+
         int pi = lookup_policy_index(dctx,
                                      dctx->policies, dctx->policy_count,
                                      dctx->policy_index_by_action_id,
                                      POLICY_ACTION_ENCRYPT_L4, policy_id);
+        
+        // DEBUG LOG:
+        printf("[DEBUG-DISPATCH] Extracted PolicyID=%u, lookup_index=%d\n", policy_id, pi);
+
         if (pi >= 0 && dctx->per_policy_ready && dctx->per_policy_ready[pi]) {
             const struct crypto_policy *cp = &dctx->policies[pi];
             if (cp->nonce_size > 0 && cp->nonce_size == nonce_size) {

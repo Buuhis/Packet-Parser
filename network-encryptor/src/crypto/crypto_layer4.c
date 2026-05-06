@@ -42,8 +42,12 @@ static void l4_write_tunnel_header_frag(uint8_t *buf, const uint8_t *nonce,
 }
 
 static int l4_is_tunnel_header(const uint8_t *buf, int nonce_size) {
-    if (buf[nonce_size + 1] != L4_TUNNEL_MAGIC) return 0;
-    if ((buf[0] & 0x80) != 0) return 0;
+    // Check for Magic Byte at the correct offset (Nonce + PolicyID slot)
+    if (buf[nonce_size + 1] != L4_TUNNEL_MAGIC && buf[nonce_size + 1] != L4_FRAG_MAGIC) 
+        return 0;
+    
+    // We removed the (buf[0] & 0x80) check because PQC nonces are random 
+    // and can safely start with a 1 bit.
     return 1;
 }
 
@@ -163,17 +167,30 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
             return -1;
         
-        enc_len = (size_t)new_len;
+        // DEBUG DUMP AAD/NONCE/KEY
+        printf("[DEBUG-ENC] AAD: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
+        printf("[DEBUG-ENC] Nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                pqc_nonce[0], pqc_nonce[1], pqc_nonce[2], pqc_nonce[3], pqc_nonce[4], pqc_nonce[5],
+                pqc_nonce[6], pqc_nonce[7], pqc_nonce[8], pqc_nonce[9], pqc_nonce[10], pqc_nonce[11]);
+        printf("[DEBUG-ENC] Key(first 4): %02X%02X%02X%02X\n",
+                key[0], key[1], key[2], key[3]);
+        
+        int tunnel_hdr_size_local = packet_crypto_get_nonce_size() + 2;
+        memmove(packet + enc_off + tunnel_hdr_size_local, packet + enc_off, new_len);
         l4_write_tunnel_header(packet + enc_off, pqc_nonce, 12); 
+
+        // DEBUG LOG:
+        printf("[DEBUG-ENC] PQC-GCM Encrypted: enc_off=%d, hdr_size=%d, payload_new_len=%d, magic_at_%d=0x%02X\n", 
+                enc_off, tunnel_hdr_size_local, new_len, enc_off + 13, packet[enc_off + 13]);
+        
+        enc_len = (size_t)new_len;
     } else {
         uint8_t iv[AES128_IV_SIZE];
         crypto_nonce_to_iv(nonce, nonce_size, iv);
         if (crypto_aes_ctr_with_key(key, iv, packet + enc_off, (int)enc_len) != 0)
             return -1;
         memmove(packet + enc_off + tunnel_hdr_size, packet + enc_off, enc_len);
-    }
-
-    if (mode != CRYPTO_MODE_PQC_GCM) {
         l4_write_tunnel_header(packet + enc_off, nonce, nonce_size);
     }
 
@@ -234,6 +251,13 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         return (int)pkt_len;
 
     int tunnel_off = transport_off + transport_hdr_size;
+    
+    // DEBUG LOG:
+    if (pkt_len > (size_t)(tunnel_off + 13)) {
+        printf("[DEBUG-DEC] Checking Tunnel: tunnel_off=%d, magic_at_%d=0x%02X, expected=0x%02X\n",
+                tunnel_off, tunnel_off + nonce_size + 1, packet[tunnel_off + nonce_size + 1], L4_TUNNEL_MAGIC);
+    }
+
     if (pkt_len < (size_t)(tunnel_off + tunnel_hdr_size) ||
         !l4_is_tunnel_header(packet + tunnel_off, nonce_size))
         return (int)pkt_len;
@@ -285,8 +309,21 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
             memcpy(aad, packet + l3_off + 12, 8);      // Src/Dst IP
             memcpy(aad + 8, packet + transport_off, 4); // Src/Dst Port
 
-            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            // DEBUG DUMP AAD/NONCE/KEY
+            printf("[DEBUG-DEC] AAD: %02X%02X%02X%02X %02X%02X%02X%02X %02X%02X%02X%02X\n",
+                    aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
+            printf("[DEBUG-DEC] Nonce: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    nonce[0], nonce[1], nonce[2], nonce[3], nonce[4], nonce[5],
+                    nonce[6], nonce[7], nonce[8], nonce[9], nonce[10], nonce[11]);
+            printf("[DEBUG-DEC] Key(first 4): %02X%02X%02X%02X (Slot: %d)\n",
+                    key[0], key[1], key[2], key[3], k);
+
+            int res = trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len);
+            if (res != TRF_PQC_OK) {
+                printf("[DEBUG-DEC] PQC Decrypt FAILED: code=%d, enc_len=%zu\n", res, enc_len);
                 continue;
+            }
+            printf("[DEBUG-DEC] PQC Decrypt SUCCESS: orig_len=%d\n", orig_len);
             enc_len = (size_t)orig_len; 
         } else {
             uint8_t iv[AES128_IV_SIZE];

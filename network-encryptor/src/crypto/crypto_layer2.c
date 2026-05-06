@@ -2,6 +2,7 @@
 #include "../../inc/config.h"
 #include <string.h>
 #include <stdio.h>
+#include "../../sig_encrypt/inc/traffic_crypto.h"
 
 #define MIN_ETH_PKT  (ETH_HEADER_SIZE + 8)
 
@@ -79,6 +80,27 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(packet + l2_enc_start + payload_len, tag, AES128_GCM_TAG_SIZE);
         return (int)(pkt_len + l2_hdr_extra + AES128_GCM_TAG_SIZE);
     }
+    else if (packet_crypto_get_mode() == CRYPTO_MODE_PQC_GCM) {
+        uint8_t pqc_nonce[12];
+        trf_pqc_generate_nonce(pqc_nonce);
+
+        uint8_t aad[12] __attribute__((aligned(64)));
+        memcpy(aad, packet, 12);     // Src/Dst MAC
+
+        int new_len = 0;
+        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
+            return -1;
+        
+        // Write tunnel header (Nonce + PolicyID + Magic)
+        // For L2, we use a slightly different magic or reuse L4_TUNNEL_MAGIC 
+        // to stay compatible with the dispatch logic.
+        uint8_t *tun_hdr = packet + ETH_HEADER_SIZE;
+        memcpy(tun_hdr, pqc_nonce, 12);
+        tun_hdr[12] = packet_crypto_get_policy_id();
+        tun_hdr[13] = 0xA5; // L4_TUNNEL_MAGIC
+
+        return (int)(ETH_HEADER_SIZE + nonce_size + 2 + new_len);
+    }
     else {
         uint8_t iv[AES128_IV_SIZE];
         crypto_nonce_to_iv(nonce, nonce_size, iv);
@@ -127,6 +149,16 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
     if (likely(is_gcm)) {
         if (likely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) == 0)) {
+            goto decrypt_success;
+        }
+    }
+    else if (packet_crypto_get_mode() == CRYPTO_MODE_PQC_GCM) {
+        uint8_t aad[12] __attribute__((aligned(64)));
+        memcpy(aad, packet, 12); // MACs
+        
+        int orig_len = 0;
+        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
+            enc_len = (size_t)orig_len;
             goto decrypt_success;
         }
     }

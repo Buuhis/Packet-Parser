@@ -468,7 +468,15 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
     }
 
 
-    uint8_t policy_id = pkt[13];
+    uint8_t policy_id = 0;
+    int nonce_size = packet_crypto_get_nonce_size();
+    
+    // For Fake EtherType L2 packets, the structure is [14 bytes Eth][Nonce][PolicyID][Magic]
+    // So PolicyID is at offset 14 + nonce_size
+    if (14 + nonce_size < (int)*pkt_len) {
+        policy_id = pkt[14 + nonce_size];
+    }
+
     int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
     if (pi >= 0 && pi < fwd->cfg->policy_count && g_policy_crypto_ctx_ready[pi]) {
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
@@ -1451,9 +1459,27 @@ release_local:
     return NULL;
 }
 
-int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
+#include "../../sig_encrypt/inc/pqc_handshake.h"
+
+int forwarder_init(struct forwarder *fwd, const struct app_config *cfg, int config_id) {
+    if (!fwd || !cfg)
+        return -1;
+
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
+
+    // ----- PQC HANDSHAKE START -----
+    if (cfg->crypto_mode == CRYPTO_MODE_PQC_GCM && cfg->wan_count > 0) {
+        bool is_initiator = (config_id == 30);
+        char peer_ip_str[64];
+        struct in_addr addr;
+        addr.s_addr = cfg->wans[0].dst_ip;
+        inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
+
+        printf("[PQC-HS] Starting Handshake for config_id=%d, Peer: %s, Initiator: %s\n",
+               config_id, peer_ip_str, is_initiator ? "YES" : "NO");
+        sig_pqc_handshake_start(is_initiator, peer_ip_str);
+    }
     g_cfg_ptr = cfg;
     interface_reset_redirect_maps();
 
@@ -1614,7 +1640,7 @@ err_locals:
     return -1;
 }
 
-int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
+int forwarder_reload_config(struct forwarder *fwd, const struct app_config *cfg) {
     if (!fwd || !cfg || !fwd->cfg)
         return -1;
     if (!same_topology(fwd->cfg, cfg)) {

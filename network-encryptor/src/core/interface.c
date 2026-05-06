@@ -199,8 +199,13 @@ int interface_init_local(struct xsk_interface *iface,
 
     interface_xdp_try_detach(iface->ifindex, iface->ifname);
 
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        fprintf(stderr, "[DEBUG-XDP] Current Working Directory: %s\n", cwd);
+    }
+
     if (access(bpf_file, F_OK) != 0) {
-        fprintf(stderr, "XDP object not found: %s\n", bpf_file);
+        fprintf(stderr, "XDP object not found: %s (Error: %s)\n", bpf_file, strerror(errno));
         return -1;
     }
 
@@ -452,8 +457,13 @@ int interface_init_wan_rx(struct xsk_interface *iface,
 
     interface_xdp_try_detach(iface->ifindex, iface->ifname);
 
+    char cwd[1024];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        fprintf(stderr, "[DEBUG-XDP] Current Working Directory: %s\n", cwd);
+    }
+
     if (access(bpf_file, F_OK) != 0) {
-        fprintf(stderr, "WAN XDP object not found: %s\n", bpf_file);
+        fprintf(stderr, "WAN XDP object not found: %s (Error: %s)\n", bpf_file, strerror(errno));
         return -1;
     }
 

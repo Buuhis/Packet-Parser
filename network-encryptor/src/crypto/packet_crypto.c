@@ -135,6 +135,44 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
     memcpy(out_key, hmac_out, key_size);
 }
 
+// Function to update keys if handshake is ready
+static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
+    if (g_crypto_mode == CRYPTO_MODE_PQC_GCM && sig_pqc_is_key_ready()) {
+        uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
+        if (sig_pqc_get_traffic_key(new_key) == 0) {
+            // Check if it's already updated (avoid redundant memcpy/logs)
+            if (memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) != 0) {
+                memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
+                memcpy(ctx->keys[KEY_SLOT_PREV],    new_key, PQC_TRAFFIC_KEY_SZ);
+                memcpy(ctx->keys[KEY_SLOT_NEXT],    new_key, PQC_TRAFFIC_KEY_SZ);
+                printf("[PQC-DATA] Traffic key updated from Handshake!\n");
+            }
+        }
+    }
+}
+
+int packet_encrypt(struct packet_crypto_ctx *ctx,
+                   uint8_t *packet,
+                   size_t pkt_len) {
+    check_and_update_pqc_key(ctx);
+    if (g_encrypt_layer == 2)
+        return crypto_layer2_encrypt(ctx, packet, pkt_len);
+    if (g_encrypt_layer == 3)
+        return crypto_layer3_encrypt(ctx, packet, pkt_len);
+    return crypto_layer4_encrypt(ctx, packet, pkt_len);
+}
+
+int packet_decrypt(struct packet_crypto_ctx *ctx,
+                   uint8_t *packet,
+                   size_t pkt_len) {
+    check_and_update_pqc_key(ctx);
+    if (g_encrypt_layer == 2)
+        return crypto_layer2_decrypt(ctx, packet, pkt_len);
+    if (g_encrypt_layer == 3)
+        return crypto_layer3_decrypt(ctx, packet, pkt_len);
+    return crypto_layer4_decrypt(ctx, packet, pkt_len);
+}
+
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
     (void)ctx;
 }
@@ -152,69 +190,15 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
     memset(ctx, 0, sizeof(*ctx));
     ctx->initialized = true;
 
-    // ----- PQC FULL STACK INTEGRATION (ML-KEM + ML-DSA + HKDF) -----
+    // ----- PQC HANDSHAKE INTEGRATION -----
     if (g_crypto_mode == CRYPTO_MODE_PQC_GCM) {
-        
         if (trf_pqc_init_global() != TRF_PQC_OK) return -1;
 
-        trf_pqc_session session;
-        memset(&session, 0, sizeof(session));
-
-        /** 
-         * [AUTOMATION]
-         * We use the DB master_key as a "Root of Trust" (Seed) to simulate 
-         * Identity Keys (DSA) and Public Keys (KEM) for both sites.
-         * In a real deployment, these would be separate stored keys.
-         */
-        // Derive seeds (32 bytes each)
-        uint8_t pqc_seed[32], pqc_remote_pk_seed[32], pqc_local_sk_seed[32];
-        uint8_t label_seed = 0xA1, label_pk = 0xA2, label_sk = 0xA3;
+        // Note: Handshake will be started here or in forwarder.c
+        // Since we don't have peer_ip here easily, we rely on the 
+        // forwarder calling the start function.
         
-        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_seed, 1, pqc_seed);
-        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_pk,   1, pqc_remote_pk_seed);
-        trf_calculate_hmac(DIGEST_TYPE_SHA256, master_key, 32, &label_sk,   1, pqc_local_sk_seed);
-
-        // STEP: Generate VALID keys on HEAP (Avoid stack alignment issues)
-        uint8_t *remote_kem_pub = NULL, *remote_kem_priv = NULL;
-        uint8_t *local_dsa_pub = NULL, *local_dsa_priv = NULL;
-        int rkp_sz, rks_sz, ldp_sz, lds_sz;
-
-        if (posix_memalign((void**)&remote_kem_pub, 64, 2048) != 0 ||
-            posix_memalign((void**)&remote_kem_priv, 64, 4096) != 0 ||
-            posix_memalign((void**)&local_dsa_pub, 64, 8192) != 0 ||
-            posix_memalign((void**)&local_dsa_priv, 64, 8192) != 0) {
-            fprintf(stderr, "[PQC-FATAL] Memory allocation failed for PQC keys.\n");
-            goto pqc_cleanup;
-        }
-
-        if (trf_kem_generate_keys(remote_kem_pub, &rkp_sz, remote_kem_priv, &rks_sz) != TRF_PQC_OK ||
-            trf_dsa_generate_keys(local_dsa_pub, &ldp_sz, local_dsa_priv, &lds_sz) != TRF_PQC_OK) {
-            fprintf(stderr, "[PQC-FATAL] Initial key generation failed.\n");
-            goto pqc_cleanup;
-        }
-
-        if (trf_pqc_setup_session(local_dsa_priv, lds_sz, local_dsa_pub, ldp_sz,
-                                  remote_kem_pub, rkp_sz, &session) == TRF_PQC_OK) {
-            
-            // Handshake SUCCESS
-            memcpy(ctx->keys[KEY_SLOT_CURRENT], session.tx_key, 32);
-            memcpy(ctx->keys[KEY_SLOT_PREV], session.rx_key, 32); 
-            memcpy(ctx->master_key, session.tx_key, 32);
-            
-            fprintf(stderr, "[PQC-HANDSHAKE] Handshake completed successfully on heap.\n");
-        } else {
-            fprintf(stderr, "[PQC-FATAL] Handshake failed even on heap.\n");
-            // Flow continues to cleanup
-        }
-
-    pqc_cleanup:
-        if (remote_kem_pub) free(remote_kem_pub);
-        if (remote_kem_priv) free(remote_kem_priv);
-        if (local_dsa_pub) free(local_dsa_pub);
-        if (local_dsa_priv) free(local_dsa_priv);
-        
-        if (!ctx->initialized || ctx->keys[KEY_SLOT_CURRENT][0] == 0) return -1;
-
+        fprintf(stderr, "[PQC-INIT] Waiting for Handshake to provide keys...\n");
     } else {
         // LEGACY OPENSSL PATH
         memcpy(ctx->master_key, master_key, key_size);
