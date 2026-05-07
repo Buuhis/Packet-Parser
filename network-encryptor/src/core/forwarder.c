@@ -1,4 +1,5 @@
 #include "../../inc/forwarder.h"
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 #include "../../inc/packet_crypto.h"
 #include "../../inc/flow_table.h"
 #include "../../inc/config.h"
@@ -1459,25 +1460,40 @@ release_local:
     return NULL;
 }
 
-#include "../../sig_encrypt/inc/pqc_handshake.h"
-
-int forwarder_init(struct forwarder *fwd, const struct app_config *cfg, int config_id) {
+int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     if (!fwd || !cfg)
         return -1;
 
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
 
-    // ----- PQC HANDSHAKE START -----
+    // ----- PQC HANDSHAKE START (Automatic Role Selection) -----
     if (cfg->crypto_mode == CRYPTO_MODE_PQC_GCM && cfg->wan_count > 0) {
-        bool is_initiator = (config_id == 30);
-        char peer_ip_str[64];
+        char my_ip_str[64] = {0};
+        char peer_ip_str[64] = {0};
         struct in_addr addr;
+
+        // Get Peer IP
         addr.s_addr = cfg->wans[0].dst_ip;
         inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
 
-        printf("[PQC-HS] Starting Handshake for config_id=%d, Peer: %s, Initiator: %s\n",
-               config_id, peer_ip_str, is_initiator ? "YES" : "NO");
+        // Try to get Local IP, if not available, use a default or comparison logic
+        bool is_initiator = false;
+        if (cfg->local_count > 0 && cfg->locals[0].ip != 0) {
+            addr.s_addr = cfg->locals[0].ip;
+            inet_ntop(AF_INET, &addr, my_ip_str, sizeof(my_ip_str));
+            // Rule: The one with the lexicographically smaller IP starts
+            is_initiator = (strcmp(my_ip_str, peer_ip_str) < 0);
+        } else {
+            // Fallback: If no local IP, we can't easily decide. 
+            // Let's use a simple heuristic or just default to false for one side.
+            // But wait, if both are 0, we have a problem.
+            // Let's assume the user has at least one IP configured.
+            is_initiator = true; // Default to true if local unknown
+        }
+
+        printf("[PQC-HS] Role Selection: MyIP=%s, PeerIP=%s, Initiator: %s\n",
+               my_ip_str[0] ? my_ip_str : "unknown", peer_ip_str, is_initiator ? "YES" : "NO");
         sig_pqc_handshake_start(is_initiator, peer_ip_str);
     }
     g_cfg_ptr = cfg;
@@ -1640,7 +1656,7 @@ err_locals:
     return -1;
 }
 
-int forwarder_reload_config(struct forwarder *fwd, const struct app_config *cfg) {
+int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
     if (!fwd || !cfg || !fwd->cfg)
         return -1;
     if (!same_topology(fwd->cfg, cfg)) {

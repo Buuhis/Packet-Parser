@@ -4,6 +4,7 @@
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 #include <string.h>
 #include <stdio.h>
 #include <openssl/evp.h>
@@ -151,30 +152,42 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
     }
 }
 
-int packet_encrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len) {
-    check_and_update_pqc_key(ctx);
-    if (g_encrypt_layer == 2)
-        return crypto_layer2_encrypt(ctx, packet, pkt_len);
-    if (g_encrypt_layer == 3)
-        return crypto_layer3_encrypt(ctx, packet, pkt_len);
-    return crypto_layer4_encrypt(ctx, packet, pkt_len);
-}
+// int packet_encrypt(struct packet_crypto_ctx *ctx,
+//                    uint8_t *packet,
+//                    size_t pkt_len) {
+//     packet_crypto_update_keys(ctx);
 
-int packet_decrypt(struct packet_crypto_ctx *ctx,
-                   uint8_t *packet,
-                   size_t pkt_len) {
-    check_and_update_pqc_key(ctx);
-    if (g_encrypt_layer == 2)
-        return crypto_layer2_decrypt(ctx, packet, pkt_len);
-    if (g_encrypt_layer == 3)
-        return crypto_layer3_decrypt(ctx, packet, pkt_len);
-    return crypto_layer4_decrypt(ctx, packet, pkt_len);
-}
+//     switch (g_encrypt_layer) {
+//     case 2:
+//         return crypto_layer2_encrypt(ctx, packet, pkt_len);
+//     case 3:
+//         return crypto_layer3_encrypt(ctx, packet, pkt_len);
+//     case 4:
+//         return crypto_layer4_encrypt(ctx, packet, pkt_len);
+//     default:
+//         return -1;
+//     }
+// }
+
+// int packet_decrypt(struct packet_crypto_ctx *ctx,
+//                    uint8_t *packet,
+//                    size_t pkt_len) {
+//     packet_crypto_update_keys(ctx);
+
+//     switch (g_encrypt_layer) {
+//     case 2:
+//         return crypto_layer2_decrypt(ctx, packet, pkt_len);
+//     case 3:
+//         return crypto_layer3_decrypt(ctx, packet, pkt_len);
+//     case 4:
+//         return crypto_layer4_decrypt(ctx, packet, pkt_len);
+//     default:
+//         return -1;
+//     }
+// }
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
-    (void)ctx;
+    check_and_update_pqc_key(ctx);
 }
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
@@ -192,13 +205,12 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
 
     // ----- PQC HANDSHAKE INTEGRATION -----
     if (g_crypto_mode == CRYPTO_MODE_PQC_GCM) {
-        if (trf_pqc_init_global() != TRF_PQC_OK) return -1;
-
-        // Note: Handshake will be started here or in forwarder.c
-        // Since we don't have peer_ip here easily, we rely on the 
-        // forwarder calling the start function.
-        
-        fprintf(stderr, "[PQC-INIT] Waiting for Handshake to provide keys...\n");
+        static bool pqc_init_done = false;
+        if (!pqc_init_done) {
+            if (trf_pqc_init_global() != TRF_PQC_OK) return -1;
+            fprintf(stderr, "[PQC-INIT] Waiting for Handshake to provide keys...\n");
+            pqc_init_done = true;
+        }
     } else {
         // LEGACY OPENSSL PATH
         memcpy(ctx->master_key, master_key, key_size);

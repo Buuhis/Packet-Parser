@@ -1,5 +1,5 @@
 #include "../inc/traffic_crypto.h"
-#include "crypt.h"
+#include "../inc/scrypt.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>

@@ -27,8 +27,8 @@ struct forwarder {
     uint64_t dropped_local_tx_fail_by_queue[FORWARDER_MAX_LOCAL_QUEUES];
 };
 
-int forwarder_init(struct forwarder *fwd, const struct app_config *cfg, int config_id);
-int forwarder_reload_config(struct forwarder *fwd, const struct app_config *cfg);
+int forwarder_init(struct forwarder *fwd, struct app_config *cfg);
+int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg);
 void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
 void forwarder_stop(void);

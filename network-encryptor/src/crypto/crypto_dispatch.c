@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <unistd.h>
+#include <stdio.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
 

@@ -6,6 +6,7 @@
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <stdio.h>
 
 #define L4_TUNNEL_MAGIC    0xA5
 #define L4_FRAG_MAGIC      (L4_TUNNEL_MAGIC | FRAG_FLAG_BIT)
