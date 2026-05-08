@@ -14,6 +14,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -379,10 +380,49 @@ static int encrypt_packet_with_ctx(struct packet_crypto_ctx *ctx,
                                      void *pkt_data, uint32_t *pkt_len) {
     if (!crypto_enabled || !ctx) return 0;
     int new_len = packet_encrypt(ctx, (uint8_t *)pkt_data, *pkt_len);
-    if (new_len < 0)
-        return -1;
-    *pkt_len = (uint32_t)new_len;
-    return 0;
+    if (new_len > 0) {
+        *pkt_len = (uint32_t)new_len;
+        
+        // --- PCAP CAPTURE LOGIC ---
+        static int pcap_count = 0;
+        static FILE *pcap_file = NULL;
+        if (pcap_count < 50) {
+            if (!pcap_file) {
+                pcap_file = fopen("encrypted_traffic.pcap", "wb");
+                if (pcap_file) {
+                    uint32_t magic = 0xa1b2c3d4;
+                    uint16_t major = 2, minor = 4;
+                    uint32_t tz = 0, sig = 0, snap = 65535, net = 1; // Ethernet
+                    fwrite(&magic, 4, 1, pcap_file);
+                    fwrite(&major, 2, 1, pcap_file); fwrite(&minor, 2, 1, pcap_file);
+                    fwrite(&tz, 4, 1, pcap_file); fwrite(&sig, 4, 1, pcap_file);
+                    fwrite(&snap, 4, 1, pcap_file); fwrite(&net, 4, 1, pcap_file);
+                }
+            }
+            if (pcap_file) {
+                struct timeval tv; gettimeofday(&tv, NULL);
+                uint32_t sec = tv.tv_sec, usec = tv.tv_usec, caplen = *pkt_len, origlen = *pkt_len;
+                fwrite(&sec, 4, 1, pcap_file); fwrite(&usec, 4, 1, pcap_file);
+                fwrite(&caplen, 4, 1, pcap_file); fwrite(&origlen, 4, 1, pcap_file);
+                fwrite(pkt_data, 1, *pkt_len, pcap_file);
+                pcap_count++;
+                if (pcap_count == 50) {
+                    fclose(pcap_file);
+                    pcap_file = NULL;
+                    printf("[PQC-DIAG] Captured 50 encrypted packets to encrypted_traffic.pcap\n");
+                }
+            }
+        }
+        // --- END PCAP ---
+
+        static uint32_t enc_count = 0;
+        if (++enc_count % 1000 == 0) {
+            printf("[PQC-DIAG] Successfully ENCRYPTED 1000 packets (Total: %u)\n", enc_count);
+            fflush(stdout);
+        }
+        return 0; // Trả về 0 để báo thành công
+    }
+    return -1; // Trả về -1 nếu mã hóa lỗi
 }
 
 static struct arp_cache g_arp[MAX_INTERFACES];
@@ -483,9 +523,16 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         const struct crypto_policy *cp = &fwd->cfg->policies[pi];
         apply_crypto_params_from_policy(cp);
         int new_len = packet_decrypt(&g_policy_crypto_ctx[pi], pkt, *pkt_len);
-        if (new_len < 0)
-            return -1;
-        *pkt_len = (uint32_t)new_len;
+        if (new_len > 0) {
+            *pkt_len = new_len;
+            
+            static uint32_t dec_count = 0;
+            if (++dec_count % 1000 == 0) {
+                printf("[PQC-DIAG] Successfully DECRYPTED 1000 packets (Total: %u)\n", dec_count);
+                fflush(stdout);
+            }
+            return 0;
+        }
         return 0;
     }
 

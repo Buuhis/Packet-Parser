@@ -60,7 +60,8 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     uint32_t counter = packet_crypto_next_counter();
     uint8_t nonce[16];
     int nonce_len;
-    const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
+    const int mode = packet_crypto_get_mode();
+    const int is_gcm = (mode == CRYPTO_MODE_GCM || mode == CRYPTO_MODE_PQC_GCM);
 
     crypto_generate_nonce(counter, proto_flag, nonce, &nonce_len);
 
@@ -132,7 +133,8 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
     (void)policy_id;
     const int is_ipv4 = (proto_flag == PROTO_FLAG_IPV4);
-    const int is_gcm = (packet_crypto_get_mode() == CRYPTO_MODE_GCM);
+    const int mode = packet_crypto_get_mode();
+    const int is_gcm = (mode == CRYPTO_MODE_GCM || mode == CRYPTO_MODE_PQC_GCM);
 
     const int nonce_len = is_gcm ? nonce_size : AES128_IV_SIZE;
 
@@ -147,12 +149,12 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     uint8_t *work_ptr = packet + l2_enc_start;
 
-    if (likely(is_gcm)) {
+    if (mode == CRYPTO_MODE_GCM) {
         if (likely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) == 0)) {
             goto decrypt_success;
         }
     }
-    else if (packet_crypto_get_mode() == CRYPTO_MODE_PQC_GCM) {
+    else if (mode == CRYPTO_MODE_PQC_GCM) {
         uint8_t aad[12] __attribute__((aligned(64)));
         memcpy(aad, packet, 12); // MACs
         
