@@ -492,13 +492,16 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         return -1;
 
 
-    uint16_t pkt_etype = ((uint16_t)pkt[12] << 8) | pkt[13];
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
     uint16_t fake_ipv6 = packet_crypto_get_fake_ethertype_ipv6();
+    uint16_t current_etype = (uint16_t)((pkt[12] << 8) | pkt[13]);
 
-    if (pkt_etype != fake_ipv4 && pkt_etype != fake_ipv6) {
+    if (current_etype != fake_ipv4 && current_etype != fake_ipv6) {
         return 0;
     }
+
+    printf("[PQC-DEC-DIAG] MATCHED Fake EtherType: 0x%04x\n", current_etype);
+    fflush(stdout);
 
     if (fwd->cfg->policy_count <= 0) {
         apply_default_crypto_params(fwd);

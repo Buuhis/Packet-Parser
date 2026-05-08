@@ -104,8 +104,8 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
         static uint32_t enc_count = 0;
         if (++enc_count % 1000 == 0) {
-            printf("[PQC-ENC-DIAG] Encrypted 1000 packets. Orig EtherType: 0x%04x, Fake: 0x%04x\n", 
-                   ether_type, fake_etype);
+            printf("[PQC-ENC-DIAG] Encrypted L2 pkt: fake_etype=0x%04x, final_len=%d\n", 
+                   fake_etype, (int)(ETH_HEADER_SIZE + nonce_size + 2 + new_len));
             fflush(stdout);
         }
 
