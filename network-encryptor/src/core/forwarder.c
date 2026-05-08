@@ -492,11 +492,11 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         return -1;
 
 
-    uint8_t pkt_marker = pkt[12];
+    uint16_t pkt_etype = ((uint16_t)pkt[12] << 8) | pkt[13];
     uint16_t fake_ipv4 = packet_crypto_get_fake_ethertype_ipv4();
     uint16_t fake_ipv6 = packet_crypto_get_fake_ethertype_ipv6();
-    if (!((fake_ipv4 && pkt_marker == (uint8_t)(fake_ipv4 >> 8)) ||
-          (fake_ipv6 && pkt_marker == (uint8_t)(fake_ipv6 >> 8)))) {
+
+    if (pkt_etype != fake_ipv4 && pkt_etype != fake_ipv6) {
         return 0;
     }
 
@@ -510,12 +510,22 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
 
 
     uint8_t policy_id = 0;
+    uint8_t magic = 0;
     int nonce_size = packet_crypto_get_nonce_size();
     
-    // For Fake EtherType L2 packets, the structure is [14 bytes Eth][Nonce][PolicyID][Magic]
-    // So PolicyID is at offset 14 + nonce_size
-    if (14 + nonce_size < (int)*pkt_len) {
+    if (14 + nonce_size + 1 < (int)*pkt_len) {
         policy_id = pkt[14 + nonce_size];
+        magic     = pkt[14 + nonce_size + 1];
+    }
+    
+    printf("[PQC-DEC-DIAG] Found L2 Marker! policy_id=%u, magic=0x%02x, nonce_size=%d\n", 
+           policy_id, magic, nonce_size);
+    fflush(stdout);
+
+    // MAGIC CHECK
+    if (magic != 0xA5) {
+        printf("[PQC-DEC-DIAG] Magic mismatch! Expected 0xA5, got 0x%02x. Skipping...\n", magic);
+        return 0;
     }
 
     int pi = g_policy_index_by_action_id[POLICY_ACTION_ENCRYPT_L2][policy_id];
@@ -532,6 +542,9 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
                 fflush(stdout);
             }
             return 0;
+        } else {
+            printf("[PQC-DEC-DIAG] packet_decrypt FAILED with res=%d\n", new_len);
+            fflush(stdout);
         }
         return 0;
     }

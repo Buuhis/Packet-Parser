@@ -93,12 +93,21 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
             return -1;
         
         // Write tunnel header (Nonce + PolicyID + Magic)
-        // For L2, we use a slightly different magic or reuse L4_TUNNEL_MAGIC 
-        // to stay compatible with the dispatch logic.
         uint8_t *tun_hdr = packet + ETH_HEADER_SIZE;
         memcpy(tun_hdr, pqc_nonce, 12);
         tun_hdr[12] = packet_crypto_get_policy_id();
         tun_hdr[13] = 0xA5; // L4_TUNNEL_MAGIC
+
+        // CRITICAL: Write fake ethertype to mark the packet for the receiver
+        packet[12] = (uint8_t)(fake_etype >> 8);
+        packet[13] = (uint8_t)(fake_etype & 0xFF);
+
+        static uint32_t enc_count = 0;
+        if (++enc_count % 1000 == 0) {
+            printf("[PQC-ENC-DIAG] Encrypted 1000 packets. Orig EtherType: 0x%04x, Fake: 0x%04x\n", 
+                   ether_type, fake_etype);
+            fflush(stdout);
+        }
 
         return (int)(ETH_HEADER_SIZE + nonce_size + 2 + new_len);
     }
