@@ -38,8 +38,6 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(!ctx || !ctx->initialized || !packet || pkt_len < MIN_ETH_PKT)) return -1;
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_hdr_extra = nonce_size;
-    const int l2_enc_start = 14 + nonce_size;
 
     uint16_t ether_type = ((uint16_t)packet[12] << 8) | packet[13];
     uint8_t proto_flag;
@@ -61,17 +59,26 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     uint8_t nonce[16];
     int nonce_len;
     const int mode = packet_crypto_get_mode();
-    const int is_gcm = (mode == CRYPTO_MODE_GCM || mode == CRYPTO_MODE_PQC_GCM);
+    const int is_pqc = (mode == CRYPTO_MODE_PQC_GCM);
+    const int is_gcm = (mode == CRYPTO_MODE_GCM); // STRICTLY GCM ONLY
+
+    // CRITICAL FIX: Calculate the exact offset for payload
+    const int l2_hdr_extra = is_pqc ? (nonce_size + 2) : nonce_size;
+    const int l2_enc_start = 14 + l2_hdr_extra;
 
     crypto_generate_nonce(counter, proto_flag, nonce, &nonce_len);
 
     const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
     const size_t payload_len = pkt_len - ETH_HEADER_SIZE;
 
+    // Safely move payload to make room for tunnel header
     memmove(packet + l2_enc_start, packet + ETH_HEADER_SIZE, payload_len);
 
-    crypto_write_counter(packet, nonce, nonce_size, (uint8_t)(fake_etype >> 8),
-                         packet_crypto_get_policy_id());
+    // Only write legacy counter if not PQC
+    if (!is_pqc) {
+        crypto_write_counter(packet, nonce, nonce_size, (uint8_t)(fake_etype >> 8),
+                             packet_crypto_get_policy_id());
+    }
 
     if (likely(is_gcm)) {
         uint8_t tag[AES128_GCM_TAG_SIZE];
@@ -89,7 +96,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(aad, packet, 12);     // Src/Dst MAC
 
         int new_len = 0;
-        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
+        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, NULL, 0, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
             return -1;
         
         // Write tunnel header (Nonce + PolicyID + Magic)
@@ -104,8 +111,19 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
 
         static uint32_t enc_count = 0;
         if (++enc_count % 1000 == 0) {
-            printf("[PQC-ENC-DIAG] Encrypted L2 pkt: fake_etype=0x%04x, final_len=%d\n", 
-                   fake_etype, (int)(ETH_HEADER_SIZE + nonce_size + 2 + new_len));
+            printf("[PQC-ENC-DIAG] L2: etype=0x%04x, pi=%u\n", fake_etype, packet_crypto_get_policy_id());
+            printf("[PQC-ENC-DIAG] Key: %02x%02x%02x%02x, Nonce: %02x%02x%02x%02x\n",
+                   key[0], key[1], key[2], key[3], pqc_nonce[0], pqc_nonce[1], pqc_nonce[2], pqc_nonce[3]);
+            printf("[PQC-ENC-DIAG] AAD: %02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x\n",
+                   aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
+            uint8_t *payload_ptr = packet + l2_enc_start;
+            // Note: This is logged AFTER trf_encrypt_payload_gcm, so it's the Ciphertext
+            printf("[PQC-ENC-DIAG] Ciphertext(first 8): %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                   payload_ptr[0], payload_ptr[1], payload_ptr[2], payload_ptr[3], payload_ptr[4], payload_ptr[5], payload_ptr[6], payload_ptr[7]);
+            // Tag is at the end of the encrypted payload
+            uint8_t *tag_ptr = packet + ETH_HEADER_SIZE + nonce_size + 2 + payload_len;
+            printf("[PQC-ENC-DIAG] Tag: %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                   tag_ptr[0], tag_ptr[1], tag_ptr[2], tag_ptr[3], tag_ptr[4], tag_ptr[5], tag_ptr[6], tag_ptr[7]);
             fflush(stdout);
         }
 
@@ -125,7 +143,13 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     if (unlikely(!ctx || !ctx->initialized || !packet)) return -1;
 
     const int nonce_size = packet_crypto_get_nonce_size();
-    const int l2_enc_start = 14 + nonce_size;
+    const int mode = packet_crypto_get_mode();
+    const int is_pqc = (mode == CRYPTO_MODE_PQC_GCM);
+    const int is_gcm = (mode == CRYPTO_MODE_GCM || is_pqc);
+
+    // CRITICAL FIX: For PQC, we have 2 extra bytes (PolicyID + Magic)
+    const int l2_hdr_extra = is_pqc ? (nonce_size + 2) : nonce_size;
+    const int l2_enc_start = 14 + l2_hdr_extra;
 
     if (unlikely(pkt_len < (size_t)l2_enc_start)) return -1;
 
@@ -142,11 +166,8 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     crypto_read_counter(packet, nonce_size, nonce, &policy_id, &proto_flag);
     (void)policy_id;
     const int is_ipv4 = (proto_flag == PROTO_FLAG_IPV4);
-    const int mode = packet_crypto_get_mode();
-    const int is_gcm = (mode == CRYPTO_MODE_GCM || mode == CRYPTO_MODE_PQC_GCM);
-
-    const int nonce_len = is_gcm ? nonce_size : AES128_IV_SIZE;
-
+    
+    const int nonce_len = is_pqc ? 12 : nonce_size;
     size_t enc_len = pkt_len - l2_enc_start;
     uint8_t tag[AES128_GCM_TAG_SIZE];
     if (is_gcm) {
@@ -167,8 +188,21 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         uint8_t aad[12] __attribute__((aligned(64)));
         memcpy(aad, packet, 12); // MACs
         
+        static uint32_t dec_diag_cnt = 0;
+        if (++dec_diag_cnt % 1000 == 0) {
+            printf("[PQC-DEC-DIAG] Key: %02x%02x%02x%02x, Nonce: %02x%02x%02x%02x, enc_len=%zu\n",
+                   key[0], key[1], key[2], key[3], nonce[0], nonce[1], nonce[2], nonce[3], enc_len);
+            printf("[PQC-DEC-DIAG] AAD: %02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x\n",
+                   aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
+            printf("[PQC-DEC-DIAG] Ciphertext(first 8): %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                   work_ptr[0], work_ptr[1], work_ptr[2], work_ptr[3], work_ptr[4], work_ptr[5], work_ptr[6], work_ptr[7]);
+            printf("[PQC-DEC-DIAG] Tag: %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                   tag[0], tag[1], tag[2], tag[3], tag[4], tag[5], tag[6], tag[7]);
+            fflush(stdout);
+        }
+
         int orig_len = 0;
-        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
+        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, NULL, 0, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
             enc_len = (size_t)orig_len;
             goto decrypt_success;
         }
