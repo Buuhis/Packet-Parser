@@ -96,7 +96,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(aad, packet, 12);     // Src/Dst MAC
 
         int new_len = 0;
-        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, NULL, 0, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
+        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
             return -1;
         
         // Write tunnel header (Nonce + PolicyID + Magic)
@@ -145,7 +145,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
     const int nonce_size = packet_crypto_get_nonce_size();
     const int mode = packet_crypto_get_mode();
     const int is_pqc = (mode == CRYPTO_MODE_PQC_GCM);
-    const int is_gcm = (mode == CRYPTO_MODE_GCM || is_pqc);
+    const int is_gcm = (mode == CRYPTO_MODE_GCM); // STRICTLY GCM ONLY
 
     // CRITICAL FIX: For PQC, we have 2 extra bytes (PolicyID + Magic)
     const int l2_hdr_extra = is_pqc ? (nonce_size + 2) : nonce_size;
@@ -196,13 +196,16 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
                    aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
             printf("[PQC-DEC-DIAG] Ciphertext(first 8): %02x%02x%02x%02x%02x%02x%02x%02x\n",
                    work_ptr[0], work_ptr[1], work_ptr[2], work_ptr[3], work_ptr[4], work_ptr[5], work_ptr[6], work_ptr[7]);
+            
+            // Extract tag just for logging without altering enc_len
+            uint8_t *pqc_tag = work_ptr + enc_len - 16;
             printf("[PQC-DEC-DIAG] Tag: %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                   tag[0], tag[1], tag[2], tag[3], tag[4], tag[5], tag[6], tag[7]);
+                   pqc_tag[0], pqc_tag[1], pqc_tag[2], pqc_tag[3], pqc_tag[4], pqc_tag[5], pqc_tag[6], pqc_tag[7]);
             fflush(stdout);
         }
 
         int orig_len = 0;
-        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, NULL, 0, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
+        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
             enc_len = (size_t)orig_len;
             goto decrypt_success;
         }
