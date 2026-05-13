@@ -1557,7 +1557,18 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
 
         printf("[PQC-HS] Role Selection: MyIP=%s, PeerIP=%s, Initiator: %s\n",
                my_ip_str[0] ? my_ip_str : "unknown", peer_ip_str, is_initiator ? "YES" : "NO");
-        sig_pqc_handshake_start(is_initiator, peer_ip_str);
+
+        // Find the first PQC policy to get identity keys for authentication
+        const char *id_priv = NULL;
+        const char *id_pub = NULL;
+        for (int i = 0; i < cfg->policy_count; i++) {
+            if (cfg->policies[i].crypto_mode == CRYPTO_MODE_PQC_GCM) {
+                id_priv = cfg->policies[i].identity_priv;
+                id_pub = cfg->policies[i].identity_pub;
+                break;
+            }
+        }
+        sig_pqc_handshake_start(is_initiator, peer_ip_str, id_priv, id_pub);
     }
     g_cfg_ptr = cfg;
     interface_reset_redirect_maps();

@@ -1,5 +1,6 @@
 #include "../../inc/db_config.h"
 #include "../../inc/packet_crypto.h"
+#include "../../sig_encrypt/inc/traffic_crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,6 +8,9 @@
 #include <arpa/inet.h>
 #include <libpq-fe.h>
 #include <strings.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -151,6 +155,33 @@ static void trim_spaces_inplace(char *s) {
     s[end - start] = '\0';
 }
 
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+static void base64_encode_pub(const unsigned char *src, size_t len, char *out) {
+    size_t i, j;
+    for (i = 0, j = 0; i < len; i += 3, j += 4) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
+        if (i + 2 < len) v |= (uint32_t)src[i + 2];
+        out[j] = base64_chars[(v >> 18) & 0x3F];
+        out[j + 1] = base64_chars[(v >> 12) & 0x3F];
+        out[j + 2] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '=';
+        out[j + 3] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
+    }
+    out[j] = '\0';
+}
+
+static void save_key_to_file(const char *filename, const char *data, mode_t mode) {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd >= 0) {
+        write(fd, data, strlen(data));
+        write(fd, "\n", 1);
+        close(fd);
+        printf("[PQC-GEN] Saved: %s (Mode: %04o)\n", filename, mode);
+    } else {
+        perror("[PQC-GEN] Failed to save key file");
+    }
+}
+
 #define MAX_CIDR_LIST_ITEMS 32
 #define MAX_CIDR_ITEM_LEN 64
 
@@ -229,6 +260,9 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     wire_id_used[0] = 1;
     for (int pi = 0; pi < cfg->profile_count; pi++) {
         struct profile_config *p = &cfg->profiles[pi];
+        bool profile_pqc_gen_done = false;
+        char profile_pqc_priv_b64[8192] = {0};
+
         char profile_id_str[32];
         snprintf(profile_id_str, sizeof(profile_id_str), "%d", p->id);
         const char *pp[1] = { profile_id_str };
@@ -352,6 +386,68 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                     if (parse_hex_bytes_pub(key_hex, cp_base.key, key_len) != 0) {
                         memset(cp_base.key, 0, sizeof(cp_base.key));
                     }
+                }
+
+                // Load PQC-specific configuration if mode is PQC-GCM
+                if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
+                    char pid_str[32];
+                    snprintf(pid_str, sizeof(pid_str), "%d", db_policy_id);
+                    const char *pqc_p[1] = { pid_str };
+                    PGresult *pqc_res = PQexecParams(conn,
+                        "SELECT identity_priv, identity_pub, rotation_interval FROM pqc_config WHERE policy_id = $1",
+                        1, NULL, pqc_p, NULL, NULL, 0);
+
+                    if (PQresultStatus(pqc_res) == PGRES_TUPLES_OK && PQntuples(pqc_res) > 0) {
+                        const char *priv = PQgetvalue(pqc_res, 0, 0);
+                        const char *pub = PQgetvalue(pqc_res, 0, 1);
+                        const char *rot = PQgetvalue(pqc_res, 0, 2);
+                        if (priv) strncpy(cp_base.identity_priv, priv, sizeof(cp_base.identity_priv) - 1);
+                        if (pub) strncpy(cp_base.identity_pub, pub, sizeof(cp_base.identity_pub) - 1);
+                        cp_base.rotation_interval = rot ? atoi(rot) : 3600;
+                    } else {
+                        // DB is empty, generate new Identity Keys for this PROFILE
+                        if (!profile_pqc_gen_done) {
+                            char cwd[512];
+                            if (getcwd(cwd, sizeof(cwd)) != NULL) {
+                                printf("[PQC-GEN] Current Directory: %s\n", cwd);
+                            }
+
+                            printf("[PQC-GEN] No identity for profile '%s'. Generating new ML-DSA Identity...\n", p->name);
+                            uint8_t dsa_pub[3000], dsa_priv[5000];
+                            int pub_sz, priv_sz;
+                            
+                            if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
+                                char *b64_priv = malloc(priv_sz * 2);
+                                char *b64_pub = malloc(pub_sz * 2);
+                                
+                                base64_encode_pub(dsa_priv, priv_sz, b64_priv);
+                                base64_encode_pub(dsa_pub, pub_sz, b64_pub);
+                                
+                                char priv_fname[256], pub_fname[256];
+                                snprintf(priv_fname, sizeof(priv_fname), "%s_priv.key", p->name);
+                                snprintf(pub_fname, sizeof(pub_fname), "%s_pub.key", p->name);
+
+                                save_key_to_file(priv_fname, b64_priv, 0600);
+                                save_key_to_file(pub_fname, b64_pub, 0644);
+                                
+                                printf("[PQC-GEN] Profile '%s' keys generated successfully.\n", p->name);
+                                
+                                strncpy(profile_pqc_priv_b64, b64_priv, sizeof(profile_pqc_priv_b64) - 1);
+                                profile_pqc_gen_done = true;
+
+                                free(b64_priv);
+                                free(b64_pub);
+                            } else {
+                                fprintf(stderr, "[PQC-GEN] ERROR: Failed to generate ML-DSA keys for profile %s\n", p->name);
+                            }
+                        }
+                        
+                        if (profile_pqc_gen_done) {
+                            strncpy(cp_base.identity_priv, profile_pqc_priv_b64, sizeof(cp_base.identity_priv) - 1);
+                        }
+                        cp_base.rotation_interval = 3600;
+                    }
+                    PQclear(pqc_res);
                 }
 
                 char policy_id_str[32];

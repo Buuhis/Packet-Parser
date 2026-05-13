@@ -69,6 +69,9 @@ struct crypto_policy {
     int aes_bits;
     int nonce_size;
     uint8_t key[AES_KEY_LEN];
+    char identity_priv[8192];
+    char identity_pub[8192];
+    int rotation_interval;
 };
 
 struct profile_config {

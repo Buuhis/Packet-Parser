@@ -198,8 +198,11 @@ int main(int argc, char **argv) {
     }
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
 
-    struct runtime_state rt;
-    memset(&rt, 0, sizeof(rt));
+    struct runtime_state *rt = calloc(1, sizeof(struct runtime_state));
+    if (!rt) {
+        fprintf(stderr, "[FATAL] Failed to allocate runtime state memory\n");
+        return 1;
+    }
     int active_ids[32];
     int active_id_count = 0;
 
@@ -238,20 +241,26 @@ int main(int argc, char **argv) {
                 active_ids[active_id_count++] = id;
             }
 
-            struct app_config merged_cfg;
-            if (build_merged_config(&merged_cfg, active_ids, active_id_count, db_pass) == 0) {
-                main_diag_log_loaded_config(&merged_cfg, id);
-                if (!rt.has_thread) {
-                    if (runtime_start(&rt, &merged_cfg) != 0) {
+            struct app_config *merged_cfg = malloc(sizeof(struct app_config));
+            if (!merged_cfg) {
+                fprintf(stderr, "[FATAL] Failed to allocate merged config memory\n");
+                PQfreemem(notify);
+                continue;
+            }
+
+            if (build_merged_config(merged_cfg, active_ids, active_id_count, db_pass) == 0) {
+                main_diag_log_loaded_config(merged_cfg, id);
+                if (!rt->has_thread) {
+                    if (runtime_start(rt, merged_cfg) != 0) {
                         fprintf(stderr, "[FATAL] failed to start merged runtime\n");
                     } else {
                         fprintf(stderr, "[OK] Applied merged runtime with %d active config(s)\n", active_id_count);
                     }
                 } else {
-                    int next_slot = 1 - rt.active_slot;
-                    rt.cfg_slots[next_slot] = merged_cfg;
-                    if (forwarder_reload_config(&rt.fwd, &rt.cfg_slots[next_slot]) == 0) {
-                        rt.active_slot = next_slot;
+                    int next_slot = 1 - rt->active_slot;
+                    rt->cfg_slots[next_slot] = *merged_cfg;
+                    if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
+                        rt->active_slot = next_slot;
                         fprintf(stderr, "[OK] Hot-reloaded merged runtime with %d active config(s)\n", active_id_count);
                     } else {
                         fprintf(stderr,
@@ -262,6 +271,7 @@ int main(int argc, char **argv) {
             } else {
                 fprintf(stderr, "[FATAL] failed to build merged config set after notify id=%d\n", id);
             }
+            free(merged_cfg);
             PQfreemem(notify);
         }
 
