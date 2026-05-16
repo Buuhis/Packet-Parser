@@ -11,6 +11,14 @@
 #include <errno.h>
 
 static uint8_t  g_traffic_key[PQC_TRAFFIC_KEY_SZ];
+static bool g_key_ready = false;
+static bool g_hs_started = false;
+static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static char *g_global_id_priv = NULL;
+static char *g_global_id_pub = NULL;
+static char *g_peer_id_pub = NULL;
+
 #define MAX_IDENTITY_REGISTRY 10
 
 typedef struct {
@@ -47,19 +55,15 @@ static void calculate_auth_tag(const char *key_str, const uint8_t *data, int len
 }
 
 static void* pqc_handshake_thread(void* arg) {
-    (void)arg;
     int sockfd;
     struct sockaddr_in servaddr, peeraddr;
-    uint8_t buffer[4096];
-    
+    uint8_t buffer[PQC_HS_MSG_MAX_SZ];
+
     sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         perror("[PQC-HS] Socket creation failed");
         return NULL;
     }
-
-    int opt = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
@@ -67,7 +71,7 @@ static void* pqc_handshake_thread(void* arg) {
     servaddr.sin_port = htons(PQC_HS_PORT);
 
     if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
-        perror("[PQC-HS] Bind failed (Port 9999)");
+        perror("[PQC-HS] Bind failed (Port 7090)");
         close(sockfd);
         return NULL;
     }
@@ -75,16 +79,14 @@ static void* pqc_handshake_thread(void* arg) {
     memset(&peeraddr, 0, sizeof(peeraddr));
     peeraddr.sin_family = AF_INET;
     peeraddr.sin_port = htons(PQC_HS_PORT);
-    inet_pton(AF_INET, g_hs_cfg.peer_ip, &peeraddr.sin_addr);
-
-    printf("[PQC-HS] Handshake thread started. Peer: %s, Role: %s\n", 
-           g_hs_cfg.peer_ip, g_hs_cfg.is_initiator ? "Initiator" : "Responder");
+    
+    printf("[PQC-HS] Handshake thread started. Role: %s\n", 
+           g_hs_cfg.is_initiator ? "Initiator" : "Responder");
     fflush(stdout);
 
     while (!g_key_ready) {
+        // 1. Wait for keys to be ready in RAM/DB
         pthread_mutex_lock(&g_key_mutex);
-        
-        // Find our private key in registry by fingerprint
         char *my_priv = NULL;
         for (int i = 0; i < g_registry_count; i++) {
             if (strcmp(g_identity_registry[i].fingerprint, g_hs_cfg.local_fingerprint) == 0) {
@@ -92,25 +94,22 @@ static void* pqc_handshake_thread(void* arg) {
                 break;
             }
         }
-
         bool has_keys = (my_priv != NULL && g_peer_id_pub != NULL);
+        char current_peer_ip[64];
+        strncpy(current_peer_ip, g_hs_cfg.peer_ip, 63);
         pthread_mutex_unlock(&g_key_mutex);
 
         if (!has_keys) {
-            static int warn_count = 0;
-            if (warn_count++ % 10 == 0) {
-                printf("[PQC-HS] Waiting for Local Identity (%s) in RAM or Peer Identity in DB...\n", 
-                       g_hs_cfg.local_fingerprint);
-                fflush(stdout);
-            }
-            sleep(3);
+            sleep(2);
             continue;
         }
 
+        inet_pton(AF_INET, current_peer_ip, &peeraddr.sin_addr);
         uint8_t pk[2048], sk[4096], ct[2048], ss[128];
         int pk_sz, sk_sz, ct_sz;
 
         if (g_hs_cfg.is_initiator) {
+            // --- INITIATOR FLOW ---
             trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
             struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
             msg->magic = PQC_HS_MAGIC;
@@ -124,102 +123,73 @@ static void* pqc_handshake_thread(void* arg) {
             pthread_mutex_unlock(&g_key_mutex);
 
             while (!g_key_ready) {
-            sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz, 0,
-                   (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
-            
-            struct timeval tv;
-            tv.tv_sec = 2; tv.tv_usec = 0;
-            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+                sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz, 0,
+                       (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                
+                struct timeval tv = {2, 0};
+                setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-            socklen_t len = sizeof(peeraddr);
-            int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peeraddr, &len);
-            if (n > 0) {
-                struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
-                if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
-                    // Verify Auth Tag (Using peer's pub identity)
-                    uint8_t expected_tag[PQC_AUTH_TAG_SZ];
-                    calculate_auth_tag(g_peer_id_pub, resp->data, resp->data_len, expected_tag);
-                    
-                    if (memcmp(resp->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) != 0) {
-                        printf("[PQC-HS] ERROR: Authentication failed for RESP message (MITM suspected!)\n");
-                        fflush(stdout);
-                        continue;
-                    }
-
-                    if (trf_kem_decapsulate(sk, sk_sz, resp->data, resp->data_len, ss) == TRF_PQC_OK) {
-                        pthread_mutex_lock(&g_key_mutex);
-                        derive_traffic_key(ss, 32, g_traffic_key);
-                        g_key_ready = true;
-                        printf("[PQC-HS] Handshake SUCCESS! Final Traffic Key: ");
-                        for(int i=0; i<PQC_TRAFFIC_KEY_SZ; i++) printf("%02x", g_traffic_key[i]);
-                        printf("\n");
-                        fflush(stdout);
-                        pthread_mutex_unlock(&g_key_mutex);
-                        break;
+                socklen_t len = sizeof(peeraddr);
+                int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peeraddr, &len);
+                if (n > 0) {
+                    struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                    if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                        uint8_t expected_tag[PQC_AUTH_TAG_SZ];
+                        calculate_auth_tag(g_peer_id_pub, resp->data, resp->data_len, expected_tag);
+                        
+                        if (memcmp(resp->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) == 0) {
+                            if (trf_kem_decapsulate(sk, sk_sz, resp->data, resp->data_len, ss) == TRF_PQC_OK) {
+                                pthread_mutex_lock(&g_key_mutex);
+                                derive_traffic_key(ss, 32, g_traffic_key);
+                                g_key_ready = true;
+                                pthread_mutex_unlock(&g_key_mutex);
+                                printf("[PQC-HS] Handshake SUCCESS!\n");
+                                break;
+                            }
+                        }
                     }
                 }
-            } else {
-                printf("[PQC-HS] HELLO timeout, retrying...\n");
-                fflush(stdout);
+                printf("[PQC-HS] Initiator retrying HELLO...\n");
             }
-            }
-        }
-    } else {
-        printf("[PQC-HS] Waiting for HELLO from initiator...\n");
-        fflush(stdout);
-        while (!g_key_ready) {
+        } else {
+            // --- RESPONDER FLOW ---
+            struct timeval tv = {1, 0};
+            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            
             socklen_t len = sizeof(peeraddr);
             int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peeraddr, &len);
             if (n > 0) {
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                 if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
-                    // Verify Auth Tag (Using peer's pub identity)
                     uint8_t expected_tag[PQC_AUTH_TAG_SZ];
                     calculate_auth_tag(g_peer_id_pub, msg->data, msg->data_len, expected_tag);
                     
-                    if (memcmp(msg->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) != 0) {
-                        printf("[PQC-HS] ERROR: Authentication failed for HELLO message (MITM suspected!)\n");
-                        fflush(stdout);
-                        continue;
-                    }
+                    if (memcmp(msg->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) == 0) {
+                        if (trf_kem_encapsulate(msg->data, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                            struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                            resp->msg_type = PQC_HS_MSG_RESP;
+                            resp->data_len = (uint16_t)ct_sz;
+                            memcpy(resp->data, ct, ct_sz);
+                            
+                            pthread_mutex_lock(&g_key_mutex);
+                            calculate_auth_tag(my_priv, resp->data, ct_sz, resp->auth_tag);
+                            pthread_mutex_unlock(&g_key_mutex);
 
-                    printf("[PQC-HS] Received HELLO. Encapsulating...\n");
-                    if (trf_kem_encapsulate(msg->data, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
-                        struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
-                        resp->magic = PQC_HS_MAGIC;
-                        resp->msg_type = PQC_HS_MSG_RESP;
-                        resp->data_len = (uint16_t)ct_sz;
-                        memcpy(resp->data, ct, ct_sz);
-                        
-                        // Calculate Auth Tag (Sign with our priv identity)
-                        pthread_mutex_lock(&g_key_mutex);
-                        char *my_priv = NULL;
-                        for (int i = 0; i < g_registry_count; i++) {
-                            if (strcmp(g_identity_registry[i].fingerprint, g_hs_cfg.local_fingerprint) == 0) {
-                                my_priv = g_identity_registry[i].priv_key;
-                                break;
-                            }
+                            sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz, 0,
+                                   (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+
+                            pthread_mutex_lock(&g_key_mutex);
+                            derive_traffic_key(ss, 32, g_traffic_key);
+                            g_key_ready = true;
+                            pthread_mutex_unlock(&g_key_mutex);
+                            printf("[PQC-HS] Responder Handshake SUCCESS!\n");
                         }
-                        calculate_auth_tag(my_priv, resp->data, ct_sz, resp->auth_tag);
-                        pthread_mutex_unlock(&g_key_mutex);
-
-                        sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz, 0,
-                               (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
-
-                        pthread_mutex_lock(&g_key_mutex);
-                        derive_traffic_key(ss, 32, g_traffic_key);
-                        g_key_ready = true;
-                        printf("[PQC-HS] Handshake SUCCESS! Final Traffic Key: ");
-                        for(int i=0; i<PQC_TRAFFIC_KEY_SZ; i++) printf("%02x", g_traffic_key[i]);
-                        printf("\n");
-                        fflush(stdout);
-                        pthread_mutex_unlock(&g_key_mutex);
-                        break;
                     }
                 }
             }
         }
     }
+
     close(sockfd);
     return NULL;
 }
