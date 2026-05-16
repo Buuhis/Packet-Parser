@@ -27,6 +27,10 @@ const char* trf_pqc_error_string(int err);
 
 // Cleanup resources before shutdown
 void trf_pqc_cleanup();
+void trf_base64_encode(const unsigned char *src, size_t len, char *out);
+void trf_base64_encode_obfuscated(const unsigned char *src, size_t len, const char *seed, char *out);
+void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned char *out, size_t *out_len);
+int trf_save_key_to_file(const char *filename, const char *data, int mode);
 
 // ===========================================
 // DATA PLANE: AEAD IN-PLACE ENCRYPTION (GCM MODE)

@@ -85,13 +85,15 @@ static void handle_gen_identity() {
         char *b64_pub = malloc(pub_sz * 2);
         
         trf_base64_encode(dsa_priv, priv_sz, b64_priv);
-        trf_base64_encode(dsa_pub, pub_sz, b64_pub);
-        
-        // Calculate 8-char fingerprint (SHA256 of public key)
+
+        // Calculate 8-char fingerprint (SHA256 of public key binary)
         uint8_t hash[64];
-        trf_calculate_digest(DIGEST_TYPE_SHA256, (uint8_t*)b64_pub, strlen(b64_pub), hash);
+        trf_calculate_digest(DIGEST_TYPE_SHA256, dsa_pub, pub_sz, hash);
         char fingerprint[16];
         for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
+
+        // Obfuscate public key with its fingerprint before saving
+        trf_base64_encode_obfuscated(dsa_pub, pub_sz, fingerprint, b64_pub);
 
         char pub_path[256];
         snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/identity_%s_pub.key", fingerprint);
@@ -126,6 +128,7 @@ int main(int argc, char **argv) {
     }
 
     int config_id = -1;
+    int check_mode = 0;
     int check_id = -1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {

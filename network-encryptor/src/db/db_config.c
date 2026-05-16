@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -406,11 +407,10 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                         char peer_ip[64] = "0.0.0.0";
                         if (p->wan_count > 0) {
                             struct in_addr addr;
-                            addr.s_addr = p->wans[0].dst_ip;
+                            addr.s_addr = cfg->wans[p->wan_indices[0]].dst_ip;
                             inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
                         }
                         
-                        // We use a new helper to set the handshake config per profile
                         sig_pqc_set_handshake_config(true, peer_ip, fp);
                     }
 

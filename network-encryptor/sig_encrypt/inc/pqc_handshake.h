@@ -13,6 +13,7 @@
 #define PQC_KEM_CT_SIZE    1088 // ML-KEM-768 CT size
 #define PQC_AUTH_TAG_SZ    32
 #define PQC_TRAFFIC_KEY_SZ 32
+#define PQC_HS_MSG_MAX_SZ  4096
 
 #pragma pack(push, 1)
 struct pqc_hs_msg {
@@ -48,5 +49,25 @@ bool sig_pqc_is_key_ready(void);
  * @return 0 on success, -1 if the key is not yet available.
  */
 int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]);
+
+/**
+ * Sets the global identity for this system (RAM-only).
+ */
+void sig_pqc_set_global_identity(const char *priv, const char *pub);
+
+/**
+ * Sets the peer's identity public key (loaded from global DB).
+ */
+void sig_pqc_set_peer_identity(const char *pub);
+
+/**
+ * Adds an identity keypair to the RAM Registry.
+ */
+void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const char *pub);
+
+/**
+ * Configures the handshake for a specific profile.
+ */
+void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint);
 
 #endif

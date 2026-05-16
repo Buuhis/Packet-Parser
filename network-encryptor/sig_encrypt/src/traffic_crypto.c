@@ -4,6 +4,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
 
 #define TAG_SIZE_GCM 16
 #define HKDF_SALT "network_encryptor_xdp_salt_v1"
@@ -51,6 +54,74 @@ void trf_pqc_cleanup() {
     if (!g_pqc_initialized) return;
     scrypt_Cleanup();
     g_pqc_initialized = 0;
+}
+
+static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+void trf_base64_encode(const unsigned char *src, size_t len, char *out) {
+    size_t i, j;
+    for (i = 0, j = 0; i < len; i += 3, j += 4) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
+        if (i + 2 < len) v |= (uint32_t)src[i + 2];
+        out[j] = base64_chars[(v >> 18) & 0x3F];
+        out[j + 1] = base64_chars[(v >> 12) & 0x3F];
+        out[j + 2] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '=';
+        out[j + 3] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
+    }
+    out[j] = '\0';
+}
+
+void trf_base64_encode_obfuscated(const unsigned char *src, size_t len, const char *seed, char *out) {
+    unsigned char *tmp = malloc(len);
+    size_t seed_len = strlen(seed);
+    for (size_t i = 0; i < len; i++) {
+        tmp[i] = src[i] ^ seed[i % seed_len];
+    }
+    trf_base64_encode(tmp, len, out);
+    free(tmp);
+}
+
+void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned char *out, size_t *out_len) {
+    // This is a simplified decode + de-XOR. 
+    // In a real system we'd need a proper Base64 decoder.
+    // For now, let's assume the caller provides the decoded buffer or use a placeholder.
+    // I will implement a basic decoder to ensure it's functional.
+    static const int b64_inv[256] = { [0 ... 255] = -1,
+        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,['Y']=24,['Z']=25,
+        ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,['y']=50,['z']=51,
+        ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63
+    };
+
+    size_t in_len = strlen(src);
+    size_t j = 0;
+    for (size_t i = 0; i < in_len; i += 4) {
+        uint32_t v = (b64_inv[(int)src[i]] << 18) | (b64_inv[(int)src[i+1]] << 12);
+        out[j++] = (v >> 16) & 0xFF;
+        if (src[i+2] != '=') {
+            v |= (b64_inv[(int)src[i+2]] << 6);
+            out[j++] = (v >> 8) & 0xFF;
+        }
+        if (src[i+3] != '=') {
+            v |= b64_inv[(int)src[i+3]];
+            out[j++] = v & 0xFF;
+        }
+    }
+    *out_len = j;
+
+    // De-XOR
+    size_t seed_len = strlen(seed);
+    for (size_t i = 0; i < j; i++) {
+        out[i] ^= seed[i % seed_len];
+    }
+}
+
+int trf_save_key_to_file(const char *filename, const char *data, int mode) {
+    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (fd < 0) return -1;
+    ssize_t written = write(fd, data, strlen(data));
+    write(fd, "\n", 1);
+    close(fd);
+    return (written > 0) ? 0 : -1;
 }
 
 // =========================================================
