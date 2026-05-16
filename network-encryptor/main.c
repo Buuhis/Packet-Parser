@@ -14,6 +14,7 @@
 #include "forwarder.h"
 #include "main_diag.h"
 #include "sig_encrypt/inc/traffic_crypto.h"
+#include "sig_encrypt/inc/pqc_handshake.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 
@@ -30,9 +31,10 @@ static void usage(const char *prog) {
     fprintf(stderr,
             "Usage:\n"
             "  %s               # daemon mode (LISTEN %s)\n"
+            "  %s -gi            # generate new identity key and load into RAM\n"
             "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
             "  %s -check [ID]    # check database config consistency\n",
-            prog, NOTIFY_CHANNEL, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog);
 }
 
 static int libbpf_print_silent(enum libbpf_print_level level,
@@ -70,6 +72,47 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     return 0;
 }
 
+static void handle_gen_identity() {
+    uint8_t dsa_pub[3000], dsa_priv[5000];
+    int pub_sz, priv_sz;
+    
+    trf_pqc_init_global();
+    mkdir("/etc/.enc_config", 0755);
+
+    printf("[PQC-GI] Generating Manual Identity (RAM-ONLY)...\n");
+    if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
+        char *b64_priv = malloc(priv_sz * 2);
+        char *b64_pub = malloc(pub_sz * 2);
+        
+        trf_base64_encode(dsa_priv, priv_sz, b64_priv);
+        trf_base64_encode(dsa_pub, pub_sz, b64_pub);
+        
+        // Calculate 8-char fingerprint (SHA256 of public key)
+        uint8_t hash[64];
+        trf_calculate_digest(DIGEST_TYPE_SHA256, (uint8_t*)b64_pub, strlen(b64_pub), hash);
+        char fingerprint[16];
+        for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
+
+        char pub_path[256];
+        snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/identity_%s_pub.key", fingerprint);
+        
+        if (trf_save_key_to_file(pub_path, b64_pub, 0644) == 0) {
+            printf("[PQC-GI] Success! Fingerprint: %s\n", fingerprint);
+            printf("[PQC-GI] Public Key Exported: %s\n", pub_path);
+        } else {
+            fprintf(stderr, "[PQC-GI] ERROR: Failed to save key to %s\n", pub_path);
+        }
+        
+        // Add to RAM Registry
+        sig_pqc_add_to_registry(fingerprint, b64_priv, b64_pub);
+        
+        free(b64_priv);
+        free(b64_pub);
+    } else {
+        fprintf(stderr, "[PQC-GI] ERROR: Failed to generate identity keys!\n");
+    }
+}
+
 int main(int argc, char **argv) {
     load_env_from_file("/opt/db_test.env");
     const char *db_pass = resolve_db_password();
@@ -77,13 +120,12 @@ int main(int argc, char **argv) {
     const char *values[]   = {getenv("POSTGRES_HOST"), getenv("POSTGRES_PORT"), getenv("POSTGRES_TABLE"),
                               getenv("POSTGRES_USER"), db_pass, "10", NULL};
 
-    if (argc > 1 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
-        usage(argv[0]);
+    if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
+        handle_gen_identity();
         return 0;
     }
 
     int config_id = -1;
-    int check_mode = 0;
     int check_id = -1;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
@@ -198,11 +240,8 @@ int main(int argc, char **argv) {
     }
     PQclear(PQexec(listen_conn, "LISTEN " NOTIFY_CHANNEL));
 
-    struct runtime_state *rt = calloc(1, sizeof(struct runtime_state));
-    if (!rt) {
-        fprintf(stderr, "[FATAL] Failed to allocate runtime state memory\n");
-        return 1;
-    }
+    struct runtime_state rt;
+    memset(&rt, 0, sizeof(rt));
     int active_ids[32];
     int active_id_count = 0;
 
@@ -241,26 +280,20 @@ int main(int argc, char **argv) {
                 active_ids[active_id_count++] = id;
             }
 
-            struct app_config *merged_cfg = malloc(sizeof(struct app_config));
-            if (!merged_cfg) {
-                fprintf(stderr, "[FATAL] Failed to allocate merged config memory\n");
-                PQfreemem(notify);
-                continue;
-            }
-
-            if (build_merged_config(merged_cfg, active_ids, active_id_count, db_pass) == 0) {
-                main_diag_log_loaded_config(merged_cfg, id);
-                if (!rt->has_thread) {
-                    if (runtime_start(rt, merged_cfg) != 0) {
+            struct app_config merged_cfg;
+            if (build_merged_config(&merged_cfg, active_ids, active_id_count, db_pass) == 0) {
+                main_diag_log_loaded_config(&merged_cfg, id);
+                if (!rt.has_thread) {
+                    if (runtime_start(&rt, &merged_cfg) != 0) {
                         fprintf(stderr, "[FATAL] failed to start merged runtime\n");
                     } else {
                         fprintf(stderr, "[OK] Applied merged runtime with %d active config(s)\n", active_id_count);
                     }
                 } else {
-                    int next_slot = 1 - rt->active_slot;
-                    rt->cfg_slots[next_slot] = *merged_cfg;
-                    if (forwarder_reload_config(&rt->fwd, &rt->cfg_slots[next_slot]) == 0) {
-                        rt->active_slot = next_slot;
+                    int next_slot = 1 - rt.active_slot;
+                    rt.cfg_slots[next_slot] = merged_cfg;
+                    if (forwarder_reload_config(&rt.fwd, &rt.cfg_slots[next_slot]) == 0) {
+                        rt.active_slot = next_slot;
                         fprintf(stderr, "[OK] Hot-reloaded merged runtime with %d active config(s)\n", active_id_count);
                     } else {
                         fprintf(stderr,
@@ -271,7 +304,6 @@ int main(int argc, char **argv) {
             } else {
                 fprintf(stderr, "[FATAL] failed to build merged config set after notify id=%d\n", id);
             }
-            free(merged_cfg);
             PQfreemem(notify);
         }
 

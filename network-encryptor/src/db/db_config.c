@@ -260,8 +260,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     wire_id_used[0] = 1;
     for (int pi = 0; pi < cfg->profile_count; pi++) {
         struct profile_config *p = &cfg->profiles[pi];
-        bool profile_pqc_gen_done = false;
-        char profile_pqc_priv_b64[8192] = {0};
 
         char profile_id_str[32];
         snprintf(profile_id_str, sizeof(profile_id_str), "%d", p->id);
@@ -326,9 +324,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         PQclear(res);
 
         res = PQexecParams(conn,
-            "SELECT id, priority, action, protocol, "
-            "       crypto_mode, aes_bits, nonce_size, crypto_key, "
-            "       src_cidr, src_port, dst_cidr, dst_port "
+            "SELECT id, action, mode, aes_bits, nonce_size, crypto_key, local_identity_fingerprint "
             "FROM xdp_profile_crypto_policies WHERE profile_id = $1 "
             "ORDER BY priority ASC, id ASC",
             1, NULL, pp, NULL, NULL, 0);
@@ -389,66 +385,34 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 }
 
                 // Load PQC-specific configuration if mode is PQC-GCM
-                if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
-                    char pid_str[32];
-                    snprintf(pid_str, sizeof(pid_str), "%d", db_policy_id);
-                    const char *pqc_p[1] = { pid_str };
-                    PGresult *pqc_res = PQexecParams(conn,
-                        "SELECT identity_priv, identity_pub, rotation_interval FROM pqc_config WHERE policy_id = $1",
-                        1, NULL, pqc_p, NULL, NULL, 0);
+                    const char *fp = PQgetvalue(res, r, 6);
+                    if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
+                        char pid_str[32];
+                        snprintf(pid_str, sizeof(pid_str), "%d", db_policy_id);
+                        const char *pqc_p[1] = { pid_str };
+                        PGresult *pqc_res = PQexecParams(conn,
+                            "SELECT rotation_interval FROM xdp_profile_crypto_policies WHERE id = $1",
+                            1, NULL, pqc_p, NULL, NULL, 0);
 
-                    if (PQresultStatus(pqc_res) == PGRES_TUPLES_OK && PQntuples(pqc_res) > 0) {
-                        const char *priv = PQgetvalue(pqc_res, 0, 0);
-                        const char *pub = PQgetvalue(pqc_res, 0, 1);
-                        const char *rot = PQgetvalue(pqc_res, 0, 2);
-                        if (priv) strncpy(cp_base.identity_priv, priv, sizeof(cp_base.identity_priv) - 1);
-                        if (pub) strncpy(cp_base.identity_pub, pub, sizeof(cp_base.identity_pub) - 1);
-                        cp_base.rotation_interval = rot ? atoi(rot) : 3600;
-                    } else {
-                        // DB is empty, generate new Identity Keys for this PROFILE
-                        if (!profile_pqc_gen_done) {
-                            char cwd[512];
-                            if (getcwd(cwd, sizeof(cwd)) != NULL) {
-                                printf("[PQC-GEN] Current Directory: %s\n", cwd);
-                            }
+                        if (PQresultStatus(pqc_res) == PGRES_TUPLES_OK && PQntuples(pqc_res) > 0) {
+                            const char *rot = PQgetvalue(pqc_res, 0, 0);
+                            cp_base.rotation_interval = rot ? atoi(rot) : 3600;
+                        } else {
+                            cp_base.rotation_interval = 3600;
+                        }
+                        PQclear(pqc_res);
 
-                            printf("[PQC-GEN] No identity for profile '%s'. Generating new ML-DSA Identity...\n", p->name);
-                            uint8_t dsa_pub[3000], dsa_priv[5000];
-                            int pub_sz, priv_sz;
-                            
-                            if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
-                                char *b64_priv = malloc(priv_sz * 2);
-                                char *b64_pub = malloc(pub_sz * 2);
-                                
-                                base64_encode_pub(dsa_priv, priv_sz, b64_priv);
-                                base64_encode_pub(dsa_pub, pub_sz, b64_pub);
-                                
-                                char priv_fname[256], pub_fname[256];
-                                snprintf(priv_fname, sizeof(priv_fname), "%s_priv.key", p->name);
-                                snprintf(pub_fname, sizeof(pub_fname), "%s_pub.key", p->name);
-
-                                save_key_to_file(priv_fname, b64_priv, 0600);
-                                save_key_to_file(pub_fname, b64_pub, 0644);
-                                
-                                printf("[PQC-GEN] Profile '%s' keys generated successfully.\n", p->name);
-                                
-                                strncpy(profile_pqc_priv_b64, b64_priv, sizeof(profile_pqc_priv_b64) - 1);
-                                profile_pqc_gen_done = true;
-
-                                free(b64_priv);
-                                free(b64_pub);
-                            } else {
-                                fprintf(stderr, "[PQC-GEN] ERROR: Failed to generate ML-DSA keys for profile %s\n", p->name);
-                            }
+                        // Configure Handshake with Fingerprint
+                        char peer_ip[64] = "0.0.0.0";
+                        if (p->wan_count > 0) {
+                            struct in_addr addr;
+                            addr.s_addr = p->wans[0].dst_ip;
+                            inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
                         }
                         
-                        if (profile_pqc_gen_done) {
-                            strncpy(cp_base.identity_priv, profile_pqc_priv_b64, sizeof(cp_base.identity_priv) - 1);
-                        }
-                        cp_base.rotation_interval = 3600;
+                        // We use a new helper to set the handshake config per profile
+                        sig_pqc_set_handshake_config(true, peer_ip, fp);
                     }
-                    PQclear(pqc_res);
-                }
 
                 char policy_id_str[32];
                 snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
@@ -550,6 +514,18 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
         PQclear(res);
     }
+
+    // Load Global Peer Identity Key
+    PGresult *pq_res = PQexec(conn, "SELECT peer_identity_pub FROM pqc_global_config LIMIT 1");
+    if (PQresultStatus(pq_res) == PGRES_TUPLES_OK && PQntuples(pq_res) > 0) {
+        const char *peer_pub = PQgetvalue(pq_res, 0, 0);
+        if (peer_pub && peer_pub[0] != '\0') {
+            sig_pqc_set_peer_identity(peer_pub);
+        }
+    } else {
+        printf("[DB-PQC] Warning: No peer identity public key found in pqc_global_config.\n");
+    }
+    PQclear(pq_res);
 
     return 0;
 }
