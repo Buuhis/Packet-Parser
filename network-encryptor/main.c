@@ -32,6 +32,7 @@ static void usage(const char *prog) {
             "Usage:\n"
             "  %s               # daemon mode (LISTEN %s)\n"
             "  %s -gi            # generate new identity key and load into RAM\n"
+            "  %s -set-identity <ProfileID> <Fingerprint> # link key to profile\n"
             "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
             "  %s -check [ID]    # check database config consistency\n",
             prog, NOTIFY_CHANNEL, prog, prog, prog);
@@ -124,6 +125,17 @@ int main(int argc, char **argv) {
 
     if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
         handle_gen_identity();
+        return 0;
+    }
+
+    if (argc > 3 && strcmp(argv[1], "-set-identity") == 0) {
+        int profile_id = atoi(argv[2]);
+        const char *fp = argv[3];
+        if (db_update_profile_identity(keywords, values, profile_id, fp) == 0) {
+            printf("[PQC-SET] Profile %d linked to Identity Fingerprint: %s\n", profile_id, fp);
+        } else {
+            fprintf(stderr, "[PQC-SET] ERROR: Failed to update database.\n");
+        }
         return 0;
     }
 

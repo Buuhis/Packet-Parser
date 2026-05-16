@@ -156,32 +156,32 @@ static void trim_spaces_inplace(char *s) {
     s[end - start] = '\0';
 }
 
-static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-static void base64_encode_pub(const unsigned char *src, size_t len, char *out) {
-    size_t i, j;
-    for (i = 0, j = 0; i < len; i += 3, j += 4) {
-        uint32_t v = (uint32_t)src[i] << 16;
-        if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
-        if (i + 2 < len) v |= (uint32_t)src[i + 2];
-        out[j] = base64_chars[(v >> 18) & 0x3F];
-        out[j + 1] = base64_chars[(v >> 12) & 0x3F];
-        out[j + 2] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '=';
-        out[j + 3] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
-    }
-    out[j] = '\0';
-}
+// static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+// static void base64_encode_pub(const unsigned char *src, size_t len, char *out) {
+//     size_t i, j;
+//     for (i = 0, j = 0; i < len; i += 3, j += 4) {
+//         uint32_t v = (uint32_t)src[i] << 16;
+//         if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
+//         if (i + 2 < len) v |= (uint32_t)src[i + 2];
+//         out[j] = base64_chars[(v >> 18) & 0x3F];
+//         out[j + 1] = base64_chars[(v >> 12) & 0x3F];
+//         out[j + 2] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '=';
+//         out[j + 3] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
+//     }
+//     out[j] = '\0';
+// }
 
-static void save_key_to_file(const char *filename, const char *data, mode_t mode) {
-    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd >= 0) {
-        write(fd, data, strlen(data));
-        write(fd, "\n", 1);
-        close(fd);
-        printf("[PQC-GEN] Saved: %s (Mode: %04o)\n", filename, mode);
-    } else {
-        perror("[PQC-GEN] Failed to save key file");
-    }
-}
+// static void save_key_to_file(const char *filename, const char *data, mode_t mode) {
+//     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
+//     if (fd >= 0) {
+//         write(fd, data, strlen(data));
+//         write(fd, "\n", 1);
+//         close(fd);
+//         printf("[PQC-GEN] Saved: %s (Mode: %04o)\n", filename, mode);
+//     } else {
+//         perror("[PQC-GEN] Failed to save key file");
+//     }
+// }
 
 #define MAX_CIDR_LIST_ITEMS 32
 #define MAX_CIDR_ITEM_LEN 64
@@ -874,6 +874,36 @@ static int fetch_config_from_db(struct app_config *cfg, PGconn *conn, int config
         return -1;
     if (load_profiles_and_policies(cfg, conn, config_id) != 0)
         return -1;
+    return 0;
+}
+
+int db_update_profile_identity(const char **keywords, const char **values, int profile_id, const char *fingerprint) {
+    PGconn *conn = PQconnectdbParams(keywords, values, 0);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "[DB] Connection failed: %s\n", PQerrorMessage(conn));
+        PQfinish(conn);
+        return -1;
+    }
+
+    const char *param_values[2];
+    char pid_str[16];
+    snprintf(pid_str, sizeof(pid_str), "%d", profile_id);
+    param_values[0] = fingerprint;
+    param_values[1] = pid_str;
+
+    PGresult *res = PQexecParams(conn,
+        "UPDATE xdp_profile_crypto_policies SET local_identity_fingerprint = $1 WHERE profile_id = $2",
+        2, NULL, param_values, NULL, NULL, 0);
+
+    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+        fprintf(stderr, "[DB] Update failed: %s\n", PQerrorMessage(conn));
+        PQclear(res);
+        PQfinish(conn);
+        return -1;
+    }
+
+    PQclear(res);
+    PQfinish(conn);
     return 0;
 }
 
