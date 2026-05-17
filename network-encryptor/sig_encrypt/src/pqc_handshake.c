@@ -31,6 +31,16 @@ static identity_entry_t g_identity_registry[MAX_IDENTITY_REGISTRY];
 static int g_registry_count = 0;
 
 typedef struct {
+    int profile_id;
+    char *local_priv;
+    char *local_pub;
+    char *peer_pub;
+} profile_key_binding_t;
+
+static profile_key_binding_t g_profile_bindings[MAX_IDENTITY_REGISTRY];
+static int g_profile_bindings_count = 0;
+
+typedef struct {
     bool is_initiator;
     char peer_ip[64];
     char local_fingerprint[16];
@@ -291,4 +301,64 @@ bool sig_pqc_has_identity(const char *fingerprint) {
     }
     pthread_mutex_unlock(&g_key_mutex);
     return false;
+}
+
+void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub) {
+    pthread_mutex_lock(&g_key_mutex);
+    
+    // Check if already bound
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        if (g_profile_bindings[i].profile_id == profile_id) {
+            if (g_profile_bindings[i].local_priv) free(g_profile_bindings[i].local_priv);
+            if (g_profile_bindings[i].local_pub) free(g_profile_bindings[i].local_pub);
+            if (g_profile_bindings[i].peer_pub) free(g_profile_bindings[i].peer_pub);
+            
+            g_profile_bindings[i].local_priv = local_priv ? strdup(local_priv) : NULL;
+            g_profile_bindings[i].local_pub = local_pub ? strdup(local_pub) : NULL;
+            g_profile_bindings[i].peer_pub = peer_pub ? strdup(peer_pub) : NULL;
+            
+            pthread_mutex_unlock(&g_key_mutex);
+            return;
+        }
+    }
+    
+    if (g_profile_bindings_count < MAX_IDENTITY_REGISTRY) {
+        profile_key_binding_t *b = &g_profile_bindings[g_profile_bindings_count++];
+        b->profile_id = profile_id;
+        b->local_priv = local_priv ? strdup(local_priv) : NULL;
+        b->local_pub = local_pub ? strdup(local_pub) : NULL;
+        b->peer_pub = peer_pub ? strdup(peer_pub) : NULL;
+        printf("[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
+    }
+    
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        if (g_profile_bindings[i].profile_id == profile_id) {
+            if (out_local_priv) *out_local_priv = g_profile_bindings[i].local_priv;
+            if (out_local_pub) *out_local_pub = g_profile_bindings[i].local_pub;
+            if (out_peer_pub) *out_peer_pub = g_profile_bindings[i].peer_pub;
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return -1;
+}
+
+int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_registry_count; i++) {
+        if (strcmp(g_identity_registry[i].fingerprint, fingerprint) == 0) {
+            if (out_priv) *out_priv = g_identity_registry[i].priv_key;
+            if (out_pub) *out_pub = g_identity_registry[i].pub_key;
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return -1;
 }

@@ -69,14 +69,14 @@ struct crypto_policy {
     int aes_bits;
     int nonce_size;
     uint8_t key[AES_KEY_LEN];
-    char identity_priv[8192];
-    char identity_pub[8192];
-    int rotation_interval;
+    char *identity_priv;
+    char *identity_pub;
 };
 
 struct profile_config {
     int id;
     char name[64];
+    char local_identity_fingerprint[16];
     int enabled;
     int channel_bonding;
     int local_indices[MAX_PROFILE_INTERFACES];

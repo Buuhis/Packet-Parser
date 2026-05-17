@@ -890,13 +890,19 @@ int db_check_identities(const char *conn_str) {
 
         printf("Profile ID: %d (%s)\n", pid, pname);
 
+        char *found_priv = NULL;
+        char *found_pub = NULL;
         if (l_fp && strlen(l_fp) > 0) {
-            bool has_local = sig_pqc_has_identity(l_fp);
-            printf("  - Local Key Fingerprint: [%s] -> %s\n", l_fp, has_local ? "MATCHED (RAM Cache Active)" : "NOT LOADED (Private Key missing in RAM Registry)");
+            if (sig_pqc_find_identity(l_fp, &found_priv, &found_pub) == 0) {
+                printf("  - Local Key Fingerprint: [%s] -> MATCHED (RAM Cache Active)\n", l_fp);
+            } else {
+                printf("  - Local Key Fingerprint: [%s] -> NOT LOADED (Private Key missing in RAM Registry)\n", l_fp);
+            }
         } else {
             printf("  - Local Key Fingerprint: NOT ASSIGNED\n");
         }
 
+        const char *db_peer_pub = NULL;
         char pid_str[16];
         snprintf(pid_str, sizeof(pid_str), "%d", pid);
         const char *pqc_p[1] = { pid_str };
@@ -905,14 +911,21 @@ int db_check_identities(const char *conn_str) {
             1, NULL, pqc_p, NULL, NULL, 0);
 
         if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
-            const char *peer_pub = PQgetvalue(peer_res, 0, 0);
-            if (peer_pub && strlen(peer_pub) > 0) {
-                printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(peer_pub));
+            const char *peer_pub_val = PQgetvalue(peer_res, 0, 0);
+            if (peer_pub_val && strlen(peer_pub_val) > 0) {
+                db_peer_pub = peer_pub_val;
+                printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(db_peer_pub));
             } else {
                 printf("  - Peer Public Key: EMPTY\n");
             }
         } else {
             printf("  - Peer Public Key: NOT ASSIGNED in pqc_identities\n");
+        }
+
+        // Perform active in-RAM binding of Local & Peer keys to this profile
+        if (found_priv || db_peer_pub) {
+            sig_pqc_bind_profile_keys(pid, found_priv, found_pub, db_peer_pub);
+            printf("  -> [RAM-BIND] Successfully bound Profile %d to keys in RAM memory.\n", pid);
         }
         PQclear(peer_res);
         printf("\n");
