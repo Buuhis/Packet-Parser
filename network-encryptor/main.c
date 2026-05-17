@@ -7,8 +7,10 @@
 #include <sys/select.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "config.h"
+#include "db_config.h"
 #include "db_env.h"
 #include "db_runtime.h"
 #include "forwarder.h"
@@ -32,10 +34,10 @@ static void usage(const char *prog) {
             "Usage:\n"
             "  %s               # daemon mode (LISTEN %s)\n"
             "  %s -gi            # generate new identity key and load into RAM\n"
-            "  %s -set-identity <ProfileID> <Fingerprint> # link key to profile\n"
+            "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
             "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
             "  %s -check [ID]    # check database config consistency\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog);
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog);
 }
 
 static int libbpf_print_silent(enum libbpf_print_level level,
@@ -128,13 +130,11 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    if (argc > 3 && strcmp(argv[1], "-set-identity") == 0) {
-        int profile_id = atoi(argv[2]);
-        const char *fp = argv[3];
-        if (db_update_profile_identity(keywords, values, profile_id, fp) == 0) {
-            printf("[PQC-SET] Profile %d linked to Identity Fingerprint: %s\n", profile_id, fp);
+    if (argc > 1 && strcmp(argv[1], "-check-identity") == 0) {
+        if (db_check_identities(NULL) == 0) {
+            printf("[PQC-CHECK] Completed successfully.\n");
         } else {
-            fprintf(stderr, "[PQC-SET] ERROR: Failed to update database.\n");
+            fprintf(stderr, "[PQC-CHECK] ERROR: Failed to run check.\n");
         }
         return 0;
     }

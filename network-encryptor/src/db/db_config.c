@@ -156,33 +156,6 @@ static void trim_spaces_inplace(char *s) {
     s[end - start] = '\0';
 }
 
-// static const char base64_chars[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-// static void base64_encode_pub(const unsigned char *src, size_t len, char *out) {
-//     size_t i, j;
-//     for (i = 0, j = 0; i < len; i += 3, j += 4) {
-//         uint32_t v = (uint32_t)src[i] << 16;
-//         if (i + 1 < len) v |= (uint32_t)src[i + 1] << 8;
-//         if (i + 2 < len) v |= (uint32_t)src[i + 2];
-//         out[j] = base64_chars[(v >> 18) & 0x3F];
-//         out[j + 1] = base64_chars[(v >> 12) & 0x3F];
-//         out[j + 2] = (i + 1 < len) ? base64_chars[(v >> 6) & 0x3F] : '=';
-//         out[j + 3] = (i + 2 < len) ? base64_chars[v & 0x3F] : '=';
-//     }
-//     out[j] = '\0';
-// }
-
-// static void save_key_to_file(const char *filename, const char *data, mode_t mode) {
-//     int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
-//     if (fd >= 0) {
-//         write(fd, data, strlen(data));
-//         write(fd, "\n", 1);
-//         close(fd);
-//         printf("[PQC-GEN] Saved: %s (Mode: %04o)\n", filename, mode);
-//     } else {
-//         perror("[PQC-GEN] Failed to save key file");
-//     }
-// }
-
 #define MAX_CIDR_LIST_ITEMS 32
 #define MAX_CIDR_ITEM_LEN 64
 
@@ -232,7 +205,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
     const char *params[1] = { id_str };
 
     PGresult *res = PQexecParams(conn,
-        "SELECT id, profile_name, enabled, channel_bonding "
+        "SELECT id, profile_name, enabled, channel_bonding, local_identity_fingerprint "
         "FROM xdp_profiles WHERE config_id = $1 ORDER BY id",
         1, NULL, params, NULL, NULL, 0);
 
@@ -252,6 +225,11 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         strncpy(p->name, PQgetvalue(res, i, 1), sizeof(p->name) - 1);
         p->enabled = atoi(PQgetvalue(res, i, 2));
         p->channel_bonding = atoi(PQgetvalue(res, i, 3));
+        if (!PQgetisnull(res, i, 4)) {
+            strncpy(p->local_identity_fingerprint, PQgetvalue(res, i, 4), sizeof(p->local_identity_fingerprint) - 1);
+        } else {
+            p->local_identity_fingerprint[0] = '\0';
+        }
         cfg->profile_count++;
     }
     PQclear(res);
@@ -325,7 +303,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         PQclear(res);
 
         res = PQexecParams(conn,
-            "SELECT id, action, mode, aes_bits, nonce_size, crypto_key, local_identity_fingerprint "
+            "SELECT id, action, mode, aes_bits, nonce_size, crypto_key "
             "FROM xdp_profile_crypto_policies WHERE profile_id = $1 "
             "ORDER BY priority ASC, id ASC",
             1, NULL, pp, NULL, NULL, 0);
@@ -386,23 +364,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 }
 
                 // Load PQC-specific configuration if mode is PQC-GCM
-                    const char *fp = PQgetvalue(res, r, 6);
                     if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
-                        char pid_str[32];
-                        snprintf(pid_str, sizeof(pid_str), "%d", db_policy_id);
-                        const char *pqc_p[1] = { pid_str };
-                        PGresult *pqc_res = PQexecParams(conn,
-                            "SELECT rotation_interval FROM xdp_profile_crypto_policies WHERE id = $1",
-                            1, NULL, pqc_p, NULL, NULL, 0);
-
-                        if (PQresultStatus(pqc_res) == PGRES_TUPLES_OK && PQntuples(pqc_res) > 0) {
-                            const char *rot = PQgetvalue(pqc_res, 0, 0);
-                            cp_base.rotation_interval = rot ? atoi(rot) : 3600;
-                        } else {
-                            cp_base.rotation_interval = 3600;
-                        }
-                        PQclear(pqc_res);
-
                         // Configure Handshake with Fingerprint
                         char peer_ip[64] = "0.0.0.0";
                         if (p->wan_count > 0) {
@@ -411,7 +373,25 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                             inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
                         }
                         
-                        sig_pqc_set_handshake_config(true, peer_ip, fp);
+                        sig_pqc_set_handshake_config(true, peer_ip, p->local_identity_fingerprint);
+
+                        // Load Peer Identity Key for this specific profile
+                        char pid_str[16];
+                        snprintf(pid_str, sizeof(pid_str), "%d", p->id);
+                        const char *pqc_p[1] = { pid_str };
+                        PGresult *peer_res = PQexecParams(conn,
+                            "SELECT peer_pub FROM pqc_identities WHERE profile_id = $1",
+                            1, NULL, pqc_p, NULL, NULL, 0);
+
+                        if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
+                            const char *peer_pub = PQgetvalue(peer_res, 0, 0);
+                            if (peer_pub && peer_pub[0] != '\0') {
+                                sig_pqc_set_peer_identity(peer_pub);
+                            }
+                        } else {
+                            printf("[DB-PQC] Warning: No peer identity public key found in pqc_identities for profile %d.\n", p->id);
+                        }
+                        PQclear(peer_res);
                     }
 
                 char policy_id_str[32];
@@ -514,18 +494,6 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         }
         PQclear(res);
     }
-
-    // Load Global Peer Identity Key
-    PGresult *pq_res = PQexec(conn, "SELECT peer_identity_pub FROM pqc_global_config LIMIT 1");
-    if (PQresultStatus(pq_res) == PGRES_TUPLES_OK && PQntuples(pq_res) > 0) {
-        const char *peer_pub = PQgetvalue(pq_res, 0, 0);
-        if (peer_pub && peer_pub[0] != '\0') {
-            sig_pqc_set_peer_identity(peer_pub);
-        }
-    } else {
-        printf("[DB-PQC] Warning: No peer identity public key found in pqc_global_config.\n");
-    }
-    PQclear(pq_res);
 
     return 0;
 }
@@ -877,7 +845,26 @@ static int fetch_config_from_db(struct app_config *cfg, PGconn *conn, int config
     return 0;
 }
 
-int db_update_profile_identity(const char **keywords, const char **values, int profile_id, const char *fingerprint) {
+int db_check_identities(const char *conn_str) {
+    (void)conn_str;
+    const char *db_host = getenv("POSTGRES_HOST");
+    const char *db_port = getenv("POSTGRES_PORT");
+    const char *db_user = getenv("POSTGRES_USER");
+    const char *db_name = getenv("POSTGRES_TABLE");
+    const char *db_pass = getenv("DB_PASS");
+
+    if (!db_host || !db_port || !db_user || !db_name || !db_pass) {
+        fprintf(stderr, "[DB] Missing DB_* environment variables in db_check_identities\n");
+        return -1;
+    }
+
+    const char *keywords[] = {
+        "host", "port", "dbname", "user", "password", "connect_timeout", NULL,
+    };
+    const char *values[] = {
+        db_host, db_port, db_name, db_user, db_pass, "10", NULL,
+    };
+
     PGconn *conn = PQconnectdbParams(keywords, values, 0);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "[DB] Connection failed: %s\n", PQerrorMessage(conn));
@@ -885,25 +872,55 @@ int db_update_profile_identity(const char **keywords, const char **values, int p
         return -1;
     }
 
-    const char *param_values[2];
-    char pid_str[16];
-    snprintf(pid_str, sizeof(pid_str), "%d", profile_id);
-    param_values[0] = fingerprint;
-    param_values[1] = pid_str;
+    printf("\n=== PQC IDENTITY INTEGRITY CHECK ===\n");
 
-    PGresult *res = PQexecParams(conn,
-        "UPDATE xdp_profile_crypto_policies SET local_identity_fingerprint = $1 WHERE profile_id = $2",
-        2, NULL, param_values, NULL, NULL, 0);
-
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        fprintf(stderr, "[DB] Update failed: %s\n", PQerrorMessage(conn));
-        PQclear(res);
+    PGresult *p_res = PQexec(conn, "SELECT id, profile_name, local_identity_fingerprint FROM xdp_profiles ORDER BY id");
+    if (PQresultStatus(p_res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "[DB] Failed to query profiles: %s\n", PQerrorMessage(conn));
+        PQclear(p_res);
         PQfinish(conn);
         return -1;
     }
 
-    PQclear(res);
+    int n_profiles = PQntuples(p_res);
+    for (int i = 0; i < n_profiles; i++) {
+        int pid = atoi(PQgetvalue(p_res, i, 0));
+        const char *pname = PQgetvalue(p_res, i, 1);
+        const char *l_fp = PQgetvalue(p_res, i, 2);
+
+        printf("Profile ID: %d (%s)\n", pid, pname);
+
+        if (l_fp && strlen(l_fp) > 0) {
+            bool has_local = sig_pqc_has_identity(l_fp);
+            printf("  - Local Key Fingerprint: [%s] -> %s\n", l_fp, has_local ? "MATCHED (RAM Cache Active)" : "NOT LOADED (Private Key missing in RAM Registry)");
+        } else {
+            printf("  - Local Key Fingerprint: NOT ASSIGNED\n");
+        }
+
+        char pid_str[16];
+        snprintf(pid_str, sizeof(pid_str), "%d", pid);
+        const char *pqc_p[1] = { pid_str };
+        PGresult *peer_res = PQexecParams(conn,
+            "SELECT peer_pub FROM pqc_identities WHERE profile_id = $1",
+            1, NULL, pqc_p, NULL, NULL, 0);
+
+        if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
+            const char *peer_pub = PQgetvalue(peer_res, 0, 0);
+            if (peer_pub && strlen(peer_pub) > 0) {
+                printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(peer_pub));
+            } else {
+                printf("  - Peer Public Key: EMPTY\n");
+            }
+        } else {
+            printf("  - Peer Public Key: NOT ASSIGNED in pqc_identities\n");
+        }
+        PQclear(peer_res);
+        printf("\n");
+    }
+
+    PQclear(p_res);
     PQfinish(conn);
+    printf("=== END OF INTEGRITY CHECK ===\n\n");
     return 0;
 }
 

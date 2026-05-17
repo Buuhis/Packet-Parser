@@ -280,3 +280,15 @@ void sig_pqc_set_peer_identity(const char *pub) {
     pthread_mutex_unlock(&g_key_mutex);
     if (pub) printf("[PQC-HS] Peer identity key loaded from DB. Ready for Handshake.\n");
 }
+
+bool sig_pqc_has_identity(const char *fingerprint) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_registry_count; i++) {
+        if (strcmp(g_identity_registry[i].fingerprint, fingerprint) == 0) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return true;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return false;
+}

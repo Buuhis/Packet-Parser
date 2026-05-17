@@ -69,5 +69,6 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
  * Configures the handshake for a specific profile.
  */
 void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint);
+bool sig_pqc_has_identity(const char *fingerprint);
 
 #endif
