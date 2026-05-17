@@ -34,8 +34,7 @@ struct pqc_hs_msg {
  * @param identity_priv The local identity private key (used for HMAC signing).
  * @param identity_pub The peer's identity public key (used for HMAC verification).
  */
-int sig_pqc_handshake_start(bool is_initiator, const char *peer_ip,
-                            const char *identity_priv, const char *identity_pub);
+int sig_pqc_handshake_start(const char *wan_ifname, const char *peer_ip);
 
 /**
  * Checks whether the Handshake has completed and the key is available.
@@ -68,7 +67,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
 /**
  * Configures the handshake for a specific profile.
  */
-void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint);
+void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname);
 bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub);
 int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);

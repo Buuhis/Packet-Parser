@@ -1530,46 +1530,18 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
 
-    // ----- PQC HANDSHAKE START (Automatic Role Selection) -----
+    // ----- PQC HANDSHAKE START (Automatic MAC-based Role Selection) -----
     if (cfg->crypto_mode == CRYPTO_MODE_PQC_GCM && cfg->wan_count > 0) {
-        char my_ip_str[64] = {0};
         char peer_ip_str[64] = {0};
         struct in_addr addr;
-
-        // Get Peer IP
         addr.s_addr = cfg->wans[0].dst_ip;
         inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
 
-        // Try to get Local IP, if not available, use a default or comparison logic
-        bool is_initiator = false;
-        if (cfg->local_count > 0 && cfg->locals[0].ip != 0) {
-            addr.s_addr = cfg->locals[0].ip;
-            inet_ntop(AF_INET, &addr, my_ip_str, sizeof(my_ip_str));
-            // Rule: The one with the lexicographically smaller IP starts
-            is_initiator = (strcmp(my_ip_str, peer_ip_str) < 0);
-        } else {
-            // Fallback: If no local IP, we can't easily decide. 
-            // Let's use a simple heuristic or just default to false for one side.
-            // But wait, if both are 0, we have a problem.
-            // Let's assume the user has at least one IP configured.
-            is_initiator = true; // Default to true if local unknown
-        }
-
-        printf("[PQC-HS] Role Selection: MyIP=%s, PeerIP=%s, Initiator: %s\n",
-               my_ip_str[0] ? my_ip_str : "unknown", peer_ip_str, is_initiator ? "YES" : "NO");
-
-        // Find the first PQC policy to get identity keys for authentication
-        const char *id_priv = NULL;
-        const char *id_pub = NULL;
-        for (int i = 0; i < cfg->policy_count; i++) {
-            if (cfg->policies[i].crypto_mode == CRYPTO_MODE_PQC_GCM) {
-                id_priv = cfg->policies[i].identity_priv;
-                id_pub = cfg->policies[i].identity_pub;
-                break;
-            }
-        }
-        sig_pqc_handshake_start(is_initiator, peer_ip_str, id_priv, id_pub);
+        printf("[PQC-HS] Starting Automatic MAC-based Role Discovery on %s -> Peer IP: %s\n",
+               cfg->wans[0].ifname, peer_ip_str);
+        sig_pqc_handshake_start(cfg->wans[0].ifname, peer_ip_str);
     }
+
     g_cfg_ptr = cfg;
     interface_reset_redirect_maps();
 

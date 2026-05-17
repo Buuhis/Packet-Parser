@@ -367,13 +367,15 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                     if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
                         // Configure Handshake with Fingerprint
                         char peer_ip[64] = "0.0.0.0";
+                        const char *wan_ifname = "";
                         if (p->wan_count > 0) {
                             struct in_addr addr;
                             addr.s_addr = cfg->wans[p->wan_indices[0]].dst_ip;
                             inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
+                            wan_ifname = cfg->wans[p->wan_indices[0]].ifname;
                         }
                         
-                        sig_pqc_set_handshake_config(true, peer_ip, p->local_identity_fingerprint);
+                        sig_pqc_set_handshake_config(true, peer_ip, p->local_identity_fingerprint, wan_ifname);
 
                         // Load Peer Identity Key for this specific profile
                         char pid_str[16];

@@ -11,14 +11,14 @@
 #include <errno.h>
 #include <dirent.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
 
 static uint8_t  g_traffic_key[PQC_TRAFFIC_KEY_SZ];
 static bool g_key_ready = false;
 static bool g_hs_started = false;
 static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static char *g_global_id_priv = NULL;
-static char *g_global_id_pub = NULL;
 static char *g_peer_id_pub = NULL;
 
 #define MAX_IDENTITY_REGISTRY 10
@@ -46,6 +46,7 @@ typedef struct {
     bool is_initiator;
     char peer_ip[64];
     char local_fingerprint[16];
+    char wan_ifname[64];
 } hs_config_t;
 
 static hs_config_t g_hs_cfg;
@@ -64,6 +65,24 @@ static void calculate_auth_tag(const char *key_str, const uint8_t *data, int len
         return;
     }
     trf_calculate_hmac(DIGEST_TYPE_SHA256, (const uint8_t *)key_str, (int)strlen(key_str), data, len, out_tag);
+}
+
+static int get_interface_mac(const char *ifname, uint8_t mac[6]) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+    if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    memcpy(mac, ifr.ifr_hwaddr.sa_data, 6);
+    close(fd);
+    return 0;
 }
 
 static void* pqc_handshake_thread(void* arg) {
@@ -91,11 +110,98 @@ static void* pqc_handshake_thread(void* arg) {
     memset(&peeraddr, 0, sizeof(peeraddr));
     peeraddr.sin_family = AF_INET;
     peeraddr.sin_port = htons(PQC_HS_PORT);
-    
-    printf("[PQC-HS] Handshake thread started. Role: %s\n", 
-           g_hs_cfg.is_initiator ? "Initiator" : "Responder");
+
+    // Parse peer IP
+    pthread_mutex_lock(&g_key_mutex);
+    char current_peer_ip[64];
+    strncpy(current_peer_ip, g_hs_cfg.peer_ip, 63);
+    pthread_mutex_unlock(&g_key_mutex);
+    inet_pton(AF_INET, current_peer_ip, &peeraddr.sin_addr);
+
+    // ----- STAGE 1: AUTOMATED ROLE DISCOVERY VIA MAC EXCHANGE -----
+    uint8_t local_mac[6] = {0};
+    uint8_t peer_mac[6] = {0};
+    bool role_settled = false;
+
+    if (get_interface_mac(g_hs_cfg.wan_ifname, local_mac) < 0) {
+        printf("[PQC-DISCO] WARNING: Failed to get MAC for interface %s. Using fallback.\n", g_hs_cfg.wan_ifname);
+        local_mac[0] = 0x02;
+        local_mac[5] = 0x01;
+    }
+
+    printf("[PQC-DISCO] Local WAN Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           g_hs_cfg.wan_ifname,
+           local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]);
+
+    // Set socket receive timeout to 500ms for active discovery
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 500000;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    #define PQC_DISCO_MAGIC 0x50514344
+    struct pqc_disco_msg {
+        uint32_t magic;
+        uint8_t mac[6];
+    } __attribute__((packed));
+
+    struct pqc_disco_msg disco_send, disco_recv;
+    disco_send.magic = htonl(PQC_DISCO_MAGIC);
+    memcpy(disco_send.mac, local_mac, 6);
+
+    printf("[PQC-DISCO] Exchanging MAC addresses with peer %s on UDP port %d...\n", current_peer_ip, PQC_HS_PORT);
     fflush(stdout);
 
+    int retries = 0;
+    while (!role_settled) {
+        // Send local MAC
+        sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+
+        // Receive peer MAC
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        int recv_sz = recvfrom(sockfd, &disco_recv, sizeof(disco_recv), 0, (struct sockaddr *)&from_addr, &from_len);
+
+        if (recv_sz == sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
+            memcpy(peer_mac, disco_recv.mac, 6);
+            role_settled = true;
+            printf("[PQC-DISCO] Received Peer MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+                   peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5]);
+            break;
+        }
+
+        retries++;
+        if (retries % 10 == 0) {
+            printf("[PQC-DISCO] Waiting for peer MAC... (elapsed %d seconds)\n", retries / 2);
+            fflush(stdout);
+        }
+    }
+
+    // Restore standard longer receive timeout (5 seconds) for main handshake
+    tv.tv_sec = 5;
+    tv.tv_usec = 0;
+    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Compare MACs to settle roles (Larger MAC = Initiator)
+    pthread_mutex_lock(&g_key_mutex);
+    int comp = memcmp(local_mac, peer_mac, 6);
+    if (comp > 0) {
+        g_hs_cfg.is_initiator = true;
+    } else if (comp < 0) {
+        g_hs_cfg.is_initiator = false;
+    } else {
+        g_hs_cfg.is_initiator = (strcmp(g_hs_cfg.peer_ip, "192.168.1.1") == 0);
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+
+    printf("[PQC-DISCO] ROLE SETTLED: Local MAC [%02x:%02x:%02x:%02x:%02x:%02x] %s Peer MAC [%02x:%02x:%02x:%02x:%02x:%02x] -> Role: %s\n",
+           local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5],
+           g_hs_cfg.is_initiator ? ">" : "<",
+           peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5],
+           g_hs_cfg.is_initiator ? "INITIATOR" : "RESPONDER");
+    fflush(stdout);
+
+    // ----- STAGE 2: MAIN ML-KEM/ML-DSA HANDSHAKE -----
     while (!g_key_ready) {
         // 1. Wait for keys to be ready in RAM/DB
         pthread_mutex_lock(&g_key_mutex);
@@ -206,8 +312,7 @@ static void* pqc_handshake_thread(void* arg) {
     return NULL;
 }
 
-int sig_pqc_handshake_start(bool is_initiator, const char *peer_ip, 
-                            const char *identity_priv, const char *identity_pub) {
+int sig_pqc_handshake_start(const char *wan_ifname, const char *peer_ip) {
     pthread_mutex_lock(&g_key_mutex);
     if (g_hs_started) {
         pthread_mutex_unlock(&g_key_mutex);
@@ -216,7 +321,7 @@ int sig_pqc_handshake_start(bool is_initiator, const char *peer_ip,
     g_hs_started = true;
     pthread_mutex_unlock(&g_key_mutex);
 
-    g_hs_cfg.is_initiator = is_initiator;
+    if (wan_ifname) strncpy(g_hs_cfg.wan_ifname, wan_ifname, 63);
     strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
 
     pthread_t thread_id;
@@ -277,11 +382,12 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint) {
+void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname) {
     pthread_mutex_lock(&g_key_mutex);
     g_hs_cfg.is_initiator = is_initiator;
     strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
     if (local_fingerprint) strncpy(g_hs_cfg.local_fingerprint, local_fingerprint, 15);
+    if (wan_ifname) strncpy(g_hs_cfg.wan_ifname, wan_ifname, 63);
     pthread_mutex_unlock(&g_key_mutex);
 }
 
