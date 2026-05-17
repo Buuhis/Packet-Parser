@@ -81,6 +81,7 @@ static void handle_gen_identity() {
     
     trf_pqc_init_global();
     mkdir("/etc/.enc_config", 0755);
+    mkdir("/dev/shm/.enc_config", 0755);
 
     printf("[PQC-GI] Generating Manual Identity (RAM-ONLY)...\n");
     if (trf_dsa_generate_keys(dsa_pub, &pub_sz, dsa_priv, &priv_sz) == TRF_PQC_OK) {
@@ -107,6 +108,18 @@ static void handle_gen_identity() {
         } else {
             fprintf(stderr, "[PQC-GI] ERROR: Failed to save key to %s\n", pub_path);
         }
+
+        // Securely export the private key locally in RAM-disk (/dev/shm) for Zero-Trace persistence
+        char priv_path[256];
+        snprintf(priv_path, sizeof(priv_path), "/dev/shm/.enc_config/identity_%s_priv.key", fingerprint);
+        char *obf_priv = malloc(priv_sz * 2 + 128);
+        trf_base64_encode_obfuscated(dsa_priv, priv_sz, fingerprint, obf_priv);
+        if (trf_save_key_to_file(priv_path, obf_priv, 0600) == 0) {
+            printf("[PQC-GI] Secure Private Key Exported locally: %s\n", priv_path);
+        } else {
+            fprintf(stderr, "[PQC-GI] ERROR: Failed to save private key securely to %s\n", priv_path);
+        }
+        free(obf_priv);
         
         // Add to RAM Registry
         sig_pqc_add_to_registry(fingerprint, b64_priv, b64_pub);
@@ -124,6 +137,9 @@ int main(int argc, char **argv) {
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
     const char *values[]   = {getenv("POSTGRES_HOST"), getenv("POSTGRES_PORT"), getenv("POSTGRES_TABLE"),
                               getenv("POSTGRES_USER"), db_pass, "10", NULL};
+
+    // Securely restore any local private keys into the volatile RAM registry on startup
+    sig_pqc_load_keys_from_disk();
 
     if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
         handle_gen_identity();

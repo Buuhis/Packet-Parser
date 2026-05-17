@@ -387,6 +387,14 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                             const char *peer_pub = PQgetvalue(peer_res, 0, 0);
                             if (peer_pub && peer_pub[0] != '\0') {
                                 sig_pqc_set_peer_identity(peer_pub);
+
+                                // Perform dynamic active RAM binding for this profile in Daemon's memory
+                                char *found_priv = NULL;
+                                char *found_pub = NULL;
+                                if (p->local_identity_fingerprint[0] != '\0') {
+                                    sig_pqc_find_identity(p->local_identity_fingerprint, &found_priv, &found_pub);
+                                }
+                                sig_pqc_bind_profile_keys(p->id, found_priv, found_pub, peer_pub);
                             }
                         } else {
                             printf("[DB-PQC] Warning: No peer identity public key found in pqc_identities for profile %d.\n", p->id);
@@ -893,11 +901,8 @@ int db_check_identities(const char *conn_str) {
         char *found_priv = NULL;
         char *found_pub = NULL;
         if (l_fp && strlen(l_fp) > 0) {
-            if (sig_pqc_find_identity(l_fp, &found_priv, &found_pub) == 0) {
-                printf("  - Local Key Fingerprint: [%s] -> MATCHED (RAM Cache Active)\n", l_fp);
-            } else {
-                printf("  - Local Key Fingerprint: [%s] -> NOT LOADED (Private Key missing in RAM Registry)\n", l_fp);
-            }
+            printf("  - Local Key Fingerprint: [%s]\n", l_fp);
+            sig_pqc_find_identity(l_fp, &found_priv, &found_pub);
         } else {
             printf("  - Local Key Fingerprint: NOT ASSIGNED\n");
         }

@@ -9,6 +9,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <dirent.h>
+#include <sys/types.h>
 
 static uint8_t  g_traffic_key[PQC_TRAFFIC_KEY_SZ];
 static bool g_key_ready = false;
@@ -361,4 +363,57 @@ int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_p
     }
     pthread_mutex_unlock(&g_key_mutex);
     return -1;
+}
+
+void sig_pqc_load_keys_from_disk(void) {
+    DIR *dir = opendir("/dev/shm/.enc_config");
+    if (!dir) return;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "identity_", 9) == 0 && strstr(entry->d_name, "_priv.key") != NULL) {
+            char fingerprint[16];
+            memset(fingerprint, 0, sizeof(fingerprint));
+            strncpy(fingerprint, entry->d_name + 9, 8);
+
+            char priv_path[512];
+            char pub_path[512];
+            snprintf(priv_path, sizeof(priv_path), "/dev/shm/.enc_config/%s", entry->d_name);
+            snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/identity_%s_pub.key", fingerprint);
+
+            FILE *fp_priv = fopen(priv_path, "r");
+            if (!fp_priv) continue;
+            char obf_priv[8192];
+            memset(obf_priv, 0, sizeof(obf_priv));
+            if (fgets(obf_priv, sizeof(obf_priv) - 1, fp_priv) == NULL) {
+                fclose(fp_priv);
+                continue;
+            }
+            fclose(fp_priv);
+            obf_priv[strcspn(obf_priv, "\r\n")] = '\0';
+
+            FILE *fp_pub = fopen(pub_path, "r");
+            if (!fp_pub) continue;
+            char obf_pub[4096];
+            memset(obf_pub, 0, sizeof(obf_pub));
+            if (fgets(obf_pub, sizeof(obf_pub) - 1, fp_pub) == NULL) {
+                fclose(fp_pub);
+                continue;
+            }
+            fclose(fp_pub);
+            obf_pub[strcspn(obf_pub, "\r\n")] = '\0';
+
+            unsigned char raw_priv[4096];
+            size_t raw_priv_len = 0;
+            trf_base64_decode_obfuscated(obf_priv, fingerprint, raw_priv, &raw_priv_len);
+
+            char plain_b64_priv[8192];
+            memset(plain_b64_priv, 0, sizeof(plain_b64_priv));
+            trf_base64_encode(raw_priv, raw_priv_len, plain_b64_priv);
+
+            sig_pqc_add_to_registry(fingerprint, plain_b64_priv, obf_pub);
+            printf("[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
+        }
+    }
+    closedir(dir);
 }

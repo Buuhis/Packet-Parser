@@ -73,5 +73,6 @@ bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub);
 int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
+void sig_pqc_load_keys_from_disk(void);
 
 #endif
