@@ -81,6 +81,31 @@ void trf_base64_encode_obfuscated(const unsigned char *src, size_t len, const ch
     free(tmp);
 }
 
+void trf_base64_decode(const char *src, unsigned char *out, size_t *out_len) {
+    static const int b64_inv[256] = { [0 ... 255] = -1,
+        ['A']=0,['B']=1,['C']=2,['D']=3,['E']=4,['F']=5,['G']=6,['H']=7,['I']=8,['J']=9,['K']=10,['L']=11,['M']=12,['N']=13,['O']=14,['P']=15,['Q']=16,['R']=17,['S']=18,['T']=19,['U']=20,['V']=21,['W']=22,['X']=23,['Y']=24,['Z']=25,
+        ['a']=26,['b']=27,['c']=28,['d']=29,['e']=30,['f']=31,['g']=32,['h']=33,['i']=34,['j']=35,['k']=36,['l']=37,['m']=38,['n']=39,['o']=40,['p']=41,['q']=42,['r']=43,['s']=44,['t']=45,['u']=46,['v']=47,['w']=48,['x']=49,['y']=50,['z']=51,
+        ['0']=52,['1']=53,['2']=54,['3']=55,['4']=56,['5']=57,['6']=58,['7']=59,['8']=60,['9']=61,['+']=62,['/']=63
+    };
+
+    size_t in_len = strlen(src);
+    size_t j = 0;
+    for (size_t i = 0; i < in_len; i += 4) {
+        if (src[i] == '\0') break;
+        uint32_t v = (b64_inv[(int)src[i]] << 18) | (b64_inv[(int)src[i+1]] << 12);
+        out[j++] = (v >> 16) & 0xFF;
+        if (src[i+2] != '=') {
+            v |= (b64_inv[(int)src[i+2]] << 6);
+            out[j++] = (v >> 8) & 0xFF;
+        }
+        if (src[i+3] != '=') {
+            v |= b64_inv[(int)src[i+3]];
+            out[j++] = v & 0xFF;
+        }
+    }
+    *out_len = j;
+}
+
 void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned char *out, size_t *out_len) {
     // This is a simplified decode + de-XOR. 
     // In a real system we'd need a proper Base64 decoder.

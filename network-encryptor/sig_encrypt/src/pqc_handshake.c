@@ -58,14 +58,7 @@ static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t
     memcpy(out_key, hash, PQC_TRAFFIC_KEY_SZ);
 }
 
-// Helper to calculate HMAC-SHA256 for authentication
-static void calculate_auth_tag(const char *key_str, const uint8_t *data, int len, uint8_t *out_tag) {
-    if (!key_str || key_str[0] == '\0') {
-        memset(out_tag, 0, PQC_AUTH_TAG_SZ);
-        return;
-    }
-    trf_calculate_hmac(DIGEST_TYPE_SHA256, (const uint8_t *)key_str, (int)strlen(key_str), data, len, out_tag);
-}
+// (HMAC helper removed as we now use actual ML-DSA signatures)
 
 static int get_interface_mac(const char *ifname, uint8_t mac[6]) {
     int fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -206,13 +199,15 @@ static void* pqc_handshake_thread(void* arg) {
         // 1. Wait for keys to be ready in RAM/DB
         pthread_mutex_lock(&g_key_mutex);
         char *my_priv = NULL;
+        char *my_pub = NULL;
         for (int i = 0; i < g_registry_count; i++) {
             if (strcmp(g_identity_registry[i].fingerprint, g_hs_cfg.local_fingerprint) == 0) {
                 my_priv = g_identity_registry[i].priv_key;
+                my_pub = g_identity_registry[i].pub_key;
                 break;
             }
         }
-        bool has_keys = (my_priv != NULL && g_peer_id_pub != NULL);
+        bool has_keys = (my_priv != NULL && my_pub != NULL && g_peer_id_pub != NULL);
         char current_peer_ip[64];
         strncpy(current_peer_ip, g_hs_cfg.peer_ip, 63);
         pthread_mutex_unlock(&g_key_mutex);
@@ -234,14 +229,20 @@ static void* pqc_handshake_thread(void* arg) {
             msg->msg_type = PQC_HS_MSG_HELLO;
             msg->session_id = 123; 
             msg->data_len = (uint16_t)pk_sz;
-            memcpy(msg->data, pk, pk_sz);
+            memcpy(msg->payload, pk, pk_sz);
             
             pthread_mutex_lock(&g_key_mutex);
-            calculate_auth_tag(my_priv, msg->data, pk_sz, msg->auth_tag);
+            size_t raw_priv_sz = 0;
+            uint8_t raw_priv[8192];
+            trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+            
+            int sig_sz = 0;
+            trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
+            msg->sig_len = (uint16_t)sig_sz;
             pthread_mutex_unlock(&g_key_mutex);
 
             while (!g_key_ready) {
-                sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz, 0,
+                sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
                        (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
                 
                 struct timeval tv = {2, 0};
@@ -252,11 +253,14 @@ static void* pqc_handshake_thread(void* arg) {
                 if (n > 0) {
                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                     if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
-                        uint8_t expected_tag[PQC_AUTH_TAG_SZ];
-                        calculate_auth_tag(g_peer_id_pub, resp->data, resp->data_len, expected_tag);
-                        
-                        if (memcmp(resp->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) == 0) {
-                            if (trf_kem_decapsulate(sk, sk_sz, resp->data, resp->data_len, ss) == TRF_PQC_OK) {
+                        pthread_mutex_lock(&g_key_mutex);
+                        size_t raw_pub_sz = 0;
+                        uint8_t raw_pub[8192];
+                        trf_base64_decode(g_peer_id_pub, raw_pub, &raw_pub_sz);
+                        pthread_mutex_unlock(&g_key_mutex);
+
+                        if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
+                            if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
                                 pthread_mutex_lock(&g_key_mutex);
                                 derive_traffic_key(ss, 32, g_traffic_key);
                                 g_key_ready = true;
@@ -284,21 +288,30 @@ static void* pqc_handshake_thread(void* arg) {
             if (n > 0) {
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                 if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
-                    uint8_t expected_tag[PQC_AUTH_TAG_SZ];
-                    calculate_auth_tag(g_peer_id_pub, msg->data, msg->data_len, expected_tag);
-                    
-                    if (memcmp(msg->auth_tag, expected_tag, PQC_AUTH_TAG_SZ) == 0) {
-                        if (trf_kem_encapsulate(msg->data, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                    pthread_mutex_lock(&g_key_mutex);
+                    size_t raw_pub_sz = 0;
+                    uint8_t raw_pub[8192];
+                    trf_base64_decode(g_peer_id_pub, raw_pub, &raw_pub_sz);
+                    pthread_mutex_unlock(&g_key_mutex);
+
+                    if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                        if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                             struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                             resp->msg_type = PQC_HS_MSG_RESP;
                             resp->data_len = (uint16_t)ct_sz;
-                            memcpy(resp->data, ct, ct_sz);
+                            memcpy(resp->payload, ct, ct_sz);
                             
                             pthread_mutex_lock(&g_key_mutex);
-                            calculate_auth_tag(my_priv, resp->data, ct_sz, resp->auth_tag);
+                            size_t raw_priv_sz = 0;
+                            uint8_t raw_priv[8192];
+                            trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                            
+                            int sig_sz = 0;
+                            trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
+                            resp->sig_len = (uint16_t)sig_sz;
                             pthread_mutex_unlock(&g_key_mutex);
 
-                            sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz, 0,
+                            sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz, 0,
                                    (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
                             pthread_mutex_lock(&g_key_mutex);

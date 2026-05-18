@@ -13,16 +13,16 @@
 #define PQC_KEM_CT_SIZE    1088 // ML-KEM-768 CT size
 #define PQC_AUTH_TAG_SZ    32
 #define PQC_TRAFFIC_KEY_SZ 32
-#define PQC_HS_MSG_MAX_SZ  4096
+#define PQC_HS_MSG_MAX_SZ  10000
 
 #pragma pack(push, 1)
 struct pqc_hs_msg {
     uint32_t magic;
     uint8_t  msg_type;
     uint32_t session_id;
-    uint8_t  auth_tag[PQC_AUTH_TAG_SZ];
-    uint16_t data_len;
-    uint8_t  data[];
+    uint16_t sig_len;  // Length of the ML-DSA signature
+    uint16_t data_len; // Length of the KEM payload
+    uint8_t  payload[0]; // data[data_len] followed by signature[sig_len]
 };
 #pragma pack(pop)
 
