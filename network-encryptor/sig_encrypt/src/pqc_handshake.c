@@ -265,6 +265,11 @@ static void* pqc_handshake_thread(void* arg) {
                                 break;
                             }
                         }
+                    } else if (n == sizeof(struct pqc_disco_msg)) {
+                        struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
+                        if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
+                            sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                        }
                     }
                 }
                 fprintf(stderr, "[PQC-HS] Initiator retrying HELLO...\n");
@@ -302,6 +307,11 @@ static void* pqc_handshake_thread(void* arg) {
                             pthread_mutex_unlock(&g_key_mutex);
                             fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
                         }
+                    }
+                } else if (n == sizeof(struct pqc_disco_msg)) {
+                    struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
+                    if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
+                        sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
                     }
                 }
             }
