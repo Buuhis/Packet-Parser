@@ -271,6 +271,7 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
         strncpy(dp->name, sp->name, sizeof(dp->name) - 1);
         dp->enabled = sp->enabled;
         dp->channel_bonding = sp->channel_bonding;
+        memcpy(dp->local_identity_fingerprint, sp->local_identity_fingerprint, sizeof(dp->local_identity_fingerprint));
 
         for (int i = 0; i < sp->local_count; i++) {
             int sli = sp->local_indices[i];

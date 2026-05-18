@@ -409,7 +409,7 @@ static int encrypt_packet_with_ctx(struct packet_crypto_ctx *ctx,
                 if (pcap_count == 50) {
                     fclose(pcap_file);
                     pcap_file = NULL;
-                    printf("[PQC-DIAG] Captured 50 encrypted packets to encrypted_traffic.pcap\n");
+                    fprintf(stderr, "[PQC-DIAG] Captured 50 encrypted packets to encrypted_traffic.pcap\n");
                 }
             }
         }
@@ -417,7 +417,7 @@ static int encrypt_packet_with_ctx(struct packet_crypto_ctx *ctx,
 
         static uint32_t enc_count = 0;
         if (++enc_count % 1000 == 0) {
-            printf("[PQC-DIAG] Successfully ENCRYPTED 1000 packets (Total: %u)\n", enc_count);
+            fprintf(stderr, "[PQC-DIAG] Successfully ENCRYPTED 1000 packets (Total: %u)\n", enc_count);
             fflush(stdout);
         }
         return 0; // Trả về 0 để báo thành công
@@ -500,7 +500,7 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         return 0;
     }
 
-    printf("[PQC-DEC-DIAG] MATCHED Fake EtherType: 0x%04x\n", current_etype);
+    fprintf(stderr, "[PQC-DEC-DIAG] MATCHED Fake EtherType: 0x%04x\n", current_etype);
     fflush(stdout);
 
     if (fwd->cfg->policy_count <= 0) {
@@ -521,13 +521,13 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
         magic     = pkt[14 + nonce_size + 1];
     }
     
-    printf("[PQC-DEC-DIAG] Found L2 Marker! policy_id=%u, magic=0x%02x, nonce_size=%d\n", 
+    fprintf(stderr, "[PQC-DEC-DIAG] Found L2 Marker! policy_id=%u, magic=0x%02x, nonce_size=%d\n", 
            policy_id, magic, nonce_size);
     fflush(stdout);
 
     // MAGIC CHECK
     if (magic != 0xA5) {
-        printf("[PQC-DEC-DIAG] Magic mismatch! Expected 0xA5, got 0x%02x. Skipping...\n", magic);
+        fprintf(stderr, "[PQC-DEC-DIAG] Magic mismatch! Expected 0xA5, got 0x%02x. Skipping...\n", magic);
         return 0;
     }
 
@@ -541,12 +541,12 @@ static int decrypt_packet_auto_l2(struct forwarder *fwd,
             
             static uint32_t dec_count = 0;
             if (++dec_count % 1000 == 0) {
-                printf("[PQC-DIAG] Successfully DECRYPTED 1000 packets (Total: %u)\n", dec_count);
+                fprintf(stderr, "[PQC-DIAG] Successfully DECRYPTED 1000 packets (Total: %u)\n", dec_count);
                 fflush(stdout);
             }
             return 0;
         } else {
-            printf("[PQC-DEC-DIAG] packet_decrypt FAILED with res=%d\n", new_len);
+            fprintf(stderr, "[PQC-DEC-DIAG] packet_decrypt FAILED with res=%d\n", new_len);
             fflush(stdout);
         }
         return 0;
@@ -1530,16 +1530,27 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     memset(fwd, 0, sizeof(*fwd));
     fwd->cfg = cfg;
 
-    // ----- PQC HANDSHAKE START (Automatic MAC-based Role Selection) -----
-    if (cfg->crypto_mode == CRYPTO_MODE_PQC_GCM && cfg->wan_count > 0) {
+    // ----- PQC HANDSHAKE START (Profile-based Authentication) -----
+    if (cfg->profile_count > 0 && cfg->profiles[0].local_identity_fingerprint[0] != '\0') {
         char peer_ip_str[64] = {0};
         struct in_addr addr;
-        addr.s_addr = cfg->wans[0].dst_ip;
-        inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
+        if (cfg->profiles[0].wan_count > 0) {
+            int w_idx = cfg->profiles[0].wan_indices[0];
+            
+            // STRICT BOUNDARY CHECK: Prevent Page Faults / Coredumps if w_idx is invalid
+            if (w_idx >= 0 && w_idx < cfg->wan_count) {
+                addr.s_addr = cfg->wans[w_idx].dst_ip;
+                inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
 
-        printf("[PQC-HS] Starting Automatic MAC-based Role Discovery on %s -> Peer IP: %s\n",
-               cfg->wans[0].ifname, peer_ip_str);
-        sig_pqc_handshake_start(cfg->wans[0].ifname, peer_ip_str);
+                fprintf(stderr, "[PQC-HS] Starting Automatic MAC-based Role Discovery on %s -> Peer IP: %s\n",
+                       cfg->wans[w_idx].ifname, peer_ip_str);
+                
+                // Start the Handshake safely
+                sig_pqc_handshake_start(cfg->wans[w_idx].ifname, peer_ip_str);
+            } else {
+                fprintf(stderr, "[PQC-HS] CRITICAL ERROR: w_idx (%d) is out of bounds! Skipping Handshake.\n", w_idx);
+            }
+        }
     }
 
     g_cfg_ptr = cfg;

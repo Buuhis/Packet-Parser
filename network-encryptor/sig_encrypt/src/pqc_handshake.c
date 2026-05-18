@@ -124,12 +124,12 @@ static void* pqc_handshake_thread(void* arg) {
     bool role_settled = false;
 
     if (get_interface_mac(g_hs_cfg.wan_ifname, local_mac) < 0) {
-        printf("[PQC-DISCO] WARNING: Failed to get MAC for interface %s. Using fallback.\n", g_hs_cfg.wan_ifname);
+        fprintf(stderr, "[PQC-DISCO] WARNING: Failed to get MAC for interface %s. Using fallback.\n", g_hs_cfg.wan_ifname);
         local_mac[0] = 0x02;
         local_mac[5] = 0x01;
     }
 
-    printf("[PQC-DISCO] Local WAN Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+    fprintf(stderr, "[PQC-DISCO] Local WAN Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
            g_hs_cfg.wan_ifname,
            local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]);
 
@@ -149,7 +149,7 @@ static void* pqc_handshake_thread(void* arg) {
     disco_send.magic = htonl(PQC_DISCO_MAGIC);
     memcpy(disco_send.mac, local_mac, 6);
 
-    printf("[PQC-DISCO] Exchanging MAC addresses with peer %s on UDP port %d...\n", current_peer_ip, PQC_HS_PORT);
+    fprintf(stderr, "[PQC-DISCO] Exchanging MAC addresses with peer %s on UDP port %d...\n", current_peer_ip, PQC_HS_PORT);
     fflush(stdout);
 
     int retries = 0;
@@ -165,14 +165,14 @@ static void* pqc_handshake_thread(void* arg) {
         if (recv_sz == sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
             memcpy(peer_mac, disco_recv.mac, 6);
             role_settled = true;
-            printf("[PQC-DISCO] Received Peer MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            fprintf(stderr, "[PQC-DISCO] Received Peer MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
                    peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5]);
             break;
         }
 
         retries++;
         if (retries % 10 == 0) {
-            printf("[PQC-DISCO] Waiting for peer MAC... (elapsed %d seconds)\n", retries / 2);
+            fprintf(stderr, "[PQC-DISCO] Waiting for peer MAC... (elapsed %d seconds)\n", retries / 2);
             fflush(stdout);
         }
     }
@@ -194,7 +194,7 @@ static void* pqc_handshake_thread(void* arg) {
     }
     pthread_mutex_unlock(&g_key_mutex);
 
-    printf("[PQC-DISCO] ROLE SETTLED: Local MAC [%02x:%02x:%02x:%02x:%02x:%02x] %s Peer MAC [%02x:%02x:%02x:%02x:%02x:%02x] -> Role: %s\n",
+    fprintf(stderr, "[PQC-DISCO] ROLE SETTLED: Local MAC [%02x:%02x:%02x:%02x:%02x:%02x] %s Peer MAC [%02x:%02x:%02x:%02x:%02x:%02x] -> Role: %s\n",
            local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5],
            g_hs_cfg.is_initiator ? ">" : "<",
            peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5],
@@ -261,13 +261,13 @@ static void* pqc_handshake_thread(void* arg) {
                                 derive_traffic_key(ss, 32, g_traffic_key);
                                 g_key_ready = true;
                                 pthread_mutex_unlock(&g_key_mutex);
-                                printf("[PQC-HS] Handshake SUCCESS!\n");
+                                fprintf(stderr, "[PQC-HS] Handshake SUCCESS!\n");
                                 break;
                             }
                         }
                     }
                 }
-                printf("[PQC-HS] Initiator retrying HELLO...\n");
+                fprintf(stderr, "[PQC-HS] Initiator retrying HELLO...\n");
             }
         } else {
             // --- RESPONDER FLOW ---
@@ -300,7 +300,7 @@ static void* pqc_handshake_thread(void* arg) {
                             derive_traffic_key(ss, 32, g_traffic_key);
                             g_key_ready = true;
                             pthread_mutex_unlock(&g_key_mutex);
-                            printf("[PQC-HS] Responder Handshake SUCCESS!\n");
+                            fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
                         }
                     }
                 }
@@ -378,7 +378,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     entry->priv_key = strdup(priv);
     entry->pub_key = strdup(pub);
     
-    printf("[PQC-REG] Added identity fingerprint: %s to RAM Registry.\n", fingerprint);
+    fprintf(stderr, "[PQC-REG] Added identity fingerprint: %s to RAM Registry.\n", fingerprint);
     pthread_mutex_unlock(&g_key_mutex);
 }
 
@@ -396,7 +396,7 @@ void sig_pqc_set_peer_identity(const char *pub) {
     if (g_peer_id_pub) free(g_peer_id_pub);
     g_peer_id_pub = pub ? strdup(pub) : NULL;
     pthread_mutex_unlock(&g_key_mutex);
-    if (pub) printf("[PQC-HS] Peer identity key loaded from DB. Ready for Handshake.\n");
+    if (pub) fprintf(stderr, "[PQC-HS] Peer identity key loaded from DB. Ready for Handshake.\n");
 }
 
 bool sig_pqc_has_identity(const char *fingerprint) {
@@ -436,7 +436,7 @@ void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const cha
         b->local_priv = local_priv ? strdup(local_priv) : NULL;
         b->local_pub = local_pub ? strdup(local_pub) : NULL;
         b->peer_pub = peer_pub ? strdup(peer_pub) : NULL;
-        printf("[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
+        fprintf(stderr, "[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
     }
     
     pthread_mutex_unlock(&g_key_mutex);
@@ -518,7 +518,7 @@ void sig_pqc_load_keys_from_disk(void) {
             trf_base64_encode(raw_priv, raw_priv_len, plain_b64_priv);
 
             sig_pqc_add_to_registry(fingerprint, plain_b64_priv, obf_pub);
-            printf("[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
+            fprintf(stderr, "[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
         }
     }
     closedir(dir);

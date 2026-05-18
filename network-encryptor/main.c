@@ -138,8 +138,6 @@ int main(int argc, char **argv) {
     const char *values[]   = {getenv("POSTGRES_HOST"), getenv("POSTGRES_PORT"), getenv("POSTGRES_TABLE"),
                               getenv("POSTGRES_USER"), db_pass, "10", NULL};
 
-    // Securely restore any local private keys into the volatile RAM registry on startup
-    sig_pqc_load_keys_from_disk();
 
     if (argc > 1 && strcmp(argv[1], "-gi") == 0) {
         handle_gen_identity();
