@@ -30,6 +30,19 @@ struct {
     __type(value, __u16);
 } wan_config_map SEC(".maps");
 
+struct pqc_frag_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 ip_id;
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 1024);
+    __type(key, struct pqc_frag_key);
+    __type(value, __u8);
+} pqc_frag_map SEC(".maps");
+
 #define STAT_TOTAL      0
 #define STAT_NON_IP     1
 #define STAT_REDIRECT   2
@@ -71,9 +84,23 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
-        // 1. Pass all IP fragments to the kernel for normal IP reassembly
-        if (ip->frag_off & __constant_htons(0x3FFF)) { // 0x3FFF covers IP_MF and offset
-            return XDP_PASS;
+        // Extract fragment offset and flags
+        __u16 frag_off = bpf_ntohs(ip->frag_off);
+        __u16 offset = frag_off & 0x1FFF;
+        __u16 mf = frag_off & 0x2000;
+
+        struct pqc_frag_key key = {
+            .src_ip = ip->saddr,
+            .dst_ip = ip->daddr,
+            .ip_id = ip->id
+        };
+
+        // 1. Pass PQC subsequent fragments to the kernel
+        if (offset > 0) {
+            __u8 *val = bpf_map_lookup_elem(&pqc_frag_map, &key);
+            if (val) {
+                return XDP_PASS;
+            }
         }
 
         if (ip->protocol == IPPROTO_ICMP_VAL) {
@@ -81,11 +108,15 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             return XDP_PASS;
         }
 
-        // 2. Pass PQC Handshake packets (port 7090) to the kernel
+        // 2. Pass PQC Handshake first fragment or unfragmented packets to the kernel
         if (ip->protocol == IPPROTO_UDP_VAL) {
             struct udphdr *udp = (void *)((__u8 *)ip + (ip->ihl * 4));
             if ((void *)(udp + 1) <= data_end) {
                 if (udp->dest == __constant_htons(PQC_HS_PORT) || udp->source == __constant_htons(PQC_HS_PORT)) {
+                    if (mf) {
+                        __u8 val = 1;
+                        bpf_map_update_elem(&pqc_frag_map, &key, &val, BPF_ANY);
+                    }
                     inc_stat(STAT_PQC_PASS);
                     return XDP_PASS;
                 }
