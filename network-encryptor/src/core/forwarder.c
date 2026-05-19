@@ -624,23 +624,23 @@ static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len) {
 // Intercept PQC handshake packets (UDP port 7090) from raw Ethernet frames.
 // Returns 1 if packet was intercepted (should NOT be forwarded), 0 otherwise.
 static int intercept_pqc_handshake(uint8_t *pkt, uint32_t pkt_len) {
-    if (pkt_len < 14 + 20 + 8) return 0; // ETH + IP + UDP minimum
+    int l3_off = crypto_eth_ipv4_offset(pkt, pkt_len);
+    if (l3_off < 0) return 0;
 
-    struct ethhdr *eth = (struct ethhdr *)pkt;
-    if (ntohs(eth->h_proto) != ETH_P_IP) return 0;
+    if (pkt_len < (uint32_t)(l3_off + 20 + 8)) return 0; // IP + UDP minimum
 
-    struct iphdr *ip = (struct iphdr *)(pkt + 14);
+    struct iphdr *ip = (struct iphdr *)(pkt + l3_off);
     if (ip->protocol != IPPROTO_UDP) return 0;
 
     int ip_hdr_len = ip->ihl * 4;
-    if (pkt_len < (uint32_t)(14 + ip_hdr_len + 8)) return 0;
+    if (pkt_len < (uint32_t)(l3_off + ip_hdr_len + 8)) return 0;
 
-    struct udphdr *udp = (struct udphdr *)(pkt + 14 + ip_hdr_len);
+    struct udphdr *udp = (struct udphdr *)(pkt + l3_off + ip_hdr_len);
     if (ntohs(udp->dest) != PQC_HS_PORT) return 0;
 
     // Extract UDP payload and feed to PQC module
-    uint8_t *udp_payload = pkt + 14 + ip_hdr_len + 8;
-    int payload_len = (int)(pkt_len - 14 - ip_hdr_len - 8);
+    uint8_t *udp_payload = pkt + l3_off + ip_hdr_len + 8;
+    int payload_len = (int)(pkt_len - l3_off - ip_hdr_len - 8);
     if (payload_len > 0) {
         sig_pqc_feed_rx_packet(udp_payload, payload_len);
     }

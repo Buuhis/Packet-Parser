@@ -264,7 +264,14 @@ static void* pqc_handshake_thread(void* arg) {
         pthread_mutex_unlock(&g_key_mutex);
 
         if (!has_keys) {
-            sleep(2);
+            // Even if keys are not ready, we must consume the feed queue to reply to peer's DISCO packets!
+            int n = pqc_rx_recv(buffer, sizeof(buffer), 2000);
+            if (n > 0) {
+                struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
+                if (n == sizeof(struct pqc_disco_msg) && ntohl(disco->magic) == PQC_DISCO_MAGIC) {
+                    sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                }
+            }
             continue;
         }
 
