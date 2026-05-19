@@ -308,10 +308,17 @@ static void* pqc_handshake_thread(void* arg) {
                 sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
                        (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
                 
-                int n = pqc_rx_recv(buffer, sizeof(buffer), 2000);
+                int n = pqc_rx_recv(buffer, sizeof(buffer), 200);
+                if (n <= 0) {
+                    struct sockaddr_in from_addr;
+                    socklen_t from_len = sizeof(from_addr);
+                    n = recvfrom(sockfd, buffer, sizeof(buffer), MSG_DONTWAIT, (struct sockaddr *)&from_addr, &from_len);
+                }
                 if (n > 0) {
                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                     if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                        int expected_sz = sizeof(struct pqc_hs_msg) + resp->data_len + resp->sig_len;
+                        fprintf(stderr, "[PQC-HS] Initiator received RESP. Total bytes rcvd (n) = %d, expected = %d\n", n, expected_sz);
                         pthread_mutex_lock(&g_key_mutex);
                         size_t raw_pub_sz = 0;
                         uint8_t raw_pub[8192];
@@ -339,11 +346,17 @@ static void* pqc_handshake_thread(void* arg) {
             }
         } else {
             // --- RESPONDER FLOW ---
-            int n = pqc_rx_recv(buffer, sizeof(buffer), 1000);
+            int n = pqc_rx_recv(buffer, sizeof(buffer), 200);
+            if (n <= 0) {
+                struct sockaddr_in from_addr;
+                socklen_t from_len = sizeof(from_addr);
+                n = recvfrom(sockfd, buffer, sizeof(buffer), MSG_DONTWAIT, (struct sockaddr *)&from_addr, &from_len);
+            }
             if (n > 0) {
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                 if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
-                    fprintf(stderr, "[PQC-HS] Responder received HELLO. Verifying signature...\n");
+                    int expected_sz = sizeof(struct pqc_hs_msg) + msg->data_len + msg->sig_len;
+                    fprintf(stderr, "[PQC-HS] Responder received HELLO. Total bytes rcvd (n) = %d, expected = %d\n", n, expected_sz);
                     pthread_mutex_lock(&g_key_mutex);
                     size_t raw_pub_sz = 0;
                     uint8_t raw_pub[8192];

@@ -71,14 +71,26 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
         if ((void *)(ip + 1) > data_end)
             return XDP_PASS;
 
+        // 1. Pass all IP fragments to the kernel for normal IP reassembly
+        if (ip->frag_off & __constant_htons(0x3FFF)) { // 0x3FFF covers IP_MF and offset
+            return XDP_PASS;
+        }
+
         if (ip->protocol == IPPROTO_ICMP_VAL) {
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
         }
 
-        /* PQC Handshake (UDP port 7090) goes through AF_XDP like all other traffic.
-         * The forwarder's intercept_pqc_handshake() will catch it and feed
-         * the handshake module via sig_pqc_feed_rx_packet(). */
+        // 2. Pass PQC Handshake packets (port 7090) to the kernel
+        if (ip->protocol == IPPROTO_UDP_VAL) {
+            struct udphdr *udp = (void *)((__u8 *)ip + (ip->ihl * 4));
+            if ((void *)(udp + 1) <= data_end) {
+                if (udp->dest == __constant_htons(PQC_HS_PORT) || udp->source == __constant_htons(PQC_HS_PORT)) {
+                    inc_stat(STAT_PQC_PASS);
+                    return XDP_PASS;
+                }
+            }
+        }
 
         goto redirect;
     }
