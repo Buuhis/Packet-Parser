@@ -201,8 +201,10 @@ static void* pqc_handshake_thread(void* arg) {
         // Send local MAC
         sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
-        // Receive peer MAC (from feed queue)
-        int recv_sz = pqc_rx_recv((uint8_t *)&disco_recv, sizeof(disco_recv), 500);
+        // Receive peer MAC (directly from socket since XDP is not loaded yet)
+        struct sockaddr_in from_addr;
+        socklen_t from_len = sizeof(from_addr);
+        int recv_sz = recvfrom(sockfd, &disco_recv, sizeof(disco_recv), 0, (struct sockaddr *)&from_addr, &from_len);
 
         if (recv_sz == sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
             memcpy(peer_mac, disco_recv.mac, 6);
