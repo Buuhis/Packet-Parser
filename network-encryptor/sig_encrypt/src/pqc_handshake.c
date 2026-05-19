@@ -211,7 +211,7 @@ static void* pqc_handshake_thread(void* arg) {
             recv_sz = recvfrom(sockfd, &disco_recv, sizeof(disco_recv), MSG_DONTWAIT, (struct sockaddr *)&from_addr, &from_len);
         }
 
-        if (recv_sz == sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
+        if (recv_sz >= sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
             memcpy(peer_mac, disco_recv.mac, 6);
             role_settled = true;
             fprintf(stderr, "[PQC-DISCO] Received Peer MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
@@ -273,7 +273,7 @@ static void* pqc_handshake_thread(void* arg) {
             int n = pqc_rx_recv(buffer, sizeof(buffer), 2000);
             if (n > 0) {
                 struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
-                if (n == sizeof(struct pqc_disco_msg) && ntohl(disco->magic) == PQC_DISCO_MAGIC) {
+                if (n >= sizeof(struct pqc_disco_msg) && ntohl(disco->magic) == PQC_DISCO_MAGIC) {
                     sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
                 }
             }
@@ -328,7 +328,7 @@ static void* pqc_handshake_thread(void* arg) {
                                 break;
                             }
                         }
-                    } else if (n == sizeof(struct pqc_disco_msg)) {
+                    } else if (n >= sizeof(struct pqc_disco_msg)) {
                         struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
                         if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
                             sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
@@ -383,7 +383,7 @@ static void* pqc_handshake_thread(void* arg) {
                     } else {
                         fprintf(stderr, "[PQC-HS] ERROR: Responder signature verification FAILED!\n");
                     }
-                } else if (n == sizeof(struct pqc_disco_msg)) {
+                } else if (n >= sizeof(struct pqc_disco_msg)) {
                     struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
                     if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
                         sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
@@ -480,12 +480,109 @@ void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const 
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-void sig_pqc_set_peer_identity(const char *pub) {
+static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
+    if (!obf_pub_str || strlen(obf_pub_str) == 0) return NULL;
+
+    // Clean up input string (trim whitespace/newlines)
+    char clean_obf[8192];
+    strncpy(clean_obf, obf_pub_str, sizeof(clean_obf) - 1);
+    clean_obf[sizeof(clean_obf) - 1] = '\0';
+    
+    size_t len = strlen(clean_obf);
+    while (len > 0 && (clean_obf[len - 1] == '\r' || clean_obf[len - 1] == '\n' || clean_obf[len - 1] == ' ')) {
+        clean_obf[len - 1] = '\0';
+        len--;
+    }
+
+    // Method 0: If fingerprint is provided in DB, de-obfuscate directly!
+    if (peer_fingerprint && strlen(peer_fingerprint) > 0) {
+        unsigned char raw_pub[4096];
+        size_t raw_pub_len = 0;
+        trf_base64_decode_obfuscated(clean_obf, peer_fingerprint, raw_pub, &raw_pub_len);
+
+        char *plain_b64_pub = malloc(8192);
+        memset(plain_b64_pub, 0, 8192);
+        trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
+        
+        fprintf(stderr, "[PQC-HS] De-obfuscated peer pub key using DB fingerprint [%s].\n", peer_fingerprint);
+        return plain_b64_pub;
+    }
+
+    // Method 1: Scan /etc/.enc_config/ for matching public key file to get fingerprint (Fallback)
+    DIR *dir = opendir("/etc/.enc_config");
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            if (strncmp(entry->d_name, "identity_", 9) == 0 && strstr(entry->d_name, "_pub.key") != NULL) {
+                char fingerprint[16];
+                memset(fingerprint, 0, sizeof(fingerprint));
+                strncpy(fingerprint, entry->d_name + 9, 8);
+
+                char filepath[512];
+                snprintf(filepath, sizeof(filepath), "/etc/.enc_config/%s", entry->d_name);
+                FILE *fp = fopen(filepath, "r");
+                if (fp) {
+                    char file_content[8192];
+                    memset(file_content, 0, sizeof(file_content));
+                    if (fgets(file_content, sizeof(file_content) - 1, fp) != NULL) {
+                        size_t flen = strlen(file_content);
+                        while (flen > 0 && (file_content[flen - 1] == '\r' || file_content[flen - 1] == '\n' || file_content[flen - 1] == ' ')) {
+                            file_content[flen - 1] = '\0';
+                            flen--;
+                        }
+                        if (strcmp(file_content, clean_obf) == 0) {
+                            fclose(fp);
+                            closedir(dir);
+                            
+                            unsigned char raw_pub[4096];
+                            size_t raw_pub_len = 0;
+                            trf_base64_decode_obfuscated(clean_obf, fingerprint, raw_pub, &raw_pub_len);
+
+                            char *plain_b64_pub = malloc(8192);
+                            memset(plain_b64_pub, 0, 8192);
+                            trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
+                            
+                            fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
+                            return plain_b64_pub;
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+        }
+        closedir(dir);
+    }
+
+    // Method 2: Check registry to see if we already have a fingerprint that matches (Fallback)
+    for (int i = 0; i < g_registry_count; i++) {
+        unsigned char raw_pub[4096];
+        size_t raw_pub_len = 0;
+        trf_base64_decode_obfuscated(clean_obf, g_identity_registry[i].fingerprint, raw_pub, &raw_pub_len);
+
+        char plain_b64_pub[8192];
+        memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
+        trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
+
+        if (strcmp(plain_b64_pub, g_identity_registry[i].pub_key) == 0) {
+            fprintf(stderr, "[PQC-HS] Found matching peer pub key in RAM Registry. De-obfuscated peer pub key using fingerprint [%s].\n", g_identity_registry[i].fingerprint);
+            return strdup(plain_b64_pub);
+        }
+    }
+
+    // Fallback: If we couldn't de-obfuscate it, return the original string
+    fprintf(stderr, "[PQC-HS] Warning: Could not find matching fingerprint for peer public key. Using original string.\n");
+    return strdup(obf_pub_str);
+}
+
+void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint) {
+    char *deobf = pub ? deobfuscate_peer_pub(pub, peer_fingerprint) : NULL;
+
     pthread_mutex_lock(&g_key_mutex);
     if (g_peer_id_pub) free(g_peer_id_pub);
-    g_peer_id_pub = pub ? strdup(pub) : NULL;
+    g_peer_id_pub = deobf;
     pthread_mutex_unlock(&g_key_mutex);
-    if (pub) fprintf(stderr, "[PQC-HS] Peer identity key loaded from DB. Ready for Handshake.\n");
+
+    if (g_peer_id_pub) fprintf(stderr, "[PQC-HS] Peer identity key loaded and de-obfuscated. Ready for Handshake.\n");
 }
 
 bool sig_pqc_has_identity(const char *fingerprint) {
@@ -500,7 +597,9 @@ bool sig_pqc_has_identity(const char *fingerprint) {
     return false;
 }
 
-void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub) {
+void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint) {
+    char *deobf_peer = peer_pub ? deobfuscate_peer_pub(peer_pub, peer_fingerprint) : NULL;
+
     pthread_mutex_lock(&g_key_mutex);
     
     // Check if already bound
@@ -512,7 +611,7 @@ void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const cha
             
             g_profile_bindings[i].local_priv = local_priv ? strdup(local_priv) : NULL;
             g_profile_bindings[i].local_pub = local_pub ? strdup(local_pub) : NULL;
-            g_profile_bindings[i].peer_pub = peer_pub ? strdup(peer_pub) : NULL;
+            g_profile_bindings[i].peer_pub = deobf_peer;
             
             pthread_mutex_unlock(&g_key_mutex);
             return;
@@ -524,7 +623,7 @@ void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const cha
         b->profile_id = profile_id;
         b->local_priv = local_priv ? strdup(local_priv) : NULL;
         b->local_pub = local_pub ? strdup(local_pub) : NULL;
-        b->peer_pub = peer_pub ? strdup(peer_pub) : NULL;
+        b->peer_pub = deobf_peer;
         fprintf(stderr, "[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
     }
     

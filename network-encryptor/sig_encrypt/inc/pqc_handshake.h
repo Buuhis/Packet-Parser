@@ -57,7 +57,7 @@ void sig_pqc_set_global_identity(const char *priv, const char *pub);
 /**
  * Sets the peer's identity public key (loaded from global DB).
  */
-void sig_pqc_set_peer_identity(const char *pub);
+void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint);
 
 /**
  * Adds an identity keypair to the RAM Registry.
@@ -69,7 +69,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
  */
 void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname);
 bool sig_pqc_has_identity(const char *fingerprint);
-void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub);
+void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint);
 int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);

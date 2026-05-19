@@ -323,19 +323,20 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
             // Load Peer Identity Key for this specific profile
             PGresult *peer_res = PQexecParams(conn,
-                "SELECT peer_pub FROM pqc_identities WHERE profile_id = $1",
+                "SELECT peer_pub, peer_fingerprint FROM pqc_identities WHERE profile_id = $1",
                 1, NULL, pp, NULL, NULL, 0);
 
             if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
                 const char *peer_pub = PQgetvalue(peer_res, 0, 0);
+                const char *peer_fg = (PQnfields(peer_res) > 1) ? PQgetvalue(peer_res, 0, 1) : NULL;
                 if (peer_pub && peer_pub[0] != '\0') {
-                    sig_pqc_set_peer_identity(peer_pub);
+                    sig_pqc_set_peer_identity(peer_pub, peer_fg);
 
                     // Perform dynamic active RAM binding for this profile in Daemon's memory
                     char *found_priv = NULL;
                     char *found_pub = NULL;
                     sig_pqc_find_identity(p->local_identity_fingerprint, &found_priv, &found_pub);
-                    sig_pqc_bind_profile_keys(p->id, found_priv, found_pub, peer_pub);
+                    sig_pqc_bind_profile_keys(p->id, found_priv, found_pub, peer_pub, peer_fg);
                 }
             } else {
                 fprintf(stderr, "[DB-PQC] Warning: No peer identity public key found in pqc_identities for profile %d.\n", p->id);
@@ -917,14 +918,21 @@ int db_check_identities(const char *conn_str) {
         snprintf(pid_str, sizeof(pid_str), "%d", pid);
         const char *pqc_p[1] = { pid_str };
         PGresult *peer_res = PQexecParams(conn,
-            "SELECT peer_pub FROM pqc_identities WHERE profile_id = $1",
+            "SELECT peer_pub, peer_fingerprint FROM pqc_identities WHERE profile_id = $1",
             1, NULL, pqc_p, NULL, NULL, 0);
 
+        const char *db_peer_fg = NULL;
         if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
             const char *peer_pub_val = PQgetvalue(peer_res, 0, 0);
+            db_peer_fg = (PQnfields(peer_res) > 1) ? PQgetvalue(peer_res, 0, 1) : NULL;
             if (peer_pub_val && strlen(peer_pub_val) > 0) {
                 db_peer_pub = peer_pub_val;
                 printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(db_peer_pub));
+                if (db_peer_fg && strlen(db_peer_fg) > 0) {
+                    printf("  - Peer Key Fingerprint: [%s]\n", db_peer_fg);
+                } else {
+                    printf("  - Peer Key Fingerprint: NOT SPECIFIED (will use auto-detection)\n");
+                }
             } else {
                 printf("  - Peer Public Key: EMPTY\n");
             }
@@ -934,7 +942,7 @@ int db_check_identities(const char *conn_str) {
 
         // Perform active in-RAM binding of Local & Peer keys to this profile
         if (found_priv || db_peer_pub) {
-            sig_pqc_bind_profile_keys(pid, found_priv, found_pub, db_peer_pub);
+            sig_pqc_bind_profile_keys(pid, found_priv, found_pub, db_peer_pub, db_peer_fg);
             printf("  -> [RAM-BIND] Successfully bound Profile %d to keys in RAM memory.\n", pid);
         }
         PQclear(peer_res);
