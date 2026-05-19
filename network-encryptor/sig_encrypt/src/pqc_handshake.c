@@ -21,6 +21,57 @@ static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static char *g_peer_id_pub = NULL;
 
+// --- RX Packet Feed Queue (fed by forwarder, consumed by handshake thread) ---
+#define PQC_RX_QUEUE_SIZE  16
+#define PQC_RX_PKT_MAX     10000
+
+typedef struct {
+    uint8_t data[PQC_RX_PKT_MAX];
+    int     len;
+} pqc_rx_slot_t;
+
+static pqc_rx_slot_t   g_rx_queue[PQC_RX_QUEUE_SIZE];
+static int              g_rx_head = 0;  // write index (producer)
+static int              g_rx_tail = 0;  // read index (consumer)
+static pthread_mutex_t  g_rx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t   g_rx_cond  = PTHREAD_COND_INITIALIZER;
+
+void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len) {
+    if (payload_len <= 0 || payload_len > PQC_RX_PKT_MAX) return;
+    pthread_mutex_lock(&g_rx_mutex);
+    int next = (g_rx_head + 1) % PQC_RX_QUEUE_SIZE;
+    if (next != g_rx_tail) {  // drop if queue full
+        memcpy(g_rx_queue[g_rx_head].data, udp_payload, payload_len);
+        g_rx_queue[g_rx_head].len = payload_len;
+        g_rx_head = next;
+        pthread_cond_signal(&g_rx_cond);
+    }
+    pthread_mutex_unlock(&g_rx_mutex);
+}
+
+// Blocking receive from the feed queue (with timeout in milliseconds)
+static int pqc_rx_recv(uint8_t *buf, int buf_sz, int timeout_ms) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec  += timeout_ms / 1000;
+    ts.tv_nsec += (timeout_ms % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+
+    pthread_mutex_lock(&g_rx_mutex);
+    while (g_rx_head == g_rx_tail) {
+        if (pthread_cond_timedwait(&g_rx_cond, &g_rx_mutex, &ts) != 0) {
+            pthread_mutex_unlock(&g_rx_mutex);
+            return -1;  // timeout
+        }
+    }
+    int len = g_rx_queue[g_rx_tail].len;
+    if (len > buf_sz) len = buf_sz;
+    memcpy(buf, g_rx_queue[g_rx_tail].data, len);
+    g_rx_tail = (g_rx_tail + 1) % PQC_RX_QUEUE_SIZE;
+    pthread_mutex_unlock(&g_rx_mutex);
+    return len;
+}
+
 #define MAX_IDENTITY_REGISTRY 10
 
 typedef struct {
@@ -150,10 +201,8 @@ static void* pqc_handshake_thread(void* arg) {
         // Send local MAC
         sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
-        // Receive peer MAC
-        struct sockaddr_in from_addr;
-        socklen_t from_len = sizeof(from_addr);
-        int recv_sz = recvfrom(sockfd, &disco_recv, sizeof(disco_recv), 0, (struct sockaddr *)&from_addr, &from_len);
+        // Receive peer MAC (from feed queue)
+        int recv_sz = pqc_rx_recv((uint8_t *)&disco_recv, sizeof(disco_recv), 500);
 
         if (recv_sz == sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
             memcpy(peer_mac, disco_recv.mac, 6);
@@ -245,11 +294,7 @@ static void* pqc_handshake_thread(void* arg) {
                 sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
                        (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
                 
-                struct timeval tv = {2, 0};
-                setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-                socklen_t len = sizeof(peeraddr);
-                int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peeraddr, &len);
+                int n = pqc_rx_recv(buffer, sizeof(buffer), 2000);
                 if (n > 0) {
                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                     if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
@@ -280,14 +325,11 @@ static void* pqc_handshake_thread(void* arg) {
             }
         } else {
             // --- RESPONDER FLOW ---
-            struct timeval tv = {1, 0};
-            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            
-            socklen_t len = sizeof(peeraddr);
-            int n = recvfrom(sockfd, buffer, sizeof(buffer), 0, (struct sockaddr *)&peeraddr, &len);
+            int n = pqc_rx_recv(buffer, sizeof(buffer), 1000);
             if (n > 0) {
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                 if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
+                    fprintf(stderr, "[PQC-HS] Responder received HELLO. Verifying signature...\n");
                     pthread_mutex_lock(&g_key_mutex);
                     size_t raw_pub_sz = 0;
                     uint8_t raw_pub[8192];
@@ -295,7 +337,9 @@ static void* pqc_handshake_thread(void* arg) {
                     pthread_mutex_unlock(&g_key_mutex);
 
                     if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                        fprintf(stderr, "[PQC-HS] Responder HELLO signature verified! Encapsulating...\n");
                         if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                            fprintf(stderr, "[PQC-HS] Responder KEM encapsulation successful.\n");
                             struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                             resp->msg_type = PQC_HS_MSG_RESP;
                             resp->data_len = (uint16_t)ct_sz;
@@ -319,14 +363,22 @@ static void* pqc_handshake_thread(void* arg) {
                             g_key_ready = true;
                             pthread_mutex_unlock(&g_key_mutex);
                             fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
+                        } else {
+                            fprintf(stderr, "[PQC-HS] ERROR: Responder KEM encapsulation failed!\n");
                         }
+                    } else {
+                        fprintf(stderr, "[PQC-HS] ERROR: Responder signature verification FAILED!\n");
                     }
                 } else if (n == sizeof(struct pqc_disco_msg)) {
                     struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
                     if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
                         sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
                     }
+                } else {
+                    fprintf(stderr, "[PQC-HS] Responder received unknown packet (len=%d, magic=0x%X)\n", n, msg->magic);
                 }
+            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                fprintf(stderr, "[PQC-HS] Responder recvfrom error: %s\n", strerror(errno));
             }
         }
     }
@@ -540,7 +592,15 @@ void sig_pqc_load_keys_from_disk(void) {
             memset(plain_b64_priv, 0, sizeof(plain_b64_priv));
             trf_base64_encode(raw_priv, raw_priv_len, plain_b64_priv);
 
-            sig_pqc_add_to_registry(fingerprint, plain_b64_priv, obf_pub);
+            unsigned char raw_pub[4096];
+            size_t raw_pub_len = 0;
+            trf_base64_decode_obfuscated(obf_pub, fingerprint, raw_pub, &raw_pub_len);
+
+            char plain_b64_pub[8192];
+            memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
+            trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
+
+            sig_pqc_add_to_registry(fingerprint, plain_b64_priv, plain_b64_pub);
             fprintf(stderr, "[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
         }
     }

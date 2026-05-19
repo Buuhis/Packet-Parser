@@ -621,6 +621,32 @@ static uint32_t get_dest_ip(void *pkt_data, uint32_t pkt_len) {
     return ip->daddr;
 }
 
+// Intercept PQC handshake packets (UDP port 7090) from raw Ethernet frames.
+// Returns 1 if packet was intercepted (should NOT be forwarded), 0 otherwise.
+static int intercept_pqc_handshake(uint8_t *pkt, uint32_t pkt_len) {
+    if (pkt_len < 14 + 20 + 8) return 0; // ETH + IP + UDP minimum
+
+    struct ethhdr *eth = (struct ethhdr *)pkt;
+    if (ntohs(eth->h_proto) != ETH_P_IP) return 0;
+
+    struct iphdr *ip = (struct iphdr *)(pkt + 14);
+    if (ip->protocol != IPPROTO_UDP) return 0;
+
+    int ip_hdr_len = ip->ihl * 4;
+    if (pkt_len < (uint32_t)(14 + ip_hdr_len + 8)) return 0;
+
+    struct udphdr *udp = (struct udphdr *)(pkt + 14 + ip_hdr_len);
+    if (ntohs(udp->dest) != PQC_HS_PORT) return 0;
+
+    // Extract UDP payload and feed to PQC module
+    uint8_t *udp_payload = pkt + 14 + ip_hdr_len + 8;
+    int payload_len = (int)(pkt_len - 14 - ip_hdr_len - 8);
+    if (payload_len > 0) {
+        sig_pqc_feed_rx_packet(udp_payload, payload_len);
+    }
+    return 1; // intercepted
+}
+
 static int parse_flow(void *pkt_data, uint32_t pkt_len,
                       uint32_t *src_ip, uint32_t *dst_ip,
                       uint16_t *src_port, uint16_t *dst_port,
@@ -790,6 +816,9 @@ static void *wan_queue_thread_no_crypto(void *arg) {
         for (int i = 0; i < rcvd; i++) {
             uint8_t *pkt = (uint8_t *)pkt_ptrs[i];
             uint32_t pkt_len = pkt_lens[i];
+
+            // Intercept PQC handshake packets before normal processing
+            if (intercept_pqc_handshake(pkt, pkt_len)) continue;
 
             uint32_t dest_ip = get_dest_ip(pkt, pkt_len);
             if (dest_ip == 0) {
@@ -1092,6 +1121,8 @@ static void *wan_queue_thread_l2(void *arg) {
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
 
+            // Intercept PQC handshake packets before crypto processing
+            if (intercept_pqc_handshake(pkt, pkt_len)) continue;
 
             if (decrypt_packet_auto_l2(fwd, pkt, &pkt_len,
                                         decrypt_scratch, sizeof(decrypt_scratch)) != 0) {
@@ -1197,6 +1228,9 @@ static void *wan_queue_thread_l3l4(void *arg) {
             uint32_t pkt_len = pkt_lens[i];
             uint8_t *final_pkt = pkt;
             uint32_t final_len = pkt_len;
+
+            // Intercept PQC handshake packets before crypto processing
+            if (intercept_pqc_handshake(pkt, pkt_len)) continue;
 
             (void)0;
 

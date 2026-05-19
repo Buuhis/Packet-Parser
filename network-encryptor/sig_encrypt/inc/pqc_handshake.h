@@ -74,4 +74,12 @@ int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_l
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
 
+/**
+ * Feed a received PQC handshake packet (UDP payload only) into the handshake module.
+ * Called by the forwarder WAN RX thread when it detects a UDP packet to port PQC_HS_PORT.
+ * @param udp_payload Pointer to the UDP payload (after UDP header).
+ * @param payload_len Length of the UDP payload.
+ */
+void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len);
+
 #endif
