@@ -2,8 +2,12 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/icmp.h>
+#include <linux/udp.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
+
+#define PQC_HS_PORT      7090
+#define IPPROTO_UDP_VAL  17
 
 struct {
     __uint(type, BPF_MAP_TYPE_XSKMAP);
@@ -32,6 +36,7 @@ struct {
 #define STAT_NO_SOCK    3
 #define STAT_ARP_PASS   4
 #define STAT_ICMP_PASS  5
+#define STAT_PQC_PASS   6
 #define IPPROTO_ICMP_VAL 1
 
 static __always_inline void inc_stat(int idx)
@@ -70,6 +75,11 @@ int xdp_wan_redirect_prog(struct xdp_md *ctx)
             inc_stat(STAT_ICMP_PASS);
             return XDP_PASS;
         }
+
+        /* PQC Handshake (UDP port 7090) goes through AF_XDP like all other traffic.
+         * The forwarder's intercept_pqc_handshake() will catch it and feed
+         * the handshake module via sig_pqc_feed_rx_packet(). */
+
         goto redirect;
     }
 
