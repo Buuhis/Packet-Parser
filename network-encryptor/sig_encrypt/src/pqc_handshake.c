@@ -162,92 +162,14 @@ static void* pqc_handshake_thread(void* arg) {
     pthread_mutex_unlock(&g_key_mutex);
     inet_pton(AF_INET, current_peer_ip, &peeraddr.sin_addr);
 
-    // ----- STAGE 1: AUTOMATED ROLE DISCOVERY VIA MAC EXCHANGE -----
-    uint8_t local_mac[6] = {0};
-    uint8_t peer_mac[6] = {0};
-    bool role_settled = false;
-
-    if (get_interface_mac(g_hs_cfg.wan_ifname, local_mac) < 0) {
-        fprintf(stderr, "[PQC-DISCO] WARNING: Failed to get MAC for interface %s. Using fallback.\n", g_hs_cfg.wan_ifname);
-        local_mac[0] = 0x02;
-        local_mac[5] = 0x01;
-    }
-
-    fprintf(stderr, "[PQC-DISCO] Local WAN Interface %s MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-           g_hs_cfg.wan_ifname,
-           local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5]);
-
-    // Set socket receive timeout to 500ms for active discovery
+    // ----- STAGE 1: DB-DRIVEN ROLE CONFIGURATION -----
     struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 500000;
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
-    #define PQC_DISCO_MAGIC 0x50514344
-    struct pqc_disco_msg {
-        uint32_t magic;
-        uint8_t mac[6];
-    } __attribute__((packed));
-
-    struct pqc_disco_msg disco_send, disco_recv;
-    disco_send.magic = htonl(PQC_DISCO_MAGIC);
-    memcpy(disco_send.mac, local_mac, 6);
-
-    fprintf(stderr, "[PQC-DISCO] Exchanging MAC addresses with peer %s on UDP port %d...\n", current_peer_ip, PQC_HS_PORT);
-    fflush(stdout);
-
-    int retries = 0;
-    while (!role_settled) {
-        // Send local MAC
-        sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
-
-        // Try reading from the AF_XDP feed queue first
-        int recv_sz = pqc_rx_recv((uint8_t *)&disco_recv, sizeof(disco_recv), 200);
-
-        // If nothing in feed queue, try reading directly from socket (non-blocking kernel stack path)
-        if (recv_sz <= 0) {
-            struct sockaddr_in from_addr;
-            socklen_t from_len = sizeof(from_addr);
-            recv_sz = recvfrom(sockfd, &disco_recv, sizeof(disco_recv), MSG_DONTWAIT, (struct sockaddr *)&from_addr, &from_len);
-        }
-
-        if (recv_sz >= sizeof(struct pqc_disco_msg) && ntohl(disco_recv.magic) == PQC_DISCO_MAGIC) {
-            memcpy(peer_mac, disco_recv.mac, 6);
-            role_settled = true;
-            fprintf(stderr, "[PQC-DISCO] Received Peer MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-                   peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5]);
-            break;
-        }
-
-        retries++;
-        if (retries % 10 == 0) {
-            fprintf(stderr, "[PQC-DISCO] Waiting for peer MAC... (elapsed %d seconds)\n", retries / 2);
-            fflush(stdout);
-        }
-    }
-
-    // Restore standard longer receive timeout (5 seconds) for main handshake
     tv.tv_sec = 5;
     tv.tv_usec = 0;
     setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // Compare MACs to settle roles (Larger MAC = Initiator)
-    pthread_mutex_lock(&g_key_mutex);
-    int comp = memcmp(local_mac, peer_mac, 6);
-    if (comp > 0) {
-        g_hs_cfg.is_initiator = true;
-    } else if (comp < 0) {
-        g_hs_cfg.is_initiator = false;
-    } else {
-        g_hs_cfg.is_initiator = (strcmp(g_hs_cfg.peer_ip, "192.168.1.1") == 0);
-    }
-    pthread_mutex_unlock(&g_key_mutex);
-
-    fprintf(stderr, "[PQC-DISCO] ROLE SETTLED: Local MAC [%02x:%02x:%02x:%02x:%02x:%02x] %s Peer MAC [%02x:%02x:%02x:%02x:%02x:%02x] -> Role: %s\n",
-           local_mac[0], local_mac[1], local_mac[2], local_mac[3], local_mac[4], local_mac[5],
-           g_hs_cfg.is_initiator ? ">" : "<",
-           peer_mac[0], peer_mac[1], peer_mac[2], peer_mac[3], peer_mac[4], peer_mac[5],
-           g_hs_cfg.is_initiator ? "INITIATOR" : "RESPONDER");
+    fprintf(stderr, "[PQC-HS] ROLE SETTLED FROM DB CONFIG: Role: %s, Peer IP: %s\n",
+            g_hs_cfg.is_initiator ? "INITIATOR" : "RESPONDER", current_peer_ip);
     fflush(stdout);
 
     // ----- STAGE 2: MAIN ML-KEM/ML-DSA HANDSHAKE -----
@@ -269,14 +191,8 @@ static void* pqc_handshake_thread(void* arg) {
         pthread_mutex_unlock(&g_key_mutex);
 
         if (!has_keys) {
-            // Even if keys are not ready, we must consume the feed queue to reply to peer's DISCO packets!
-            int n = pqc_rx_recv(buffer, sizeof(buffer), 2000);
-            if (n > 0) {
-                struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
-                if (n >= sizeof(struct pqc_disco_msg) && ntohl(disco->magic) == PQC_DISCO_MAGIC) {
-                    sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
-                }
-            }
+            // Simple sleep to wait for keys to load
+            usleep(200000);
             continue;
         }
 
@@ -335,11 +251,6 @@ static void* pqc_handshake_thread(void* arg) {
                                 break;
                             }
                         }
-                    } else if (n >= sizeof(struct pqc_disco_msg)) {
-                        struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
-                        if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
-                            sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
-                        }
                     }
                 }
                 fprintf(stderr, "[PQC-HS] Initiator retrying HELLO...\n");
@@ -395,11 +306,6 @@ static void* pqc_handshake_thread(void* arg) {
                         }
                     } else {
                         fprintf(stderr, "[PQC-HS] ERROR: Responder signature verification FAILED!\n");
-                    }
-                } else if (n >= sizeof(struct pqc_disco_msg)) {
-                    struct pqc_disco_msg *disco = (struct pqc_disco_msg *)buffer;
-                    if (ntohl(disco->magic) == PQC_DISCO_MAGIC) {
-                        sendto(sockfd, &disco_send, sizeof(disco_send), 0, (struct sockaddr *)&peeraddr, sizeof(peeraddr));
                     }
                 } else {
                     fprintf(stderr, "[PQC-HS] Responder received unknown packet (len=%d, magic=0x%X)\n", n, msg->magic);

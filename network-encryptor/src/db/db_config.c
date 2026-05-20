@@ -318,17 +318,24 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 wan_ifname = cfg->wans[p->wan_indices[0]].ifname;
             }
 
-            // Configure Handshake globally with Fingerprint
-            sig_pqc_set_handshake_config(true, peer_ip, p->local_identity_fingerprint, wan_ifname);
-
-            // Load Peer Identity Key for this specific profile
+            // Load Peer Identity Key and Role for this specific profile
             PGresult *peer_res = PQexecParams(conn,
-                "SELECT peer_pub, peer_fingerprint FROM pqc_identities WHERE profile_id = $1",
+                "SELECT peer_pub, peer_fingerprint, is_initiator FROM pqc_identities WHERE profile_id = $1",
                 1, NULL, pp, NULL, NULL, 0);
 
             if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
                 const char *peer_pub = PQgetvalue(peer_res, 0, 0);
                 const char *peer_fg = (PQnfields(peer_res) > 1) ? PQgetvalue(peer_res, 0, 1) : NULL;
+                const char *is_init_str = (PQnfields(peer_res) > 2) ? PQgetvalue(peer_res, 0, 2) : NULL;
+                bool is_init = true;
+                if (is_init_str) {
+                    is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
+                }
+
+                // Configure Handshake globally with Fingerprint and Role
+                printf("[DB-PQC] Profile %d configured role: %s\n", p->id, is_init ? "INITIATOR" : "RESPONDER");
+                sig_pqc_set_handshake_config(is_init, peer_ip, p->local_identity_fingerprint, wan_ifname);
+
                 if (peer_pub && peer_pub[0] != '\0') {
                     sig_pqc_set_peer_identity(peer_pub, peer_fg);
 
@@ -918,13 +925,19 @@ int db_check_identities(const char *conn_str) {
         snprintf(pid_str, sizeof(pid_str), "%d", pid);
         const char *pqc_p[1] = { pid_str };
         PGresult *peer_res = PQexecParams(conn,
-            "SELECT peer_pub, peer_fingerprint FROM pqc_identities WHERE profile_id = $1",
+            "SELECT peer_pub, peer_fingerprint, is_initiator FROM pqc_identities WHERE profile_id = $1",
             1, NULL, pqc_p, NULL, NULL, 0);
 
         const char *db_peer_fg = NULL;
         if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
             const char *peer_pub_val = PQgetvalue(peer_res, 0, 0);
             db_peer_fg = (PQnfields(peer_res) > 1) ? PQgetvalue(peer_res, 0, 1) : NULL;
+            const char *is_init_str = (PQnfields(peer_res) > 2) ? PQgetvalue(peer_res, 0, 2) : NULL;
+            bool is_init = true;
+            if (is_init_str) {
+                is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
+            }
+            printf("  - Role Configured: [%s]\n", is_init ? "INITIATOR" : "RESPONDER");
             if (peer_pub_val && strlen(peer_pub_val) > 0) {
                 db_peer_pub = peer_pub_val;
                 printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(db_peer_pub));
