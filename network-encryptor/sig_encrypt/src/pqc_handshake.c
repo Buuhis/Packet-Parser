@@ -14,6 +14,8 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 
+extern void forwarder_pre_diversify_pqc_keys(int profile_id);
+
 static uint8_t  g_traffic_key[PQC_TRAFFIC_KEY_SZ];
 static bool g_key_ready = false;
 static bool g_hs_started = false;
@@ -88,12 +90,15 @@ typedef struct {
     char *local_priv;
     char *local_pub;
     char *peer_pub;
+    uint8_t master_traffic_key[PQC_TRAFFIC_KEY_SZ];
+    bool key_ready;
 } profile_key_binding_t;
 
 static profile_key_binding_t g_profile_bindings[MAX_IDENTITY_REGISTRY];
 static int g_profile_bindings_count = 0;
 
 typedef struct {
+    int profile_id;
     bool is_initiator;
     char peer_ip[64];
     char local_fingerprint[16];
@@ -243,11 +248,27 @@ static void* pqc_handshake_thread(void* arg) {
 
                         if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
                             if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                                uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                derive_traffic_key(ss, 32, derived_master);
+
                                 pthread_mutex_lock(&g_key_mutex);
-                                derive_traffic_key(ss, 32, g_traffic_key);
+                                memcpy(g_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
                                 g_key_ready = true;
+
+                                for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
+                                    if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
+                                        memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+                                        g_profile_bindings[b_idx].key_ready = true;
+                                        fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
+                                        fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                                derived_master[0], derived_master[1], derived_master[2], derived_master[3],
+                                                derived_master[4], derived_master[5], derived_master[6], derived_master[7]);
+                                        break;
+                                    }
+                                }
                                 pthread_mutex_unlock(&g_key_mutex);
                                 fprintf(stderr, "[PQC-HS] Handshake SUCCESS!\n");
+                                forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
                                 break;
                             }
                         }
@@ -296,11 +317,27 @@ static void* pqc_handshake_thread(void* arg) {
                             sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz, 0,
                                    (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
+                            uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                            derive_traffic_key(ss, 32, derived_master);
+
                             pthread_mutex_lock(&g_key_mutex);
-                            derive_traffic_key(ss, 32, g_traffic_key);
+                            memcpy(g_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
                             g_key_ready = true;
+
+                            for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
+                                if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
+                                    memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+                                    g_profile_bindings[b_idx].key_ready = true;
+                                    fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
+                                    fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                                            derived_master[0], derived_master[1], derived_master[2], derived_master[3],
+                                            derived_master[4], derived_master[5], derived_master[6], derived_master[7]);
+                                    break;
+                                }
+                            }
                             pthread_mutex_unlock(&g_key_mutex);
                             fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS!\n");
+                            forwarder_pre_diversify_pqc_keys(g_hs_cfg.profile_id);
                         } else {
                             fprintf(stderr, "[PQC-HS] ERROR: Responder KEM encapsulation failed!\n");
                         }
@@ -320,13 +357,14 @@ static void* pqc_handshake_thread(void* arg) {
     return NULL;
 }
 
-int sig_pqc_handshake_start(const char *wan_ifname, const char *peer_ip) {
+int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *peer_ip) {
     pthread_mutex_lock(&g_key_mutex);
     if (g_hs_started) {
         pthread_mutex_unlock(&g_key_mutex);
         return 0;
     }
     g_hs_started = true;
+    g_hs_cfg.profile_id = profile_id;
     pthread_mutex_unlock(&g_key_mutex);
 
     if (wan_ifname) strncpy(g_hs_cfg.wan_ifname, wan_ifname, 63);
@@ -361,6 +399,41 @@ int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]) {
     return 0;
 }
 
+int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
+    pthread_mutex_lock(&g_key_mutex);
+    profile_key_binding_t *binding = NULL;
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        if (g_profile_bindings[i].profile_id == profile_id) {
+            binding = &g_profile_bindings[i];
+            break;
+        }
+    }
+    
+    if (!binding || !binding->key_ready) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -1; // Master key not ready for this profile yet
+    }
+    
+    // Diversify key: Policy_Key = HMAC-SHA256(Master_Key, policy_id)
+    uint8_t mac_out[32];
+    uint8_t msg[4];
+    msg[0] = (policy_id >> 24) & 0xFF;
+    msg[1] = (policy_id >> 16) & 0xFF;
+    msg[2] = (policy_id >> 8) & 0xFF;
+    msg[3] = policy_id & 0xFF;
+    
+    int ret = trf_calculate_hmac(DIGEST_TYPE_SHA256, binding->master_traffic_key, PQC_TRAFFIC_KEY_SZ,
+                                 msg, 4, mac_out);
+    if (ret == TRF_PQC_OK) {
+        memcpy(out_policy_key, mac_out, PQC_TRAFFIC_KEY_SZ);
+        pthread_mutex_unlock(&g_key_mutex);
+        return 0;
+    }
+    
+    pthread_mutex_unlock(&g_key_mutex);
+    return -1;
+}
+
 void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const char *pub) {
     pthread_mutex_lock(&g_key_mutex);
     if (g_registry_count >= MAX_IDENTITY_REGISTRY) {
@@ -390,8 +463,9 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-void sig_pqc_set_handshake_config(bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname) {
+void sig_pqc_set_handshake_config(int profile_id, bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname) {
     pthread_mutex_lock(&g_key_mutex);
+    g_hs_cfg.profile_id = profile_id;
     g_hs_cfg.is_initiator = is_initiator;
     strncpy(g_hs_cfg.peer_ip, peer_ip, 63);
     if (local_fingerprint) strncpy(g_hs_cfg.local_fingerprint, local_fingerprint, 15);

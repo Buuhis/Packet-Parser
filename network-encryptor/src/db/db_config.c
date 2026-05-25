@@ -334,7 +334,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
                 // Configure Handshake globally with Fingerprint and Role
                 printf("[DB-PQC] Profile %d configured role: %s\n", p->id, is_init ? "INITIATOR" : "RESPONDER");
-                sig_pqc_set_handshake_config(is_init, peer_ip, p->local_identity_fingerprint, wan_ifname);
+                sig_pqc_set_handshake_config(p->id, is_init, peer_ip, p->local_identity_fingerprint, wan_ifname);
 
                 if (peer_pub && peer_pub[0] != '\0') {
                     sig_pqc_set_peer_identity(peer_pub, peer_fg);
@@ -353,7 +353,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         // ------------------------------------------------------------------
 
         res = PQexecParams(conn,
-            "SELECT id, action, mode, aes_bits, nonce_size, crypto_key "
+            "SELECT id, priority, action, protocol, crypto_mode, aes_bits, nonce_size, crypto_key "
             "FROM xdp_profile_crypto_policies WHERE profile_id = $1 "
             "ORDER BY priority ASC, id ASC",
             1, NULL, pp, NULL, NULL, 0);
@@ -486,6 +486,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
 
                             struct crypto_policy *cp = &cfg->policies[cfg->policy_count];
                             *cp = cp_match;
+                            cp->profile_id = p->id;
 
                             if (parse_cidr_any_or_negated(src_items[si], &cp->src_any, &cp->src_negate,
                                                           &cp->src_net, &cp->src_mask) != 0) {
@@ -511,8 +512,11 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 }
                 PQclear(mres);
             }
+        } else {
+            fprintf(stderr, "[DB CRYPTO] failed to read xdp_profile_crypto_policies: %s\n", PQresultErrorMessage(res));
+            PQclear(res);
+            return -1;
         }
-        PQclear(res);
     }
 
     return 0;
@@ -827,15 +831,24 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg)
 
     if (cfg->crypto_enabled) {
         if (first_key_pi < 0) {
-            fprintf(stderr,
-                    "[DB CRYPTO] policies request encryption but no crypto_key was provided in xdp_profile_crypto_policies\n");
-            return -1;
+            if (has_pqc) {
+                // For PQC-GCM, static DB key is optional since it is negotiated dynamically via Handshake
+                cfg->crypto_mode = CRYPTO_MODE_PQC_GCM;
+                cfg->aes_bits = 256;
+                cfg->nonce_size = 12;
+                memset(cfg->crypto_key, 0, sizeof(cfg->crypto_key));
+            } else {
+                fprintf(stderr,
+                        "[DB CRYPTO] policies request encryption but no crypto_key was provided in xdp_profile_crypto_policies\n");
+                return -1;
+            }
+        } else {
+            const struct crypto_policy *cp = &cfg->policies[first_key_pi];
+            cfg->crypto_mode = cp->crypto_mode;
+            cfg->aes_bits = (cp->aes_bits == 256) ? 256 : 128;
+            cfg->nonce_size = (cp->nonce_size > 0) ? cp->nonce_size : 12;
+            memcpy(cfg->crypto_key, cp->key, sizeof(cfg->crypto_key));
         }
-        const struct crypto_policy *cp = &cfg->policies[first_key_pi];
-        cfg->crypto_mode = cp->crypto_mode;
-        cfg->aes_bits = (cp->aes_bits == 256) ? 256 : 128;
-        cfg->nonce_size = (cp->nonce_size > 0) ? cp->nonce_size : 12;
-        memcpy(cfg->crypto_key, cp->key, sizeof(cfg->crypto_key));
     }
 
     if (has_l3 || has_l4) {
@@ -844,6 +857,18 @@ static int apply_crypto_derived_from_policies(struct app_config *cfg)
     if (has_l2) {
         cfg->fake_ethertype_ipv4 = 0x88b5;
         cfg->fake_ethertype_ipv6 = 0x88b6;
+    }
+
+    if (cfg->crypto_enabled) {
+        const char *mode_str = "UNKNOWN";
+        if (cfg->crypto_mode == CRYPTO_MODE_GCM) mode_str = "GCM";
+        else if (cfg->crypto_mode == CRYPTO_MODE_CTR) mode_str = "CTR";
+        else if (cfg->crypto_mode == CRYPTO_MODE_PQC_GCM) mode_str = "PQC-GCM";
+
+        fprintf(stderr, "[DB CRYPTO] Policies loaded successfully! Crypto: ENABLED, Layer: %d, Mode: %s, AES: %d-bits, Nonce: %d bytes\n",
+                cfg->encrypt_layer, mode_str, cfg->aes_bits, cfg->nonce_size);
+    } else {
+        fprintf(stderr, "[DB CRYPTO] Policies loaded: Crypto is DISABLED\n");
     }
 
     return 0;

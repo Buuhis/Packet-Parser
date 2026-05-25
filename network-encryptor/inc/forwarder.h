@@ -33,5 +33,6 @@ void forwarder_cleanup(struct forwarder *fwd);
 void forwarder_run(struct forwarder *fwd);
 void forwarder_stop(void);
 void forwarder_print_stats(struct forwarder *fwd);
+void forwarder_pre_diversify_pqc_keys(int profile_id);
 
 #endif

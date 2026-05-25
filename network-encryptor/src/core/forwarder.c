@@ -238,6 +238,8 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
                         cp->id, cp->aes_bits);
                 continue;
             }
+            g_policy_crypto_ctx[pi].profile_id = cp->profile_id;
+            g_policy_crypto_ctx[pi].policy_id = cp->id;
             g_policy_crypto_ctx_ready[pi] = 1;
         }
         if (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) {
@@ -1565,24 +1567,27 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     fwd->cfg = cfg;
 
     // ----- PQC HANDSHAKE START (Profile-based Authentication) -----
-    if (cfg->profile_count > 0 && cfg->profiles[0].local_identity_fingerprint[0] != '\0') {
-        char peer_ip_str[64] = {0};
-        struct in_addr addr;
-        if (cfg->profiles[0].wan_count > 0) {
-            int w_idx = cfg->profiles[0].wan_indices[0];
-            
-            // STRICT BOUNDARY CHECK: Prevent Page Faults / Coredumps if w_idx is invalid
-            if (w_idx >= 0 && w_idx < cfg->wan_count) {
-                addr.s_addr = cfg->wans[w_idx].dst_ip;
-                inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
-
-                fprintf(stderr, "[PQC-HS] Starting Automatic MAC-based Role Discovery on %s -> Peer IP: %s\n",
-                       cfg->wans[w_idx].ifname, peer_ip_str);
+    for (int p_idx = 0; p_idx < cfg->profile_count; p_idx++) {
+        if (cfg->profiles[p_idx].local_identity_fingerprint[0] != '\0') {
+            char peer_ip_str[64] = {0};
+            struct in_addr addr;
+            if (cfg->profiles[p_idx].wan_count > 0) {
+                int w_idx = cfg->profiles[p_idx].wan_indices[0];
                 
-                // Start the Handshake safely
-                sig_pqc_handshake_start(cfg->wans[w_idx].ifname, peer_ip_str);
-            } else {
-                fprintf(stderr, "[PQC-HS] CRITICAL ERROR: w_idx (%d) is out of bounds! Skipping Handshake.\n", w_idx);
+                // STRICT BOUNDARY CHECK: Prevent Page Faults / Coredumps if w_idx is invalid
+                if (w_idx >= 0 && w_idx < cfg->wan_count) {
+                    addr.s_addr = cfg->wans[w_idx].dst_ip;
+                    inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
+
+                    fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
+                           cfg->profiles[p_idx].id, cfg->wans[w_idx].ifname, peer_ip_str);
+                    
+                    // Start the Handshake safely
+                    sig_pqc_handshake_start(cfg->profiles[p_idx].id, cfg->wans[w_idx].ifname, peer_ip_str);
+                } else {
+                    fprintf(stderr, "[PQC-HS] CRITICAL ERROR: w_idx (%d) is out of bounds for Profile %d! Skipping Handshake.\n",
+                            w_idx, cfg->profiles[p_idx].id);
+                }
             }
         }
     }
@@ -2213,6 +2218,16 @@ void forwarder_print_stats(struct forwarder *fwd) {
         } else {
             fprintf(stdout, "[WAN ARP] if=%s peer=%s dest_mac=UNRESOLVED\n",
                     fwd->wans[w].ifname, ipbuf);
+        }
+    }
+}
+
+void forwarder_pre_diversify_pqc_keys(int profile_id) {
+    for (int pi = 0; pi < g_active_policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
+        if (g_policy_crypto_ctx_ready[pi]) {
+            if (g_policy_crypto_ctx[pi].profile_id == profile_id) {
+                packet_crypto_update_keys(&g_policy_crypto_ctx[pi]);
+            }
         }
     }
 }

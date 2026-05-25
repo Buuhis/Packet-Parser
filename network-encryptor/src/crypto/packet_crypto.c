@@ -138,15 +138,19 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
 
 // Function to update keys if handshake is ready
 static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
-    if (g_crypto_mode == CRYPTO_MODE_PQC_GCM && sig_pqc_is_key_ready()) {
+    if (g_crypto_mode == CRYPTO_MODE_PQC_GCM) {
         uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
-        if (sig_pqc_get_traffic_key(new_key) == 0) {
+        if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) == 0) {
             // Check if it's already updated (avoid redundant memcpy/logs)
             if (memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) != 0) {
                 memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
                 memcpy(ctx->keys[KEY_SLOT_PREV],    new_key, PQC_TRAFFIC_KEY_SZ);
                 memcpy(ctx->keys[KEY_SLOT_NEXT],    new_key, PQC_TRAFFIC_KEY_SZ);
-                printf("[PQC-DATA] Traffic key updated from Handshake!\n");
+                printf("[PQC-DATA] Policy %d key diversified and updated from Handshake (Profile %d)!\n",
+                       ctx->policy_id, ctx->profile_id);
+                printf("[PQC-DATA]   -> Policy Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
+                       new_key[0], new_key[1], new_key[2], new_key[3],
+                       new_key[4], new_key[5], new_key[6], new_key[7]);
             }
         }
     }

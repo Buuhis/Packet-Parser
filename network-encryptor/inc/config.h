@@ -49,6 +49,7 @@ struct profile_traffic_rule {
 
 struct crypto_policy {
     int id;
+    int profile_id;
     int db_id;
     int priority;
     int action;
