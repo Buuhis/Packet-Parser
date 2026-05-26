@@ -14,7 +14,10 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 
-extern void forwarder_pre_diversify_pqc_keys(int profile_id);
+// Declare as weak so that test programs (like db-loader-test) that do not link forwarder.c will compile successfully.
+__attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
+    (void)profile_id;
+}
 
 static uint8_t  g_traffic_key[PQC_TRAFFIC_KEY_SZ];
 static bool g_key_ready = false;
@@ -258,7 +261,28 @@ static void* pqc_handshake_thread(void* arg) {
                                 for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
                                     if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
                                         memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+                                        fprintf(stderr, "[PQC-HS-DEBUG] BEFORE write: b_idx=%d, key_ready=%d\n", b_idx, (int)g_profile_bindings[b_idx].key_ready);
+                                         
                                         g_profile_bindings[b_idx].key_ready = true;
+                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER standard write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                         
+                                        g_profile_bindings[b_idx].key_ready = 1;
+                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER integer 1 write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                         
+                                        volatile bool *v_ptr = &g_profile_bindings[b_idx].key_ready;
+                                        *v_ptr = true;
+                                        fprintf(stderr, "[PQC-HS-DEBUG] AFTER volatile write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                         
+                                        fprintf(stderr, "[PQC-HS-DEBUG] b_idx=%d, key_ready address=%p, size=%zu, raw_value=%d\n",
+                                                b_idx, (void*)&g_profile_bindings[b_idx].key_ready, sizeof(g_profile_bindings[b_idx].key_ready),
+                                                (int)g_profile_bindings[b_idx].key_ready);
+                                        fprintf(stderr, "[PQC-HS-DEBUG] SET READY (Initiator): profile_id=%d, b_idx=%d, array_addr=%p\n",
+                                                g_hs_cfg.profile_id, b_idx, (void*)g_profile_bindings);
+                                        for (int i = 0; i < g_profile_bindings_count; i++) {
+                                            fprintf(stderr, "[PQC-HS-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%d\n",
+                                                    i, g_profile_bindings[i].profile_id,
+                                                    (int)g_profile_bindings[i].key_ready);
+                                        }
                                         fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
                                         fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
                                                 derived_master[0], derived_master[1], derived_master[2], derived_master[3],
@@ -327,7 +351,28 @@ static void* pqc_handshake_thread(void* arg) {
                             for (int b_idx = 0; b_idx < g_profile_bindings_count; b_idx++) {
                                 if (g_profile_bindings[b_idx].profile_id == g_hs_cfg.profile_id) {
                                     memcpy(g_profile_bindings[b_idx].master_traffic_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+                                    fprintf(stderr, "[PQC-HS-DEBUG] BEFORE write: b_idx=%d, key_ready=%d\n", b_idx, (int)g_profile_bindings[b_idx].key_ready);
+                                    
                                     g_profile_bindings[b_idx].key_ready = true;
+                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER standard write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                    
+                                    g_profile_bindings[b_idx].key_ready = 1;
+                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER integer 1 write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                    
+                                    volatile bool *v_ptr = &g_profile_bindings[b_idx].key_ready;
+                                    *v_ptr = true;
+                                    fprintf(stderr, "[PQC-HS-DEBUG] AFTER volatile write: key_ready=%d\n", (int)g_profile_bindings[b_idx].key_ready);
+                                    
+                                    fprintf(stderr, "[PQC-HS-DEBUG] b_idx=%d, key_ready address=%p, size=%zu, raw_value=%d\n",
+                                            b_idx, (void*)&g_profile_bindings[b_idx].key_ready, sizeof(g_profile_bindings[b_idx].key_ready),
+                                            (int)g_profile_bindings[b_idx].key_ready);
+                                    fprintf(stderr, "[PQC-HS-DEBUG] SET READY (Responder): profile_id=%d, b_idx=%d, array_addr=%p\n",
+                                            g_hs_cfg.profile_id, b_idx, (void*)g_profile_bindings);
+                                    for (int i = 0; i < g_profile_bindings_count; i++) {
+                                        fprintf(stderr, "[PQC-HS-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%d\n",
+                                                i, g_profile_bindings[i].profile_id,
+                                                (int)g_profile_bindings[i].key_ready);
+                                    }
                                     fprintf(stderr, "[PQC-HS] Master key bound to profile %d successfully!\n", g_hs_cfg.profile_id);
                                     fprintf(stderr, "[PQC-HS]   -> Master Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
                                             derived_master[0], derived_master[1], derived_master[2], derived_master[3],
@@ -401,6 +446,16 @@ int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]) {
 
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
     pthread_mutex_lock(&g_key_mutex);
+    
+    printf("[PQC-DEBUG] sig_pqc_diversify_key (policy_id=%d, profile_id=%d): g_profile_bindings_count = %d, array_addr = %p\n",
+           policy_id, profile_id, g_profile_bindings_count, (void*)g_profile_bindings);
+    for (int i = 0; i < g_profile_bindings_count; i++) {
+        printf("[PQC-DEBUG]   -> Binding[%d]: profile_id=%d, key_ready=%s, master_traffic_key_addr=%p\n",
+               i, g_profile_bindings[i].profile_id,
+               g_profile_bindings[i].key_ready ? "TRUE" : "FALSE",
+               (void*)g_profile_bindings[i].master_traffic_key);
+    }
+
     profile_key_binding_t *binding = NULL;
     for (int i = 0; i < g_profile_bindings_count; i++) {
         if (g_profile_bindings[i].profile_id == profile_id) {
@@ -409,9 +464,16 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
         }
     }
     
-    if (!binding || !binding->key_ready) {
+    if (!binding) {
+        printf("[PQC-DEBUG] sig_pqc_diversify_key: NO binding found for profile_id %d!\n", profile_id);
         pthread_mutex_unlock(&g_key_mutex);
-        return -1; // Master key not ready for this profile yet
+        return -1;
+    }
+    if (!binding->key_ready) {
+        printf("[PQC-DEBUG] sig_pqc_diversify_key: Binding found for profile_id %d, but key_ready is FALSE!\n",
+               profile_id);
+        pthread_mutex_unlock(&g_key_mutex);
+        return -1;
     }
     
     // Diversify key: Policy_Key = HMAC-SHA256(Master_Key, policy_id)

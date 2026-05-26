@@ -216,7 +216,7 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
         for (int k = 0; k < AES_KEY_LEN; k++) {
             if (cp->key[k] != 0) { key_nonzero = 1; break; }
         }
-        if (!key_nonzero)
+        if (!key_nonzero && cp->crypto_mode != CRYPTO_MODE_PQC_GCM)
             continue;
 
         int reused = 0;
@@ -226,14 +226,17 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
             if (!same_crypto_policy(&old_policies[oi], cp))
                 continue;
             g_policy_crypto_ctx[pi] = old_ctx[oi];
+            g_policy_crypto_ctx[pi].crypto_mode = cp->crypto_mode;
             g_policy_crypto_ctx_ready[pi] = 1;
+            printf("[PQC-DEBUG] REUSED policy pi=%d, db_id=%d, cp->id=%d, cp->crypto_mode=%d, ctx->crypto_mode=%d\n",
+                   pi, cp->db_id, cp->id, cp->crypto_mode, g_policy_crypto_ctx[pi].crypto_mode);
             reused = 1;
             break;
         }
 
         if (!reused) {
             packet_crypto_set_aes_bits(cp->aes_bits);
-            if (packet_crypto_init(&g_policy_crypto_ctx[pi], cp->key) != 0) {
+            if (packet_crypto_init(&g_policy_crypto_ctx[pi], cp->key, cp->crypto_mode) != 0) {
                 fprintf(stderr, "[DB CRYPTO] Failed to init policy ctx id=%d (AES=%d)\n",
                         cp->id, cp->aes_bits);
                 continue;
@@ -241,6 +244,8 @@ static int rebuild_crypto_runtime(const struct app_config *cfg, int *has_encrypt
             g_policy_crypto_ctx[pi].profile_id = cp->profile_id;
             g_policy_crypto_ctx[pi].policy_id = cp->id;
             g_policy_crypto_ctx_ready[pi] = 1;
+            printf("[PQC-DEBUG] NEW policy pi=%d, db_id=%d, cp->id=%d, cp->crypto_mode=%d, ctx->crypto_mode=%d\n",
+                   pi, cp->db_id, cp->id, cp->crypto_mode, g_policy_crypto_ctx[pi].crypto_mode);
         }
         if (cp->action >= 0 && cp->action <= POLICY_ACTION_ENCRYPT_L4) {
             uint8_t pid = (uint8_t)cp->id;
@@ -1629,7 +1634,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         packet_crypto_set_mode(cfg->crypto_mode);
         packet_crypto_set_nonce_size(cfg->nonce_size);
 
-        if (packet_crypto_init(&crypto_ctx, cfg->crypto_key) != 0) {
+        if (packet_crypto_init(&crypto_ctx, cfg->crypto_key, cfg->crypto_mode) != 0) {
             fprintf(stderr, "Failed to initialize AES-%d encryption\n", cfg->aes_bits);
             return -1;
         }

@@ -138,7 +138,13 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
 
 // Function to update keys if handshake is ready
 static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
-    if (g_crypto_mode == CRYPTO_MODE_PQC_GCM) {
+    if (ctx) {
+        printf("[PQC-DEBUG] check_and_update_pqc_key: policy_id=%d, profile_id=%d, crypto_mode=%d (expected=%d)\n",
+               ctx->policy_id, ctx->profile_id, ctx->crypto_mode, CRYPTO_MODE_PQC_GCM);
+    } else {
+        printf("[PQC-DEBUG] check_and_update_pqc_key: ctx is NULL!\n");
+    }
+    if (ctx && ctx->crypto_mode == CRYPTO_MODE_PQC_GCM) {
         uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
         if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) == 0) {
             // Check if it's already updated (avoid redundant memcpy/logs)
@@ -156,40 +162,6 @@ static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
     }
 }
 
-// int packet_encrypt(struct packet_crypto_ctx *ctx,
-//                    uint8_t *packet,
-//                    size_t pkt_len) {
-//     packet_crypto_update_keys(ctx);
-
-//     switch (g_encrypt_layer) {
-//     case 2:
-//         return crypto_layer2_encrypt(ctx, packet, pkt_len);
-//     case 3:
-//         return crypto_layer3_encrypt(ctx, packet, pkt_len);
-//     case 4:
-//         return crypto_layer4_encrypt(ctx, packet, pkt_len);
-//     default:
-//         return -1;
-//     }
-// }
-
-// int packet_decrypt(struct packet_crypto_ctx *ctx,
-//                    uint8_t *packet,
-//                    size_t pkt_len) {
-//     packet_crypto_update_keys(ctx);
-
-//     switch (g_encrypt_layer) {
-//     case 2:
-//         return crypto_layer2_decrypt(ctx, packet, pkt_len);
-//     case 3:
-//         return crypto_layer3_decrypt(ctx, packet, pkt_len);
-//     case 4:
-//         return crypto_layer4_decrypt(ctx, packet, pkt_len);
-//     default:
-//         return -1;
-//     }
-// }
-
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
     check_and_update_pqc_key(ctx);
 }
@@ -200,15 +172,17 @@ const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
 }
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,
-                       const uint8_t master_key[AES_MAX_KEY_SIZE]) {
+                       const uint8_t master_key[AES_MAX_KEY_SIZE],
+                       int crypto_mode) {
     if (!ctx || !master_key) return -1;
 
     int key_size = get_key_size();
     memset(ctx, 0, sizeof(*ctx));
     ctx->initialized = true;
+    ctx->crypto_mode = crypto_mode;
 
     // ----- PQC HANDSHAKE INTEGRATION -----
-    if (g_crypto_mode == CRYPTO_MODE_PQC_GCM) {
+    if (ctx->crypto_mode == CRYPTO_MODE_PQC_GCM) {
         static bool pqc_init_done = false;
         if (!pqc_init_done) {
             if (trf_pqc_init_global() != TRF_PQC_OK) return -1;

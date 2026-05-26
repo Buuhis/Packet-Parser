@@ -25,13 +25,15 @@
 struct packet_crypto_ctx {
     int profile_id;
     int policy_id;
+    int crypto_mode;
     uint8_t master_key[AES_MAX_KEY_SIZE];
     uint8_t keys[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE];
     bool initialized;
 };
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,
-                       const uint8_t master_key[AES_MAX_KEY_SIZE]);
+                       const uint8_t master_key[AES_MAX_KEY_SIZE],
+                       int crypto_mode);
 
 void packet_crypto_update_keys(struct packet_crypto_ctx *ctx);
 
