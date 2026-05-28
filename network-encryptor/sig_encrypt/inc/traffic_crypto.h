@@ -41,14 +41,14 @@ int trf_save_key_to_file(const char *filename, const char *data, int mode);
 // Requirement (Tailroom): The allocated data_len must have at least (len + 16 bytes) capacity.
 // A 16-byte authentication tag will be appended to the end of the 'data' array.
 // aad: Optional Additional Authenticated Data (e.g. network headers)
-int trf_encrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
+int trf_encrypt_payload_gcm(SCryptCipherCtx* ctx, const byte* key, const byte* nonce, int nonce_len, 
                             const byte* aad, int aad_len,
                             byte* data, int len, int* new_len_out);
 
 // Decrypt payload in-place. The 'data' buffer will be overwritten with plaintext.
 // The function automatically extracts the 16-byte Tag at the end for authentication comparison.
 // aad: Must match the AAD provided during encryption for successful authentication.
-int trf_decrypt_payload_gcm(const byte* key, const byte* nonce, int nonce_len, 
+int trf_decrypt_payload_gcm(SCryptCipherCtx* ctx, const byte* key, const byte* nonce, int nonce_len, 
                             const byte* aad, int aad_len,
                             byte* data, int len, int* orig_len_out);
 

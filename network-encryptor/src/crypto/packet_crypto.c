@@ -4,6 +4,7 @@
 #include "../../inc/crypto_layer3.h"
 #include "../../inc/crypto_layer4.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
+#include "../../sig_encrypt/inc/crypt.h"
 #include "../../sig_encrypt/inc/pqc_handshake.h"
 #include <string.h>
 #include <stdio.h>
@@ -189,6 +190,11 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
             fprintf(stderr, "[PQC-INIT] Waiting for Handshake to provide keys...\n");
             pqc_init_done = true;
         }
+        ctx->cipher_ctx_enc = scrypt_CipherCtxNew();
+        ctx->cipher_ctx_dec = scrypt_CipherCtxNew();
+        if (!ctx->cipher_ctx_enc || !ctx->cipher_ctx_dec) {
+            return -1;
+        }
     } else {
         // LEGACY OPENSSL PATH
         memcpy(ctx->master_key, master_key, key_size);
@@ -210,6 +216,14 @@ void packet_crypto_cleanup(struct packet_crypto_ctx *ctx) {
     if (ctx) {
         memset(ctx->master_key, 0, sizeof(ctx->master_key));
         memset(ctx->keys, 0, sizeof(ctx->keys));
+        if (ctx->cipher_ctx_enc) {
+            scrypt_CipherCtxFree(ctx->cipher_ctx_enc);
+            ctx->cipher_ctx_enc = NULL;
+        }
+        if (ctx->cipher_ctx_dec) {
+            scrypt_CipherCtxFree(ctx->cipher_ctx_dec);
+            ctx->cipher_ctx_dec = NULL;
+        }
         ctx->initialized = false;
     }
 

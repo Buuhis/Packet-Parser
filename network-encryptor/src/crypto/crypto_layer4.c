@@ -165,7 +165,7 @@ int crypto_layer4_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(aad + 8, &src_port, 2);
         memcpy(aad + 10, &dst_port, 2);
 
-        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
+        if (trf_encrypt_payload_gcm(ctx->cipher_ctx_enc, key, pqc_nonce, 12, aad, 12, packet + enc_off, (int)enc_len, &new_len) != TRF_PQC_OK)
             return -1;
         
         // DEBUG DUMP AAD/NONCE/KEY
@@ -319,7 +319,7 @@ int crypto_layer4_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
             printf("[DEBUG-DEC] Key(first 4): %02X%02X%02X%02X (Slot: %d)\n",
                     key[0], key[1], key[2], key[3], k);
 
-            int res = trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len);
+            int res = trf_decrypt_payload_gcm(ctx->cipher_ctx_dec, key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len);
             if (res != TRF_PQC_OK) {
                 printf("[DEBUG-DEC] PQC Decrypt FAILED: code=%d, enc_len=%zu\n", res, enc_len);
                 continue;
@@ -451,7 +451,7 @@ int crypto_layer4_encrypt_fragment_single(struct packet_crypto_ctx *ctx,
         memcpy(aad, ip_hdr + 12, 8);
         memcpy(aad + 8, transport_hdr, 4);
 
-        if (trf_encrypt_payload_gcm(key, nonce, nonce_len, aad, 12, out_buf + enc_off, (int)app_payload_len, &new_len) != TRF_PQC_OK)
+        if (trf_encrypt_payload_gcm(ctx->cipher_ctx_enc, key, nonce, nonce_len, aad, 12, out_buf + enc_off, (int)app_payload_len, &new_len) != TRF_PQC_OK)
             return -1;
     } else {
         uint8_t iv[AES128_IV_SIZE];
@@ -563,7 +563,7 @@ int crypto_layer4_decrypt_fragment(struct packet_crypto_ctx *ctx,
             memcpy(aad, packet + l3_off + 12, 8);
             memcpy(aad + 8, packet + transport_off, 4);
 
-            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            if (trf_decrypt_payload_gcm(ctx->cipher_ctx_dec, key, nonce, nonce_len, aad, 12, work, (int)enc_len, &orig_len) != TRF_PQC_OK)
                 continue;
             enc_len = (size_t)orig_len;
         } else {

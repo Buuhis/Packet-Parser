@@ -29,6 +29,8 @@ struct packet_crypto_ctx {
     uint8_t master_key[AES_MAX_KEY_SIZE];
     uint8_t keys[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE];
     bool initialized;
+    void *cipher_ctx_enc;
+    void *cipher_ctx_dec;
 };
 
 int packet_crypto_init(struct packet_crypto_ctx *ctx,

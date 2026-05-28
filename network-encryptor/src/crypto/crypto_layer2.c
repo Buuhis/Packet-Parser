@@ -96,7 +96,7 @@ int crypto_layer2_encrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(aad, packet, 12);     // Src/Dst MAC
 
         int new_len = 0;
-        if (trf_encrypt_payload_gcm(key, pqc_nonce, 12, aad, 12, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
+        if (trf_encrypt_payload_gcm(ctx->cipher_ctx_enc, key, pqc_nonce, 12, aad, 12, packet + l2_enc_start, (int)payload_len, &new_len) != TRF_PQC_OK)
             return -1;
         
         // Write tunnel header (Nonce + PolicyID + Magic)
@@ -205,7 +205,7 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         }
 
         int orig_len = 0;
-        if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
+        if (trf_decrypt_payload_gcm(ctx->cipher_ctx_dec, key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
             enc_len = (size_t)orig_len;
             goto decrypt_success;
         }
