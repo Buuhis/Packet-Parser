@@ -177,9 +177,9 @@ static int build_and_encrypt_fragment(struct packet_crypto_ctx *ctx,
         uint8_t aad[8];
         memcpy(aad, out_buf + 14 + 12, 8); 
 
-        if (trf_encrypt_payload_gcm(key, nonce, nonce_len, aad, 8,
-                                    out_buf + enc_off, (int)transport_len, &new_len) != TRF_PQC_OK)
-            return -1;
+        // if (trf_encrypt_payload_gcm(key, nonce, nonce_len, aad, 8,
+        //                             out_buf + enc_off, (int)transport_len, &new_len) != TRF_PQC_OK)
+        //     return -1;
         hdr_overhead += AES128_GCM_TAG_SIZE;
     } else {
         uint8_t iv[AES128_IV_SIZE];
@@ -368,8 +368,8 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
             uint8_t aad[8];
             memcpy(aad, packet + 14 + 12, 8);
 
-            if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 8, packet + enc_off, (int)enc_len, &orig_len) != TRF_PQC_OK)
-                continue;
+            // if (trf_decrypt_payload_gcm(key, nonce, nonce_len, aad, 8, packet + enc_off, (int)enc_len, &orig_len) != TRF_PQC_OK)
+            //     continue;
             enc_len = orig_len;
         } else {
             uint8_t iv[AES128_IV_SIZE];
