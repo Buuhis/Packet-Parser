@@ -1,4 +1,5 @@
 #include "../inc/pqc_l2_handshake.h"
+#include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -412,4 +413,25 @@ void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer) {
         }
         peer->discovered = 0;
     }
+}
+
+int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
+    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        return -1;
+    }
+    const struct profile_config *p = &cfg->profiles[profile_idx];
+    if (p->wan_count <= 0) {
+        return -1;
+    }
+    int chosen_w_idx = p->wan_indices[0];
+    for (int w = 0; w < p->wan_count; w++) {
+        int w_idx = p->wan_indices[w];
+        if (w_idx >= 0 && w_idx < cfg->wan_count) {
+            if (cfg->wans[w_idx].dst_ip != 0) {
+                chosen_w_idx = w_idx;
+                break;
+            }
+        }
+    }
+    return chosen_w_idx;
 }

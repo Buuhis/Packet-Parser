@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include "../../sig_encrypt/inc/pqc_handshake.h"
+#include "../../sig_encrypt/inc/pqc_l2_handshake.h"
 
 static int str_is_any(const char *v) {
     if (!v) return 1;
@@ -311,11 +312,12 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         if (p->local_identity_fingerprint[0] != '\0') {
             char peer_ip[64] = "0.0.0.0";
             const char *wan_ifname = "";
-            if (p->wan_count > 0) {
+            int chosen_idx = pqc_select_handshake_wan(cfg, pi);
+            if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
                 struct in_addr addr;
-                addr.s_addr = cfg->wans[p->wan_indices[0]].dst_ip;
+                addr.s_addr = cfg->wans[chosen_idx].dst_ip;
                 inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
-                wan_ifname = cfg->wans[p->wan_indices[0]].ifname;
+                wan_ifname = cfg->wans[chosen_idx].ifname;
             }
 
             // Load Peer Identity Key and Role for this specific profile

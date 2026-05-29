@@ -1,5 +1,6 @@
 #include "../../inc/forwarder.h"
 #include "../../sig_encrypt/inc/pqc_handshake.h"
+#include "../../sig_encrypt/inc/pqc_l2_handshake.h"
 #include "../../inc/packet_crypto.h"
 #include "../../inc/flow_table.h"
 #include "../../inc/config.h"
@@ -1576,23 +1577,19 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
         if (cfg->profiles[p_idx].local_identity_fingerprint[0] != '\0') {
             char peer_ip_str[64] = {0};
             struct in_addr addr;
-            if (cfg->profiles[p_idx].wan_count > 0) {
-                int w_idx = cfg->profiles[p_idx].wan_indices[0];
-                
-                // STRICT BOUNDARY CHECK: Prevent Page Faults / Coredumps if w_idx is invalid
-                if (w_idx >= 0 && w_idx < cfg->wan_count) {
-                    addr.s_addr = cfg->wans[w_idx].dst_ip;
-                    inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
+            int chosen_w_idx = pqc_select_handshake_wan(cfg, p_idx);
+            if (chosen_w_idx >= 0 && chosen_w_idx < cfg->wan_count) {
+                addr.s_addr = cfg->wans[chosen_w_idx].dst_ip;
+                inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
 
-                    fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
-                           cfg->profiles[p_idx].id, cfg->wans[w_idx].ifname, peer_ip_str);
-                    
-                    // Start the Handshake safely
-                    sig_pqc_handshake_start(cfg->profiles[p_idx].id, cfg->wans[w_idx].ifname, peer_ip_str);
-                } else {
-                    fprintf(stderr, "[PQC-HS] CRITICAL ERROR: w_idx (%d) is out of bounds for Profile %d! Skipping Handshake.\n",
-                            w_idx, cfg->profiles[p_idx].id);
-                }
+                fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
+                       cfg->profiles[p_idx].id, cfg->wans[chosen_w_idx].ifname, peer_ip_str);
+                
+                // Start the Handshake safely
+                sig_pqc_handshake_start(cfg->profiles[p_idx].id, cfg->wans[chosen_w_idx].ifname, peer_ip_str);
+            } else {
+                fprintf(stderr, "[PQC-HS] CRITICAL ERROR: chosen_w_idx (%d) is out of bounds for Profile %d! Skipping Handshake.\n",
+                        chosen_w_idx, cfg->profiles[p_idx].id);
             }
         }
     }

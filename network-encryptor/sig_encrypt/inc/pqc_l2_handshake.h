@@ -95,6 +95,13 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
  */
 void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer);
 
+struct app_config;
+/**
+ * Dynamically select the best WAN interface for handshake on a given profile.
+ * Returns WAN index on success, negative on error.
+ */
+int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx);
+
 #ifdef __cplusplus
 }
 #endif
