@@ -1,4 +1,5 @@
 #include "../inc/pqc_l2_handshake.h"
+#include "pqc_handshake.h"
 #include "config.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -434,4 +435,33 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
         }
     }
     return chosen_w_idx;
+}
+
+void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname) {
+    if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        return;
+    }
+    int chosen_idx = pqc_select_handshake_wan(cfg, profile_idx);
+    if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
+        struct in_addr addr;
+        addr.s_addr = cfg->wans[chosen_idx].dst_ip;
+        inet_ntop(AF_INET, &addr, out_peer_ip, 64);
+        *out_wan_ifname = cfg->wans[chosen_idx].ifname;
+    }
+}
+
+void pqc_handshake_start_all_profiles(struct app_config *cfg) {
+    if (!cfg) return;
+    for (int p_idx = 0; p_idx < cfg->profile_count; p_idx++) {
+        if (cfg->profiles[p_idx].local_identity_fingerprint[0] != '\0') {
+            char peer_ip_str[64] = "0.0.0.0";
+            const char *wan_ifname = "";
+            pqc_get_profile_handshake_params(cfg, p_idx, peer_ip_str, &wan_ifname);
+            if (wan_ifname && wan_ifname[0] != '\0') {
+                fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
+                       cfg->profiles[p_idx].id, wan_ifname, peer_ip_str);
+                sig_pqc_handshake_start(cfg->profiles[p_idx].id, wan_ifname, peer_ip_str);
+            }
+        }
+    }
 }

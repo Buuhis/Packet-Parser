@@ -102,6 +102,16 @@ struct app_config;
  */
 int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx);
 
+/**
+ * Retrieve the WAN IP and Interface name for handshaking on a profile.
+ */
+void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname);
+
+/**
+ * Run handshake initialization across all configured profiles.
+ */
+void pqc_handshake_start_all_profiles(struct app_config *cfg);
+
 #ifdef __cplusplus
 }
 #endif

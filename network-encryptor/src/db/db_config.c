@@ -312,13 +312,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
         if (p->local_identity_fingerprint[0] != '\0') {
             char peer_ip[64] = "0.0.0.0";
             const char *wan_ifname = "";
-            int chosen_idx = pqc_select_handshake_wan(cfg, pi);
-            if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
-                struct in_addr addr;
-                addr.s_addr = cfg->wans[chosen_idx].dst_ip;
-                inet_ntop(AF_INET, &addr, peer_ip, sizeof(peer_ip));
-                wan_ifname = cfg->wans[chosen_idx].ifname;
-            }
+            pqc_get_profile_handshake_params(cfg, pi, peer_ip, &wan_ifname);
 
             // Load Peer Identity Key and Role for this specific profile
             PGresult *peer_res = PQexecParams(conn,

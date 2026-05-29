@@ -1573,26 +1573,7 @@ int forwarder_init(struct forwarder *fwd, struct app_config *cfg) {
     fwd->cfg = cfg;
 
     // ----- PQC HANDSHAKE START (Profile-based Authentication) -----
-    for (int p_idx = 0; p_idx < cfg->profile_count; p_idx++) {
-        if (cfg->profiles[p_idx].local_identity_fingerprint[0] != '\0') {
-            char peer_ip_str[64] = {0};
-            struct in_addr addr;
-            int chosen_w_idx = pqc_select_handshake_wan(cfg, p_idx);
-            if (chosen_w_idx >= 0 && chosen_w_idx < cfg->wan_count) {
-                addr.s_addr = cfg->wans[chosen_w_idx].dst_ip;
-                inet_ntop(AF_INET, &addr, peer_ip_str, sizeof(peer_ip_str));
-
-                fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
-                       cfg->profiles[p_idx].id, cfg->wans[chosen_w_idx].ifname, peer_ip_str);
-                
-                // Start the Handshake safely
-                sig_pqc_handshake_start(cfg->profiles[p_idx].id, cfg->wans[chosen_w_idx].ifname, peer_ip_str);
-            } else {
-                fprintf(stderr, "[PQC-HS] CRITICAL ERROR: chosen_w_idx (%d) is out of bounds for Profile %d! Skipping Handshake.\n",
-                        chosen_w_idx, cfg->profiles[p_idx].id);
-            }
-        }
-    }
+    pqc_handshake_start_all_profiles(cfg);
 
     g_cfg_ptr = cfg;
     interface_reset_redirect_maps();
