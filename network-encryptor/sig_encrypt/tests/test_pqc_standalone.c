@@ -2,6 +2,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "../inc/traffic_crypto.h"
+#include "../inc/crypt.h"
 
 // Màu sắc cho log
 #define KNRM  "\x1B[0m"
@@ -160,8 +161,15 @@ int main(int argc, char *argv[]) {
         if (buf) {
             memcpy(buf, data, strlen(data));
             
+            SCryptCipherCtx* c_ctx = scrypt_CipherCtxNew();
+            if (!c_ctx) {
+                printf("%s[FAIL] Failed to create cipher context!%s\n", KRED, KNRM);
+                free(buf);
+                return 1;
+            }
+
             // 4.1: Test mã hóa với AAD
-            if (trf_encrypt_payload_gcm(tx_key, nonce, 12, (byte*)aad_header, strlen(aad_header), buf, strlen(data), &enc_len) == TRF_PQC_OK) {
+            if (trf_encrypt_payload_gcm(c_ctx, tx_key, nonce, 12, (byte*)aad_header, strlen(aad_header), buf, strlen(data), &enc_len) == TRF_PQC_OK) {
                 printf(" - Encrypted size: %d bytes (with AAD binding)\n", enc_len);
 
                 // Lưu lại ciphertext để test 2 lần giải mã
@@ -169,7 +177,7 @@ int main(int argc, char *argv[]) {
                 memcpy(backup, buf, enc_len);
 
                 // 4.2: Giải mã với ĐÚNG AAD (Thành công)
-                if (trf_decrypt_payload_gcm(tx_key, nonce, 12, (byte*)aad_header, strlen(aad_header), buf, enc_len, &dec_len) == TRF_PQC_OK) {
+                if (trf_decrypt_payload_gcm(c_ctx, tx_key, nonce, 12, (byte*)aad_header, strlen(aad_header), buf, enc_len, &dec_len) == TRF_PQC_OK) {
                     buf[dec_len] = '\0';
                     printf("%s[OK] L4 Decrypt (Correct AAD): %s%s\n", KGRN, (char*)buf, KNRM);
                 } else {
@@ -178,7 +186,7 @@ int main(int argc, char *argv[]) {
 
                 // 4.3: Giải mã với SAI AAD (Phải thất bại - Chống giả mạo Header)
                 memcpy(buf, backup, enc_len); // Khôi phục ciphertext
-                if (trf_decrypt_payload_gcm(tx_key, nonce, 12, (byte*)wrong_aad, strlen(wrong_aad), buf, enc_len, &dec_len) != TRF_PQC_OK) {
+                if (trf_decrypt_payload_gcm(c_ctx, tx_key, nonce, 12, (byte*)wrong_aad, strlen(wrong_aad), buf, enc_len, &dec_len) != TRF_PQC_OK) {
                     printf("%s[OK] AAD Tampering detected! (Decryption failed as expected for wrong header)%s\n", KGRN, KNRM);
                 } else {
                     printf("%s[CRITICAL FAIL] L4 Decrypt accepted WRONG AAD! Security breach.%s\n", KRED, KNRM);
@@ -186,6 +194,7 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("%s[FAIL] L4 Encryption error.%s\n", KRED, KNRM);
             }
+            scrypt_CipherCtxFree(c_ctx);
             free(buf);
         }
     }

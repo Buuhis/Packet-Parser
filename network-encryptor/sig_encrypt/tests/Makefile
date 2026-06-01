@@ -4,10 +4,13 @@ LDFLAGS = -L/usr/local/lib -L../lib -lscrypt -lssl -lcrypto -lpthread -Wl,-rpath
 
 SRC = test_pqc_standalone.c ../src/traffic_crypto.c
 INSPECTOR_SRC = pqc_packet_inspector.c ../src/traffic_crypto.c
+PERF_SRC = test_pqc_perf.c ../src/traffic_crypto.c
+
 TARGET = ../../bin/test_pqc_standalone
 INSPECTOR_TARGET = ../../bin/pqc_packet_inspector
+PERF_TARGET = ../../bin/test_pqc_perf
 
-all: $(TARGET) $(INSPECTOR_TARGET)
+all: $(TARGET) $(INSPECTOR_TARGET) $(PERF_TARGET)
 
 $(TARGET): $(SRC)
 	mkdir -p ../../bin
@@ -17,5 +20,9 @@ $(INSPECTOR_TARGET): $(INSPECTOR_SRC)
 	mkdir -p ../../bin
 	$(CC) $(CFLAGS) -o $@ $(INSPECTOR_SRC) $(LDFLAGS)
 
+$(PERF_TARGET): $(PERF_SRC)
+	mkdir -p ../../bin
+	$(CC) $(CFLAGS) -o $@ $(PERF_SRC) $(LDFLAGS)
+
 clean:
-	rm -f $(TARGET) $(INSPECTOR_TARGET)
+	rm -f $(TARGET) $(INSPECTOR_TARGET) $(PERF_TARGET)
