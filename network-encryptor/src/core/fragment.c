@@ -172,7 +172,7 @@ static int build_and_encrypt_fragment(struct packet_crypto_ctx *ctx,
         memcpy(out_buf + enc_off + transport_len, tag, AES128_GCM_TAG_SIZE);
         hdr_overhead += AES128_GCM_TAG_SIZE;
     } else if (mode == CRYPTO_MODE_PQC_GCM) {
-        int new_len;
+        // int new_len;
         // Prepare AAD for fragment (IP Src/Dst)
         uint8_t aad[8];
         memcpy(aad, out_buf + 14 + 12, 8); 
@@ -329,7 +329,7 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
 
     size_t enc_len;
     uint8_t tag[AES128_GCM_TAG_SIZE];
-    uint8_t hmac_tag[32];
+    // uint8_t hmac_tag[32];
     if (mode == CRYPTO_MODE_GCM) {
         if (total_after_hdr < AES128_GCM_TAG_SIZE) return -1;
         enc_len = total_after_hdr - AES128_GCM_TAG_SIZE;

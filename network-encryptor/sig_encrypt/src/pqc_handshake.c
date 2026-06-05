@@ -15,14 +15,11 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 
-// Declare as weak so that test programs (like db-loader-test) that do not link forwarder.c will compile successfully.
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
 }
 
 static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
-static char *g_peer_id_pub = NULL;
-
 #define PQC_RX_QUEUE_SIZE  16
 #define PQC_RX_PKT_MAX     10000
 
@@ -43,16 +40,6 @@ typedef struct {
     bool valid;
 } diversified_key_cache_t;
 
-typedef struct {
-    int profile_id;
-    char *local_priv;
-    char *local_pub;
-    char *peer_pub;
-} profile_key_binding_t;
-
-static profile_key_binding_t g_profile_bindings[MAX_IDENTITY_REGISTRY];
-static int g_profile_bindings_count = 0;
-
 #define MAX_POLICY_BINDINGS 128
 
 typedef struct {
@@ -66,6 +53,18 @@ typedef struct {
     uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
     uint8_t decrypt_key[PQC_TRAFFIC_KEY_SZ];
     bool key_ready;
+
+    // Policy-level PQC Handshake Config
+    bool is_initiator;
+    char peer_ip[64];
+    char local_fingerprint[16];
+    char peer_fingerprint[16];
+    char wan_ifname[64];
+
+    // Policy-level PQC Identity Keys (RAM registry mappings)
+    char *local_priv;
+    char *local_pub;
+    char *peer_pub;
 
     // Parallel Handshake Worker Thread variables
     bool thread_started;
@@ -83,18 +82,6 @@ typedef struct {
 
 static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
-
-#define MAX_PROFILE_CONFIGS 16
-typedef struct {
-    int profile_id;
-    bool is_initiator;
-    char peer_ip[64];
-    char local_fingerprint[16];
-    char wan_ifname[64];
-} profile_config_t;
-
-static profile_config_t g_profile_configs[MAX_PROFILE_CONFIGS];
-static int g_profile_configs_count = 0;
 
 static bool g_dispatcher_running = false;
 
@@ -121,14 +108,7 @@ static uint64_t get_time_ms_hs(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-static profile_config_t* get_profile_config(int profile_id) {
-    for (int i = 0; i < g_profile_configs_count; i++) {
-        if (g_profile_configs[i].profile_id == profile_id) {
-            return &g_profile_configs[i];
-        }
-    }
-    return NULL;
-}
+
 
 static void pqc_feed_packet_to_policy_l2(policy_key_binding_t *b, const uint8_t *data, int len, const uint8_t *src_mac) {
     pthread_mutex_lock(&b->rx_mutex);
@@ -294,35 +274,32 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
     fprintf(stderr, "[PQC-WORKER] Handshake Worker started for Policy %d (Profile %d)\n", policy_id, profile_id);
 
-    profile_config_t *cfg = NULL;
-    while (g_dispatcher_running) {
-        pthread_mutex_lock(&g_key_mutex);
-        cfg = get_profile_config(profile_id);
-        pthread_mutex_unlock(&g_key_mutex);
-        if (cfg) break;
-        usleep(200000);
+    pthread_mutex_lock(&g_key_mutex);
+    char *my_priv = b->local_priv ? strdup(b->local_priv) : NULL;
+    char *my_pub = b->local_pub ? strdup(b->local_pub) : NULL;
+    char *peer_pub = b->peer_pub ? strdup(b->peer_pub) : NULL;
+    bool is_initiator = b->is_initiator;
+    char wan_ifname[64];
+    strncpy(wan_ifname, b->wan_ifname, sizeof(wan_ifname) - 1);
+    wan_ifname[sizeof(wan_ifname) - 1] = '\0';
+    char peer_ip[64];
+    strncpy(peer_ip, b->peer_ip, sizeof(peer_ip) - 1);
+    peer_ip[sizeof(peer_ip) - 1] = '\0';
+    pthread_mutex_unlock(&g_key_mutex);
+
+    if (!my_priv || !my_pub || !peer_pub) {
+        fprintf(stderr, "[PQC-WORKER] Policy %d error: local or peer keys not configured.\n", policy_id);
+        if (my_priv) free(my_priv);
+        if (my_pub) free(my_pub);
+        if (peer_pub) free(peer_pub);
+        return NULL;
     }
 
-    if (!cfg) return NULL;
-
-    bool is_bridge_mode = (strlen(cfg->wan_ifname) > 0 && 
-                          (strlen(cfg->peer_ip) == 0 || strcmp(cfg->peer_ip, "0.0.0.0") == 0));
-
-    char *my_priv = NULL;
-    char *my_pub = NULL;
-    char *peer_pub = NULL;
-    while (g_dispatcher_running) {
-        if (sig_pqc_get_profile_keys(profile_id, &my_priv, &my_pub, &peer_pub) == 0 &&
-            my_priv && my_pub && peer_pub) {
-            break;
-        }
-        usleep(200000);
-    }
-
-    if (!g_dispatcher_running) return NULL;
+    bool is_bridge_mode = (strlen(wan_ifname) > 0 && 
+                          (strlen(peer_ip) == 0 || strcmp(peer_ip, "0.0.0.0") == 0));
 
     fprintf(stderr, "[PQC-WORKER] Policy %d keys loaded. Starting state machine (role: %s, mode: %s)\n",
-            policy_id, cfg->is_initiator ? "INITIATOR" : "RESPONDER", is_bridge_mode ? "L2" : "L3");
+            policy_id, is_initiator ? "INITIATOR" : "RESPONDER", is_bridge_mode ? "L2" : "L3");
 
     uint8_t pk[2048], sk[4096], ct[2048], ss[128];
     int pk_sz = 0, sk_sz = 0, ct_sz = 0;
@@ -330,12 +307,13 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
     if (is_bridge_mode) {
         struct pqc_l2_peer peer;
-        if (pqc_l2_init_peer(&peer, cfg->wan_ifname) < 0) {
-            fprintf(stderr, "[PQC-WORKER] Policy %d: Failed to init L2 peer on %s\n", policy_id, cfg->wan_ifname);
+        if (pqc_l2_init_peer(&peer, wan_ifname) < 0) {
+            fprintf(stderr, "[PQC-WORKER] Policy %d: Failed to init L2 peer on %s\n", policy_id, wan_ifname);
+            free(my_priv); free(my_pub); free(peer_pub);
             return NULL;
         }
 
-        if (cfg->is_initiator) {
+        if (is_initiator) {
             fprintf(stderr, "[PQC-WORKER] Policy %d: Initiator peer MAC discovery...\n", policy_id);
             while (g_dispatcher_running && !b->key_ready) {
                 if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
@@ -480,9 +458,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         memset(&peeraddr, 0, sizeof(peeraddr));
         peeraddr.sin_family = AF_INET;
         peeraddr.sin_port = htons(PQC_HS_PORT);
-        inet_pton(AF_INET, cfg->peer_ip, &peeraddr.sin_addr);
+        inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr);
 
-        if (cfg->is_initiator) {
+        if (is_initiator) {
             trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
             struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
             msg->magic = PQC_HS_MAGIC;
@@ -600,6 +578,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         }
         close(sockfd);
     }
+    free(my_priv);
+    free(my_pub);
+    free(peer_pub);
     return NULL;
 }
 
@@ -687,36 +668,7 @@ int sig_pqc_get_traffic_key(uint8_t out_key[PQC_TRAFFIC_KEY_SZ]) {
     return 0;
 }
 
-void sig_pqc_bind_policy(int policy_id, int profile_id) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].policy_id == policy_id) {
-            g_policy_bindings[i].profile_id = profile_id;
-            pthread_mutex_unlock(&g_key_mutex);
-            return;
-        }
-    }
-    if (g_policy_bindings_count < MAX_POLICY_BINDINGS) {
-        policy_key_binding_t *b = &g_policy_bindings[g_policy_bindings_count];
-        b->policy_id = policy_id;
-        b->profile_id = profile_id;
-        memset(b->encrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
-        memset(b->decrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
-        b->key_ready = false;
-        b->thread_started = false;
-        b->rx_head = 0;
-        b->rx_tail = 0;
-        pthread_mutex_init(&b->rx_mutex, NULL);
-        pthread_cond_init(&b->rx_cond, NULL);
-        for (int j = 0; j < PQC_RX_QUEUE_SIZE; j++) {
-            b->rx_queue[j] = NULL;
-            b->rx_len[j] = 0;
-        }
-        g_policy_bindings_count++;
-        fprintf(stderr, "[PQC-BIND] Policy %d bound to Profile %d in RAM.\n", policy_id, profile_id);
-    }
-    pthread_mutex_unlock(&g_key_mutex);
-}
+
 
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key) {
     pthread_mutex_lock(&g_key_mutex);
@@ -765,31 +717,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-void sig_pqc_set_handshake_config(int profile_id, bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_profile_configs_count; i++) {
-        if (g_profile_configs[i].profile_id == profile_id) {
-            g_profile_configs[i].is_initiator = is_initiator;
-            if (peer_ip) strncpy(g_profile_configs[i].peer_ip, peer_ip, 63);
-            if (local_fingerprint) strncpy(g_profile_configs[i].local_fingerprint, local_fingerprint, 15);
-            if (wan_ifname) strncpy(g_profile_configs[i].wan_ifname, wan_ifname, 63);
-            pthread_mutex_unlock(&g_key_mutex);
-            return;
-        }
-    }
-    if (g_profile_configs_count < MAX_PROFILE_CONFIGS) {
-        profile_config_t *cfg = &g_profile_configs[g_profile_configs_count++];
-        cfg->profile_id = profile_id;
-        cfg->is_initiator = is_initiator;
-        if (peer_ip) strncpy(cfg->peer_ip, peer_ip, 63);
-        else cfg->peer_ip[0] = '\0';
-        if (local_fingerprint) strncpy(cfg->local_fingerprint, local_fingerprint, 15);
-        else cfg->local_fingerprint[0] = '\0';
-        if (wan_ifname) strncpy(cfg->wan_ifname, wan_ifname, 63);
-        else cfg->wan_ifname[0] = '\0';
-    }
-    pthread_mutex_unlock(&g_key_mutex);
-}
+
 
 static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
     if (!obf_pub_str || strlen(obf_pub_str) == 0) return NULL;
@@ -884,18 +812,6 @@ static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fing
     fprintf(stderr, "[PQC-HS] Warning: Could not find matching fingerprint for peer public key. Using original string.\n");
     return strdup(obf_pub_str);
 }
-
-void sig_pqc_set_peer_identity(const char *pub, const char *peer_fingerprint) {
-    char *deobf = pub ? deobfuscate_peer_pub(pub, peer_fingerprint) : NULL;
-
-    pthread_mutex_lock(&g_key_mutex);
-    if (g_peer_id_pub) free(g_peer_id_pub);
-    g_peer_id_pub = deobf;
-    pthread_mutex_unlock(&g_key_mutex);
-
-    if (g_peer_id_pub) fprintf(stderr, "[PQC-HS] Peer identity key loaded and de-obfuscated. Ready for Handshake.\n");
-}
-
 bool sig_pqc_has_identity(const char *fingerprint) {
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
@@ -908,52 +824,64 @@ bool sig_pqc_has_identity(const char *fingerprint) {
     return false;
 }
 
-void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint) {
-    char *deobf_peer = peer_pub ? deobfuscate_peer_pub(peer_pub, peer_fingerprint) : NULL;
+void sig_pqc_bind_policy(int policy_id, int profile_id, bool is_initiator,
+                         const char *peer_ip, const char *local_fg,
+                         const char *peer_fg, const char *wan_ifname,
+                         const char *local_priv, const char *local_pub,
+                         const char *peer_pub) {
+    char *deobf_peer = peer_pub ? deobfuscate_peer_pub(peer_pub, peer_fg) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
-    
-    // Check if already bound
-    for (int i = 0; i < g_profile_bindings_count; i++) {
-        if (g_profile_bindings[i].profile_id == profile_id) {
-            if (g_profile_bindings[i].local_priv) free(g_profile_bindings[i].local_priv);
-            if (g_profile_bindings[i].local_pub) free(g_profile_bindings[i].local_pub);
-            if (g_profile_bindings[i].peer_pub) free(g_profile_bindings[i].peer_pub);
-            
-            g_profile_bindings[i].local_priv = local_priv ? strdup(local_priv) : NULL;
-            g_profile_bindings[i].local_pub = local_pub ? strdup(local_pub) : NULL;
-            g_profile_bindings[i].peer_pub = deobf_peer;
-            
-            pthread_mutex_unlock(&g_key_mutex);
-            return;
+    policy_key_binding_t *b = NULL;
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            b = &g_policy_bindings[i];
+            break;
         }
     }
-    
-    if (g_profile_bindings_count < MAX_IDENTITY_REGISTRY) {
-        profile_key_binding_t *b = &g_profile_bindings[g_profile_bindings_count++];
+    if (!b && g_policy_bindings_count < MAX_POLICY_BINDINGS) {
+        b = &g_policy_bindings[g_policy_bindings_count++];
+        memset(b->encrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+        memset(b->decrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+        b->key_ready = false;
+        b->thread_started = false;
+        b->rx_head = 0;
+        b->rx_tail = 0;
+        pthread_mutex_init(&b->rx_mutex, NULL);
+        pthread_cond_init(&b->rx_cond, NULL);
+        for (int j = 0; j < PQC_RX_QUEUE_SIZE; j++) {
+            b->rx_queue[j] = NULL;
+            b->rx_len[j] = 0;
+        }
+        b->local_priv = NULL;
+        b->local_pub = NULL;
+        b->peer_pub = NULL;
+    }
+    if (b) {
+        b->policy_id = policy_id;
         b->profile_id = profile_id;
+        b->is_initiator = is_initiator;
+        strncpy(b->peer_ip, peer_ip ? peer_ip : "", sizeof(b->peer_ip) - 1);
+        b->peer_ip[sizeof(b->peer_ip) - 1] = '\0';
+        strncpy(b->local_fingerprint, local_fg ? local_fg : "", sizeof(b->local_fingerprint) - 1);
+        b->local_fingerprint[sizeof(b->local_fingerprint) - 1] = '\0';
+        strncpy(b->peer_fingerprint, peer_fg ? peer_fg : "", sizeof(b->peer_fingerprint) - 1);
+        b->peer_fingerprint[sizeof(b->peer_fingerprint) - 1] = '\0';
+        strncpy(b->wan_ifname, wan_ifname ? wan_ifname : "", sizeof(b->wan_ifname) - 1);
+        b->wan_ifname[sizeof(b->wan_ifname) - 1] = '\0';
+
+        if (b->local_priv) free(b->local_priv);
+        if (b->local_pub) free(b->local_pub);
+        if (b->peer_pub) free(b->peer_pub);
+
         b->local_priv = local_priv ? strdup(local_priv) : NULL;
         b->local_pub = local_pub ? strdup(local_pub) : NULL;
         b->peer_pub = deobf_peer;
-        fprintf(stderr, "[PQC-BIND] Profile %d bound to Local/Peer keys in RAM.\n", profile_id);
-    }
-    
-    pthread_mutex_unlock(&g_key_mutex);
-}
 
-int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_profile_bindings_count; i++) {
-        if (g_profile_bindings[i].profile_id == profile_id) {
-            if (out_local_priv) *out_local_priv = g_profile_bindings[i].local_priv;
-            if (out_local_pub) *out_local_pub = g_profile_bindings[i].local_pub;
-            if (out_peer_pub) *out_peer_pub = g_profile_bindings[i].peer_pub;
-            pthread_mutex_unlock(&g_key_mutex);
-            return 0;
-        }
+        fprintf(stderr, "[PQC-BIND] Policy %d bound in RAM (Local FG: %s, Peer FG: %s, Initiator: %s, WAN: %s, Peer IP: %s).\n", 
+                policy_id, b->local_fingerprint, b->peer_fingerprint, is_initiator ? "YES" : "NO", b->wan_ifname, b->peer_ip);
     }
     pthread_mutex_unlock(&g_key_mutex);
-    return -1;
 }
 
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub) {
