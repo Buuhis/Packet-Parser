@@ -15,12 +15,32 @@
 // External declaration for the underlying symbol is no longer needed
 static int g_pqc_initialized = 0;
 
+static __thread uint8_t tls_pqc_salt[8];
+static __thread uint32_t tls_pqc_counter = 0;
+static __thread int tls_salt_initialized = 0;
+
 static void* get_aligned_library_obj(void* (*new_func)(), void (*free_func)(void*));
 
 int trf_pqc_generate_nonce(byte* out_nonce) {
     if (!out_nonce) return TRF_PQC_ERR_INIT;
-    // Use the library's random generator as recommended by tutorial
-    return scrypt_RandomBytes(out_nonce, 12);
+    
+    // Generate random 8-byte salt ONCE per thread/session
+    if (__builtin_expect(!tls_salt_initialized, 0)) {
+        int ret = scrypt_RandomBytes(tls_pqc_salt, 8);
+        if (__builtin_expect(ret != 0, 0)) {
+            return TRF_PQC_ERR_CRYPTO;
+        }
+        tls_salt_initialized = 1;
+    }
+    
+    // Increment local packet counter
+    uint32_t cnt = ++tls_pqc_counter;
+    
+    // Nonce (12 bytes) = 8-byte Salt + 4-byte Counter
+    memcpy(out_nonce, tls_pqc_salt, 8);
+    memcpy(out_nonce + 8, &cnt, 4);
+    
+    return 0; // Success
 }
 
 const char* trf_pqc_error_string(int err) {

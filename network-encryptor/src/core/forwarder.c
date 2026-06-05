@@ -2206,11 +2206,10 @@ void forwarder_print_stats(struct forwarder *fwd) {
 }
 
 void forwarder_pre_diversify_pqc_keys(int profile_id) {
+    (void)profile_id; // Unused
     for (int pi = 0; pi < g_active_policy_count && pi < MAX_CRYPTO_POLICIES; pi++) {
         if (g_policy_crypto_ctx_ready[pi]) {
-            if (g_policy_crypto_ctx[pi].profile_id == profile_id) {
-                packet_crypto_update_keys(&g_policy_crypto_ctx[pi]);
-            }
+            packet_crypto_update_keys(&g_policy_crypto_ctx[pi]);
         }
     }
 }

@@ -409,6 +409,10 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                     }
                 }
 
+                if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
+                    sig_pqc_bind_policy(db_policy_id, p->id);
+                }
+
 
                 char policy_id_str[32];
                 snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);

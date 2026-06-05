@@ -20,6 +20,7 @@ struct pqc_hs_msg {
     uint32_t magic;
     uint8_t  msg_type;
     uint32_t session_id;
+    uint32_t policy_id;
     uint16_t sig_len;  // Length of the ML-DSA signature
     uint16_t data_len; // Length of the KEM payload
     uint8_t  payload[0]; // data[data_len] followed by signature[sig_len]
@@ -79,6 +80,7 @@ int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key
 void sig_pqc_set_handshake_config(int profile_id, bool is_initiator, const char *peer_ip, const char *local_fingerprint, const char *wan_ifname);
 bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_profile_keys(int profile_id, const char *local_priv, const char *local_pub, const char *peer_pub, const char *peer_fingerprint);
+void sig_pqc_bind_policy(int policy_id, int profile_id);
 int sig_pqc_get_profile_keys(int profile_id, char **out_local_priv, char **out_local_pub, char **out_peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);

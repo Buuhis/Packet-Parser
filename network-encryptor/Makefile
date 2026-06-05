@@ -20,7 +20,7 @@ TARGET = $(BIN_DIR)/test_network-encryptor
 DB_LIB_SRC = src/db/config.c src/db/db_config.c src/db/db_env.c src/db/db_runtime.c
 DB_LIB_OBJ = $(DB_LIB_SRC:.c=.o)
 DB_LIB = $(BIN_DIR)/libdb_loader.a
-DB_TEST_SRC = src/db_loader_test.c src/core/main_diag.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c
+DB_TEST_SRC = src/db_loader_test.c src/core/main_diag.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c sig_encrypt/src/pqc_l2_handshake.c
 DB_TEST_OBJ = $(DB_TEST_SRC:.c=.o)
 DB_TEST_TARGET = $(BIN_DIR)/db-loader-test
 

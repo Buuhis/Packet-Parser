@@ -13,8 +13,12 @@
 #include <linux/if_packet.h>
 #include <net/ethernet.h>
 #include <poll.h>
+#include <pthread.h>
+
 
 static struct pqc_l2_reassemble *g_reassemble_list = NULL;
+static pthread_mutex_t g_reassemble_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 
 static uint64_t get_time_ms(void) {
     struct timespec ts;
@@ -246,6 +250,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
 
     // Timeout cleanup for active reassemblies
     uint64_t now = get_time_ms();
+    pthread_mutex_lock(&g_reassemble_mutex);
     struct pqc_l2_reassemble *curr = g_reassemble_list;
     struct pqc_l2_reassemble *prev = NULL;
 
@@ -262,6 +267,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             curr = curr->next;
         }
     }
+    pthread_mutex_unlock(&g_reassemble_mutex);
 
     uint8_t rx_buf[2048];
     ssize_t rx_len = recv(peer->raw_sock_fd, rx_buf, sizeof(rx_buf), MSG_DONTWAIT);
@@ -331,6 +337,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
 
         if (rx_len < (ssize_t)(expected_hdr + payload_len)) return 0;
 
+        pthread_mutex_lock(&g_reassemble_mutex);
         // Search for active assembly buffer
         struct pqc_l2_reassemble *r = g_reassemble_list;
         while (r) {
@@ -341,7 +348,10 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
         // Create a new assembly node if not found
         if (!r) {
             r = (struct pqc_l2_reassemble *)calloc(1, sizeof(*r));
-            if (!r) return -1;
+            if (!r) {
+                pthread_mutex_unlock(&g_reassemble_mutex);
+                return -1;
+            }
             r->msg_id = msg_id;
             r->total_len = total_len;
             r->frag_count = frag_count;
@@ -351,6 +361,7 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             
             if (!r->data_buffer || !r->frag_bitmap) {
                 free_reassemble(r);
+                pthread_mutex_unlock(&g_reassemble_mutex);
                 return -1;
             }
 
@@ -399,8 +410,11 @@ int pqc_l2_recv_and_process(struct pqc_l2_peer *peer, uint8_t **out_payload, uin
             free(r->frag_bitmap);
             free(r);
 
+            pthread_mutex_unlock(&g_reassemble_mutex);
             return (int)final_len;
         }
+
+        pthread_mutex_unlock(&g_reassemble_mutex);
     }
 
     return 0;
