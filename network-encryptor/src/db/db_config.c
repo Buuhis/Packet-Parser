@@ -391,13 +391,41 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                             is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
                         }
 
+                        int role_mode = PQC_ROLE_RESPONDER;
+                        if (PQC_USE_DYNAMIC_ROLE) {
+                            role_mode = PQC_ROLE_DYNAMIC;
+                        } else {
+                            role_mode = is_init ? PQC_ROLE_INITIATOR : PQC_ROLE_RESPONDER;
+                        }
+
+                        // Validation checks
+                        bool valid = true;
+                        if (!local_fg || strlen(local_fg) == 0) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing local_identity_fingerprint in DB!\n", db_policy_id);
+                            valid = false;
+                        }
+                        if (!peer_pub || strlen(peer_pub) == 0) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key in DB!\n", db_policy_id);
+                            valid = false;
+                        }
+
                         char *found_priv = NULL;
                         char *found_pub = NULL;
-                        sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+                        if (valid) {
+                            sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+                            if (!found_priv || !found_pub) {
+                                fprintf(stderr, "[DB-PQC] ERROR: Local keys for fingerprint [%s] (Policy %d) are not loaded in memory registry! (Please run key generator command first)\n", local_fg, db_policy_id);
+                                valid = false;
+                            }
+                        }
 
-                        sig_pqc_bind_policy(db_policy_id, p->id, is_init, peer_ip, local_fg, peer_fg, wan_ifname, found_priv, found_pub, peer_pub);
+                        if (valid) {
+                            sig_pqc_bind_policy(db_policy_id, p->id, role_mode, peer_ip, local_fg, peer_fg, wan_ifname, found_priv, found_pub, peer_pub);
+                        } else {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
+                        }
                     } else {
-                        fprintf(stderr, "[DB-PQC] Warning: No policy identity configuration found in pqc_identities for policy %d.\n", db_policy_id);
+                        fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);
                     }
                     PQclear(peer_res);
                 }

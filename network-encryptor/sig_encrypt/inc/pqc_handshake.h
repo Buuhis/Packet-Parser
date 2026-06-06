@@ -68,8 +68,16 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
  * @return 0 on success, -1 if the master key is not ready.
  */
 int sig_pqc_diversify_key(int profile_id, int policy_id, uint8_t *out_policy_key);
+#define PQC_USE_DYNAMIC_ROLE  1 // 1 = Dynamic (compare IP/MAC), 0 = Static (DB configured)
+
+typedef enum {
+    PQC_ROLE_RESPONDER = 0,
+    PQC_ROLE_INITIATOR = 1,
+    PQC_ROLE_DYNAMIC   = 2
+} pqc_role_mode_t;
+
 bool sig_pqc_has_identity(const char *fingerprint);
-void sig_pqc_bind_policy(int policy_id, int profile_id, bool is_initiator,
+void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_ip, const char *local_fg,
                          const char *peer_fg, const char *wan_ifname,
                          const char *local_priv, const char *local_pub,
