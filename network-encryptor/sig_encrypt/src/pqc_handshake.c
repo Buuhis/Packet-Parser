@@ -487,30 +487,62 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 serv.sin_family = AF_INET;
                 serv.sin_addr.s_addr = inet_addr(peer_ip);
                 serv.sin_port = htons(PQC_HS_PORT);
-                int conn_ret = connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv));
-                if (conn_ret == 0) {
-                    struct sockaddr_in name;
-                    socklen_t namelen = sizeof(name);
-                    if (getsockname(temp_sock, (struct sockaddr *)&name, &namelen) == 0) {
-                        uint32_t local_ip_num = ntohl(name.sin_addr.s_addr);
-                        uint32_t peer_ip_num = ntohl(serv.sin_addr.s_addr);
-                        if (local_ip_num > peer_ip_num) {
-                            is_initiator = true;
-                        } else {
-                            is_initiator = false;
-                        }
-                        char local_ip_str[32];
-                        struct in_addr local_addr = { .s_addr = name.sin_addr.s_addr };
-                        strncpy(local_ip_str, inet_ntoa(local_addr), sizeof(local_ip_str) - 1);
-                        local_ip_str[sizeof(local_ip_str) - 1] = '\0';
 
-                        fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved: local_ip=%s (0x%08X), peer_ip=%s (0x%08X). Resolved Role: %s\n",
-                                policy_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num, is_initiator ? "INITIATOR" : "RESPONDER");
+                bool resolved = false;
+                uint32_t local_ip_num = 0;
+                char local_ip_str[32] = "0.0.0.0";
+
+                // Method 2: Try to resolve using ioctl SIOCGIFADDR on wan_ifname first
+                if (b->wan_ifname && strlen(b->wan_ifname) > 0) {
+                    struct ifreq ifr;
+                    memset(&ifr, 0, sizeof(ifr));
+                    strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
+                    ifr.ifr_addr.sa_family = AF_INET;
+                    if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
+                        struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                        local_ip_num = ntohl(ipaddr->sin_addr.s_addr);
+                        strncpy(local_ip_str, inet_ntoa(ipaddr->sin_addr), sizeof(local_ip_str) - 1);
+                        local_ip_str[sizeof(local_ip_str) - 1] = '\0';
+                        resolved = true;
+                        fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved via wan_ifname [%s]: local_ip=%s\n",
+                                policy_id, b->wan_ifname, local_ip_str);
                     } else {
-                        fprintf(stderr, "[PQC-WORKER] Policy %d: getsockname failed.\n", policy_id);
+                        fprintf(stderr, "[PQC-WORKER] Policy %d: ioctl SIOCGIFADDR failed for interface [%s] (errno=%d). Falling back to routing resolution.\n",
+                                policy_id, b->wan_ifname, errno);
                     }
-                } else {
-                    fprintf(stderr, "[PQC-WORKER] Policy %d: connect to %s failed (ret=%d).\n", policy_id, peer_ip, conn_ret);
+                }
+
+                // Fallback (Method 1): connect + getsockname
+                if (!resolved) {
+                    int conn_ret = connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv));
+                    if (conn_ret == 0) {
+                        struct sockaddr_in name;
+                        socklen_t namelen = sizeof(name);
+                        if (getsockname(temp_sock, (struct sockaddr *)&name, &namelen) == 0) {
+                            local_ip_num = ntohl(name.sin_addr.s_addr);
+                            struct in_addr local_addr = { .s_addr = name.sin_addr.s_addr };
+                            strncpy(local_ip_str, inet_ntoa(local_addr), sizeof(local_ip_str) - 1);
+                            local_ip_str[sizeof(local_ip_str) - 1] = '\0';
+                            resolved = true;
+                            fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved via routing fallback: local_ip=%s\n",
+                                    policy_id, local_ip_str);
+                        } else {
+                            fprintf(stderr, "[PQC-WORKER] Policy %d: getsockname failed.\n", policy_id);
+                        }
+                    } else {
+                        fprintf(stderr, "[PQC-WORKER] Policy %d: connect to %s failed (ret=%d).\n", policy_id, peer_ip, conn_ret);
+                    }
+                }
+
+                if (resolved) {
+                    uint32_t peer_ip_num = ntohl(serv.sin_addr.s_addr);
+                    if (local_ip_num > peer_ip_num) {
+                        is_initiator = true;
+                    } else {
+                        is_initiator = false;
+                    }
+                    fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved: local_ip=%s (0x%08X), peer_ip=%s (0x%08X). Resolved Role: %s\n",
+                            policy_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num, is_initiator ? "INITIATOR" : "RESPONDER");
                 }
                 close(temp_sock);
             }

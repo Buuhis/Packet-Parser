@@ -467,14 +467,28 @@ void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_
 void pqc_handshake_start_all_profiles(struct app_config *cfg) {
     if (!cfg) return;
     for (int p_idx = 0; p_idx < cfg->profile_count; p_idx++) {
-        if (cfg->profiles[p_idx].local_identity_fingerprint[0] != '\0') {
+        const struct profile_config *p = &cfg->profiles[p_idx];
+        
+        // Check if there is at least one policy in this profile configured with PQC
+        bool has_pqc_policy = false;
+        for (int i = 0; i < p->policy_count; i++) {
+            int pol_idx = p->policy_indices[i];
+            if (pol_idx >= 0 && pol_idx < cfg->policy_count) {
+                if (cfg->policies[pol_idx].crypto_mode == CRYPTO_MODE_PQC_GCM) {
+                    has_pqc_policy = true;
+                    break;
+                }
+            }
+        }
+
+        if (has_pqc_policy) {
             char peer_ip_str[64] = "0.0.0.0";
             const char *wan_ifname = "";
             pqc_get_profile_handshake_params(cfg, p_idx, peer_ip_str, &wan_ifname);
             if (wan_ifname && wan_ifname[0] != '\0') {
                 fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
-                       cfg->profiles[p_idx].id, wan_ifname, peer_ip_str);
-                sig_pqc_handshake_start(cfg->profiles[p_idx].id, wan_ifname, peer_ip_str);
+                       p->id, wan_ifname, peer_ip_str);
+                sig_pqc_handshake_start(p->id, wan_ifname, peer_ip_str);
             }
         }
     }
