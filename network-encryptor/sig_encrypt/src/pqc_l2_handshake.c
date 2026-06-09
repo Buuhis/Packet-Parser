@@ -432,9 +432,11 @@ void pqc_l2_cleanup_peer(struct pqc_l2_peer *peer) {
 
 int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        fprintf(stderr, "[PQC-DEBUG] pqc_select_handshake_wan: invalid cfg or profile_idx=%d (profile_count=%d)\n", profile_idx, cfg ? cfg->profile_count : -1);
         return -1;
     }
     const struct profile_config *p = &cfg->profiles[profile_idx];
+    fprintf(stderr, "[PQC-DEBUG] profile_idx=%d (id=%d, name=%s), wan_count=%d\n", profile_idx, p->id, p->name, p->wan_count);
     if (p->wan_count <= 0) {
         return -1;
     }
@@ -442,10 +444,17 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
     for (int w = 0; w < p->wan_count; w++) {
         int w_idx = p->wan_indices[w];
         if (w_idx >= 0 && w_idx < cfg->wan_count) {
+            char ip_str[32] = "0.0.0.0";
+            struct in_addr addr = { .s_addr = cfg->wans[w_idx].dst_ip };
+            inet_ntop(AF_INET, &addr, ip_str, sizeof(ip_str));
+            fprintf(stderr, "[PQC-DEBUG]   checking wan %d: index=%d, name=%s, dst_ip=%s (0x%08X)\n",
+                    w, w_idx, cfg->wans[w_idx].ifname, ip_str, cfg->wans[w_idx].dst_ip);
             if (cfg->wans[w_idx].dst_ip != 0) {
                 chosen_w_idx = w_idx;
                 break;
             }
+        } else {
+            fprintf(stderr, "[PQC-DEBUG]   invalid wan index %d in profile (cfg->wan_count=%d)\n", w_idx, cfg->wan_count);
         }
     }
     return chosen_w_idx;
@@ -453,14 +462,19 @@ int pqc_select_handshake_wan(const struct app_config *cfg, int profile_idx) {
 
 void pqc_get_profile_handshake_params(const struct app_config *cfg, int profile_idx, char *out_peer_ip, const char **out_wan_ifname) {
     if (!cfg || profile_idx < 0 || profile_idx >= cfg->profile_count) {
+        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: invalid cfg or profile_idx=%d\n", profile_idx);
         return;
     }
     int chosen_idx = pqc_select_handshake_wan(cfg, profile_idx);
+    fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: chosen_idx=%d\n", chosen_idx);
     if (chosen_idx >= 0 && chosen_idx < cfg->wan_count) {
         struct in_addr addr;
         addr.s_addr = cfg->wans[chosen_idx].dst_ip;
         inet_ntop(AF_INET, &addr, out_peer_ip, 64);
         *out_wan_ifname = cfg->wans[chosen_idx].ifname;
+        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: resolved to wan_ifname=%s, peer_ip=%s\n", *out_wan_ifname, out_peer_ip);
+    } else {
+        fprintf(stderr, "[PQC-DEBUG] pqc_get_profile_handshake_params: failed to choose wan\n");
     }
 }
 

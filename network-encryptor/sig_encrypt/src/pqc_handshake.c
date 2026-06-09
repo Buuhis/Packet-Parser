@@ -299,8 +299,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     bool is_bridge_mode = (strlen(wan_ifname) > 0 && 
                           (strlen(peer_ip) == 0 || strcmp(peer_ip, "0.0.0.0") == 0));
 
+    const char *initial_role = (b->role_mode == PQC_ROLE_INITIATOR) ? "INITIATOR" :
+                               (b->role_mode == PQC_ROLE_RESPONDER) ? "RESPONDER" : "DYNAMIC (resolving...)";
     fprintf(stderr, "[PQC-WORKER] Policy %d keys loaded. Starting state machine (role: %s, mode: %s)\n",
-            policy_id, is_initiator ? "INITIATOR" : "RESPONDER", is_bridge_mode ? "L2" : "L3");
+            policy_id, initial_role, is_bridge_mode ? "L2" : "L3");
 
     uint8_t pk[2048], sk[4096], ct[2048], ss[128];
     int pk_sz = 0, sk_sz = 0, ct_sz = 0;
@@ -716,6 +718,14 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].profile_id == profile_id) {
+            if (wan_ifname && wan_ifname[0] != '\0') {
+                strncpy(g_policy_bindings[i].wan_ifname, wan_ifname, sizeof(g_policy_bindings[i].wan_ifname) - 1);
+                g_policy_bindings[i].wan_ifname[sizeof(g_policy_bindings[i].wan_ifname) - 1] = '\0';
+            }
+            if (peer_ip && peer_ip[0] != '\0') {
+                strncpy(g_policy_bindings[i].peer_ip, peer_ip, sizeof(g_policy_bindings[i].peer_ip) - 1);
+                g_policy_bindings[i].peer_ip[sizeof(g_policy_bindings[i].peer_ip) - 1] = '\0';
+            }
             if (!g_policy_bindings[i].thread_started) {
                 g_policy_bindings[i].thread_started = true;
                 if (pthread_create(&g_policy_bindings[i].thread_id, NULL, pqc_policy_handshake_worker_run, &g_policy_bindings[i]) == 0) {
