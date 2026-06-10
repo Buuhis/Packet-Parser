@@ -139,25 +139,33 @@ static void derive_key(const uint8_t master[AES_MAX_KEY_SIZE],
 
 // Function to update keys if handshake is ready
 static void check_and_update_pqc_key(struct packet_crypto_ctx *ctx) {
-    if (ctx) {
-        printf("[PQC-DEBUG] check_and_update_pqc_key: policy_id=%d, profile_id=%d, crypto_mode=%d (expected=%d)\n",
-               ctx->policy_id, ctx->profile_id, ctx->crypto_mode, CRYPTO_MODE_PQC_GCM);
-    } else {
-        printf("[PQC-DEBUG] check_and_update_pqc_key: ctx is NULL!\n");
-    }
     if (ctx && ctx->crypto_mode == CRYPTO_MODE_PQC_GCM) {
-        uint8_t new_key[PQC_TRAFFIC_KEY_SZ];
-        if (sig_pqc_diversify_key(ctx->profile_id, ctx->policy_id, new_key) == 0) {
-            // Check if it's already updated (avoid redundant memcpy/logs)
-            if (memcmp(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ) != 0) {
-                memcpy(ctx->keys[KEY_SLOT_CURRENT], new_key, PQC_TRAFFIC_KEY_SZ);
-                memcpy(ctx->keys[KEY_SLOT_PREV],    new_key, PQC_TRAFFIC_KEY_SZ);
-                memcpy(ctx->keys[KEY_SLOT_NEXT],    new_key, PQC_TRAFFIC_KEY_SZ);
-                printf("[PQC-DATA] Policy %d key diversified and updated from Handshake (Profile %d)!\n",
-                       ctx->policy_id, ctx->profile_id);
-                printf("[PQC-DATA]   -> Policy Key (first 8 bytes): %02X%02X%02X%02X%02X%02X%02X%02X\n",
-                       new_key[0], new_key[1], new_key[2], new_key[3],
-                       new_key[4], new_key[5], new_key[6], new_key[7]);
+        uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
+        uint8_t key_ids[KEY_SLOT_COUNT];
+        bool key_slots_valid[KEY_SLOT_COUNT];
+        if (sig_pqc_get_keys(ctx->policy_id, keys, key_ids, key_slots_valid) == 0) {
+            bool diff = false;
+            for (int s = 0; s < KEY_SLOT_COUNT; s++) {
+                if (ctx->key_slots_valid[s] != key_slots_valid[s] ||
+                    ctx->key_ids[s] != key_ids[s] ||
+                    (key_slots_valid[s] && memcmp(ctx->keys[s], keys[s], PQC_TRAFFIC_KEY_SZ) != 0)) {
+                    diff = true;
+                    break;
+                }
+            }
+            if (diff) {
+                memcpy(ctx->keys, keys, KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
+                memcpy(ctx->key_ids, key_ids, KEY_SLOT_COUNT);
+                memcpy(ctx->key_slots_valid, key_slots_valid, KEY_SLOT_COUNT * sizeof(bool));
+                printf("[PQC-DATA] Datapath keys updated from control plane for Policy %d!\n", ctx->policy_id);
+                for (int s = 0; s < KEY_SLOT_COUNT; s++) {
+                    if (ctx->key_slots_valid[s]) {
+                        printf("[PQC-DATA]   Slot %d (ID %d): %02X%02X%02X%02X...\n",
+                               s, ctx->key_ids[s], ctx->keys[s][0], ctx->keys[s][1], ctx->keys[s][2], ctx->keys[s][3]);
+                    } else {
+                        printf("[PQC-DATA]   Slot %d: INVALID\n", s);
+                    }
+                }
             }
         }
     }
@@ -169,6 +177,7 @@ void packet_crypto_update_keys(struct packet_crypto_ctx *ctx) {
 
 const uint8_t *packet_crypto_get_key(struct packet_crypto_ctx *ctx, int slot) {
     if (!ctx || slot < 0 || slot >= KEY_SLOT_COUNT) return NULL;
+    if (ctx->crypto_mode == CRYPTO_MODE_PQC_GCM && !ctx->key_slots_valid[slot]) return NULL;
     return ctx->keys[slot];
 }
 
@@ -201,6 +210,9 @@ int packet_crypto_init(struct packet_crypto_ctx *ctx,
         derive_key(ctx->master_key, 0, ctx->keys[KEY_SLOT_PREV]);
         derive_key(ctx->master_key, 0, ctx->keys[KEY_SLOT_CURRENT]);
         derive_key(ctx->master_key, 0, ctx->keys[KEY_SLOT_NEXT]);
+        ctx->key_slots_valid[KEY_SLOT_PREV] = true;
+        ctx->key_slots_valid[KEY_SLOT_CURRENT] = true;
+        ctx->key_slots_valid[KEY_SLOT_NEXT] = true;
     }
 
     packet_crypto_reset_counter();
@@ -506,16 +518,22 @@ int packet_encrypt(struct packet_crypto_ctx *ctx,
                    size_t pkt_len) {
     packet_crypto_update_keys(ctx);
 
+    int res = -1;
     switch (g_encrypt_layer) {
     case 2:
-        return crypto_layer2_encrypt(ctx, packet, pkt_len);
+        res = crypto_layer2_encrypt(ctx, packet, pkt_len);
+        break;
     case 3:
-        return crypto_layer3_encrypt(ctx, packet, pkt_len);
+        res = crypto_layer3_encrypt(ctx, packet, pkt_len);
+        break;
     case 4:
-        return crypto_layer4_encrypt(ctx, packet, pkt_len);
-    default:
-        return -1;
+        res = crypto_layer4_encrypt(ctx, packet, pkt_len);
+        break;
     }
+    if (res == 0 && ctx) {
+        sig_pqc_record_sent(ctx->policy_id);
+    }
+    return res;
 }
 
 int packet_decrypt(struct packet_crypto_ctx *ctx,
@@ -523,16 +541,22 @@ int packet_decrypt(struct packet_crypto_ctx *ctx,
                    size_t pkt_len) {
     packet_crypto_update_keys(ctx);
 
+    int res = -1;
     switch (g_encrypt_layer) {
     case 2:
-        return crypto_layer2_decrypt(ctx,packet, pkt_len);
+        res = crypto_layer2_decrypt(ctx, packet, pkt_len);
+        break;
     case 3:
-        return crypto_layer3_decrypt(ctx, packet, pkt_len);
+        res = crypto_layer3_decrypt(ctx, packet, pkt_len);
+        break;
     case 4:
-        return crypto_layer4_decrypt(ctx, packet, pkt_len);
-    default:
-        return -1;
+        res = crypto_layer4_decrypt(ctx, packet, pkt_len);
+        break;
     }
+    if (res == 0 && ctx) {
+        sig_pqc_record_recv(ctx->policy_id);
+    }
+    return res;
 }
 
 void packet_crypto_set_fake_protocol(uint8_t proto) { g_fake_protocol = proto; }

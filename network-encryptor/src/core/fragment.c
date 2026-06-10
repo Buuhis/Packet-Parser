@@ -6,6 +6,7 @@
 #include "../../inc/crypto_layer4.h"
 #include "../../inc/config.h"
 #include "../../sig_encrypt/inc/traffic_crypto.h"
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -212,6 +213,9 @@ static int build_and_encrypt_fragment(struct packet_crypto_ctx *ctx,
     }
 
     *out_len = pkt_len + (uint32_t)hdr_overhead;
+    if (ctx) {
+        sig_pqc_record_sent(ctx->policy_id);
+    }
     return 0;
 }
 
@@ -387,6 +391,20 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
             }
         }
 
+        if (key_order[k] == KEY_SLOT_NEXT) {
+            memcpy(ctx->keys[KEY_SLOT_PREV], ctx->keys[KEY_SLOT_CURRENT], AES_MAX_KEY_SIZE);
+            ctx->key_ids[KEY_SLOT_PREV] = ctx->key_ids[KEY_SLOT_CURRENT];
+            ctx->key_slots_valid[KEY_SLOT_PREV] = ctx->key_slots_valid[KEY_SLOT_CURRENT];
+
+            memcpy(ctx->keys[KEY_SLOT_CURRENT], ctx->keys[KEY_SLOT_NEXT], AES_MAX_KEY_SIZE);
+            ctx->key_ids[KEY_SLOT_CURRENT] = ctx->key_ids[KEY_SLOT_NEXT];
+            ctx->key_slots_valid[KEY_SLOT_CURRENT] = true;
+
+            ctx->key_slots_valid[KEY_SLOT_NEXT] = false;
+            printf("[PQC-DATA] Fragment L3 Implicit key promotion: NEXT -> CURRENT for Policy %d!\n", ctx->policy_id);
+            sig_pqc_promote_responder_key(ctx->policy_id);
+        }
+
         memmove(packet + tunnel_off, packet + enc_off, enc_len);
 
         if (proto_flag == PROTO_FLAG_IPV4) {
@@ -411,6 +429,9 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
             packet[14 + 5] = (uint8_t)(new_paylen & 0xFF);
         }
 
+        if (ctx) {
+            sig_pqc_record_recv(ctx->policy_id);
+        }
         return (int)(pkt_len - hdr_overhead);
     }
 

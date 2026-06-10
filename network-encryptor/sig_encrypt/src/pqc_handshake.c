@@ -1,6 +1,7 @@
 #include "../inc/pqc_handshake.h"
 #include "../inc/traffic_crypto.h"
 #include "../inc/pqc_l2_handshake.h"
+#include "packet_crypto.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +56,12 @@ typedef struct {
     int role_mode;
     bool key_ready;
 
+    // 3-Slot Key Buffer
+    uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
+    uint8_t key_ids[KEY_SLOT_COUNT];
+    bool key_slots_valid[KEY_SLOT_COUNT];
+    uint64_t last_rotation_time;
+
     // Policy-level PQC Handshake Config
     bool is_initiator;
     char peer_ip[64];
@@ -79,6 +86,10 @@ typedef struct {
     int rx_tail;
     pthread_mutex_t rx_mutex;
     pthread_cond_t rx_cond;
+
+    // Rekey and self-healing activity timestamps
+    uint64_t last_sent_time;
+    uint64_t last_recv_time;
 } policy_key_binding_t;
 
 static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
@@ -96,6 +107,8 @@ typedef struct {
 static l2_dispatcher_t g_l2_dispatchers[MAX_L2_DISPATCHERS];
 static int g_l2_dispatchers_count = 0;
 
+static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
+
 // Helper to calculate SHA256 hash
 static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t *out_key) {
     uint8_t hash[64]; // Enough for SHA512
@@ -109,7 +122,190 @@ static uint64_t get_time_ms_hs(void) {
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
+static void handle_handshake_success_initiator(policy_key_binding_t *b, const uint8_t *derived_master) {
+    memcpy(b->keys[KEY_SLOT_PREV], b->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+    b->key_ids[KEY_SLOT_PREV] = b->key_ids[KEY_SLOT_CURRENT];
+    b->key_slots_valid[KEY_SLOT_PREV] = b->key_slots_valid[KEY_SLOT_CURRENT];
 
+    memcpy(b->keys[KEY_SLOT_CURRENT], derived_master, PQC_TRAFFIC_KEY_SZ);
+    b->key_ids[KEY_SLOT_CURRENT] = (b->key_ids[KEY_SLOT_CURRENT] + 1) & 0xFF;
+    if (b->key_ids[KEY_SLOT_CURRENT] == 0) b->key_ids[KEY_SLOT_CURRENT] = 1;
+    b->key_slots_valid[KEY_SLOT_CURRENT] = true;
+
+    b->key_slots_valid[KEY_SLOT_NEXT] = false;
+
+    memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+    memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+
+    b->key_ready = true;
+    b->last_sent_time = get_time_ms_hs();
+    b->last_recv_time = get_time_ms_hs();
+    b->last_rotation_time = get_time_ms_hs();
+
+    fprintf(stderr, "[PQC-HS] Initiator Handshake SUCCESS for Policy %d. Promoted new key ID: %d to CURRENT\n",
+            b->policy_id, b->key_ids[KEY_SLOT_CURRENT]);
+}
+
+static void handle_handshake_success_responder(policy_key_binding_t *b, const uint8_t *derived_master) {
+    memcpy(b->keys[KEY_SLOT_NEXT], derived_master, PQC_TRAFFIC_KEY_SZ);
+    b->key_ids[KEY_SLOT_NEXT] = (b->key_ids[KEY_SLOT_CURRENT] + 1) & 0xFF;
+    if (b->key_ids[KEY_SLOT_NEXT] == 0) b->key_ids[KEY_SLOT_NEXT] = 1;
+    b->key_slots_valid[KEY_SLOT_NEXT] = true;
+
+    if (!b->key_slots_valid[KEY_SLOT_CURRENT]) {
+        memcpy(b->keys[KEY_SLOT_CURRENT], derived_master, PQC_TRAFFIC_KEY_SZ);
+        b->key_ids[KEY_SLOT_CURRENT] = b->key_ids[KEY_SLOT_NEXT];
+        b->key_slots_valid[KEY_SLOT_CURRENT] = true;
+        b->key_slots_valid[KEY_SLOT_NEXT] = false;
+
+        memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+        memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
+
+        fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS (initial) for Policy %d. Promoted new key ID: %d to CURRENT\n",
+                b->policy_id, b->key_ids[KEY_SLOT_CURRENT]);
+    } else {
+        fprintf(stderr, "[PQC-HS] Responder Handshake SUCCESS (rotation) for Policy %d. Stored new key ID: %d in NEXT\n",
+                b->policy_id, b->key_ids[KEY_SLOT_NEXT]);
+    }
+
+    b->key_ready = true;
+    b->last_sent_time = get_time_ms_hs();
+    b->last_recv_time = get_time_ms_hs();
+}
+
+static void initiate_key_rotation_l3(policy_key_binding_t *b, int sockfd, struct sockaddr_in *peeraddr, char *my_priv, char *peer_pub, int profile_id) {
+    fprintf(stderr, "[PQC-HS-L3] Proactively initiating periodic key rotation for Policy %d...\n", b->policy_id);
+
+    uint8_t pk[2048], sk[4096], ss[128];
+    int pk_sz = 0, sk_sz = 0;
+    uint8_t buffer[PQC_HS_MSG_MAX_SZ];
+
+    if (trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz) != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-HS-L3] KEM keygen failed during rotation!\n");
+        return;
+    }
+
+    uint32_t msg_id = (uint32_t)rand();
+    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+    msg->magic = PQC_HS_MAGIC;
+    msg->msg_type = PQC_HS_MSG_HELLO;
+    msg->session_id = msg_id;
+    msg->policy_id = b->policy_id;
+    msg->data_len = (uint16_t)pk_sz;
+    memcpy(msg->payload, pk, pk_sz);
+
+    pthread_mutex_lock(&g_key_mutex);
+    size_t raw_priv_sz = 0;
+    uint8_t raw_priv[8192];
+    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+    int sig_sz = 0;
+    trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
+    msg->sig_len = (uint16_t)sig_sz;
+    pthread_mutex_unlock(&g_key_mutex);
+
+    int payload_tot_sz = sizeof(struct pqc_hs_msg) + pk_sz + sig_sz;
+    sendto(sockfd, buffer, payload_tot_sz, 0, (const struct sockaddr *)peeraddr, sizeof(struct sockaddr_in));
+
+    uint64_t start_rx = get_time_ms_hs();
+    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000) {
+        uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+        pqc_rx_pkt_info_t info;
+        int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+        if (rx_len > 0) {
+            struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
+            if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP && resp->session_id == msg_id) {
+                pthread_mutex_lock(&g_key_mutex);
+                size_t raw_pub_sz = 0;
+                uint8_t raw_pub[8192];
+                trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                pthread_mutex_unlock(&g_key_mutex);
+
+                if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
+                    if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                        uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                        derive_traffic_key(ss, 32, derived_master);
+
+                        pthread_mutex_lock(&g_key_mutex);
+                        handle_handshake_success_initiator(b, derived_master);
+                        pthread_mutex_unlock(&g_key_mutex);
+
+                        forwarder_pre_diversify_pqc_keys(profile_id);
+                        return;
+                    }
+                }
+            }
+        }
+        usleep(10000);
+    }
+    fprintf(stderr, "[PQC-HS-L3] Key rotation handshake attempt timed out or failed for Policy %d.\n", b->policy_id);
+}
+
+static void initiate_key_rotation_l2(policy_key_binding_t *b, struct pqc_l2_peer *peer, char *my_priv, char *peer_pub, int profile_id) {
+    fprintf(stderr, "[PQC-HS-L2] Proactively initiating periodic key rotation for Policy %d...\n", b->policy_id);
+
+    uint8_t pk[2048], sk[4096], ss[128];
+    int pk_sz = 0, sk_sz = 0;
+    uint8_t buffer[PQC_HS_MSG_MAX_SZ];
+
+    if (trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz) != TRF_PQC_OK) {
+        fprintf(stderr, "[PQC-HS-L2] KEM keygen failed during rotation!\n");
+        return;
+    }
+
+    uint32_t msg_id = (uint32_t)rand();
+    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+    msg->magic = PQC_HS_MAGIC;
+    msg->msg_type = PQC_HS_MSG_HELLO;
+    msg->session_id = msg_id;
+    msg->policy_id = b->policy_id;
+    msg->data_len = (uint16_t)pk_sz;
+    memcpy(msg->payload, pk, pk_sz);
+
+    pthread_mutex_lock(&g_key_mutex);
+    size_t raw_priv_sz = 0;
+    uint8_t raw_priv[8192];
+    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+    int sig_sz = 0;
+    trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
+    msg->sig_len = (uint16_t)sig_sz;
+    pthread_mutex_unlock(&g_key_mutex);
+
+    int payload_tot_sz = sizeof(struct pqc_hs_msg) + pk_sz + sig_sz;
+    pqc_l2_send_payload_fragmented(peer, msg_id, buffer, payload_tot_sz);
+
+    uint64_t start_rx = get_time_ms_hs();
+    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000) {
+        uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+        pqc_rx_pkt_info_t info;
+        int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+        if (rx_len > 0) {
+            struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
+            if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP && resp->session_id == msg_id) {
+                pthread_mutex_lock(&g_key_mutex);
+                size_t raw_pub_sz = 0;
+                uint8_t raw_pub[8192];
+                trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                pthread_mutex_unlock(&g_key_mutex);
+
+                if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
+                    if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                        uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                        derive_traffic_key(ss, 32, derived_master);
+
+                        pthread_mutex_lock(&g_key_mutex);
+                        handle_handshake_success_initiator(b, derived_master);
+                        pthread_mutex_unlock(&g_key_mutex);
+
+                        forwarder_pre_diversify_pqc_keys(profile_id);
+                        return;
+                    }
+                }
+            }
+        }
+        usleep(10000);
+    }
+    fprintf(stderr, "[PQC-HS-L2] Key rotation handshake attempt timed out or failed for Policy %d.\n", b->policy_id);
+}
 
 static void pqc_feed_packet_to_policy_l2(policy_key_binding_t *b, const uint8_t *data, int len, const uint8_t *src_mac) {
     pthread_mutex_lock(&b->rx_mutex);
@@ -316,155 +512,219 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             return NULL;
         }
 
-        if (b->role_mode == PQC_ROLE_DYNAMIC || is_initiator) {
-            fprintf(stderr, "[PQC-WORKER] Policy %d: Initiator peer MAC discovery...\n", policy_id);
-            while (g_dispatcher_running && !b->key_ready) {
-                if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
-                    break;
+        while (g_dispatcher_running) {
+            if (!b->key_ready) {
+                if (b->role_mode == PQC_ROLE_DYNAMIC || is_initiator) {
+                    fprintf(stderr, "[PQC-WORKER] Policy %d: Initiator peer MAC discovery...\n", policy_id);
+                    while (g_dispatcher_running && !b->key_ready) {
+                        if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
+                            break;
+                        }
+                        usleep(1000000);
+                    }
+
+                    if (!g_dispatcher_running) {
+                        break;
+                    }
+
+                    if (b->role_mode == PQC_ROLE_DYNAMIC && peer.discovered) {
+                        if (memcmp(peer.local_mac, peer.peer_mac, 6) > 0) {
+                            is_initiator = true;
+                        } else {
+                            is_initiator = false;
+                        }
+                        fprintf(stderr, "[PQC-WORKER-L2] Policy %d: Dynamic role resolved. Local MAC: %02X:%02X:%02X:%02X:%02X:%02X, Peer MAC: %02X:%02X:%02X:%02X:%02X:%02X. Resolved Role: %s\n",
+                                policy_id,
+                                peer.local_mac[0], peer.local_mac[1], peer.local_mac[2],
+                                peer.local_mac[3], peer.local_mac[4], peer.local_mac[5],
+                                peer.peer_mac[0], peer.peer_mac[1], peer.peer_mac[2],
+                                peer.peer_mac[3], peer.peer_mac[4], peer.peer_mac[5],
+                                is_initiator ? "INITIATOR" : "RESPONDER");
+                    }
+
+                    if (is_initiator) {
+                        trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
+                        struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+                        msg->magic = PQC_HS_MAGIC;
+                        msg->msg_type = PQC_HS_MSG_HELLO;
+                        msg->session_id = 123;
+                        msg->policy_id = policy_id;
+                        msg->data_len = (uint16_t)pk_sz;
+                        memcpy(msg->payload, pk, pk_sz);
+
+                        pthread_mutex_lock(&g_key_mutex);
+                        size_t raw_priv_sz = 0;
+                        uint8_t raw_priv[8192];
+                        trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                        int sig_sz = 0;
+                        trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
+                        msg->sig_len = (uint16_t)sig_sz;
+                        pthread_mutex_unlock(&g_key_mutex);
+
+                        uint32_t payload_tot_sz = sizeof(struct pqc_hs_msg) + pk_sz + sig_sz;
+                        uint32_t msg_id = 10000 + policy_id;
+                        int retry_cnt = 0;
+
+                        while (g_dispatcher_running && !b->key_ready) {
+                            fprintf(stderr, "[PQC-WORKER-L2] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
+                            pqc_l2_send_payload_fragmented(&peer, msg_id, buffer, payload_tot_sz);
+
+                            uint64_t start_rx = get_time_ms_hs();
+                            while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+                                uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+                                pqc_rx_pkt_info_t info;
+                                int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+                                if (rx_len > 0) {
+                                    struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
+                                    if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                                        pthread_mutex_lock(&g_key_mutex);
+                                        size_t raw_pub_sz = 0;
+                                        uint8_t raw_pub[8192];
+                                        trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                                        pthread_mutex_unlock(&g_key_mutex);
+
+                                        if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
+                                            if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                                                uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                                derive_traffic_key(ss, 32, derived_master);
+
+                                                pthread_mutex_lock(&g_key_mutex);
+                                                handle_handshake_success_initiator(b, derived_master);
+                                                pthread_mutex_unlock(&g_key_mutex);
+
+                                                forwarder_pre_diversify_pqc_keys(profile_id);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                usleep(10000);
+                            }
+                            retry_cnt++;
+                        }
+                    }
                 }
-                usleep(1000000);
-            }
-
-            if (!g_dispatcher_running) {
-                pqc_l2_cleanup_peer(&peer);
-                return NULL;
-            }
-
-            if (b->role_mode == PQC_ROLE_DYNAMIC && peer.discovered) {
-                if (memcmp(peer.local_mac, peer.peer_mac, 6) > 0) {
-                    is_initiator = true;
-                } else {
-                    is_initiator = false;
-                }
-                fprintf(stderr, "[PQC-WORKER-L2] Policy %d: Dynamic role resolved. Local MAC: %02X:%02X:%02X:%02X:%02X:%02X, Peer MAC: %02X:%02X:%02X:%02X:%02X:%02X. Resolved Role: %s\n",
-                        policy_id,
-                        peer.local_mac[0], peer.local_mac[1], peer.local_mac[2],
-                        peer.local_mac[3], peer.local_mac[4], peer.local_mac[5],
-                        peer.peer_mac[0], peer.peer_mac[1], peer.peer_mac[2],
-                        peer.peer_mac[3], peer.peer_mac[4], peer.peer_mac[5],
-                        is_initiator ? "INITIATOR" : "RESPONDER");
-            }
-
-            if (is_initiator) {
-                trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
-                struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
-                msg->magic = PQC_HS_MAGIC;
-                msg->msg_type = PQC_HS_MSG_HELLO;
-                msg->session_id = 123;
-                msg->policy_id = policy_id;
-                msg->data_len = (uint16_t)pk_sz;
-                memcpy(msg->payload, pk, pk_sz);
-
-                pthread_mutex_lock(&g_key_mutex);
-                size_t raw_priv_sz = 0;
-                uint8_t raw_priv[8192];
-                trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
-                int sig_sz = 0;
-                trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
-                msg->sig_len = (uint16_t)sig_sz;
-                pthread_mutex_unlock(&g_key_mutex);
-
-                uint32_t payload_tot_sz = sizeof(struct pqc_hs_msg) + pk_sz + sig_sz;
-                uint32_t msg_id = 10000 + policy_id;
-                int retry_cnt = 0;
-
-                while (g_dispatcher_running && !b->key_ready) {
-                    fprintf(stderr, "[PQC-WORKER-L2] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
-                    pqc_l2_send_payload_fragmented(&peer, msg_id, buffer, payload_tot_sz);
-
-                    uint64_t start_rx = get_time_ms_hs();
-                    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+                if (!is_initiator && g_dispatcher_running && !b->key_ready) {
+                    fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) listening for HELLO...\n", policy_id);
+                    while (g_dispatcher_running && !b->key_ready) {
                         uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                         pqc_rx_pkt_info_t info;
                         int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
                         if (rx_len > 0) {
-                            struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
-                            if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                            struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
+                            if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
                                 pthread_mutex_lock(&g_key_mutex);
                                 size_t raw_pub_sz = 0;
                                 uint8_t raw_pub[8192];
                                 trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
                                 pthread_mutex_unlock(&g_key_mutex);
 
-                                if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
-                                    if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                                if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                    if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                        struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                                        resp->magic = PQC_HS_MAGIC;
+                                        resp->msg_type = PQC_HS_MSG_RESP;
+                                        resp->session_id = msg->session_id;
+                                        resp->policy_id = policy_id;
+                                        resp->data_len = (uint16_t)ct_sz;
+                                        memcpy(resp->payload, ct, ct_sz);
+
+                                        pthread_mutex_lock(&g_key_mutex);
+                                        size_t raw_priv_sz = 0;
+                                        uint8_t raw_priv[8192];
+                                        trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                                        int sig_sz = 0;
+                                        trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
+                                        resp->sig_len = (uint16_t)sig_sz;
+                                        pthread_mutex_unlock(&g_key_mutex);
+
+                                        memcpy(peer.peer_mac, info.src_mac, 6);
+                                        peer.discovered = 1;
+
+                                        pqc_l2_send_payload_fragmented(&peer, msg->session_id, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz);
+
                                         uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                                         derive_traffic_key(ss, 32, derived_master);
 
                                         pthread_mutex_lock(&g_key_mutex);
-                                        memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                        memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                        b->key_ready = true;
+                                        handle_handshake_success_responder(b, derived_master);
                                         pthread_mutex_unlock(&g_key_mutex);
 
-                                        fprintf(stderr, "[PQC-WORKER-L2] Handshake SUCCESS for Policy %d!\n", policy_id);
                                         forwarder_pre_diversify_pqc_keys(profile_id);
-                                        break;
                                     }
                                 }
                             }
                         }
                         usleep(10000);
                     }
-                    retry_cnt++;
                 }
-            }
-        }
-        if (!is_initiator) {
-            fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) listening for HELLO...\n", policy_id);
-            while (g_dispatcher_running && !b->key_ready) {
-                uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
-                pqc_rx_pkt_info_t info;
-                int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
-                if (rx_len > 0) {
-                    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
-                    if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
+            } else {
+                if (is_initiator) {
+                    uint64_t now = get_time_ms_hs();
+                    if (b->last_sent_time > 0 && (now - b->last_sent_time < 10000) && (now - b->last_recv_time > 15000)) {
+                        fprintf(stderr, "[PQC-HS-L2] Self-healing triggered (Initiator): active TX but no RX. Resetting key for Policy %d.\n", policy_id);
                         pthread_mutex_lock(&g_key_mutex);
-                        size_t raw_pub_sz = 0;
-                        uint8_t raw_pub[8192];
-                        trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                        b->key_ready = false;
+                        b->last_sent_time = 0;
+                        b->last_recv_time = 0;
                         pthread_mutex_unlock(&g_key_mutex);
+                    } else if (now - b->last_rotation_time > 30000) {
+                        initiate_key_rotation_l2(b, &peer, my_priv, peer_pub, profile_id);
+                    }
+                    usleep(500000);
+                } else {
+                    uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+                    pqc_rx_pkt_info_t info;
+                    int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+                    if (rx_len > 0) {
+                        struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
+                        if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
+                            fprintf(stderr, "[PQC-HS-L2] Responder received HELLO while ONLINE. Peer might have restarted! Re-handshaking for Policy %d...\n", policy_id);
 
-                        if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                            if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
-                                struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
-                                resp->magic = PQC_HS_MAGIC;
-                                resp->msg_type = PQC_HS_MSG_RESP;
-                                resp->session_id = msg->session_id;
-                                resp->policy_id = policy_id;
-                                resp->data_len = (uint16_t)ct_sz;
-                                memcpy(resp->payload, ct, ct_sz);
+                            pthread_mutex_lock(&g_key_mutex);
+                            size_t raw_pub_sz = 0;
+                            uint8_t raw_pub[8192];
+                            trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                            pthread_mutex_unlock(&g_key_mutex);
 
-                                pthread_mutex_lock(&g_key_mutex);
-                                size_t raw_priv_sz = 0;
-                                uint8_t raw_priv[8192];
-                                trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
-                                int sig_sz = 0;
-                                trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
-                                resp->sig_len = (uint16_t)sig_sz;
-                                pthread_mutex_unlock(&g_key_mutex);
+                            if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                    struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                                    resp->magic = PQC_HS_MAGIC;
+                                    resp->msg_type = PQC_HS_MSG_RESP;
+                                    resp->session_id = msg->session_id;
+                                    resp->policy_id = policy_id;
+                                    resp->data_len = (uint16_t)ct_sz;
+                                    memcpy(resp->payload, ct, ct_sz);
 
-                                memcpy(peer.peer_mac, info.src_mac, 6);
-                                peer.discovered = 1;
+                                    pthread_mutex_lock(&g_key_mutex);
+                                    size_t raw_priv_sz = 0;
+                                    uint8_t raw_priv[8192];
+                                    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                                    int sig_sz = 0;
+                                    trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
+                                    resp->sig_len = (uint16_t)sig_sz;
+                                    pthread_mutex_unlock(&g_key_mutex);
 
-                                pqc_l2_send_payload_fragmented(&peer, msg->session_id, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz);
+                                    memcpy(peer.peer_mac, info.src_mac, 6);
+                                    peer.discovered = 1;
 
-                                uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
-                                derive_traffic_key(ss, 32, derived_master);
+                                    pqc_l2_send_payload_fragmented(&peer, msg->session_id, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz);
 
-                                pthread_mutex_lock(&g_key_mutex);
-                                memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                b->key_ready = true;
-                                pthread_mutex_unlock(&g_key_mutex);
+                                    uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                    derive_traffic_key(ss, 32, derived_master);
 
-                                fprintf(stderr, "[PQC-WORKER-L2] Responder Handshake SUCCESS for Policy %d!\n", policy_id);
-                                forwarder_pre_diversify_pqc_keys(profile_id);
+                                    pthread_mutex_lock(&g_key_mutex);
+                                    handle_handshake_success_responder(b, derived_master);
+                                    pthread_mutex_unlock(&g_key_mutex);
+
+                                    forwarder_pre_diversify_pqc_keys(profile_id);
+                                }
                             }
                         }
                     }
+                    usleep(10000);
                 }
-                usleep(10000);
             }
         }
         pqc_l2_cleanup_peer(&peer);
@@ -472,6 +732,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (sockfd < 0) {
             perror("[PQC-WORKER] UDP Socket creation failed");
+            free(my_priv); free(my_pub); free(peer_pub);
             return NULL;
         }
 
@@ -481,189 +742,236 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         peeraddr.sin_port = htons(PQC_HS_PORT);
         inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr);
 
-        if (b->role_mode == PQC_ROLE_DYNAMIC) {
-            int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-            if (temp_sock >= 0) {
-                struct sockaddr_in serv;
-                memset(&serv, 0, sizeof(serv));
-                serv.sin_family = AF_INET;
-                serv.sin_addr.s_addr = inet_addr(peer_ip);
-                serv.sin_port = htons(PQC_HS_PORT);
+        while (g_dispatcher_running) {
+            if (!b->key_ready) {
+                if (b->role_mode == PQC_ROLE_DYNAMIC) {
+                    int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+                    if (temp_sock >= 0) {
+                        struct sockaddr_in serv;
+                        memset(&serv, 0, sizeof(serv));
+                        serv.sin_family = AF_INET;
+                        serv.sin_addr.s_addr = inet_addr(peer_ip);
+                        serv.sin_port = htons(PQC_HS_PORT);
 
-                bool resolved = false;
-                uint32_t local_ip_num = 0;
-                char local_ip_str[32] = "0.0.0.0";
+                        bool resolved = false;
+                        uint32_t local_ip_num = 0;
+                        char local_ip_str[32] = "0.0.0.0";
 
-                // Method 2: Try to resolve using ioctl SIOCGIFADDR on wan_ifname first
-                if (b->wan_ifname && strlen(b->wan_ifname) > 0) {
-                    struct ifreq ifr;
-                    memset(&ifr, 0, sizeof(ifr));
-                    strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
-                    ifr.ifr_addr.sa_family = AF_INET;
-                    if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
-                        struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
-                        local_ip_num = ntohl(ipaddr->sin_addr.s_addr);
-                        strncpy(local_ip_str, inet_ntoa(ipaddr->sin_addr), sizeof(local_ip_str) - 1);
-                        local_ip_str[sizeof(local_ip_str) - 1] = '\0';
-                        resolved = true;
-                        fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved via wan_ifname [%s]: local_ip=%s\n",
-                                policy_id, b->wan_ifname, local_ip_str);
-                    } else {
-                        fprintf(stderr, "[PQC-WORKER] Policy %d: ioctl SIOCGIFADDR failed for interface [%s] (errno=%d). Falling back to routing resolution.\n",
-                                policy_id, b->wan_ifname, errno);
-                    }
-                }
-
-                // Fallback (Method 1): connect + getsockname
-                if (!resolved) {
-                    int conn_ret = connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv));
-                    if (conn_ret == 0) {
-                        struct sockaddr_in name;
-                        socklen_t namelen = sizeof(name);
-                        if (getsockname(temp_sock, (struct sockaddr *)&name, &namelen) == 0) {
-                            local_ip_num = ntohl(name.sin_addr.s_addr);
-                            struct in_addr local_addr = { .s_addr = name.sin_addr.s_addr };
-                            strncpy(local_ip_str, inet_ntoa(local_addr), sizeof(local_ip_str) - 1);
-                            local_ip_str[sizeof(local_ip_str) - 1] = '\0';
-                            resolved = true;
-                            fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved via routing fallback: local_ip=%s\n",
-                                    policy_id, local_ip_str);
-                        } else {
-                            fprintf(stderr, "[PQC-WORKER] Policy %d: getsockname failed.\n", policy_id);
+                        if (strlen(b->wan_ifname) > 0) {
+                            struct ifreq ifr;
+                            memset(&ifr, 0, sizeof(ifr));
+                            strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
+                            ifr.ifr_addr.sa_family = AF_INET;
+                            if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
+                                struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                                local_ip_num = ntohl(ipaddr->sin_addr.s_addr);
+                                strncpy(local_ip_str, inet_ntoa(ipaddr->sin_addr), sizeof(local_ip_str) - 1);
+                                resolved = true;
+                            }
                         }
-                    } else {
-                        fprintf(stderr, "[PQC-WORKER] Policy %d: connect to %s failed (ret=%d).\n", policy_id, peer_ip, conn_ret);
+
+                        if (!resolved) {
+                            struct sockaddr_in local_addr;
+                            socklen_t addr_len = sizeof(local_addr);
+                            if (connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv)) == 0 &&
+                                getsockname(temp_sock, (struct sockaddr *)&local_addr, &addr_len) == 0) {
+                                local_ip_num = ntohl(local_addr.sin_addr.s_addr);
+                                strncpy(local_ip_str, inet_ntoa(local_addr.sin_addr), sizeof(local_ip_str) - 1);
+                                resolved = true;
+                            }
+                        }
+                        close(temp_sock);
+
+                        if (resolved) {
+                            uint32_t peer_ip_num = ntohl(serv.sin_addr.s_addr);
+                            if (local_ip_num > peer_ip_num) {
+                                is_initiator = true;
+                            } else {
+                                is_initiator = false;
+                            }
+                            fprintf(stderr, "[PQC-WORKER-L3] Policy %d: Dynamic role resolved. Local IP: %s (%u), Peer IP: %s (%u). Resolved Role: %s\n",
+                                    policy_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num,
+                                    is_initiator ? "INITIATOR" : "RESPONDER");
+                        }
                     }
                 }
 
-                if (resolved) {
-                    uint32_t peer_ip_num = ntohl(serv.sin_addr.s_addr);
-                    if (local_ip_num > peer_ip_num) {
-                        is_initiator = true;
-                    } else {
-                        is_initiator = false;
+                if (is_initiator) {
+                    trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
+                    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+                    msg->magic = PQC_HS_MAGIC;
+                    msg->msg_type = PQC_HS_MSG_HELLO;
+                    msg->session_id = 123;
+                    msg->policy_id = policy_id;
+                    msg->data_len = (uint16_t)pk_sz;
+                    memcpy(msg->payload, pk, pk_sz);
+
+                    pthread_mutex_lock(&g_key_mutex);
+                    size_t raw_priv_sz = 0;
+                    uint8_t raw_priv[8192];
+                    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                    int sig_sz = 0;
+                    trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
+                    msg->sig_len = (uint16_t)sig_sz;
+                    pthread_mutex_unlock(&g_key_mutex);
+
+                    int retry_cnt = 0;
+                    while (g_dispatcher_running && !b->key_ready) {
+                        fprintf(stderr, "[PQC-WORKER-L3] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
+                        sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
+                               (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+
+                        uint64_t start_rx = get_time_ms_hs();
+                        while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+                            uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+                            pqc_rx_pkt_info_t info;
+                            int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+                            if (rx_len > 0) {
+                                struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
+                                if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                                    pthread_mutex_lock(&g_key_mutex);
+                                    size_t raw_pub_sz = 0;
+                                    uint8_t raw_pub[8192];
+                                    trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                                    pthread_mutex_unlock(&g_key_mutex);
+
+                                    if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
+                                        if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                                            uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                            derive_traffic_key(ss, 32, derived_master);
+
+                                            pthread_mutex_lock(&g_key_mutex);
+                                            handle_handshake_success_initiator(b, derived_master);
+                                            pthread_mutex_unlock(&g_key_mutex);
+
+                                            fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Policy %d!\n", policy_id);
+                                            forwarder_pre_diversify_pqc_keys(profile_id);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            usleep(10000);
+                        }
+                        retry_cnt++;
                     }
-                    fprintf(stderr, "[PQC-WORKER] Policy %d: Dynamic L3 Role resolved: local_ip=%s (0x%08X), peer_ip=%s (0x%08X). Resolved Role: %s\n",
-                            policy_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num, is_initiator ? "INITIATOR" : "RESPONDER");
+                } else {
+                    fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) listening for HELLO...\n", policy_id);
+                    while (g_dispatcher_running && !b->key_ready) {
+                        uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
+                        pqc_rx_pkt_info_t info;
+                        int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
+                        if (rx_len > 0) {
+                            struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
+                            if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
+                                pthread_mutex_lock(&g_key_mutex);
+                                size_t raw_pub_sz = 0;
+                                uint8_t raw_pub[8192];
+                                trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                                pthread_mutex_unlock(&g_key_mutex);
+
+                                if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                    if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                        struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                                        resp->magic = PQC_HS_MAGIC;
+                                        resp->msg_type = PQC_HS_MSG_RESP;
+                                        resp->session_id = msg->session_id;
+                                        resp->policy_id = policy_id;
+                                        resp->data_len = (uint16_t)ct_sz;
+                                        memcpy(resp->payload, ct, ct_sz);
+
+                                        pthread_mutex_lock(&g_key_mutex);
+                                        size_t raw_priv_sz = 0;
+                                        uint8_t raw_priv[8192];
+                                        trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                                        int sig_sz = 0;
+                                        trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
+                                        resp->sig_len = (uint16_t)sig_sz;
+                                        pthread_mutex_unlock(&g_key_mutex);
+
+                                        sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz, 0,
+                                               (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+
+                                        uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                        derive_traffic_key(ss, 32, derived_master);
+
+                                        pthread_mutex_lock(&g_key_mutex);
+                                        handle_handshake_success_responder(b, derived_master);
+                                        pthread_mutex_unlock(&g_key_mutex);
+
+                                        forwarder_pre_diversify_pqc_keys(profile_id);
+                                    }
+                                }
+                            }
+                        }
+                        usleep(10000);
+                    }
                 }
-                close(temp_sock);
-            }
-        }
-
-        if (is_initiator) {
-            trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
-            struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
-            msg->magic = PQC_HS_MAGIC;
-            msg->msg_type = PQC_HS_MSG_HELLO;
-            msg->session_id = 123;
-            msg->policy_id = policy_id;
-            msg->data_len = (uint16_t)pk_sz;
-            memcpy(msg->payload, pk, pk_sz);
-
-            pthread_mutex_lock(&g_key_mutex);
-            size_t raw_priv_sz = 0;
-            uint8_t raw_priv[8192];
-            trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
-            int sig_sz = 0;
-            trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, pk_sz, msg->payload + pk_sz, &sig_sz);
-            msg->sig_len = (uint16_t)sig_sz;
-            pthread_mutex_unlock(&g_key_mutex);
-
-            int retry_cnt = 0;
-            while (g_dispatcher_running && !b->key_ready) {
-                fprintf(stderr, "[PQC-WORKER-L3] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
-                sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
-                       (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
-
-                uint64_t start_rx = get_time_ms_hs();
-                while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+            } else {
+                if (is_initiator) {
+                    uint64_t now = get_time_ms_hs();
+                    if (b->last_sent_time > 0 && (now - b->last_sent_time < 10000) && (now - b->last_recv_time > 15000)) {
+                        fprintf(stderr, "[PQC-HS-L3] Self-healing triggered (Initiator): active TX but no RX. Resetting key for Policy %d.\n", policy_id);
+                        pthread_mutex_lock(&g_key_mutex);
+                        b->key_ready = false;
+                        b->last_sent_time = 0;
+                        b->last_recv_time = 0;
+                        pthread_mutex_unlock(&g_key_mutex);
+                    } else if (now - b->last_rotation_time > 30000) {
+                        initiate_key_rotation_l3(b, sockfd, &peeraddr, my_priv, peer_pub, profile_id);
+                    }
+                    usleep(500000);
+                } else {
                     uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                     pqc_rx_pkt_info_t info;
                     int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
                     if (rx_len > 0) {
-                        struct pqc_hs_msg *resp = (struct pqc_hs_msg *)rx_buf;
-                        if (resp->magic == PQC_HS_MAGIC && resp->msg_type == PQC_HS_MSG_RESP) {
+                        struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
+                        if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
+                            fprintf(stderr, "[PQC-HS-L3] Responder received HELLO while ONLINE. Peer might have restarted! Re-handshaking for Policy %d...\n", policy_id);
+
                             pthread_mutex_lock(&g_key_mutex);
                             size_t raw_pub_sz = 0;
                             uint8_t raw_pub[8192];
                             trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
                             pthread_mutex_unlock(&g_key_mutex);
 
-                            if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, resp->payload, resp->data_len, resp->payload + resp->data_len, resp->sig_len) == TRF_PQC_OK) {
-                                if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                            if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                    struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
+                                    resp->magic = PQC_HS_MAGIC;
+                                    resp->msg_type = PQC_HS_MSG_RESP;
+                                    resp->session_id = msg->session_id;
+                                    resp->policy_id = policy_id;
+                                    resp->data_len = (uint16_t)ct_sz;
+                                    memcpy(resp->payload, ct, ct_sz);
+
+                                    pthread_mutex_lock(&g_key_mutex);
+                                    size_t raw_priv_sz = 0;
+                                    uint8_t raw_priv[8192];
+                                    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+                                    int sig_sz = 0;
+                                    trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
+                                    resp->sig_len = (uint16_t)sig_sz;
+                                    pthread_mutex_unlock(&g_key_mutex);
+
+                                    sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz, 0,
+                                           (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+
                                     uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                                     derive_traffic_key(ss, 32, derived_master);
 
                                     pthread_mutex_lock(&g_key_mutex);
-                                    memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                    memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                    b->key_ready = true;
+                                    handle_handshake_success_responder(b, derived_master);
                                     pthread_mutex_unlock(&g_key_mutex);
 
-                                    fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Policy %d!\n", policy_id);
                                     forwarder_pre_diversify_pqc_keys(profile_id);
-                                    break;
                                 }
                             }
                         }
                     }
                     usleep(10000);
                 }
-                retry_cnt++;
-            }
-        } else {
-            fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) listening for HELLO...\n", policy_id);
-            while (g_dispatcher_running && !b->key_ready) {
-                uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
-                pqc_rx_pkt_info_t info;
-                int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
-                if (rx_len > 0) {
-                    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
-                    if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
-                        pthread_mutex_lock(&g_key_mutex);
-                        size_t raw_pub_sz = 0;
-                        uint8_t raw_pub[8192];
-                        trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
-                        pthread_mutex_unlock(&g_key_mutex);
-
-                        if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                            if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
-                                struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
-                                resp->magic = PQC_HS_MAGIC;
-                                resp->msg_type = PQC_HS_MSG_RESP;
-                                resp->session_id = msg->session_id;
-                                resp->policy_id = policy_id;
-                                resp->data_len = (uint16_t)ct_sz;
-                                memcpy(resp->payload, ct, ct_sz);
-
-                                pthread_mutex_lock(&g_key_mutex);
-                                size_t raw_priv_sz = 0;
-                                uint8_t raw_priv[8192];
-                                trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
-                                int sig_sz = 0;
-                                trf_dsa_sign_payload(raw_priv, raw_priv_sz, resp->payload, ct_sz, resp->payload + ct_sz, &sig_sz);
-                                resp->sig_len = (uint16_t)sig_sz;
-                                pthread_mutex_unlock(&g_key_mutex);
-
-                                sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + ct_sz + sig_sz, 0,
-                                       (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
-
-                                uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
-                                derive_traffic_key(ss, 32, derived_master);
-
-                                pthread_mutex_lock(&g_key_mutex);
-                                memcpy(b->encrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
-                                b->key_ready = true;
-                                pthread_mutex_unlock(&g_key_mutex);
-
-                                fprintf(stderr, "[PQC-WORKER-L3] Responder Handshake SUCCESS for Policy %d!\n", policy_id);
-                                forwarder_pre_diversify_pqc_keys(profile_id);
-                            }
-                        }
-                    }
-                }
-                usleep(10000);
             }
         }
         close(sockfd);
@@ -954,6 +1262,16 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->local_priv = NULL;
         b->local_pub = NULL;
         b->peer_pub = NULL;
+
+        // Initialize 3-slot metadata
+        b->last_rotation_time = get_time_ms_hs();
+        b->last_sent_time = 0;
+        b->last_recv_time = 0;
+        for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+            memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
+            b->key_ids[slot] = 0;
+            b->key_slots_valid[slot] = false;
+        }
     }
     if (b) {
         b->policy_id = policy_id;
@@ -1065,4 +1383,67 @@ void sig_pqc_load_keys_from_disk(void) {
         }
     }
     closedir(dir);
+}
+
+void sig_pqc_record_sent(int policy_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            g_policy_bindings[i].last_sent_time = get_time_ms_hs();
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+void sig_pqc_record_recv(int policy_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            g_policy_bindings[i].last_recv_time = get_time_ms_hs();
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            memcpy(keys, g_policy_bindings[i].keys, KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
+            memcpy(key_ids, g_policy_bindings[i].key_ids, KEY_SLOT_COUNT);
+            memcpy(key_slots_valid, g_policy_bindings[i].key_slots_valid, KEY_SLOT_COUNT * sizeof(bool));
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return -1;
+}
+
+void sig_pqc_promote_responder_key(int policy_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            // Promote key in control plane as well
+            memcpy(g_policy_bindings[i].keys[KEY_SLOT_PREV], g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+            g_policy_bindings[i].key_ids[KEY_SLOT_PREV] = g_policy_bindings[i].key_ids[KEY_SLOT_CURRENT];
+            g_policy_bindings[i].key_slots_valid[KEY_SLOT_PREV] = g_policy_bindings[i].key_slots_valid[KEY_SLOT_CURRENT];
+
+            memcpy(g_policy_bindings[i].keys[KEY_SLOT_CURRENT], g_policy_bindings[i].keys[KEY_SLOT_NEXT], PQC_TRAFFIC_KEY_SZ);
+            g_policy_bindings[i].key_ids[KEY_SLOT_CURRENT] = g_policy_bindings[i].key_ids[KEY_SLOT_NEXT];
+            g_policy_bindings[i].key_slots_valid[KEY_SLOT_CURRENT] = true;
+
+            g_policy_bindings[i].key_slots_valid[KEY_SLOT_NEXT] = false;
+
+            // Keep legacy config in sync
+            memcpy(g_policy_bindings[i].encrypt_key, g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+            memcpy(g_policy_bindings[i].decrypt_key, g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
+
+            fprintf(stderr, "[PQC-HS] Control plane key promoted (NEXT -> CURRENT) for Policy %d!\n", policy_id);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
 }

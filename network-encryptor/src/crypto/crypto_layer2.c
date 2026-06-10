@@ -1,5 +1,6 @@
 #include "../../inc/crypto_layer2.h"
 #include "../../inc/config.h"
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 #include <string.h>
 #include <stdio.h>
 #include "../../sig_encrypt/inc/traffic_crypto.h"
@@ -176,49 +177,73 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
         memcpy(tag, packet + l2_enc_start + enc_len, AES128_GCM_TAG_SIZE);
     }
 
-    const uint8_t *key = packet_crypto_get_key(ctx, KEY_SLOT_CURRENT);
+    uint8_t backup[2048];
+    int has_backup = (enc_len <= sizeof(backup));
+    if (has_backup) memcpy(backup, packet + l2_enc_start, enc_len);
+
     uint8_t *work_ptr = packet + l2_enc_start;
+    int key_order[] = { KEY_SLOT_CURRENT, KEY_SLOT_PREV, KEY_SLOT_NEXT };
 
-    if (mode == CRYPTO_MODE_GCM) {
-        if (likely(crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) == 0)) {
-            goto decrypt_success;
+    for (int k = 0; k < KEY_SLOT_COUNT; k++) {
+        const uint8_t *key = packet_crypto_get_key(ctx, key_order[k]);
+        if (!key) continue;
+
+        if (k > 0 && has_backup) memcpy(work_ptr, backup, enc_len);
+
+        if (mode == CRYPTO_MODE_GCM) {
+            if (crypto_aes_gcm_decrypt(key, nonce, nonce_len, work_ptr, (int)enc_len, tag) != 0)
+                continue;
         }
-    }
-    else if (mode == CRYPTO_MODE_PQC_GCM) {
-        uint8_t aad[12] __attribute__((aligned(64)));
-        memcpy(aad, packet, 12); // MACs
-        
-        static uint32_t dec_diag_cnt = 0;
-        if (++dec_diag_cnt % 1000 == 0) {
-            printf("[PQC-DEC-DIAG] Key: %02x%02x%02x%02x, Nonce: %02x%02x%02x%02x, enc_len=%zu\n",
-                   key[0], key[1], key[2], key[3], nonce[0], nonce[1], nonce[2], nonce[3], enc_len);
-            printf("[PQC-DEC-DIAG] AAD: %02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x\n",
-                   aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
-            printf("[PQC-DEC-DIAG] Ciphertext(first 8): %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                   work_ptr[0], work_ptr[1], work_ptr[2], work_ptr[3], work_ptr[4], work_ptr[5], work_ptr[6], work_ptr[7]);
+        else if (mode == CRYPTO_MODE_PQC_GCM) {
+            uint8_t aad[12] __attribute__((aligned(64)));
+            memcpy(aad, packet, 12); // MACs
             
-            // Extract tag just for logging without altering enc_len
-            uint8_t *pqc_tag = work_ptr + enc_len - 16;
-            printf("[PQC-DEC-DIAG] Tag: %02x%02x%02x%02x%02x%02x%02x%02x\n",
-                   pqc_tag[0], pqc_tag[1], pqc_tag[2], pqc_tag[3], pqc_tag[4], pqc_tag[5], pqc_tag[6], pqc_tag[7]);
-            fflush(stdout);
-        }
+            static uint32_t dec_diag_cnt = 0;
+            if (++dec_diag_cnt % 1000 == 0) {
+                printf("[PQC-DEC-DIAG] Key: %02x%02x%02x%02x, Nonce: %02x%02x%02x%02x, enc_len=%zu\n",
+                       key[0], key[1], key[2], key[3], nonce[0], nonce[1], nonce[2], nonce[3], enc_len);
+                printf("[PQC-DEC-DIAG] AAD: %02x%02x%02x%02x%02x%02x %02x%02x%02x%02x%02x%02x\n",
+                       aad[0], aad[1], aad[2], aad[3], aad[4], aad[5], aad[6], aad[7], aad[8], aad[9], aad[10], aad[11]);
+                printf("[PQC-DEC-DIAG] Ciphertext(first 8): %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       work_ptr[0], work_ptr[1], work_ptr[2], work_ptr[3], work_ptr[4], work_ptr[5], work_ptr[6], work_ptr[7]);
+                
+                uint8_t *pqc_tag = work_ptr + enc_len - 16;
+                printf("[PQC-DEC-DIAG] Tag: %02x%02x%02x%02x%02x%02x%02x%02x\n",
+                       pqc_tag[0], pqc_tag[1], pqc_tag[2], pqc_tag[3], pqc_tag[4], pqc_tag[5], pqc_tag[6], pqc_tag[7]);
+                fflush(stdout);
+            }
 
-        int orig_len = 0;
-        if (trf_decrypt_payload_gcm(ctx->cipher_ctx_dec, key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) == TRF_PQC_OK) {
+            int orig_len = 0;
+            if (trf_decrypt_payload_gcm(ctx->cipher_ctx_dec, key, nonce, nonce_len, aad, 12, work_ptr, (int)enc_len, &orig_len) != TRF_PQC_OK)
+                continue;
             enc_len = (size_t)orig_len;
-            goto decrypt_success;
         }
-    }
-    else {
-        uint8_t iv[AES128_IV_SIZE];
-        crypto_nonce_to_iv(nonce, nonce_size, iv);
-        if (likely(crypto_aes_ctr_with_key(key, iv, work_ptr, (int)enc_len) == 0)) {
-            if (likely(is_ipv4 ? verify_ipv4_after_decrypt(work_ptr, enc_len)
-                               : verify_ipv6_after_decrypt(work_ptr, enc_len))) {
-                goto decrypt_success;
+        else {
+            uint8_t iv[AES128_IV_SIZE];
+            crypto_nonce_to_iv(nonce, nonce_size, iv);
+            if (crypto_aes_ctr_with_key(key, iv, work_ptr, (int)enc_len) != 0)
+                continue;
+            if (!(is_ipv4 ? verify_ipv4_after_decrypt(work_ptr, enc_len)
+                          : verify_ipv6_after_decrypt(work_ptr, enc_len))) {
+                continue;
             }
         }
+
+        // Success! Promote key if slot next
+        if (key_order[k] == KEY_SLOT_NEXT) {
+            memcpy(ctx->keys[KEY_SLOT_PREV], ctx->keys[KEY_SLOT_CURRENT], AES_MAX_KEY_SIZE);
+            ctx->key_ids[KEY_SLOT_PREV] = ctx->key_ids[KEY_SLOT_CURRENT];
+            ctx->key_slots_valid[KEY_SLOT_PREV] = ctx->key_slots_valid[KEY_SLOT_CURRENT];
+
+            memcpy(ctx->keys[KEY_SLOT_CURRENT], ctx->keys[KEY_SLOT_NEXT], AES_MAX_KEY_SIZE);
+            ctx->key_ids[KEY_SLOT_CURRENT] = ctx->key_ids[KEY_SLOT_NEXT];
+            ctx->key_slots_valid[KEY_SLOT_CURRENT] = true;
+
+            ctx->key_slots_valid[KEY_SLOT_NEXT] = false;
+            printf("[PQC-DATA] L2 Implicit key promotion: NEXT -> CURRENT for Policy %d!\n", ctx->policy_id);
+            sig_pqc_promote_responder_key(ctx->policy_id);
+        }
+        goto decrypt_success;
     }
     return -1;
 

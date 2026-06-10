@@ -28,6 +28,8 @@ struct packet_crypto_ctx {
     int crypto_mode;
     uint8_t master_key[AES_MAX_KEY_SIZE];
     uint8_t keys[KEY_SLOT_COUNT][AES_MAX_KEY_SIZE];
+    uint8_t key_ids[KEY_SLOT_COUNT];
+    bool key_slots_valid[KEY_SLOT_COUNT];
     bool initialized;
     void *cipher_ctx_enc;
     void *cipher_ctx_dec;
