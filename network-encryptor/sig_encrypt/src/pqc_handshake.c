@@ -29,6 +29,8 @@ static int g_registry_count = 0;
 
 static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
+static volatile int g_policy_key_version[MAX_POLICY_BINDINGS] = {0};
+static volatile int g_datapath_key_version[MAX_POLICY_BINDINGS] = {0};
 
 static bool g_dispatcher_running = false;
 
@@ -70,6 +72,11 @@ static void handle_handshake_success_initiator(policy_key_binding_t *b, const ui
     b->last_recv_time = get_time_ms_hs();
     b->last_rotation_time = get_time_ms_hs();
 
+    int idx = b - g_policy_bindings;
+    if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
+        g_policy_key_version[idx]++;
+    }
+
     fprintf(stderr, "[PQC-HS] Initiator Handshake SUCCESS for Policy %d. Promoted new key ID: %d to CURRENT\n",
             b->policy_id, b->key_ids[KEY_SLOT_CURRENT]);
 }
@@ -99,6 +106,11 @@ static void handle_handshake_success_responder(policy_key_binding_t *b, const ui
     b->key_ready = true;
     b->last_sent_time = get_time_ms_hs();
     b->last_recv_time = get_time_ms_hs();
+
+    int idx = b - g_policy_bindings;
+    if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
+        g_policy_key_version[idx]++;
+    }
 }
 
 static void send_pqc_keepalive(policy_key_binding_t *b, struct pqc_l2_peer *peer, int sockfd, struct sockaddr_in *peeraddr, char *my_priv, bool is_l2) {
@@ -1297,6 +1309,11 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                                (role_mode == PQC_ROLE_RESPONDER) ? "FORCE_RESPONDER" : "DYNAMIC";
         fprintf(stderr, "[PQC-BIND] Policy %d bound in RAM (Local FG: %s, Peer FG: %s, Role Mode: %s, WAN: %s, Peer IP: %s).\n", 
                 policy_id, b->local_fingerprint, b->peer_fingerprint, role_str, b->wan_ifname, b->peer_ip);
+
+        int idx = b - g_policy_bindings;
+        if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
+            g_policy_key_version[idx]++;
+        }
     }
     pthread_mutex_unlock(&g_key_mutex);
 }
@@ -1399,18 +1416,27 @@ void sig_pqc_record_recv(int policy_id) {
 }
 
 int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]) {
-    pthread_mutex_lock(&g_key_mutex);
+    int idx = -1;
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == policy_id) {
-            memcpy(keys, g_policy_bindings[i].keys, KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
-            memcpy(key_ids, g_policy_bindings[i].key_ids, KEY_SLOT_COUNT);
-            memcpy(key_slots_valid, g_policy_bindings[i].key_slots_valid, KEY_SLOT_COUNT * sizeof(bool));
-            pthread_mutex_unlock(&g_key_mutex);
-            return 0;
+            idx = i;
+            break;
         }
     }
+    if (idx == -1) return -1;
+
+    // Lock-free check if the datapath's key version matches the control plane
+    if (g_datapath_key_version[idx] == g_policy_key_version[idx]) {
+        return 1; // 1 indicates keys are unchanged, skips update
+    }
+
+    pthread_mutex_lock(&g_key_mutex);
+    memcpy(keys, g_policy_bindings[idx].keys, KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
+    memcpy(key_ids, g_policy_bindings[idx].key_ids, KEY_SLOT_COUNT);
+    memcpy(key_slots_valid, g_policy_bindings[idx].key_slots_valid, KEY_SLOT_COUNT * sizeof(bool));
+    g_datapath_key_version[idx] = g_policy_key_version[idx];
     pthread_mutex_unlock(&g_key_mutex);
-    return -1;
+    return 0; // 0 indicates keys were updated
 }
 
 void sig_pqc_promote_responder_key(int policy_id) {
@@ -1433,6 +1459,7 @@ void sig_pqc_promote_responder_key(int policy_id) {
             memcpy(g_policy_bindings[i].decrypt_key, g_policy_bindings[i].keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
 
             fprintf(stderr, "[PQC-HS] Control plane key promoted (NEXT -> CURRENT) for Policy %d!\n", policy_id);
+            g_policy_key_version[i]++;
             break;
         }
     }
