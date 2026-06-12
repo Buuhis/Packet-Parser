@@ -3,17 +3,103 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 #define PQC_HS_PORT        7090
 #define PQC_HS_MAGIC       0x50514348 // "PQCH"
 #define PQC_HS_MSG_HELLO   1
 #define PQC_HS_MSG_RESP    2
+#define PQC_HS_MSG_KEEPALIVE 3
 
 #define PQC_KEM_PK_SIZE    1184 // ML-KEM-768 PK size
 #define PQC_KEM_CT_SIZE    1088 // ML-KEM-768 CT size
 #define PQC_AUTH_TAG_SZ    32
 #define PQC_TRAFFIC_KEY_SZ 32
 #define PQC_HS_MSG_MAX_SZ  10000
+
+#ifndef KEY_SLOT_COUNT
+#define KEY_SLOT_COUNT   3
+#endif
+
+#ifndef KEY_SLOT_PREV
+#define KEY_SLOT_PREV    0
+#define KEY_SLOT_CURRENT 1
+#define KEY_SLOT_NEXT    2
+#endif
+
+#define PQC_RX_QUEUE_SIZE  16
+#define MAX_IDENTITY_REGISTRY 10
+#define MAX_POLICY_BINDINGS 128
+#define MAX_L2_DISPATCHERS 16
+
+typedef struct {
+    char fingerprint[16];
+    char *priv_key;
+    char *pub_key;
+} identity_entry_t;
+
+typedef struct {
+    int policy_id;
+    uint8_t diversified_key[PQC_TRAFFIC_KEY_SZ];
+    bool valid;
+} diversified_key_cache_t;
+
+typedef struct {
+    struct sockaddr_in src_addr;
+    uint8_t src_mac[6];
+} pqc_rx_pkt_info_t;
+
+typedef struct {
+    int policy_id;
+    int profile_id;
+    uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
+    uint8_t decrypt_key[PQC_TRAFFIC_KEY_SZ];
+    int role_mode;
+    bool key_ready;
+
+    // 3-Slot Key Buffer
+    uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
+    uint8_t key_ids[KEY_SLOT_COUNT];
+    bool key_slots_valid[KEY_SLOT_COUNT];
+    uint64_t last_rotation_time;
+
+    // Policy-level PQC Handshake Config
+    bool is_initiator;
+    char peer_ip[64];
+    char local_fingerprint[16];
+    char peer_fingerprint[16];
+    char wan_ifname[64];
+
+    // Policy-level PQC Identity Keys (RAM registry mappings)
+    char *local_priv;
+    char *local_pub;
+    char *peer_pub;
+
+    // Parallel Handshake Worker Thread variables
+    bool thread_started;
+    pthread_t thread_id;
+
+    // Per-policy queue
+    uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
+    int rx_len[PQC_RX_QUEUE_SIZE];
+    pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
+    int rx_head;
+    int rx_tail;
+    pthread_mutex_t rx_mutex;
+    pthread_cond_t rx_cond;
+
+    // Rekey and self-healing activity timestamps
+    uint64_t last_sent_time;
+    uint64_t last_recv_time;
+} policy_key_binding_t;
+
+typedef struct {
+    char ifname[64];
+    pthread_t thread;
+    bool running;
+} l2_dispatcher_t;
 
 #pragma pack(push, 1)
 struct pqc_hs_msg {

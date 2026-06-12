@@ -16,93 +16,21 @@
 #include <sys/ioctl.h>
 #include <net/if.h>
 
+#define PQC_RX_PKT_MAX     10000
+
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
 }
 
 static pthread_mutex_t g_key_mutex = PTHREAD_MUTEX_INITIALIZER;
-#define PQC_RX_QUEUE_SIZE  16
-#define PQC_RX_PKT_MAX     10000
-
-#define MAX_IDENTITY_REGISTRY 10
-
-typedef struct {
-    char fingerprint[16];
-    char *priv_key;
-    char *pub_key;
-} identity_entry_t;
 
 static identity_entry_t g_identity_registry[MAX_IDENTITY_REGISTRY];
 static int g_registry_count = 0;
-
-typedef struct {
-    int policy_id;
-    uint8_t diversified_key[PQC_TRAFFIC_KEY_SZ];
-    bool valid;
-} diversified_key_cache_t;
-
-#define MAX_POLICY_BINDINGS 128
-
-typedef struct {
-    struct sockaddr_in src_addr;
-    uint8_t src_mac[6];
-} pqc_rx_pkt_info_t;
-
-typedef struct {
-    int policy_id;
-    int profile_id;
-    uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
-    uint8_t decrypt_key[PQC_TRAFFIC_KEY_SZ];
-    int role_mode;
-    bool key_ready;
-
-    // 3-Slot Key Buffer
-    uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
-    uint8_t key_ids[KEY_SLOT_COUNT];
-    bool key_slots_valid[KEY_SLOT_COUNT];
-    uint64_t last_rotation_time;
-
-    // Policy-level PQC Handshake Config
-    bool is_initiator;
-    char peer_ip[64];
-    char local_fingerprint[16];
-    char peer_fingerprint[16];
-    char wan_ifname[64];
-
-    // Policy-level PQC Identity Keys (RAM registry mappings)
-    char *local_priv;
-    char *local_pub;
-    char *peer_pub;
-
-    // Parallel Handshake Worker Thread variables
-    bool thread_started;
-    pthread_t thread_id;
-
-    // Per-policy queue
-    uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
-    int rx_len[PQC_RX_QUEUE_SIZE];
-    pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
-    int rx_head;
-    int rx_tail;
-    pthread_mutex_t rx_mutex;
-    pthread_cond_t rx_cond;
-
-    // Rekey and self-healing activity timestamps
-    uint64_t last_sent_time;
-    uint64_t last_recv_time;
-} policy_key_binding_t;
 
 static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
 
 static bool g_dispatcher_running = false;
-
-#define MAX_L2_DISPATCHERS 16
-typedef struct {
-    char ifname[64];
-    pthread_t thread;
-    bool running;
-} l2_dispatcher_t;
 
 static l2_dispatcher_t g_l2_dispatchers[MAX_L2_DISPATCHERS];
 static int g_l2_dispatchers_count = 0;
@@ -173,6 +101,37 @@ static void handle_handshake_success_responder(policy_key_binding_t *b, const ui
     b->last_recv_time = get_time_ms_hs();
 }
 
+static void send_pqc_keepalive(policy_key_binding_t *b, struct pqc_l2_peer *peer, int sockfd, struct sockaddr_in *peeraddr, char *my_priv, bool is_l2) {
+    uint8_t buffer[sizeof(struct pqc_hs_msg) + 4 + 4096];
+    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+    msg->magic = PQC_HS_MAGIC;
+    msg->msg_type = PQC_HS_MSG_KEEPALIVE;
+    msg->session_id = (uint32_t)rand();
+    msg->policy_id = b->policy_id;
+    msg->data_len = 4;
+
+    uint32_t val_to_sign = msg->policy_id;
+    memcpy(msg->payload, &val_to_sign, 4);
+
+    pthread_mutex_lock(&g_key_mutex);
+    size_t raw_priv_sz = 0;
+    uint8_t raw_priv[8192];
+    trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
+    int sig_sz = 0;
+    trf_dsa_sign_payload(raw_priv, raw_priv_sz, msg->payload, 4, msg->payload + 4, &sig_sz);
+    msg->sig_len = (uint16_t)sig_sz;
+    pthread_mutex_unlock(&g_key_mutex);
+
+    int payload_tot_sz = sizeof(struct pqc_hs_msg) + 4 + sig_sz;
+    if (is_l2) {
+        fprintf(stderr, "[PQC-HS-L2] Sending KEEPALIVE/ACK for Policy %d...\n", b->policy_id);
+        pqc_l2_send_payload_fragmented(peer, msg->session_id, buffer, payload_tot_sz);
+    } else {
+        fprintf(stderr, "[PQC-HS-L3] Sending KEEPALIVE/ACK for Policy %d...\n", b->policy_id);
+        sendto(sockfd, buffer, payload_tot_sz, 0, (const struct sockaddr *)peeraddr, sizeof(struct sockaddr_in));
+    }
+}
+
 static void initiate_key_rotation_l3(policy_key_binding_t *b, int sockfd, struct sockaddr_in *peeraddr, char *my_priv, char *peer_pub, int profile_id) {
     fprintf(stderr, "[PQC-HS-L3] Proactively initiating periodic key rotation for Policy %d...\n", b->policy_id);
 
@@ -230,6 +189,7 @@ static void initiate_key_rotation_l3(policy_key_binding_t *b, int sockfd, struct
                         pthread_mutex_unlock(&g_key_mutex);
 
                         forwarder_pre_diversify_pqc_keys(profile_id);
+                        send_pqc_keepalive(b, NULL, sockfd, peeraddr, my_priv, false);
                         return;
                     }
                 }
@@ -297,6 +257,7 @@ static void initiate_key_rotation_l2(policy_key_binding_t *b, struct pqc_l2_peer
                         pthread_mutex_unlock(&g_key_mutex);
 
                         forwarder_pre_diversify_pqc_keys(profile_id);
+                        send_pqc_keepalive(b, peer, -1, NULL, my_priv, true);
                         return;
                     }
                 }
@@ -593,6 +554,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                                 pthread_mutex_unlock(&g_key_mutex);
 
                                                 forwarder_pre_diversify_pqc_keys(profile_id);
+                                                send_pqc_keepalive(b, &peer, -1, NULL, my_priv, true);
                                                 break;
                                             }
                                         }
@@ -721,6 +683,20 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                     forwarder_pre_diversify_pqc_keys(profile_id);
                                 }
                             }
+                        } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
+                            fprintf(stderr, "[PQC-HS-L2] Responder received KEEPALIVE for Policy %d. Verifying signature...\n", policy_id);
+                            pthread_mutex_lock(&g_key_mutex);
+                            size_t raw_pub_sz = 0;
+                            uint8_t raw_pub[8192];
+                            trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                            pthread_mutex_unlock(&g_key_mutex);
+
+                            if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                fprintf(stderr, "[PQC-HS-L2] Keepalive verified successfully! Promoting responder key.\n");
+                                sig_pqc_promote_responder_key(policy_id);
+                            } else {
+                                fprintf(stderr, "[PQC-HS-L2] Keepalive signature verification failed!\n");
+                            }
                         }
                     }
                     usleep(10000);
@@ -846,6 +822,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                             fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Policy %d!\n", policy_id);
                                             forwarder_pre_diversify_pqc_keys(profile_id);
+                                            send_pqc_keepalive(b, NULL, sockfd, &peeraddr, my_priv, false);
                                             break;
                                         }
                                     }
@@ -967,6 +944,20 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                                     forwarder_pre_diversify_pqc_keys(profile_id);
                                 }
+                            }
+                        } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
+                            fprintf(stderr, "[PQC-HS-L3] Responder received KEEPALIVE for Policy %d. Verifying signature...\n", policy_id);
+                            pthread_mutex_lock(&g_key_mutex);
+                            size_t raw_pub_sz = 0;
+                            uint8_t raw_pub[8192];
+                            trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
+                            pthread_mutex_unlock(&g_key_mutex);
+
+                            if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
+                                fprintf(stderr, "[PQC-HS-L3] Keepalive verified successfully! Promoting responder key.\n");
+                                sig_pqc_promote_responder_key(policy_id);
+                            } else {
+                                fprintf(stderr, "[PQC-HS-L3] Keepalive signature verification failed!\n");
                             }
                         }
                     }
