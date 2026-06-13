@@ -650,7 +650,7 @@ static int intercept_pqc_handshake(uint8_t *pkt, uint32_t pkt_len) {
     uint8_t *udp_payload = pkt + l3_off + ip_hdr_len + 8;
     int payload_len = (int)(pkt_len - l3_off - ip_hdr_len - 8);
     if (payload_len > 0) {
-        sig_pqc_feed_rx_packet(udp_payload, payload_len);
+        sig_pqc_feed_rx_packet(udp_payload, payload_len, NULL);
     }
     return 1; // intercepted
 }

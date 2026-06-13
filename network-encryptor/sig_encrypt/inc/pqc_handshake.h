@@ -177,12 +177,13 @@ void sig_pqc_load_keys_from_disk(void);
  * @param udp_payload Pointer to the UDP payload (after UDP header).
  * @param payload_len Length of the UDP payload.
  */
-void sig_pqc_feed_rx_packet(const uint8_t *udp_payload, int payload_len);
+void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_mac);
 
 void sig_pqc_record_sent(int policy_id);
 void sig_pqc_record_recv(int policy_id);
 
 int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]);
 void sig_pqc_promote_responder_key(int policy_id);
+void sig_pqc_discard_prev_key(int policy_id);
 
 #endif

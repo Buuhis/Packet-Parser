@@ -229,6 +229,11 @@ int crypto_layer2_decrypt(struct packet_crypto_ctx *ctx, uint8_t *packet, size_t
             }
         }
 
+        if (key_order[k] == KEY_SLOT_CURRENT && ctx->key_slots_valid[KEY_SLOT_PREV]) {
+            ctx->key_slots_valid[KEY_SLOT_PREV] = false;
+            sig_pqc_discard_prev_key(ctx->policy_id);
+        }
+
         // Success! Promote key if slot next
         if (key_order[k] == KEY_SLOT_NEXT) {
             memcpy(ctx->keys[KEY_SLOT_PREV], ctx->keys[KEY_SLOT_CURRENT], AES_MAX_KEY_SIZE);

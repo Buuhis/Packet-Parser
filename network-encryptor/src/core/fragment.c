@@ -391,6 +391,11 @@ int frag_decrypt_fragment(struct packet_crypto_ctx *ctx,
             }
         }
 
+        if (key_order[k] == KEY_SLOT_CURRENT && ctx->key_slots_valid[KEY_SLOT_PREV]) {
+            ctx->key_slots_valid[KEY_SLOT_PREV] = false;
+            sig_pqc_discard_prev_key(ctx->policy_id);
+        }
+
         if (key_order[k] == KEY_SLOT_NEXT) {
             memcpy(ctx->keys[KEY_SLOT_PREV], ctx->keys[KEY_SLOT_CURRENT], AES_MAX_KEY_SIZE);
             ctx->key_ids[KEY_SLOT_PREV] = ctx->key_ids[KEY_SLOT_CURRENT];
