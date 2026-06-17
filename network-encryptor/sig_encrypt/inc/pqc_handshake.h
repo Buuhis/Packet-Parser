@@ -53,52 +53,47 @@ typedef struct {
 } pqc_rx_pkt_info_t;
 
 typedef struct {
+    // 8-Byte Aligned Members
+    uint64_t last_rotation_time;
+    uint64_t last_sent_time;
+    uint64_t last_recv_time;
+    uint64_t handshake_start_time;
+    uint64_t rotation_start_time;
+
+    char *local_priv;
+    char *local_pub;
+    char *peer_pub;
+
+    pthread_t thread_id;
+    uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
+    pthread_mutex_t rx_mutex;
+    pthread_cond_t rx_cond;
+
+    // 4-Byte Aligned Members
     int policy_id;
     int profile_id;
+    int role_mode;
+    int rx_head;
+    int rx_tail;
+    int rx_len[PQC_RX_QUEUE_SIZE];
+    pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
+
+    // 1-Byte Aligned Members
     uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
     uint8_t decrypt_key[PQC_TRAFFIC_KEY_SZ];
-    int role_mode;
-    bool key_ready;
-
-    // 3-Slot Key Buffer
     uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
     uint8_t key_ids[KEY_SLOT_COUNT];
     bool key_slots_valid[KEY_SLOT_COUNT];
-    uint64_t last_rotation_time;
 
-    // Policy-level PQC Handshake Config
-    bool is_initiator;
     char peer_ip[64];
     char local_fingerprint[16];
     char peer_fingerprint[16];
     char wan_ifname[64];
 
-    // Policy-level PQC Identity Keys (RAM registry mappings)
-    char *local_priv;
-    char *local_pub;
-    char *peer_pub;
-
-    // Parallel Handshake Worker Thread variables
+    bool key_ready;
+    bool is_initiator;
     bool thread_started;
-    pthread_t thread_id;
-
-    // Per-policy queue
-    uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
-    int rx_len[PQC_RX_QUEUE_SIZE];
-    pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
-    int rx_head;
-    int rx_tail;
-    pthread_mutex_t rx_mutex;
-    pthread_cond_t rx_cond;
-
-    // Rekey and self-healing activity timestamps
-    uint64_t last_sent_time;
-    uint64_t last_recv_time;
-
-    // Handshake and Rotation retry timeout variables
-    uint64_t handshake_start_time;
     bool handshake_give_up;
-    uint64_t rotation_start_time;
     bool rotation_give_up;
     bool send_poke;
 } policy_key_binding_t;

@@ -41,14 +41,14 @@ struct pqc_frag_hdr {
 
 // 3. Reassembly state buffer
 struct pqc_l2_reassemble {
-    uint32_t msg_id;
     uint8_t  *data_buffer;
-    uint32_t total_len;
-    uint16_t frag_received;
-    uint16_t frag_count;
     uint8_t  *frag_bitmap;  // Bitmap to prevent duplicate fragment processing
     uint64_t start_time_ms; // Timestamp to handle drop timeout
     struct pqc_l2_reassemble* next; // Linked list pointer for active assemblies
+    uint32_t msg_id;
+    uint32_t total_len;
+    uint16_t frag_received;
+    uint16_t frag_count;
 };
 
 // Peer node MAC state
