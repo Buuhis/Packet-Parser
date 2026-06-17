@@ -17,6 +17,7 @@
 #include <net/if.h>
 
 #define PQC_RX_PKT_MAX     10000
+#define KEY_ROTATION_INTERVAL_MS 30000 
 
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
@@ -71,6 +72,10 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     b->last_sent_time = get_time_ms_hs();
     b->last_recv_time = get_time_ms_hs();
     b->last_rotation_time = get_time_ms_hs();
+    b->handshake_start_time = 0;
+    b->handshake_give_up = false;
+    b->rotation_start_time = 0;
+    b->rotation_give_up = false;
 
     int idx = b - g_policy_bindings;
     if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
@@ -184,7 +189,18 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == (int)policy_id) {
-            pqc_feed_packet_to_policy_l2(&g_policy_bindings[i], payload, len, src_mac);
+            policy_key_binding_t *b = &g_policy_bindings[i];
+            if (msg->msg_type == PQC_HS_MSG_POKE) {
+                b->handshake_give_up = false;
+                b->handshake_start_time = 0;
+                b->rotation_give_up = false;
+                b->rotation_start_time = 0;
+                b->key_ready = false;
+                fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry for Policy %d.\n", policy_id);
+                pthread_mutex_unlock(&g_key_mutex);
+                return;
+            }
+            pqc_feed_packet_to_policy_l2(b, payload, len, src_mac);
             pthread_mutex_unlock(&g_key_mutex);
             return;
         }
@@ -371,6 +387,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
 
                     if (is_initiator) {
+                        if (b->handshake_give_up) {
+                            usleep(500000);
+                            continue;
+                        }
+                        if (b->handshake_start_time == 0) {
+                            b->handshake_start_time = get_time_ms_hs();
+                        }
+
                         trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
                         struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                         msg->magic = PQC_HS_MAGIC;
@@ -394,6 +418,11 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         int retry_cnt = 0;
 
                         while (g_dispatcher_running && !b->key_ready) {
+                            if (get_time_ms_hs() - b->handshake_start_time > 300000) {
+                                fprintf(stderr, "[PQC-HS-L2] Handshake timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                                b->handshake_give_up = true;
+                                break;
+                            }
                             fprintf(stderr, "[PQC-WORKER-L2] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
                             pqc_l2_send_payload_fragmented(&peer, msg_id, buffer, payload_tot_sz);
 
@@ -435,6 +464,25 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 if (!is_initiator && g_dispatcher_running && !b->key_ready) {
                     fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) listening for HELLO...\n", policy_id);
                     while (g_dispatcher_running && !b->key_ready) {
+                        pthread_mutex_lock(&g_key_mutex);
+                        if (b->send_poke) {
+                            b->send_poke = false;
+                            pthread_mutex_unlock(&g_key_mutex);
+                            if (peer.discovered) {
+                                struct pqc_hs_msg poke_msg;
+                                poke_msg.magic = PQC_HS_MAGIC;
+                                poke_msg.msg_type = PQC_HS_MSG_POKE;
+                                poke_msg.session_id = 999;
+                                poke_msg.policy_id = policy_id;
+                                poke_msg.sig_len = 0;
+                                poke_msg.data_len = 0;
+                                fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) sending POKE to Initiator...\n", policy_id);
+                                pqc_l2_send_payload_fragmented(&peer, 999, (uint8_t *)&poke_msg, sizeof(poke_msg));
+                            }
+                        } else {
+                            pthread_mutex_unlock(&g_key_mutex);
+                        }
+
                         uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                         pqc_rx_pkt_info_t info;
                         int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -496,8 +544,18 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         b->last_sent_time = 0;
                         b->last_recv_time = 0;
                         pthread_mutex_unlock(&g_key_mutex);
-                    } else if (now - b->last_rotation_time > 30000) {
-                        initiate_key_rotation(b, &peer, -1, NULL, my_priv, peer_pub, profile_id, true);
+                    } else if (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS) {
+                        if (!b->rotation_give_up) {
+                            if (b->rotation_start_time == 0) {
+                                b->rotation_start_time = now;
+                            }
+                            if (now - b->rotation_start_time > 300000) {
+                                fprintf(stderr, "[PQC-HS-L2] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                                b->rotation_give_up = true;
+                            } else {
+                                initiate_key_rotation(b, &peer, -1, NULL, my_priv, peer_pub, profile_id, true);
+                            }
+                        }
                     }
                     usleep(500000);
                 } else {
@@ -639,6 +697,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 }
 
                 if (is_initiator) {
+                    if (b->handshake_give_up) {
+                        usleep(500000);
+                        continue;
+                    }
+                    if (b->handshake_start_time == 0) {
+                        b->handshake_start_time = get_time_ms_hs();
+                    }
+
                     trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz);
                     struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
                     msg->magic = PQC_HS_MAGIC;
@@ -659,6 +725,11 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                     int retry_cnt = 0;
                     while (g_dispatcher_running && !b->key_ready) {
+                        if (get_time_ms_hs() - b->handshake_start_time > 300000) {
+                            fprintf(stderr, "[PQC-HS-L3] Handshake timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                            b->handshake_give_up = true;
+                            break;
+                        }
                         fprintf(stderr, "[PQC-WORKER-L3] Initiator (Policy %d) sending HELLO (try: %d)...\n", policy_id, retry_cnt + 1);
                         sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
                                (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
@@ -700,6 +771,23 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 } else {
                     fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) listening for HELLO...\n", policy_id);
                     while (g_dispatcher_running && !b->key_ready) {
+                        pthread_mutex_lock(&g_key_mutex);
+                        if (b->send_poke) {
+                            b->send_poke = false;
+                            pthread_mutex_unlock(&g_key_mutex);
+                            struct pqc_hs_msg poke_msg;
+                            poke_msg.magic = PQC_HS_MAGIC;
+                            poke_msg.msg_type = PQC_HS_MSG_POKE;
+                            poke_msg.session_id = 999;
+                            poke_msg.policy_id = policy_id;
+                            poke_msg.sig_len = 0;
+                            poke_msg.data_len = 0;
+                            fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) sending POKE to Initiator...\n", policy_id);
+                            sendto(sockfd, &poke_msg, sizeof(poke_msg), 0, (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                        } else {
+                            pthread_mutex_unlock(&g_key_mutex);
+                        }
+
                         uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                         pqc_rx_pkt_info_t info;
                         int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -759,8 +847,18 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         b->last_sent_time = 0;
                         b->last_recv_time = 0;
                         pthread_mutex_unlock(&g_key_mutex);
-                    } else if (now - b->last_rotation_time > 30000) {
-                        initiate_key_rotation(b, NULL, sockfd, &peeraddr, my_priv, peer_pub, profile_id, false);
+                    } else if (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS) {
+                        if (!b->rotation_give_up) {
+                            if (b->rotation_start_time == 0) {
+                                b->rotation_start_time = now;
+                            }
+                            if (now - b->rotation_start_time > 300000) {
+                                fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                                b->rotation_give_up = true;
+                            } else {
+                                initiate_key_rotation(b, NULL, sockfd, &peeraddr, my_priv, peer_pub, profile_id, false);
+                            }
+                        }
                     }
                     usleep(500000);
                 } else {
@@ -1123,6 +1221,11 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->last_rotation_time = get_time_ms_hs();
         b->last_sent_time = 0;
         b->last_recv_time = 0;
+        b->handshake_start_time = 0;
+        b->handshake_give_up = false;
+        b->rotation_start_time = 0;
+        b->rotation_give_up = false;
+        b->send_poke = false;
         for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
             memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
             b->key_ids[slot] = 0;
@@ -1332,6 +1435,24 @@ void sig_pqc_discard_prev_key(int policy_id) {
                 g_policy_key_version[i]++;
                 fprintf(stderr, "[PQC-HS] Discarded PREV key for Policy %d!\n", policy_id);
             }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+void sig_pqc_trigger_retry(int policy_id) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].policy_id == policy_id) {
+            policy_key_binding_t *b = &g_policy_bindings[i];
+            b->handshake_give_up = false;
+            b->handshake_start_time = 0;
+            b->rotation_give_up = false;
+            b->rotation_start_time = 0;
+            b->key_ready = false;
+            b->send_poke = true;
+            fprintf(stderr, "[PQC-HS] Manual retry triggered for Policy %d. All retry states reset.\n", policy_id);
             break;
         }
     }

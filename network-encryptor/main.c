@@ -17,6 +17,7 @@
 #include "main_diag.h"
 #include "sig_encrypt/inc/traffic_crypto.h"
 #include "sig_encrypt/inc/pqc_handshake.h"
+#include "sig_encrypt/inc/pqc_ipc.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 
@@ -36,8 +37,9 @@ static void usage(const char *prog) {
             "  %s -gi            # generate new identity key and load into RAM\n"
             "  %s -check-identity # check PQC DB identity integrity and link to RAM cache\n"
             "  %s -id <ID>       # notify daemon to apply config already stored in DB\n"
-            "  %s -check [ID]    # check database config consistency\n",
-            prog, NOTIFY_CHANNEL, prog, prog, prog, prog);
+            "  %s -check [ID]    # check database config consistency\n"
+            "  %s -r <policy_id> # trigger manual handshake retry for policy\n",
+            prog, NOTIFY_CHANNEL, prog, prog, prog, prog, prog);
 }
 
 static int libbpf_print_silent(enum libbpf_print_level level,
@@ -132,6 +134,11 @@ static void handle_gen_identity() {
 }
 
 int main(int argc, char **argv) {
+    int ipc_rc = sig_pqc_handle_ipc_cli(argc, argv);
+    if (ipc_rc >= 0) {
+        return ipc_rc;
+    }
+
     load_env_from_file("/opt/db_test.env");
     const char *db_pass = resolve_db_password();
     const char *keywords[] = {"host", "port", "dbname", "user", "password", "connect_timeout", NULL};
@@ -259,6 +266,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[FATAL] Failed to initialize PQC subsystem.\n");
         return 1;
     }
+
+    sig_pqc_start_ipc_server();
 
     libbpf_set_print(libbpf_print_silent);
     PGconn *listen_conn = PQconnectdbParams(keywords, values, 0);

@@ -12,6 +12,7 @@
 #define PQC_HS_MSG_HELLO   1
 #define PQC_HS_MSG_RESP    2
 #define PQC_HS_MSG_KEEPALIVE 3
+#define PQC_HS_MSG_POKE    4
 
 #define PQC_KEM_PK_SIZE    1184 // ML-KEM-768 PK size
 #define PQC_KEM_CT_SIZE    1088 // ML-KEM-768 CT size
@@ -93,6 +94,13 @@ typedef struct {
     // Rekey and self-healing activity timestamps
     uint64_t last_sent_time;
     uint64_t last_recv_time;
+
+    // Handshake and Rotation retry timeout variables
+    uint64_t handshake_start_time;
+    bool handshake_give_up;
+    uint64_t rotation_start_time;
+    bool rotation_give_up;
+    bool send_poke;
 } policy_key_binding_t;
 
 typedef struct {
@@ -185,5 +193,6 @@ void sig_pqc_record_recv(int policy_id);
 int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]);
 void sig_pqc_promote_responder_key(int policy_id);
 void sig_pqc_discard_prev_key(int policy_id);
+void sig_pqc_trigger_retry(int policy_id);
 
 #endif
