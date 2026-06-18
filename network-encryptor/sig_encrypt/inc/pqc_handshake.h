@@ -173,6 +173,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
+char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
 
 /**
  * Feed a received PQC handshake packet (UDP payload only) into the handshake module.
@@ -189,5 +190,7 @@ int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], boo
 void sig_pqc_promote_responder_key(int policy_id);
 void sig_pqc_discard_prev_key(int policy_id);
 void sig_pqc_trigger_retry(int policy_id);
+
+void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
 
 #endif

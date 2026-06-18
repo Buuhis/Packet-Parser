@@ -370,64 +370,7 @@ static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int 
                 }
 
                 if (cp_base.crypto_mode == CRYPTO_MODE_PQC_GCM) {
-                    char peer_ip[64] = "0.0.0.0";
-                    const char *wan_ifname = "";
-                    pqc_get_profile_handshake_params(cfg, pi, peer_ip, &wan_ifname);
-
-                    char policy_id_str[32];
-                    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
-                    const char *pqc_params[1] = { policy_id_str };
-                    PGresult *peer_res = PQexecParams(conn,
-                        "SELECT local_identity_fingerprint, peer_pub, peer_fingerprint, is_initiator FROM pqc_identities WHERE policy_id = $1",
-                        1, NULL, pqc_params, NULL, NULL, 0);
-
-                    if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
-                        const char *local_fg = PQgetvalue(peer_res, 0, 0);
-                        const char *peer_pub = PQgetvalue(peer_res, 0, 1);
-                        const char *peer_fg = (PQnfields(peer_res) > 2) ? PQgetvalue(peer_res, 0, 2) : NULL;
-                        const char *is_init_str = (PQnfields(peer_res) > 3) ? PQgetvalue(peer_res, 0, 3) : NULL;
-                        bool is_init = true;
-                        if (is_init_str) {
-                            is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
-                        }
-
-                        int role_mode = PQC_ROLE_RESPONDER;
-                        if (PQC_USE_DYNAMIC_ROLE) {
-                            role_mode = PQC_ROLE_DYNAMIC;
-                        } else {
-                            role_mode = is_init ? PQC_ROLE_INITIATOR : PQC_ROLE_RESPONDER;
-                        }
-
-                        // Validation checks
-                        bool valid = true;
-                        if (!local_fg || strlen(local_fg) == 0) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing local_identity_fingerprint in DB!\n", db_policy_id);
-                            valid = false;
-                        }
-                        if (!peer_pub || strlen(peer_pub) == 0) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key in DB!\n", db_policy_id);
-                            valid = false;
-                        }
-
-                        char *found_priv = NULL;
-                        char *found_pub = NULL;
-                        if (valid) {
-                            sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
-                            if (!found_priv || !found_pub) {
-                                fprintf(stderr, "[DB-PQC] ERROR: Local keys for fingerprint [%s] (Policy %d) are not loaded in memory registry! (Please run key generator command first)\n", local_fg, db_policy_id);
-                                valid = false;
-                            }
-                        }
-
-                        if (valid) {
-                            sig_pqc_bind_policy(db_policy_id, p->id, role_mode, peer_ip, local_fg, peer_fg, wan_ifname, found_priv, found_pub, peer_pub);
-                        } else {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
-                        }
-                    } else {
-                        fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);
-                    }
-                    PQclear(peer_res);
+                    sig_pqc_load_and_bind_policy(conn, cfg, pi, db_policy_id, p->id);
                 }
 
 
@@ -938,7 +881,7 @@ int db_check_identities(const char *conn_str) {
     sig_pqc_load_keys_from_disk();
 
     PGresult *p_res = PQexec(conn, 
-        "SELECT c.id AS policy_id, p.profile_name, i.local_identity_fingerprint, i.peer_pub, i.peer_fingerprint, i.is_initiator "
+        "SELECT c.id AS policy_id, p.profile_name, i.local_identity_fingerprint, i.peer_pub "
         "FROM xdp_profile_crypto_policies c "
         "JOIN xdp_profiles p ON c.profile_id = p.id "
         "LEFT JOIN pqc_identities i ON c.id = i.policy_id "
@@ -957,9 +900,7 @@ int db_check_identities(const char *conn_str) {
         int policy_id = atoi(PQgetvalue(p_res, i, 0));
         const char *pname = PQgetvalue(p_res, i, 1);
         const char *local_fg = PQgetvalue(p_res, i, 2);
-        const char *peer_pub = PQgetvalue(p_res, i, 3);
-        const char *peer_fg = PQgetvalue(p_res, i, 4);
-        const char *is_init_str = PQgetvalue(p_res, i, 5);
+        const char *peer_pub_path = PQgetvalue(p_res, i, 3);
 
         printf("Policy ID: %d (Profile: %s)\n", policy_id, pname);
 
@@ -977,22 +918,34 @@ int db_check_identities(const char *conn_str) {
             printf("  - Local Key Fingerprint: NOT ASSIGNED\n");
         }
 
-        if (peer_pub && strlen(peer_pub) > 0) {
-            printf("  - Peer Public Key: LOADED (%d characters Base64 string)\n", (int)strlen(peer_pub));
-            if (peer_fg && strlen(peer_fg) > 0) {
-                printf("  - Peer Key Fingerprint: [%s]\n", peer_fg);
+        if (peer_pub_path && strlen(peer_pub_path) > 0) {
+            printf("  - Peer Public Key: PATH [%s]\n", peer_pub_path);
+            FILE *fp = fopen(peer_pub_path, "r");
+            if (fp) {
+                char file_content[128];
+                memset(file_content, 0, sizeof(file_content));
+                if (fgets(file_content, sizeof(file_content) - 1, fp) != NULL) {
+                    file_content[strcspn(file_content, "\r\n")] = '\0';
+                    if (strlen(file_content) >= 8) {
+                        char peer_fg[16];
+                        strncpy(peer_fg, file_content, 8);
+                        peer_fg[8] = '\0';
+                        printf("  - Peer Key Fingerprint: [%s] (loaded from file)\n", peer_fg);
+                    } else {
+                        printf("  - Peer Key Fingerprint: INVALID FORMAT (too short)\n");
+                    }
+                } else {
+                    printf("  - Peer Key Fingerprint: EMPTY FILE\n");
+                }
+                fclose(fp);
             } else {
-                printf("  - Peer Key Fingerprint: NOT SPECIFIED\n");
+                printf("  - Peer Key Fingerprint: ERROR (could not read file [%s])\n", peer_pub_path);
             }
         } else {
             printf("  - Peer Public Key: EMPTY / NOT ASSIGNED in pqc_identities\n");
         }
 
-        bool is_init = true;
-        if (is_init_str) {
-            is_init = (is_init_str[0] == 't' || is_init_str[0] == '1' || is_init_str[0] == 'T');
-        }
-        printf("  - Role Configured: [%s]\n", is_init ? "INITIATOR" : "RESPONDER");
+        printf("  - Role Configured: [DYNAMIC (resolved at runtime)]\n");
         printf("\n");
     }
 

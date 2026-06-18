@@ -2,6 +2,8 @@
 #include "../inc/traffic_crypto.h"
 #include "../inc/pqc_l2_handshake.h"
 #include "packet_crypto.h"
+#include <sys/stat.h>
+#include <postgresql/libpq-fe.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,6 +20,7 @@
 
 #define PQC_RX_PKT_MAX     10000
 #define KEY_ROTATION_INTERVAL_MS 30000 
+#define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
@@ -82,8 +85,9 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
         g_policy_key_version[idx]++;
     }
 
-    fprintf(stderr, "[PQC-HS] %s Handshake SUCCESS for Policy %d. Promoted new key ID: %d to CURRENT\n",
-            role, b->policy_id, b->key_ids[KEY_SLOT_CURRENT]);
+    fprintf(stderr, "[PQC-HS] %s Handshake SUCCESS for Policy %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
+            role, b->policy_id, b->key_ids[KEY_SLOT_CURRENT],
+            derived_master[0], derived_master[1], derived_master[2], derived_master[3]);
 }
 
 static void initiate_key_rotation(policy_key_binding_t *b, struct pqc_l2_peer *peer, int sockfd, struct sockaddr_in *peeraddr, char *my_priv, char *peer_pub, int profile_id, bool is_l2) {
@@ -357,6 +361,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         }
 
         while (g_dispatcher_running) {
+            if (b->handshake_give_up) {
+                usleep(500000);
+                continue;
+            }
             if (!b->key_ready) {
                 if (b->role_mode == PQC_ROLE_DYNAMIC || is_initiator) {
                     fprintf(stderr, "[PQC-WORKER] Policy %d: Initiator peer MAC discovery...\n", policy_id);
@@ -387,10 +395,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
 
                     if (is_initiator) {
-                        if (b->handshake_give_up) {
-                            usleep(500000);
-                            continue;
-                        }
                         if (b->handshake_start_time == 0) {
                             b->handshake_start_time = get_time_ms_hs();
                         }
@@ -418,8 +422,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         int retry_cnt = 0;
 
                         while (g_dispatcher_running && !b->key_ready) {
-                            if (get_time_ms_hs() - b->handshake_start_time > 300000) {
-                                fprintf(stderr, "[PQC-HS-L2] Handshake timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                            if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
+                                fprintf(stderr, "[PQC-HS-L2] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
+                                        PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
                                 b->handshake_give_up = true;
                                 break;
                             }
@@ -643,6 +648,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr);
 
         while (g_dispatcher_running) {
+            if (b->handshake_give_up) {
+                usleep(500000);
+                continue;
+            }
             if (!b->key_ready) {
                 if (b->role_mode == PQC_ROLE_DYNAMIC) {
                     int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -669,17 +678,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 resolved = true;
                             }
                         }
-
-                        if (!resolved) {
-                            struct sockaddr_in local_addr;
-                            socklen_t addr_len = sizeof(local_addr);
-                            if (connect(temp_sock, (const struct sockaddr *)&serv, sizeof(serv)) == 0 &&
-                                getsockname(temp_sock, (struct sockaddr *)&local_addr, &addr_len) == 0) {
-                                local_ip_num = ntohl(local_addr.sin_addr.s_addr);
-                                strncpy(local_ip_str, inet_ntoa(local_addr.sin_addr), sizeof(local_ip_str) - 1);
-                                resolved = true;
-                            }
-                        }
                         close(temp_sock);
 
                         if (resolved) {
@@ -697,10 +695,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 }
 
                 if (is_initiator) {
-                    if (b->handshake_give_up) {
-                        usleep(500000);
-                        continue;
-                    }
                     if (b->handshake_start_time == 0) {
                         b->handshake_start_time = get_time_ms_hs();
                     }
@@ -725,8 +719,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                     int retry_cnt = 0;
                     while (g_dispatcher_running && !b->key_ready) {
-                        if (get_time_ms_hs() - b->handshake_start_time > 300000) {
-                            fprintf(stderr, "[PQC-HS-L3] Handshake timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                        if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
+                            fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
+                                    PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
                             b->handshake_give_up = true;
                             break;
                         }
@@ -1077,9 +1072,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-
-
-static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
+char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
     if (!obf_pub_str || strlen(obf_pub_str) == 0) return NULL;
 
     // Clean up input string (trim whitespace/newlines)
@@ -1107,42 +1100,42 @@ static char* deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fing
         return plain_b64_pub;
     }
 
-    // Method 1: Scan /etc/.enc_config/ for matching public key file to get fingerprint (Fallback)
-    DIR *dir = opendir("/etc/.enc_config");
+    // Method 1: Scan /etc/.dec_config/ for matching public key file to get fingerprint (Fallback)
+    DIR *dir = opendir("/etc/.dec_config");
     if (dir) {
         struct dirent *entry;
         while ((entry = readdir(dir)) != NULL) {
-            if (strncmp(entry->d_name, "identity_", 9) == 0 && strstr(entry->d_name, "_pub.key") != NULL) {
+            size_t name_len = strlen(entry->d_name);
+            if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
                 char fingerprint[16];
                 memset(fingerprint, 0, sizeof(fingerprint));
-                strncpy(fingerprint, entry->d_name + 9, 8);
+                strncpy(fingerprint, entry->d_name, 8);
 
                 char filepath[512];
-                snprintf(filepath, sizeof(filepath), "/etc/.enc_config/%s", entry->d_name);
+                snprintf(filepath, sizeof(filepath), "/etc/.dec_config/%s", entry->d_name);
                 FILE *fp = fopen(filepath, "r");
                 if (fp) {
                     char file_content[8192];
                     memset(file_content, 0, sizeof(file_content));
                     if (fgets(file_content, sizeof(file_content) - 1, fp) != NULL) {
-                        size_t flen = strlen(file_content);
-                        while (flen > 0 && (file_content[flen - 1] == '\r' || file_content[flen - 1] == '\n' || file_content[flen - 1] == ' ')) {
-                            file_content[flen - 1] = '\0';
-                            flen--;
-                        }
-                        if (strcmp(file_content, clean_obf) == 0) {
-                            fclose(fp);
-                            closedir(dir);
-                            
-                            unsigned char raw_pub[4096];
-                            size_t raw_pub_len = 0;
-                            trf_base64_decode_obfuscated(clean_obf, fingerprint, raw_pub, &raw_pub_len);
+                        file_content[strcspn(file_content, "\r\n")] = '\0';
+                        if (strncmp(file_content, fingerprint, 8) == 0) {
+                            const char *obf_pub = file_content + 8;
+                            if (strcmp(obf_pub, clean_obf) == 0) {
+                                fclose(fp);
+                                closedir(dir);
+                                
+                                unsigned char raw_pub[4096];
+                                size_t raw_pub_len = 0;
+                                trf_base64_decode_obfuscated(clean_obf, fingerprint, raw_pub, &raw_pub_len);
 
-                            char *plain_b64_pub = malloc(8192);
-                            memset(plain_b64_pub, 0, 8192);
-                            trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-                            
-                            fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
-                            return plain_b64_pub;
+                                char *plain_b64_pub = malloc(8192);
+                                memset(plain_b64_pub, 0, 8192);
+                                trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
+                                
+                                fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
+                                return plain_b64_pub;
+                            }
                         }
                     }
                     fclose(fp);
@@ -1189,7 +1182,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_fg, const char *wan_ifname,
                          const char *local_priv, const char *local_pub,
                          const char *peer_pub) {
-    char *deobf_peer = peer_pub ? deobfuscate_peer_pub(peer_pub, peer_fg) : NULL;
+    char *deobf_peer = peer_pub ? sig_pqc_deobfuscate_peer_pub(peer_pub, peer_fg) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
     policy_key_binding_t *b = NULL;
@@ -1294,37 +1287,52 @@ void sig_pqc_load_keys_from_disk(void) {
 
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
-        if (strncmp(entry->d_name, "identity_", 9) == 0 && strstr(entry->d_name, "_priv.key") != NULL) {
+        size_t name_len = strlen(entry->d_name);
+        if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
             char fingerprint[16];
             memset(fingerprint, 0, sizeof(fingerprint));
-            strncpy(fingerprint, entry->d_name + 9, 8);
+            strncpy(fingerprint, entry->d_name, 8);
 
             char priv_path[512];
             char pub_path[512];
             snprintf(priv_path, sizeof(priv_path), "/dev/shm/.enc_config/%s", entry->d_name);
-            snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/identity_%s_pub.key", fingerprint);
+            snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/%s", entry->d_name);
 
             FILE *fp_priv = fopen(priv_path, "r");
             if (!fp_priv) continue;
-            char obf_priv[8192];
-            memset(obf_priv, 0, sizeof(obf_priv));
-            if (fgets(obf_priv, sizeof(obf_priv) - 1, fp_priv) == NULL) {
+            char raw_file_priv[8192];
+            memset(raw_file_priv, 0, sizeof(raw_file_priv));
+            if (fgets(raw_file_priv, sizeof(raw_file_priv) - 1, fp_priv) == NULL) {
                 fclose(fp_priv);
                 continue;
             }
             fclose(fp_priv);
-            obf_priv[strcspn(obf_priv, "\r\n")] = '\0';
+            raw_file_priv[strcspn(raw_file_priv, "\r\n")] = '\0';
+
+            // Verify embedded fingerprint matches
+            if (strncmp(raw_file_priv, fingerprint, 8) != 0) {
+                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in private key %s\n", entry->d_name);
+                continue;
+            }
+            const char *obf_priv = raw_file_priv + 8;
 
             FILE *fp_pub = fopen(pub_path, "r");
             if (!fp_pub) continue;
-            char obf_pub[4096];
-            memset(obf_pub, 0, sizeof(obf_pub));
-            if (fgets(obf_pub, sizeof(obf_pub) - 1, fp_pub) == NULL) {
+            char raw_file_pub[8192];
+            memset(raw_file_pub, 0, sizeof(raw_file_pub));
+            if (fgets(raw_file_pub, sizeof(raw_file_pub) - 1, fp_pub) == NULL) {
                 fclose(fp_pub);
                 continue;
             }
             fclose(fp_pub);
-            obf_pub[strcspn(obf_pub, "\r\n")] = '\0';
+            raw_file_pub[strcspn(raw_file_pub, "\r\n")] = '\0';
+
+            // Verify embedded fingerprint matches
+            if (strncmp(raw_file_pub, fingerprint, 8) != 0) {
+                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in public key %s\n", pub_path);
+                continue;
+            }
+            const char *obf_pub = raw_file_pub + 8;
 
             unsigned char raw_priv[4096];
             size_t raw_priv_len = 0;
@@ -1457,4 +1465,85 @@ void sig_pqc_trigger_retry(int policy_id) {
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
+}
+
+void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id) {
+    PGconn *conn = (PGconn *)conn_ptr;
+    const struct app_config *cfg = (const struct app_config *)cfg_ptr;
+
+    char peer_ip[64] = "0.0.0.0";
+    const char *wan_ifname = "";
+    pqc_get_profile_handshake_params(cfg, profile_idx, peer_ip, &wan_ifname);
+
+    char policy_id_str[32];
+    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
+    const char *pqc_params[1] = { policy_id_str };
+    PGresult *peer_res = PQexecParams(conn,
+        "SELECT local_identity_fingerprint, peer_pub FROM pqc_identities WHERE policy_id = $1",
+        1, NULL, pqc_params, NULL, NULL, 0);
+
+    if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {
+        const char *local_fg = PQgetvalue(peer_res, 0, 0);
+        const char *peer_pub_path = PQgetvalue(peer_res, 0, 1);
+
+        char peer_fg_buf[16] = "";
+        char *deobf_pub = NULL;
+        bool valid = true;
+
+        if (!peer_pub_path || strlen(peer_pub_path) == 0) {
+            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key file path in DB!\n", db_policy_id);
+            valid = false;
+        } else {
+            FILE *fp_pub = fopen(peer_pub_path, "r");
+            if (!fp_pub) {
+                fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] could not be opened!\n", db_policy_id, peer_pub_path);
+                valid = false;
+            } else {
+                char file_content[8192];
+                memset(file_content, 0, sizeof(file_content));
+                if (fgets(file_content, sizeof(file_content) - 1, fp_pub) == NULL) {
+                    fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] is empty!\n", db_policy_id, peer_pub_path);
+                    valid = false;
+                } else {
+                    file_content[strcspn(file_content, "\r\n")] = '\0';
+                    if (strlen(file_content) < 8) {
+                        fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] has invalid format (too short)!\n", db_policy_id, peer_pub_path);
+                        valid = false;
+                    } else {
+                        strncpy(peer_fg_buf, file_content, 8);
+                        peer_fg_buf[8] = '\0';
+                        const char *obf_pub = file_content + 8;
+                        deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
+                        if (!deobf_pub) {
+                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] deobfuscation failed!\n", db_policy_id, peer_pub_path);
+                            valid = false;
+                        }
+                    }
+                }
+                fclose(fp_pub);
+            }
+        }
+
+        int role_mode = PQC_USE_DYNAMIC_ROLE ? PQC_ROLE_DYNAMIC : PQC_ROLE_RESPONDER;
+
+        char *found_priv = NULL;
+        char *found_pub = NULL;
+        if (valid) {
+            sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+            if (!found_priv || !found_pub) {
+                fprintf(stderr, "[DB-PQC] ERROR: Local keys for fingerprint [%s] (Policy %d) are not loaded in memory registry! (Please run key generator command first)\n", local_fg, db_policy_id);
+                valid = false;
+            }
+        }
+
+        if (valid) {
+            sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, found_priv, found_pub, deobf_pub);
+        } else {
+            fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
+        }
+        if (deobf_pub) free(deobf_pub);
+    } else {
+        fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);
+    }
+    PQclear(peer_res);
 }
