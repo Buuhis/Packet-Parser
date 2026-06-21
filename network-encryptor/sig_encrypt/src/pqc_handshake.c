@@ -1,6 +1,7 @@
 #include "../inc/pqc_handshake.h"
 #include "../inc/traffic_crypto.h"
 #include "../inc/pqc_l2_handshake.h"
+#include "../inc/pqc_logger.h"
 #include "packet_crypto.h"
 #include <sys/stat.h>
 #include <postgresql/libpq-fe.h>
@@ -57,6 +58,12 @@ static uint64_t get_time_ms_hs(void) {
 }
 
 static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *derived_master, const char *role) {
+    if (b->key_ready) {
+        sig_pqc_write_log(b->policy_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Session key updated.");
+    } else {
+        sig_pqc_write_log(b->policy_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Secure session established.");
+    }
+
     memcpy(b->keys[KEY_SLOT_PREV], b->keys[KEY_SLOT_CURRENT], PQC_TRAFFIC_KEY_SZ);
     b->key_ids[KEY_SLOT_PREV] = b->key_ids[KEY_SLOT_CURRENT];
     b->key_slots_valid[KEY_SLOT_PREV] = b->key_slots_valid[KEY_SLOT_CURRENT];
@@ -425,6 +432,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                                 fprintf(stderr, "[PQC-HS-L2] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                         PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
+                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
                                 b->handshake_give_up = true;
                                 break;
                             }
@@ -556,6 +564,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             }
                             if (now - b->rotation_start_time > 300000) {
                                 fprintf(stderr, "[PQC-HS-L2] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
                                 b->rotation_give_up = true;
                             } else {
                                 initiate_key_rotation(b, &peer, -1, NULL, my_priv, peer_pub, profile_id, true);
@@ -722,6 +731,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                             fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                     PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
+                            sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Peer connection timeout.");
                             b->handshake_give_up = true;
                             break;
                         }
@@ -849,6 +859,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             }
                             if (now - b->rotation_start_time > 300000) {
                                 fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                                sig_pqc_write_log(policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
                                 b->rotation_give_up = true;
                             } else {
                                 initiate_key_rotation(b, NULL, sockfd, &peeraddr, my_priv, peer_pub, profile_id, false);
@@ -1182,7 +1193,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_fg, const char *wan_ifname,
                          const char *local_priv, const char *local_pub,
                          const char *peer_pub) {
-    char *deobf_peer = peer_pub ? sig_pqc_deobfuscate_peer_pub(peer_pub, peer_fg) : NULL;
+    char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
     policy_key_binding_t *b = NULL;
@@ -1540,10 +1551,12 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
             sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, found_priv, found_pub, deobf_pub);
         } else {
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
+            sig_pqc_write_log(db_policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
         }
         if (deobf_pub) free(deobf_pub);
     } else {
         fprintf(stderr, "[DB-PQC] ERROR: No policy identity configuration found in pqc_identities for PQC policy %d. PQC Handshake will NOT start.\n", db_policy_id);
+        sig_pqc_write_log(db_policy_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
     }
     PQclear(peer_res);
 }

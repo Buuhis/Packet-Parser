@@ -9,6 +9,7 @@
 
 #include "pqc_ipc.h"
 #include "pqc_handshake.h"
+#include "traffic_crypto.h"
 
 #define IPC_SOCKET_PATH "/var/run/test_network-encryptor.sock"
 

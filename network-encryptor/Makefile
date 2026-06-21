@@ -7,20 +7,20 @@ CFLAGS = -D_GNU_SOURCE -Iinc -Isig_encrypt/inc -I/usr/local/include -Wall -O2 $(
 
 # Quan trọng: Thêm -L/usr/local/lib và -Lsig_encrypt/lib để Linker tìm thấy thư viện.
 # Thêm -Wl,-rpath để chương trình tìm thấy file .so lúc chạy mà không cần ldconfig.
-LDFLAGS = -L/usr/local/lib -Lsig_encrypt/lib -lxdp -lbpf -lpthread -lssl -lcrypto -lpq -lscrypt -Wl,-rpath,$(shell pwd)/sig_encrypt/lib
+LDFLAGS = -L/usr/local/lib -Lsig_encrypt/lib -lxdp -lbpf -lpthread -lssl -lcrypto -lpq -Wl,-rpath,$(shell pwd)/sig_encrypt/lib
 
 BPF_CFLAGS = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include
 
 BIN_DIR = bin
 
-APP_SRC = main.c src/core/main_diag.c src/core/interface.c src/core/forwarder.c src/core/wan_arp.c src/crypto/crypto_policy_utils.c src/crypto/crypto_dispatch.c src/crypto/packet_crypto.c src/crypto/crypto_layer2.c src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c src/core/flow_table.c src/core/fragment.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c sig_encrypt/src/pqc_l2_handshake.c sig_encrypt/src/pqc_ipc.c
+APP_SRC = main.c src/core/main_diag.c src/core/interface.c src/core/forwarder.c src/core/wan_arp.c src/crypto/crypto_policy_utils.c src/crypto/crypto_dispatch.c src/crypto/packet_crypto.c src/crypto/crypto_layer2.c src/crypto/crypto_layer3.c src/crypto/crypto_layer4.c src/core/flow_table.c src/core/fragment.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c sig_encrypt/src/pqc_l2_handshake.c sig_encrypt/src/pqc_ipc.c sig_encrypt/src/pqc_logger.c
 APP_OBJ = $(APP_SRC:.c=.o)
 TARGET = $(BIN_DIR)/test_network-encryptor
 DB_LIB_SRC = src/db/config.c src/db/db_config.c src/db/db_env.c src/db/db_runtime.c
 DB_LIB_OBJ = $(DB_LIB_SRC:.c=.o)
 DB_LIB = $(BIN_DIR)/libdb_loader.a
-DB_TEST_SRC = src/db_loader_test.c src/core/main_diag.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c sig_encrypt/src/pqc_l2_handshake.c
+DB_TEST_SRC = src/db_loader_test.c src/core/main_diag.c sig_encrypt/src/traffic_crypto.c sig_encrypt/src/pqc_handshake.c sig_encrypt/src/pqc_l2_handshake.c sig_encrypt/src/pqc_logger.c
 DB_TEST_OBJ = $(DB_TEST_SRC:.c=.o)
 DB_TEST_TARGET = $(BIN_DIR)/db-loader-test
 
