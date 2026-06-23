@@ -1,6 +1,7 @@
 #include "../../inc/forwarder.h"
 #include "../../sig_encrypt/inc/pqc_handshake.h"
 #include "../../sig_encrypt/inc/pqc_l2_handshake.h"
+#include "cfm_diag.h"
 #include "../../inc/packet_crypto.h"
 #include "../../inc/flow_table.h"
 #include "../../inc/config.h"
@@ -309,10 +310,10 @@ static void compute_profile_weighted_wan_windows(const struct app_config *cfg,
     }
 }
 
-static int select_wan_idx_for_packet(struct forwarder *fwd,
-                                     uint32_t src_ip, uint32_t dst_ip,
-                                     uint16_t src_port, uint16_t dst_port,
-                                     uint8_t protocol, uint32_t pkt_len) {
+static int select_wan_idx_for_packet_raw(struct forwarder *fwd,
+                                         uint32_t src_ip, uint32_t dst_ip,
+                                         uint16_t src_port, uint16_t dst_port,
+                                         uint8_t protocol, uint32_t pkt_len) {
 
     if (fwd && fwd->cfg && fwd->cfg->profile_count > 0) {
         int profile_idx = config_select_profile_for_flow(fwd->cfg, src_ip, dst_ip);
@@ -358,6 +359,16 @@ static int select_wan_idx_for_packet(struct forwarder *fwd,
     return flow_table_get_wan(&g_flow_table,
                                src_ip, dst_ip, src_port, dst_port,
                                protocol, pkt_len);
+}
+
+static int select_wan_idx_for_packet(struct forwarder *fwd,
+                                     uint32_t src_ip, uint32_t dst_ip,
+                                     uint16_t src_port, uint16_t dst_port,
+                                     uint8_t protocol, uint32_t pkt_len) {
+    int profile_idx = (fwd && fwd->cfg && fwd->cfg->profile_count > 0) ?
+                      config_select_profile_for_flow(fwd->cfg, src_ip, dst_ip) : -1;
+    int chosen_wan = select_wan_idx_for_packet_raw(fwd, src_ip, dst_ip, src_port, dst_port, protocol, pkt_len);
+    return failover_select_wan(fwd->cfg, profile_idx, chosen_wan);
 }
 
 static const struct crypto_policy *select_crypto_policy_for_packet(struct forwarder *fwd,

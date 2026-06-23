@@ -19,6 +19,7 @@
 #include "sig_encrypt/inc/traffic_crypto.h"
 #include "sig_encrypt/inc/pqc_handshake.h"
 #include "sig_encrypt/inc/pqc_ipc.h"
+#include "cfm_diag.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
 
@@ -70,8 +71,13 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
     rt->active_slot = 0;
     rt->cfg_slots[rt->active_slot] = *cfg;
     rt->running = 0;
+    
+    // Initialize L2 CFM diagnostics before starting forwarder thread
+    cfm_init(cfg);
+
     if (pthread_create(&rt->thread, NULL, forwarder_thread_main, rt) != 0) {
         fprintf(stderr, "[FATAL] failed to create forwarder thread\n");
+        cfm_cleanup();
         return -1;
     }
     rt->has_thread = 1;
@@ -81,6 +87,7 @@ static int runtime_start(struct runtime_state *rt, const struct app_config *cfg)
 static void handle_shutdown_signal(int sig) {
     (void)sig;
     sig_pqc_cleanup_ipc();
+    cfm_cleanup();
     exit(0);
 }
 
@@ -286,6 +293,10 @@ int main(int argc, char **argv) {
                     rt.cfg_slots[next_slot] = merged_cfg;
                     if (forwarder_reload_config(&rt.fwd, &rt.cfg_slots[next_slot]) == 0) {
                         rt.active_slot = next_slot;
+                        
+                        // Hot-reload L2 CFM diagnostics with updated WAN configurations
+                        cfm_init(&rt.cfg_slots[rt.active_slot]);
+
                         fprintf(stderr, "[OK] Hot-reloaded merged runtime with %d active config(s)\n", active_id_count);
                     } else {
                         fprintf(stderr,
