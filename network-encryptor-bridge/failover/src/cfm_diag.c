@@ -250,6 +250,17 @@ int cfm_init(const struct app_config *cfg) {
             continue;
         }
 
+        // Join the CFM multicast group to receive multicast CCM frames
+        struct packet_mreq mreq;
+        memset(&mreq, 0, sizeof(mreq));
+        mreq.mr_ifindex = ifindex;
+        mreq.mr_type = PACKET_MR_MULTICAST;
+        mreq.mr_alen = 6;
+        memcpy(mreq.mr_address, CFM_MULTICAST_MAC, 6);
+        if (setsockopt(sock, SOL_PACKET, PACKET_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0) {
+            fprintf(stderr, "[CFM-INIT] Warning: Cannot join multicast group on %s: %s\n", wan->ifname, strerror(errno));
+        }
+
         // Set non-blocking socket
         int flags = fcntl(sock, F_GETFL, 0);
         fcntl(sock, F_SETFL, flags | O_NONBLOCK);

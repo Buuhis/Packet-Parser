@@ -4,7 +4,7 @@ LDFLAGS = -L../lib -Wl,-rpath,'$$ORIGIN/../../lib' -lxdp -lbpf -lelf -lz -lpthre
 
 TARGET = cfm_test
 
-SRC = src/cfm_test.c src/cfm_diag.c
+SRC = test/cfm_test.c src/cfm_diag.c
 OBJ = $(SRC:.c=.o)
 
 .PHONY: all clean
