@@ -4,8 +4,25 @@
 #include <unistd.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <net/if.h>
 #include "cfm_diag.h"
-#include "config.h"
+
+#define MAX_INTERFACES 16
+#define MAC_LEN 6
+
+struct wan_config {
+    char ifname[IFNAMSIZ];
+    uint32_t dst_ip;
+    uint8_t src_mac[MAC_LEN];
+    uint8_t dst_mac[MAC_LEN];
+    int dataplane;
+};
+
+struct app_config {
+    struct wan_config wans[MAX_INTERFACES];
+    int wan_count;
+};
 
 static volatile bool keep_running = true;
 
@@ -17,6 +34,15 @@ int fwd_wan_is_stopped(int dp) {
 static void handle_signal(int sig) {
     (void)sig;
     keep_running = false;
+}
+
+static const char *state_to_str(int state) {
+    switch (state) {
+        case CFM_LINK_STATE_INIT: return "-";
+        case CFM_LINK_STATE_UP:   return "UP";
+        case CFM_LINK_STATE_DOWN: return "DOWN";
+        default:                  return "?";
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -61,27 +87,29 @@ int main(int argc, char *argv[]) {
 
     printf("[CFM-TEST] CFM initialized successfully. Monitoring link status...\n");
 
-    bool last_status1 = cfm_is_link_up(0);
-    bool last_status2 = cfm_is_link_up(1);
+    int last_state1 = cfm_get_link_state(0);
+    int last_state2 = cfm_get_link_state(1);
 
     printf("[CFM-TEST] Initial Link Status:\n");
-    printf("           %s: %s\n", wan1, last_status1 ? "UP" : "DOWN");
-    printf("           %s: %s\n", wan2, last_status2 ? "UP" : "DOWN");
+    printf("           %s: %s\n", wan1, state_to_str(last_state1));
+    printf("           %s: %s\n", wan2, state_to_str(last_state2));
 
     while (keep_running) {
         usleep(100000); // Check every 100ms
 
-        bool status1 = cfm_is_link_up(0);
-        bool status2 = cfm_is_link_up(1);
+        int state1 = cfm_get_link_state(0);
+        int state2 = cfm_get_link_state(1);
 
-        if (status1 != last_status1) {
-            printf("[CFM-TEST] STATUS CHANGE -> Interface %s is now: %s\n", wan1, status1 ? "UP" : "DOWN");
-            last_status1 = status1;
+        if (state1 != last_state1) {
+            printf("[CFM-TEST] STATUS CHANGE -> Interface %s: %s -> %s\n", 
+                   wan1, state_to_str(last_state1), state_to_str(state1));
+            last_state1 = state1;
         }
 
-        if (status2 != last_status2) {
-            printf("[CFM-TEST] STATUS CHANGE -> Interface %s is now: %s\n", wan2, status2 ? "UP" : "DOWN");
-            last_status2 = status2;
+        if (state2 != last_state2) {
+            printf("[CFM-TEST] STATUS CHANGE -> Interface %s: %s -> %s\n", 
+                   wan2, state_to_str(last_state2), state_to_str(state2));
+            last_state2 = state2;
         }
     }
 

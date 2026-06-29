@@ -6,6 +6,12 @@
 struct app_config;
 struct forwarder;
 
+typedef enum {
+    CFM_LINK_STATE_INIT = 0,
+    CFM_LINK_STATE_UP = 1,
+    CFM_LINK_STATE_DOWN = -1
+} cfm_link_state_t;
+
 /**
  * Initialize the CFM diagnostic subsystem.
  * This reads WAN ports from the configuration, opens Raw sockets, 
@@ -17,24 +23,23 @@ struct forwarder;
 int cfm_init(const struct app_config *cfg);
 
 /**
- * Query the health status of a WAN interface by index.
+ * Query the health status of a WAN interface by dataplane index.
  *
- * @param wan_idx The index of the WAN interface in the cfg->wans array.
+ * @param wan_dp The dataplane index of the WAN interface.
  * @return true if the link is active and CCM packets are being received,
  *         false if the link has timed out (failed) or is not initialized.
  */
-bool cfm_is_link_up(int wan_idx);
+bool cfm_is_link_up(int wan_dp);
 
 /**
- * Perform WAN failover lookup: if the initially chosen WAN is down,
- * returns an alternative active WAN from the same profile, or falls back.
+ * Query the detailed state of a WAN interface by dataplane index.
+ *
+ * @param wan_dp The dataplane index of the WAN interface.
+ * @return 0 for INIT, 1 for UP, 2 for DOWN.
  */
-int failover_select_wan(const struct app_config *cfg, int profile_idx, int initial_wan_idx);
+int cfm_get_link_state(int wan_dp);
 
-/**
- * Perform WAN failover lookup on dataplane index.
- */
-int failover_select_wan_dp(const struct forwarder *fwd, int profile_idx, int initial_dp);
+
 
 /**
  * Terminate the CFM diagnostic subsystem.

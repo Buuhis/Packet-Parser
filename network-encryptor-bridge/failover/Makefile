@@ -1,6 +1,6 @@
 CC = gcc
-CFLAGS = -D_GNU_SOURCE -I. -Iinc -I../inc -I../inc/core -I../inc/crypto -I../inc/db -I../include -Wall -O2 -mcmodel=medium $(shell pg_config --includedir 2>/dev/null | xargs -I{} echo -I{})
-LDFLAGS = -L../lib -Wl,-rpath,'$$ORIGIN/../../lib' -lxdp -lbpf -lelf -lz -lpthread -lssl -lcrypto -lpq -lscrypt
+CFLAGS = -D_GNU_SOURCE -I. -Iinc -Itest -Wall -O2 -mcmodel=medium
+LDFLAGS = -lpthread
 
 TARGET = cfm_test
 
