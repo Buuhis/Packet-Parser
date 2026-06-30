@@ -94,8 +94,10 @@ int main(int argc, char *argv[]) {
     printf("           %s: %s\n", wan1, state_to_str(last_state1));
     printf("           %s: %s\n", wan2, state_to_str(last_state2));
 
+    int print_counter = 0;
     while (keep_running) {
         usleep(100000); // Check every 100ms
+        print_counter++;
 
         int state1 = cfm_get_link_state(0);
         int state2 = cfm_get_link_state(1);
@@ -110,6 +112,21 @@ int main(int argc, char *argv[]) {
             printf("[CFM-TEST] STATUS CHANGE -> Interface %s: %s -> %s\n", 
                    wan2, state_to_str(last_state2), state_to_str(state2));
             last_state2 = state2;
+        }
+
+        if (print_counter >= 10) {
+            print_counter = 0;
+            y1731_metrics_t m1, m2;
+            if (cfm_get_link_quality(0, &m1) == 0 && state1 == CFM_LINK_STATE_UP) {
+                printf("[CFM-TEST] Link %s Quality: RTT = %u us, Jitter = %u us, Loss Rate = %.2f%% (%s)\n",
+                       wan1, m1.rtt_us, m1.jitter_us, m1.loss_rate * 100.0f,
+                       m1.loss_mechanism == 1 ? "LMM" : "SLM");
+            }
+            if (cfm_get_link_quality(1, &m2) == 0 && state2 == CFM_LINK_STATE_UP) {
+                printf("[CFM-TEST] Link %s Quality: RTT = %u us, Jitter = %u us, Loss Rate = %.2f%% (%s)\n",
+                       wan2, m2.rtt_us, m2.jitter_us, m2.loss_rate * 100.0f,
+                       m2.loss_mechanism == 1 ? "LMM" : "SLM");
+            }
         }
     }
 

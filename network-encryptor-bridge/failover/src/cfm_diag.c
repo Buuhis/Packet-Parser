@@ -39,6 +39,23 @@ typedef struct cfm_link {
     bool mac_learned;           
     int cfg_wan_idx;            
     int wan_dp;                 
+    
+    // ITU-T Y.1731 quality metrics
+    uint32_t rtt_us;
+    uint32_t jitter_us;
+    float    loss_rate;
+    int      loss_mechanism; // 1 = LMM, 2 = SLM
+    
+    // SLM/SLR sequence tracking
+    uint32_t tx_slm_seq;
+    uint32_t rx_slr_count;
+    uint32_t tx_slm_count;
+    
+    // LMM/LMR previous counters (initiator)
+    uint32_t prev_tx_fc_f;
+    uint32_t prev_rx_fc_f;
+    uint32_t prev_tx_fc_b;
+    uint32_t prev_rx_fc_b;
 } cfm_link_t;
 
 static cfm_link_t g_links[MAX_INTERFACES];
@@ -100,10 +117,110 @@ static void send_ccm_packet(cfm_link_t *link) {
     }
 }
 
+static int get_interface_counters(const char *ifname, uint32_t *rx_packets, uint32_t *tx_packets) {
+    char path[256];
+    FILE *fp;
+    unsigned long val;
+    
+    if (rx_packets) {
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/rx_packets", ifname);
+        fp = fopen(path, "r");
+        if (!fp) return -1;
+        if (fscanf(fp, "%lu", &val) != 1) {
+            fclose(fp);
+            return -1;
+        }
+        fclose(fp);
+        *rx_packets = (uint32_t)val;
+    }
+    
+    if (tx_packets) {
+        snprintf(path, sizeof(path), "/sys/class/net/%s/statistics/tx_packets", ifname);
+        fp = fopen(path, "r");
+        if (!fp) return -1;
+        if (fscanf(fp, "%lu", &val) != 1) {
+            fclose(fp);
+            return -1;
+        }
+        fclose(fp);
+        *tx_packets = (uint32_t)val;
+    }
+    return 0;
+}
+
+static void send_y1731_packet(cfm_link_t *link, uint8_t opcode) {
+    uint8_t tx_buf[1024];
+    memset(tx_buf, 0, sizeof(tx_buf));
+    size_t pkt_len = 0;
+    
+    eth_hdr_t *eth = (eth_hdr_t *)tx_buf;
+    pthread_mutex_lock(&link->lock);
+    memcpy(eth->dst_mac, link->remote_mac, 6);
+    memcpy(eth->src_mac, link->local_mac, 6);
+    eth->eth_type = htons(ETH_P_CFM);
+    
+    if (opcode == Y1731_OPCODE_DMM) {
+        y1731_dmm_dmr_hdr_t *dmm = (y1731_dmm_dmr_hdr_t *)(tx_buf + sizeof(eth_hdr_t));
+        dmm->md_lvl_version = 0xA0; // Level 5
+        dmm->opcode = Y1731_OPCODE_DMM;
+        dmm->flags = 0;
+        dmm->first_tlv_offset = 32;
+        
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        dmm->tx_timestamp_f.sec = htonl((uint32_t)ts.tv_sec);
+        dmm->tx_timestamp_f.nsec = htonl((uint32_t)ts.tv_nsec);
+        pkt_len = sizeof(y1731_dmm_dmr_packet_t);
+    } 
+    else if (opcode == Y1731_OPCODE_LMM) {
+        y1731_lmm_lmr_hdr_t *lmm = (y1731_lmm_lmr_hdr_t *)(tx_buf + sizeof(eth_hdr_t));
+        lmm->md_lvl_version = 0xA0;
+        lmm->opcode = Y1731_OPCODE_LMM;
+        lmm->flags = 0;
+        lmm->first_tlv_offset = 12;
+        
+        uint32_t tx_packets = 0;
+        get_interface_counters(link->ifname, NULL, &tx_packets);
+        lmm->tx_fc_f = htonl(tx_packets);
+        link->prev_tx_fc_f = tx_packets;
+        pkt_len = sizeof(y1731_lmm_lmr_packet_t);
+    } 
+    else if (opcode == Y1731_OPCODE_SLM) {
+        y1731_slm_slr_hdr_t *slm = (y1731_slm_slr_hdr_t *)(tx_buf + sizeof(eth_hdr_t));
+        slm->md_lvl_version = 0xA0;
+        slm->opcode = Y1731_OPCODE_SLM;
+        slm->flags = 0;
+        slm->first_tlv_offset = 16;
+        
+        slm->src_mep_id = htons((uint16_t)link->local_mep_id);
+        slm->responder_mep_id = 0;
+        slm->test_id = 0;
+        
+        link->tx_slm_seq++;
+        slm->tx_fc_l = htonl(link->tx_slm_seq);
+        link->tx_slm_count++;
+        pkt_len = sizeof(y1731_slm_slr_packet_t);
+    }
+    
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = link->ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, link->remote_mac, 6);
+    int sock_fd = link->sock_fd;
+    pthread_mutex_unlock(&link->lock);
+    
+    if (pkt_len > 0 && sock_fd >= 0) {
+        sendto(sock_fd, tx_buf, pkt_len, 0, (struct sockaddr *)&sll, sizeof(sll));
+    }
+}
+
 static void *cfm_monitor_thread(void *arg) {
     (void)arg;
     struct pollfd fds[MAX_INTERFACES];
     uint64_t last_tx_time = get_time_ms();
+    uint64_t last_y1731_time = get_time_ms();
 
     while (g_cfm_running) {
         int active_fds = 0;
@@ -127,54 +244,247 @@ static void *cfm_monitor_thread(void *arg) {
             uint64_t now = get_time_ms();
             for (int i = 0; i < active_fds; i++) {
                 if (fds[i].revents & POLLIN) {
-                    cfm_ccm_packet_t rx_pkt;
-                    ssize_t rx_bytes = recv(fds[i].fd, &rx_pkt, sizeof(rx_pkt), 0);
+                    uint8_t rx_buf[1024];
+                    struct sockaddr_ll sll_rx;
+                    socklen_t sll_rx_len = sizeof(sll_rx);
+                    ssize_t rx_bytes = recvfrom(fds[i].fd, rx_buf, sizeof(rx_buf), 0, (struct sockaddr *)&sll_rx, &sll_rx_len);
                     
-                    if (rx_bytes >= (ssize_t)(sizeof(eth_hdr_t) + sizeof(cfm_ccm_hdr_t))) {
-                        if (ntohs(rx_pkt.eth.eth_type) == ETH_P_CFM) {
-                            uint8_t lvl = (rx_pkt.ccm.md_lvl_version >> 5) & 0x07;
-                            uint8_t op = rx_pkt.ccm.opcode;
+                    if (rx_bytes >= (ssize_t)(sizeof(eth_hdr_t) + 4)) {
+                        eth_hdr_t *eth = (eth_hdr_t *)rx_buf;
+                        if (ntohs(eth->eth_type) == ETH_P_CFM) {
+                            uint8_t *cfm_pdu = rx_buf + sizeof(eth_hdr_t);
+                            uint8_t lvl = (cfm_pdu[0] >> 5) & 0x07;
+                            uint8_t op = cfm_pdu[1];
                             
                             // Process only Level 5 CCM packets
-                            if (lvl == 5 && op == CFM_OPCODE_CCM) {
-                                uint16_t rx_mep_id = ntohs(rx_pkt.ccm.mep_id);
+                            if (lvl == 5) {
+                                cfm_ccm_hdr_t *ccm = (cfm_ccm_hdr_t *)cfm_pdu;
+                                uint16_t rx_mep_id = 0;
+                                if (op == CFM_OPCODE_CCM) {
+                                    rx_mep_id = ntohs(ccm->mep_id);
+                                }
                                 
                                 // Find corresponding link by socket
+                                cfm_link_t *link = NULL;
                                 for (int j = 0; j < g_link_count; j++) {
                                     if (g_links[j].sock_fd == fds[i].fd) {
-                                        pthread_mutex_lock(&g_links[j].lock);
-                                         if (!g_links[j].mac_learned) {
-                                             // Learn peer's MAC and MEP ID dynamically
-                                             memcpy(g_links[j].remote_mac, rx_pkt.eth.src_mac, 6);
-                                             g_links[j].remote_mep_id = rx_mep_id;
-                                             g_links[j].mac_learned = true;
-                                             cfm_link_state_t old_state = g_links[j].state;
-                                             g_links[j].state = CFM_LINK_STATE_UP;
-                                             g_links[j].last_recv_time = now;
-                                             printf("[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x and MEP %d on %s\n",
-                                                    g_links[j].remote_mac[0], g_links[j].remote_mac[1], g_links[j].remote_mac[2],
-                                                    g_links[j].remote_mac[3], g_links[j].remote_mac[4], g_links[j].remote_mac[5],
-                                                    g_links[j].remote_mep_id, g_links[j].ifname);
-                                             if (g_links[j].state != old_state) {
-                                                 const char *old_str = (old_state == CFM_LINK_STATE_INIT) ? "INIT" : ((old_state == CFM_LINK_STATE_UP) ? "UP" : "DOWN");
-                                                 printf("[CFM] Link status on %s changed: %s -> UP\n", g_links[j].ifname, old_str);
-                                             }
-                                         } else {
-                                             // Check if incoming packet matches learned peer
-                                             if (rx_mep_id == g_links[j].remote_mep_id &&
-                                                 memcmp(rx_pkt.eth.src_mac, g_links[j].remote_mac, 6) == 0) {
-                                                 g_links[j].last_recv_time = now;
-                                                 cfm_link_state_t old_state = g_links[j].state;
-                                                 g_links[j].state = CFM_LINK_STATE_UP;
-                                                 if (g_links[j].state != old_state) {
-                                                     const char *old_str = (old_state == CFM_LINK_STATE_INIT) ? "INIT" : ((old_state == CFM_LINK_STATE_UP) ? "UP" : "DOWN");
-                                                     printf("[CFM] Link status on %s changed: %s -> UP\n", g_links[j].ifname, old_str);
-                                                 }
-                                             }
-                                         }
-                                         pthread_mutex_unlock(&g_links[j].lock);
+                                        link = &g_links[j];
                                         break;
                                     }
+                                }
+                                
+                                if (link) {
+                                    pthread_mutex_lock(&link->lock);
+                                    
+                                    if (op == CFM_OPCODE_CCM) {
+                                        if (!link->mac_learned) {
+                                            // Learn peer's MAC and MEP ID dynamically
+                                            memcpy(link->remote_mac, eth->src_mac, 6);
+                                            link->remote_mep_id = rx_mep_id;
+                                            link->mac_learned = true;
+                                            cfm_link_state_t old_state = link->state;
+                                            link->state = CFM_LINK_STATE_UP;
+                                            link->last_recv_time = now;
+                                            printf("[CFM] Learned remote MAC %02x:%02x:%02x:%02x:%02x:%02x and MEP %d on %s\n",
+                                                link->remote_mac[0], link->remote_mac[1], link->remote_mac[2],
+                                                link->remote_mac[3], link->remote_mac[4], link->remote_mac[5],
+                                                link->remote_mep_id, link->ifname);
+                                            if (link->state != old_state) {
+                                                const char *old_str = (old_state == CFM_LINK_STATE_INIT) ? "INIT" : ((old_state == CFM_LINK_STATE_UP) ? "UP" : "DOWN");
+                                                printf("[CFM] Link status on %s changed: %s -> UP\n", link->ifname, old_str);
+                                            }
+                                        } else {
+                                            // Check if incoming packet matches learned peer
+                                            if (rx_mep_id == link->remote_mep_id &&
+                                                memcmp(eth->src_mac, link->remote_mac, 6) == 0) {
+                                                link->last_recv_time = now;
+                                                cfm_link_state_t old_state = link->state;
+                                                link->state = CFM_LINK_STATE_UP;
+                                                if (link->state != old_state) {
+                                                    const char *old_str = (old_state == CFM_LINK_STATE_INIT) ? "INIT" : ((old_state == CFM_LINK_STATE_UP) ? "UP" : "DOWN");
+                                                    printf("[CFM] Link status on %s changed: %s -> UP\n", link->ifname, old_str);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    else if (op == Y1731_OPCODE_DMM) {
+                                        // Responder: Respond to DMM with DMR
+                                        y1731_dmm_dmr_hdr_t *dmm = (y1731_dmm_dmr_hdr_t *)cfm_pdu;
+                                        struct timespec ts_rx, ts_tx;
+                                        clock_gettime(CLOCK_MONOTONIC, &ts_rx);
+                                        
+                                        y1731_dmm_dmr_packet_t tx_pkt;
+                                        memset(&tx_pkt, 0, sizeof(tx_pkt));
+                                        
+                                        memcpy(tx_pkt.eth.dst_mac, eth->src_mac, 6);
+                                        memcpy(tx_pkt.eth.src_mac, link->local_mac, 6);
+                                        tx_pkt.eth.eth_type = htons(ETH_P_CFM);
+                                        
+                                        tx_pkt.dmm_dmr.md_lvl_version = 0xA0;
+                                        tx_pkt.dmm_dmr.opcode = Y1731_OPCODE_DMR;
+                                        tx_pkt.dmm_dmr.flags = 0;
+                                        tx_pkt.dmm_dmr.first_tlv_offset = 32;
+                                        
+                                        tx_pkt.dmm_dmr.tx_timestamp_f = dmm->tx_timestamp_f;
+                                        
+                                        tx_pkt.dmm_dmr.rx_timestamp_f.sec = htonl((uint32_t)ts_rx.tv_sec);
+                                        tx_pkt.dmm_dmr.rx_timestamp_f.nsec = htonl((uint32_t)ts_rx.tv_nsec);
+                                        
+                                        clock_gettime(CLOCK_MONOTONIC, &ts_tx);
+                                        tx_pkt.dmm_dmr.tx_timestamp_b.sec = htonl((uint32_t)ts_tx.tv_sec);
+                                        tx_pkt.dmm_dmr.tx_timestamp_b.nsec = htonl((uint32_t)ts_tx.tv_nsec);
+                                        
+                                        struct sockaddr_ll sll_tx;
+                                        memset(&sll_tx, 0, sizeof(sll_tx));
+                                        sll_tx.sll_family = AF_PACKET;
+                                        sll_tx.sll_ifindex = link->ifindex;
+                                        sll_tx.sll_halen = 6;
+                                        memcpy(sll_tx.sll_addr, eth->src_mac, 6);
+                                        
+                                        sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                    }
+                                    else if (op == Y1731_OPCODE_LMM) {
+                                        // Responder: Respond to LMM with LMR
+                                        y1731_lmm_lmr_hdr_t *lmm = (y1731_lmm_lmr_hdr_t *)cfm_pdu;
+                                        uint32_t rx_packets = 0, tx_packets = 0;
+                                        get_interface_counters(link->ifname, &rx_packets, &tx_packets);
+                                        
+                                        y1731_lmm_lmr_packet_t tx_pkt;
+                                        memset(&tx_pkt, 0, sizeof(tx_pkt));
+                                        
+                                        memcpy(tx_pkt.eth.dst_mac, eth->src_mac, 6);
+                                        memcpy(tx_pkt.eth.src_mac, link->local_mac, 6);
+                                        tx_pkt.eth.eth_type = htons(ETH_P_CFM);
+                                        
+                                        tx_pkt.lmm_lmr.md_lvl_version = 0xA0;
+                                        tx_pkt.lmm_lmr.opcode = Y1731_OPCODE_LMR;
+                                        tx_pkt.lmm_lmr.flags = 0;
+                                        tx_pkt.lmm_lmr.first_tlv_offset = 12;
+                                        
+                                        tx_pkt.lmm_lmr.tx_fc_f = lmm->tx_fc_f;
+                                        tx_pkt.lmm_lmr.rx_fc_f = htonl(rx_packets);
+                                        tx_pkt.lmm_lmr.tx_fc_b = htonl(tx_packets);
+                                        
+                                        struct sockaddr_ll sll_tx;
+                                        memset(&sll_tx, 0, sizeof(sll_tx));
+                                        sll_tx.sll_family = AF_PACKET;
+                                        sll_tx.sll_ifindex = link->ifindex;
+                                        sll_tx.sll_halen = 6;
+                                        memcpy(sll_tx.sll_addr, eth->src_mac, 6);
+                                        
+                                        sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                    }
+                                    else if (op == Y1731_OPCODE_SLM) {
+                                        // Responder: Respond to SLM with SLR
+                                        y1731_slm_slr_hdr_t *slm = (y1731_slm_slr_hdr_t *)cfm_pdu;
+                                        
+                                        y1731_slm_slr_packet_t tx_pkt;
+                                        memset(&tx_pkt, 0, sizeof(tx_pkt));
+                                        
+                                        memcpy(tx_pkt.eth.dst_mac, eth->src_mac, 6);
+                                        memcpy(tx_pkt.eth.src_mac, link->local_mac, 6);
+                                        tx_pkt.eth.eth_type = htons(ETH_P_CFM);
+                                        
+                                        tx_pkt.slm_slr.md_lvl_version = 0xA0;
+                                        tx_pkt.slm_slr.opcode = Y1731_OPCODE_SLR;
+                                        tx_pkt.slm_slr.flags = 0;
+                                        tx_pkt.slm_slr.first_tlv_offset = 16;
+                                        
+                                        tx_pkt.slm_slr.src_mep_id = slm->src_mep_id;
+                                        tx_pkt.slm_slr.responder_mep_id = htons((uint16_t)link->local_mep_id);
+                                        tx_pkt.slm_slr.test_id = slm->test_id;
+                                        tx_pkt.slm_slr.tx_fc_l = slm->tx_fc_l;
+                                        tx_pkt.slm_slr.tx_fc_b = slm->tx_fc_l; // Reflected
+                                        
+                                        struct sockaddr_ll sll_tx;
+                                        memset(&sll_tx, 0, sizeof(sll_tx));
+                                        sll_tx.sll_family = AF_PACKET;
+                                        sll_tx.sll_ifindex = link->ifindex;
+                                        sll_tx.sll_halen = 6;
+                                        memcpy(sll_tx.sll_addr, eth->src_mac, 6);
+                                        
+                                        sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                    }
+                                    else if (op == Y1731_OPCODE_DMR) {
+                                        // Initiator: Process DMR response to calculate RTT & Jitter
+                                        y1731_dmm_dmr_hdr_t *dmr = (y1731_dmm_dmr_hdr_t *)cfm_pdu;
+                                        struct timespec ts4;
+                                        clock_gettime(CLOCK_MONOTONIC, &ts4);
+                                        
+                                        uint32_t t1_sec = ntohl(dmr->tx_timestamp_f.sec);
+                                        uint32_t t1_nsec = ntohl(dmr->tx_timestamp_f.nsec);
+                                        uint32_t t2_sec = ntohl(dmr->rx_timestamp_f.sec);
+                                        uint32_t t2_nsec = ntohl(dmr->rx_timestamp_f.nsec);
+                                        uint32_t t3_sec = ntohl(dmr->tx_timestamp_b.sec);
+                                        uint32_t t3_nsec = ntohl(dmr->tx_timestamp_b.nsec);
+                                        uint32_t t4_sec = (uint32_t)ts4.tv_sec;
+                                        uint32_t t4_nsec = (uint32_t)ts4.tv_nsec;
+                                        
+                                        int64_t t41_us = ((int64_t)t4_sec - t1_sec) * 1000000 + ((int64_t)t4_nsec - t1_nsec) / 1000;
+                                        int64_t t32_us = ((int64_t)t3_sec - t2_sec) * 1000000 + ((int64_t)t3_nsec - t2_nsec) / 1000;
+                                        
+                                        int64_t rtt_us = t41_us - t32_us;
+                                        if (rtt_us < 0) rtt_us = 0;
+                                        
+                                        float alpha = 0.2f;
+                                        if (link->rtt_us == 0) {
+                                            link->rtt_us = (uint32_t)rtt_us;
+                                            link->jitter_us = 0;
+                                        } else {
+                                            int32_t diff = (int32_t)rtt_us - (int32_t)link->rtt_us;
+                                            uint32_t abs_diff = (diff < 0) ? -diff : diff;
+                                            link->jitter_us = (uint32_t)((1.0f - alpha) * link->jitter_us + alpha * abs_diff);
+                                            link->rtt_us = (uint32_t)((1.0f - alpha) * link->rtt_us + alpha * rtt_us);
+                                        }
+                                    }
+                                    else if (op == Y1731_OPCODE_LMR) {
+                                        // Initiator: Process LMR response to calculate hardware packet loss
+                                        y1731_lmm_lmr_hdr_t *lmr = (y1731_lmm_lmr_hdr_t *)cfm_pdu;
+                                        uint32_t t_xfcf = ntohl(lmr->tx_fc_f);
+                                        uint32_t r_xfcf = ntohl(lmr->rx_fc_f);
+                                        uint32_t t_xfcb = ntohl(lmr->tx_fc_b);
+                                        
+                                        uint32_t r_xfcb = 0;
+                                        get_interface_counters(link->ifname, &r_xfcb, NULL);
+                                        
+                                        if (link->prev_tx_fc_f != 0 && link->prev_rx_fc_f != 0 &&
+                                            link->prev_tx_fc_b != 0 && link->prev_rx_fc_b != 0) {
+                                            
+                                            uint32_t tx_diff_init = t_xfcf - link->prev_tx_fc_f;
+                                            uint32_t rx_diff_resp = r_xfcf - link->prev_rx_fc_f;
+                                            uint32_t tx_diff_resp = t_xfcb - link->prev_tx_fc_b;
+                                            uint32_t rx_diff_init = r_xfcb - link->prev_rx_fc_b;
+                                            
+                                            int32_t loss_far = (int32_t)(tx_diff_init - rx_diff_resp);
+                                            int32_t loss_near = (int32_t)(tx_diff_resp - rx_diff_init);
+                                            if (loss_far < 0) loss_far = 0;
+                                            if (loss_near < 0) loss_near = 0;
+                                            
+                                            uint32_t total_loss = loss_far + loss_near;
+                                            uint32_t total_sent = tx_diff_init + tx_diff_resp;
+                                            
+                                            if (total_sent > 0) {
+                                                float rate = (float)total_loss / (float)total_sent;
+                                                if (rate > 1.0f) rate = 1.0f;
+                                                
+                                                float alpha = 0.2f;
+                                                link->loss_rate = (1.0f - alpha) * link->loss_rate + alpha * rate;
+                                            }
+                                        }
+                                        
+                                        link->prev_tx_fc_f = t_xfcf;
+                                        link->prev_rx_fc_f = r_xfcf;
+                                        link->prev_tx_fc_b = t_xfcb;
+                                        link->prev_rx_fc_b = r_xfcb;
+                                        link->loss_mechanism = 1; // LMM
+                                    }
+                                    else if (op == Y1731_OPCODE_SLR) {
+                                        // Initiator: Process SLR response to calculate synthetic packet loss
+                                        link->rx_slr_count++;
+                                        link->loss_mechanism = 2; // SLM
+                                    }
+                                    
+                                    pthread_mutex_unlock(&link->lock);
                                 }
                             }
                         }
@@ -216,6 +526,46 @@ static void *cfm_monitor_thread(void *arg) {
                 }
             }
             last_tx_time = now;
+        }
+
+        // Periodic Y.1731 probes (DMM + LMM/SLM) every 500ms
+        if (now - last_y1731_time >= 500) {
+            for (int i = 0; i < g_link_count; i++) {
+                if (g_links[i].sock_fd >= 0) {
+                    pthread_mutex_lock(&g_links[i].lock);
+                    cfm_link_state_t st = g_links[i].state;
+                    pthread_mutex_unlock(&g_links[i].lock);
+                    
+                    if (st == CFM_LINK_STATE_UP) {
+                        // Send DMM
+                        send_y1731_packet(&g_links[i], Y1731_OPCODE_DMM);
+                        
+                        // Check counters availability to choose LMM vs SLM
+                        uint32_t rx = 0, tx = 0;
+                        if (get_interface_counters(g_links[i].ifname, &rx, &tx) == 0) {
+                            send_y1731_packet(&g_links[i], Y1731_OPCODE_LMM);
+                        } else {
+                            send_y1731_packet(&g_links[i], Y1731_OPCODE_SLM);
+                        }
+                        
+                        // Periodic SLM rate calculation
+                        pthread_mutex_lock(&g_links[i].lock);
+                        if (g_links[i].loss_mechanism == 2 && g_links[i].tx_slm_count >= 10) {
+                            float rate = 1.0f - ((float)g_links[i].rx_slr_count / (float)g_links[i].tx_slm_count);
+                            if (rate < 0.0f) rate = 0.0f;
+                            if (rate > 1.0f) rate = 1.0f;
+                            
+                            float alpha = 0.2f;
+                            g_links[i].loss_rate = (1.0f - alpha) * g_links[i].loss_rate + alpha * rate;
+                            
+                            g_links[i].tx_slm_count = 0;
+                            g_links[i].rx_slr_count = 0;
+                        }
+                        pthread_mutex_unlock(&g_links[i].lock);
+                    }
+                }
+            }
+            last_y1731_time = now;
         }
     }
     return NULL;
@@ -280,8 +630,6 @@ int cfm_init(const struct app_config *cfg) {
                 dp_idx++;
         }
 
-
-
         int sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_CFM));
         if (sock < 0) {
             fprintf(stderr, "[CFM-INIT] Error: Cannot create raw socket for %s: %s\n", bind_ifname, strerror(errno));
@@ -325,7 +673,7 @@ int cfm_init(const struct app_config *cfg) {
         // Query local MAC address dynamically, fallback to DB configuration
         struct ifreq ifr;
         memset(&ifr, 0, sizeof(ifr));
-        strncpy(ifr.ifr_name, wan->ifname, IFNAMSIZ - 1);
+        strncpy(ifr.ifr_name, bind_ifname, IFNAMSIZ - 1);
         if (ioctl(sock, SIOCGIFHWADDR, &ifr) == 0) {
             memcpy(link->local_mac, ifr.ifr_hwaddr.sa_data, 6);
         } else {
@@ -409,6 +757,22 @@ int cfm_get_link_state(int wan_dp) {
         }
     }
     return (int)CFM_LINK_STATE_DOWN;
+}
+
+int cfm_get_link_quality(int wan_dp, y1731_metrics_t *metrics) {
+    if (!metrics) return -1;
+    for (int i = 0; i < g_link_count; i++) {
+        if (g_links[i].wan_dp == wan_dp) {
+            pthread_mutex_lock(&g_links[i].lock);
+            metrics->rtt_us = g_links[i].rtt_us;
+            metrics->jitter_us = g_links[i].jitter_us;
+            metrics->loss_rate = g_links[i].loss_rate;
+            metrics->loss_mechanism = g_links[i].loss_mechanism;
+            pthread_mutex_unlock(&g_links[i].lock);
+            return 0;
+        }
+    }
+    return -2;
 }
 
 void cfm_cleanup(void) {
