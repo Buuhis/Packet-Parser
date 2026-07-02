@@ -3,6 +3,8 @@
 #include "config.h"
 #include "forwarder.h"
 #include "forwarder_wan.h"
+#include "../../inc/db/db_env.h"
+#include <libpq-fe.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +58,21 @@ typedef struct cfm_link {
     uint32_t prev_rx_fc_f;
     uint32_t prev_tx_fc_b;
     uint32_t prev_rx_fc_b;
+
+    // Failover and threshold settings
+    int latency_threshold_ms;
+    bool latency_enable;
+    int loss_threshold_pct;
+    bool loss_enable;
+    int latency_duration_sec;
+    int loss_duration_sec;
+
+    int consecutive_fails;
+    int consecutive_successes;
+    bool quality_is_bad;
+
+    uint64_t last_dmm_tx_time;
+    uint64_t last_lmm_tx_time;
 } cfm_link_t;
 
 static cfm_link_t g_links[MAX_INTERFACES];
@@ -216,11 +233,52 @@ static void send_y1731_packet(cfm_link_t *link, uint8_t opcode) {
     }
 }
 
+static void evaluate_link_quality(cfm_link_t *link, bool is_fail, const char *metric_name, float val, float thresh) {
+    if (is_fail) {
+        link->consecutive_fails++;
+        link->consecutive_successes = 0;
+        printf("[Y1731] Probe fail on %s (%s: %.2f > %.2f). Fails: %d/3\n",
+               link->ifname, metric_name, val, thresh, link->consecutive_fails);
+        if (link->consecutive_fails >= 3 && !link->quality_is_bad) {
+            link->quality_is_bad = true;
+            printf("[Y1731] !!! WAN %s quality marked BAD due to consecutive %s failures !!!\n",
+                   link->ifname, metric_name);
+        }
+    } else {
+        bool latency_ok = true;
+        bool loss_ok = true;
+
+        if (link->latency_enable && link->rtt_us > 0) {
+            float rtt_ms = (float)link->rtt_us / 1000.0f;
+            if (rtt_ms > (float)link->latency_threshold_ms * 0.8f) {
+                latency_ok = false;
+            }
+        }
+        if (link->loss_enable) {
+            float loss_pct = link->loss_rate * 100.0f;
+            if (loss_pct > (float)link->loss_threshold_pct * 0.8f) {
+                loss_ok = false;
+            }
+        }
+
+        if (latency_ok && loss_ok) {
+            link->consecutive_successes++;
+            link->consecutive_fails = 0;
+            printf("[Y1731] Probe success on %s (%s: %.2f <= 80%% of %.2f). Successes: %d/10\n",
+                   link->ifname, metric_name, val, thresh, link->consecutive_successes);
+            if (link->consecutive_successes >= 10 && link->quality_is_bad) {
+                link->quality_is_bad = false;
+                printf("[Y1731] !!! WAN %s quality recovered to GOOD after 10 consecutive successes !!!\n",
+                       link->ifname);
+            }
+        }
+    }
+}
+
 static void *cfm_monitor_thread(void *arg) {
     (void)arg;
     struct pollfd fds[MAX_INTERFACES];
     uint64_t last_tx_time = get_time_ms();
-    uint64_t last_y1731_time = get_time_ms();
 
     while (g_cfm_running) {
         int active_fds = 0;
@@ -342,6 +400,7 @@ static void *cfm_monitor_thread(void *arg) {
                                         memcpy(sll_tx.sll_addr, eth->src_mac, 6);
                                         
                                         sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                        printf("[Y1731] Responded to DMM with DMR on %s\n", link->ifname);
                                     }
                                     else if (op == Y1731_OPCODE_LMM) {
                                         // Responder: Respond to LMM with LMR
@@ -373,6 +432,7 @@ static void *cfm_monitor_thread(void *arg) {
                                         memcpy(sll_tx.sll_addr, eth->src_mac, 6);
                                         
                                         sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                        printf("[Y1731] Responded to LMM with LMR on %s (RxFC: %u, TxFC: %u)\n", link->ifname, rx_packets, tx_packets);
                                     }
                                     else if (op == Y1731_OPCODE_SLM) {
                                         // Responder: Respond to SLM with SLR
@@ -404,6 +464,7 @@ static void *cfm_monitor_thread(void *arg) {
                                         memcpy(sll_tx.sll_addr, eth->src_mac, 6);
                                         
                                         sendto(link->sock_fd, &tx_pkt, sizeof(tx_pkt), 0, (struct sockaddr *)&sll_tx, sizeof(sll_tx));
+                                        printf("[Y1731] Responded to SLM with SLR on %s (Seq: %u)\n", link->ifname, ntohl(slm->tx_fc_l));
                                     }
                                     else if (op == Y1731_OPCODE_DMR) {
                                         // Initiator: Process DMR response to calculate RTT & Jitter
@@ -435,6 +496,14 @@ static void *cfm_monitor_thread(void *arg) {
                                             uint32_t abs_diff = (diff < 0) ? -diff : diff;
                                             link->jitter_us = (uint32_t)((1.0f - alpha) * link->jitter_us + alpha * abs_diff);
                                             link->rtt_us = (uint32_t)((1.0f - alpha) * link->rtt_us + alpha * rtt_us);
+                                        }
+                                        printf("[Y1731] Received DMR on %s: RTT = %u us, Jitter = %u us\n", link->ifname, link->rtt_us, link->jitter_us);
+                                        if (link->latency_enable) {
+                                            float rtt_ms = (float)link->rtt_us / 1000.0f;
+                                            bool is_fail = (rtt_ms > (float)link->latency_threshold_ms);
+                                            if (is_fail || rtt_ms <= (float)link->latency_threshold_ms * 0.8f) {
+                                                evaluate_link_quality(link, is_fail, "latency", rtt_ms, (float)link->latency_threshold_ms);
+                                            }
                                         }
                                     }
                                     else if (op == Y1731_OPCODE_LMR) {
@@ -469,6 +538,14 @@ static void *cfm_monitor_thread(void *arg) {
                                                 
                                                 float alpha = 0.2f;
                                                 link->loss_rate = (1.0f - alpha) * link->loss_rate + alpha * rate;
+                                                printf("[Y1731] Received LMR on %s: Loss Rate = %.2f%% (LMM)\n", link->ifname, link->loss_rate * 100.0f);
+                                                if (link->loss_enable) {
+                                                    float loss_pct = link->loss_rate * 100.0f;
+                                                    bool is_fail = (loss_pct > (float)link->loss_threshold_pct);
+                                                    if (is_fail || loss_pct <= (float)link->loss_threshold_pct * 0.8f) {
+                                                        evaluate_link_quality(link, is_fail, "loss", loss_pct, (float)link->loss_threshold_pct);
+                                                    }
+                                                }
                                             }
                                         }
                                         
@@ -482,6 +559,7 @@ static void *cfm_monitor_thread(void *arg) {
                                         // Initiator: Process SLR response to calculate synthetic packet loss
                                         link->rx_slr_count++;
                                         link->loss_mechanism = 2; // SLM
+                                        printf("[Y1731] Received SLR on %s: Seq reflected, SLR count = %u\n", link->ifname, link->rx_slr_count);
                                     }
                                     
                                     pthread_mutex_unlock(&link->lock);
@@ -528,44 +606,61 @@ static void *cfm_monitor_thread(void *arg) {
             last_tx_time = now;
         }
 
-        // Periodic Y.1731 probes (DMM + LMM/SLM) every 500ms
-        if (now - last_y1731_time >= 500) {
-            for (int i = 0; i < g_link_count; i++) {
-                if (g_links[i].sock_fd >= 0) {
-                    pthread_mutex_lock(&g_links[i].lock);
-                    cfm_link_state_t st = g_links[i].state;
-                    pthread_mutex_unlock(&g_links[i].lock);
-                    
-                    if (st == CFM_LINK_STATE_UP) {
-                        // Send DMM
-                        send_y1731_packet(&g_links[i], Y1731_OPCODE_DMM);
-                        
-                        // Check counters availability to choose LMM vs SLM
-                        uint32_t rx = 0, tx = 0;
-                        if (get_interface_counters(g_links[i].ifname, &rx, &tx) == 0) {
-                            send_y1731_packet(&g_links[i], Y1731_OPCODE_LMM);
-                        } else {
-                            send_y1731_packet(&g_links[i], Y1731_OPCODE_SLM);
+        // Periodic Y.1731 probes (DMM + LMM/SLM) based on user configured durations
+        for (int i = 0; i < g_link_count; i++) {
+            if (g_links[i].sock_fd >= 0) {
+                pthread_mutex_lock(&g_links[i].lock);
+                cfm_link_state_t st = g_links[i].state;
+                
+                if (st == CFM_LINK_STATE_UP) {
+                    // Send DMM if enabled and latency duration has elapsed
+                    if (g_links[i].latency_enable) {
+                        uint64_t lat_dur_ms = (g_links[i].latency_duration_sec > 0 ? g_links[i].latency_duration_sec : 5) * 1000ULL;
+                        if (now - g_links[i].last_dmm_tx_time >= lat_dur_ms) {
+                            send_y1731_packet(&g_links[i], Y1731_OPCODE_DMM);
+                            g_links[i].last_dmm_tx_time = now;
                         }
-                        
-                        // Periodic SLM rate calculation
-                        pthread_mutex_lock(&g_links[i].lock);
-                        if (g_links[i].loss_mechanism == 2 && g_links[i].tx_slm_count >= 10) {
-                            float rate = 1.0f - ((float)g_links[i].rx_slr_count / (float)g_links[i].tx_slm_count);
-                            if (rate < 0.0f) rate = 0.0f;
-                            if (rate > 1.0f) rate = 1.0f;
-                            
-                            float alpha = 0.2f;
-                            g_links[i].loss_rate = (1.0f - alpha) * g_links[i].loss_rate + alpha * rate;
-                            
-                            g_links[i].tx_slm_count = 0;
-                            g_links[i].rx_slr_count = 0;
+                    }
+
+                    // Send LMM/SLM if enabled and loss duration has elapsed
+                    if (g_links[i].loss_enable) {
+                        uint64_t loss_dur_ms = (g_links[i].loss_duration_sec > 0 ? g_links[i].loss_duration_sec : 5) * 1000ULL;
+                        if (now - g_links[i].last_lmm_tx_time >= loss_dur_ms) {
+                            uint32_t rx = 0, tx = 0;
+                            if (get_interface_counters(g_links[i].ifname, &rx, &tx) == 0) {
+                                send_y1731_packet(&g_links[i], Y1731_OPCODE_LMM);
+                            } else {
+                                send_y1731_packet(&g_links[i], Y1731_OPCODE_SLM);
+                            }
+                            g_links[i].last_lmm_tx_time = now;
                         }
-                        pthread_mutex_unlock(&g_links[i].lock);
+                    }
+
+                    // Periodic SLM rate calculation
+                    if (g_links[i].loss_mechanism == 2 && g_links[i].tx_slm_count >= 10) {
+                        float rate = 1.0f - ((float)g_links[i].rx_slr_count / (float)g_links[i].tx_slm_count);
+                        if (rate < 0.0f) rate = 0.0f;
+                        if (rate > 1.0f) rate = 1.0f;
+                        
+                        float alpha = 0.2f;
+                        g_links[i].loss_rate = (1.0f - alpha) * g_links[i].loss_rate + alpha * rate;
+                        printf("[Y1731] Calculated SLR loss rate on %s: Loss Rate = %.2f%% (SLM)\n", g_links[i].ifname, g_links[i].loss_rate * 100.0f);
+                        
+                        g_links[i].tx_slm_count = 0;
+                        g_links[i].rx_slr_count = 0;
+
+                        // Evaluate loss quality for SLM
+                        if (g_links[i].loss_enable) {
+                            float loss_pct = g_links[i].loss_rate * 100.0f;
+                            bool is_fail = (loss_pct > (float)g_links[i].loss_threshold_pct);
+                            if (is_fail || loss_pct <= (float)g_links[i].loss_threshold_pct * 0.8f) {
+                                evaluate_link_quality(&g_links[i], is_fail, "loss", loss_pct, (float)g_links[i].loss_threshold_pct);
+                            }
+                        }
                     }
                 }
+                pthread_mutex_unlock(&g_links[i].lock);
             }
-            last_y1731_time = now;
         }
     }
     return NULL;
@@ -585,6 +680,8 @@ static void get_cfm_bind_interface(const char *phys_ifname, char *bind_ifname, s
         bind_ifname[max_len - 1] = '\0';
     }
 }
+
+static void cfm_update_thresholds_internal(bool lock_init);
 
 int cfm_init(const struct app_config *cfg) {
     pthread_mutex_lock(&g_cfm_init_lock);
@@ -709,11 +806,24 @@ int cfm_init(const struct app_config *cfg) {
         link->state = CFM_LINK_STATE_INIT;
         pthread_mutex_init(&link->lock, NULL);
 
+        link->latency_threshold_ms = 0;
+        link->latency_enable = false;
+        link->loss_threshold_pct = 0;
+        link->loss_enable = false;
+        link->latency_duration_sec = 0;
+        link->loss_duration_sec = 0;
+        link->consecutive_fails = 0;
+        link->consecutive_successes = 0;
+        link->quality_is_bad = false;
+        link->last_dmm_tx_time = 0;
+        link->last_lmm_tx_time = 0;
+
         g_link_count++;
         initialized_links++;
     }
 
     if (initialized_links > 0) {
+        cfm_update_thresholds_internal(false);
         g_cfm_running = true;
         if (pthread_create(&g_cfm_thread, NULL, cfm_monitor_thread, NULL) != 0) {
             fprintf(stderr, "[CFM-INIT] Error: Failed to create CFM monitor thread.\n");
@@ -735,12 +845,107 @@ int cfm_init(const struct app_config *cfg) {
     return 0;
 }
 
+static void cfm_update_thresholds_internal(bool lock_init) {
+    struct ne_postgres_conn pg;
+    memset(&pg, 0, sizeof(pg));
+    if (load_ne_env() != 0) {
+        // Envs loaded
+    }
+    if (ne_postgres_conn_fill(&pg) != 0) {
+        fprintf(stderr, "[CFM-DB] Error: ne_postgres_conn_fill failed\n");
+        return;
+    }
+
+    PGconn *conn = PQconnectdbParams(pg.keywords, pg.values, 0);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "[CFM-DB] Error: DB Connection failed: %s\n", PQerrorMessage(conn));
+        PQfinish(conn);
+        return;
+    }
+
+    if (lock_init) {
+        pthread_mutex_lock(&g_cfm_init_lock);
+    }
+    for (int j = 0; j < g_link_count; j++) {
+        const char *param_values[1];
+        param_values[0] = g_links[j].ifname;
+
+        PGresult *res = PQexecParams(conn,
+            "SELECT w.latency, w.latency_enable, w.loss_percentage, w.loss_enable, p.latency_duration, p.loss_duration "
+            "FROM ne_wan w "
+            "JOIN ne_profiles p ON w.profile_id = p.id "
+            "WHERE w.interface = $1 "
+            "ORDER BY w.created_at DESC LIMIT 1",
+            1, NULL, param_values, NULL, NULL, 0);
+
+        if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+            pthread_mutex_lock(&g_links[j].lock);
+            
+            // Read latency
+            int col_lat = PQfnumber(res, "latency");
+            int col_lat_en = PQfnumber(res, "latency_enable");
+            if (col_lat >= 0 && !PQgetisnull(res, 0, col_lat)) {
+                g_links[j].latency_threshold_ms = atoi(PQgetvalue(res, 0, col_lat));
+            }
+            if (col_lat_en >= 0 && !PQgetisnull(res, 0, col_lat_en)) {
+                const char *val = PQgetvalue(res, 0, col_lat_en);
+                g_links[j].latency_enable = (val[0] == 't' || val[0] == '1');
+            }
+
+            // Read loss
+            int col_loss = PQfnumber(res, "loss_percentage");
+            int col_loss_en = PQfnumber(res, "loss_enable");
+            if (col_loss >= 0 && !PQgetisnull(res, 0, col_loss)) {
+                g_links[j].loss_threshold_pct = atoi(PQgetvalue(res, 0, col_loss));
+            }
+            if (col_loss_en >= 0 && !PQgetisnull(res, 0, col_loss_en)) {
+                const char *val = PQgetvalue(res, 0, col_loss_en);
+                g_links[j].loss_enable = (val[0] == 't' || val[0] == '1');
+            }
+
+            // Read durations
+            int col_lat_dur = PQfnumber(res, "latency_duration");
+            int col_loss_dur = PQfnumber(res, "loss_duration");
+            if (col_lat_dur >= 0 && !PQgetisnull(res, 0, col_lat_dur)) {
+                g_links[j].latency_duration_sec = atoi(PQgetvalue(res, 0, col_lat_dur));
+            }
+            if (col_loss_dur >= 0 && !PQgetisnull(res, 0, col_loss_dur)) {
+                g_links[j].loss_duration_sec = atoi(PQgetvalue(res, 0, col_loss_dur));
+            }
+
+            pthread_mutex_unlock(&g_links[j].lock);
+
+            printf("[CFM-DB] Query OK for %s: latency=%d/%d (dur=%ds), loss=%d/%d (dur=%ds)\n",
+                   g_links[j].ifname,
+                   g_links[j].latency_threshold_ms, g_links[j].latency_enable, g_links[j].latency_duration_sec,
+                   g_links[j].loss_threshold_pct, g_links[j].loss_enable, g_links[j].loss_duration_sec);
+        } else {
+            fprintf(stderr, "[CFM-DB] Warning: No WAN thresholds found in DB for %s (query status: %s)\n",
+                    g_links[j].ifname, PQresultErrorMessage(res));
+        }
+        PQclear(res);
+    }
+    if (lock_init) {
+        pthread_mutex_unlock(&g_cfm_init_lock);
+    }
+
+    PQfinish(conn);
+}
+
+void cfm_update_thresholds(const struct app_config *cfg) {
+    (void)cfg;
+    cfm_update_thresholds_internal(true);
+}
+
+
 bool cfm_is_link_up(int wan_dp) {
     for (int i = 0; i < g_link_count; i++) {
         if (g_links[i].wan_dp == wan_dp) {
             pthread_mutex_lock(&g_links[i].lock);
             cfm_link_state_t state = g_links[i].state;
+            bool bad = g_links[i].quality_is_bad;
             pthread_mutex_unlock(&g_links[i].lock);
+            if (bad) return false;
             return (state == CFM_LINK_STATE_UP || state == CFM_LINK_STATE_INIT);
         }
     }

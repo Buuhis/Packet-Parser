@@ -62,4 +62,9 @@ int cfm_get_link_quality(int wan_dp, y1731_metrics_t *metrics);
  */
 void cfm_cleanup(void);
 
+/**
+ * Update latency/loss thresholds dynamically when config reloads.
+ */
+void cfm_update_thresholds(const struct app_config *cfg);
+
 #endif // CFM_DIAG_H
