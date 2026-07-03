@@ -1481,16 +1481,73 @@ void sig_pqc_trigger_retry(int policy_id) {
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id) {
     PGconn *conn = (PGconn *)conn_ptr;
     const struct app_config *cfg = (const struct app_config *)cfg_ptr;
+    (void)profile_idx;
+    (void)cfg;
 
     char peer_ip[64] = "0.0.0.0";
+    char wan_ifname_buf[64] = "";
     const char *wan_ifname = "";
-    pqc_get_profile_handshake_params(cfg, profile_idx, peer_ip, &wan_ifname);
 
     char policy_id_str[32];
     snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
     const char *pqc_params[1] = { policy_id_str };
+
+    // Query to get the tunnel parameters from pqc_exchange_tunnels
+    PGresult *tunnel_res = PQexecParams(conn,
+        "SELECT t.tunnel_name, t.client_tunnel_ip::text, t.peer_tunnel_ip::text "
+        "FROM pqc_exchange_tunnels t "
+        "JOIN profile_tunnel_ref r ON t.id = r.tunnel_id "
+        "JOIN ne_policies p ON r.profile_id = p.profile_id "
+        "WHERE p.id = $1",
+        1, NULL, pqc_params, NULL, NULL, 0);
+
+    if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
+        const char *t_name = PQgetvalue(tunnel_res, 0, 0);
+        const char *client_ip = PQgetvalue(tunnel_res, 0, 1);
+        const char *peer_ip_db = PQgetvalue(tunnel_res, 0, 2);
+
+        if (t_name) {
+            strncpy(wan_ifname_buf, t_name, sizeof(wan_ifname_buf) - 1);
+            wan_ifname = wan_ifname_buf;
+
+            // Resolve local IP on the tunnel interface
+            char local_ip[64] = "0.0.0.0";
+            int temp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+            if (temp_sock >= 0) {
+                struct ifreq ifr;
+                memset(&ifr, 0, sizeof(ifr));
+                strncpy(ifr.ifr_name, t_name, IFNAMSIZ - 1);
+                ifr.ifr_addr.sa_family = AF_INET;
+                if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
+                    struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
+                    strncpy(local_ip, inet_ntoa(ipaddr->sin_addr), sizeof(local_ip) - 1);
+                }
+                close(temp_sock);
+            }
+
+            // Compare local IP with client_tunnel_ip and peer_tunnel_ip
+            if (client_ip && peer_ip_db) {
+                if (strcmp(local_ip, client_ip) == 0) {
+                    strncpy(peer_ip, peer_ip_db, sizeof(peer_ip) - 1);
+                } else if (strcmp(local_ip, peer_ip_db) == 0) {
+                    strncpy(peer_ip, client_ip, sizeof(peer_ip) - 1);
+                } else {
+                    strncpy(peer_ip, peer_ip_db, sizeof(peer_ip) - 1);
+                }
+            }
+            fprintf(stderr, "[DB-PQC] Tunnel resolved: Name=%s, LocalIP=%s, PeerIP=%s\n",
+                    t_name, local_ip, peer_ip);
+        }
+    } else {
+        fprintf(stderr, "[DB-PQC] Warning: No tunnel configuration found for policy %d\n", db_policy_id);
+    }
+    PQclear(tunnel_res);
+
     PGresult *peer_res = PQexecParams(conn,
-        "SELECT local_identity_fingerprint, peer_pub FROM pqc_identities WHERE policy_id = $1",
+        "SELECT k.local, k.remote "
+        "FROM pqc_keys k "
+        "JOIN policy_pqc_ref r ON k.key_id = r.key_id "
+        "WHERE r.policy_id = $1",
         1, NULL, pqc_params, NULL, NULL, 0);
 
     if (PQresultStatus(peer_res) == PGRES_TUPLES_OK && PQntuples(peer_res) > 0) {

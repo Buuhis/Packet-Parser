@@ -496,14 +496,8 @@ void pqc_handshake_start_all_profiles(struct app_config *cfg) {
         }
 
         if (has_pqc_policy) {
-            char peer_ip_str[64] = "0.0.0.0";
-            const char *wan_ifname = "";
-            pqc_get_profile_handshake_params(cfg, p_idx, peer_ip_str, &wan_ifname);
-            if (wan_ifname && wan_ifname[0] != '\0') {
-                fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d on %s -> Peer IP: %s\n",
-                       p->id, wan_ifname, peer_ip_str);
-                sig_pqc_handshake_start(p->id, wan_ifname, peer_ip_str);
-            }
+            fprintf(stderr, "[PQC-HS] Starting Handshake for Profile %d using tunnel configuration\n", p->id);
+            sig_pqc_handshake_start(p->id, "", "");
         }
     }
 }
