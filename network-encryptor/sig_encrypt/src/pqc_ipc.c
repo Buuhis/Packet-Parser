@@ -57,8 +57,10 @@ static void *ipc_listener_thread_main(void *arg) {
         if (n > 0) {
             int policy_id = -1;
             if (sscanf(buf, "RETRY %d", &policy_id) == 1) {
-                sig_pqc_trigger_retry(policy_id);
-                if (write(client_fd, "SUCCESS\n", 8) < 0) {
+                char resp_buf[1024];
+                memset(resp_buf, 0, sizeof(resp_buf));
+                sig_pqc_trigger_retry_with_info(policy_id, resp_buf, sizeof(resp_buf) - 1);
+                if (write(client_fd, resp_buf, strlen(resp_buf)) < 0) {
                     perror("write");
                 }
             } else {

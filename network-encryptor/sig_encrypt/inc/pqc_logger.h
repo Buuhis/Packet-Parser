@@ -11,6 +11,6 @@
 // Thread-safe log writer.
 // Formats log and writes it to the top of /var/log/NE/authen_pqc.log,
 // keeping only up to 5,000 lines and pruning lines older than 15 days.
-void sig_pqc_write_log(int policy_id, const char *level, const char *status, const char *msg);
+void sig_pqc_write_log(int policy_id, const char *key_id, const char *level, const char *status, const char *msg);
 
 #endif // PQC_LOGGER_H

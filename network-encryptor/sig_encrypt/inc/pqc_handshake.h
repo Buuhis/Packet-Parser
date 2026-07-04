@@ -89,6 +89,7 @@ typedef struct {
     char local_fingerprint[16];
     char peer_fingerprint[16];
     char wan_ifname[64];
+    char key_id[256];
 
     bool key_ready;
     bool is_initiator;
@@ -169,6 +170,7 @@ bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_ip, const char *local_fg,
                          const char *peer_fg, const char *wan_ifname,
+                         const char *key_id,
                          const char *local_priv, const char *local_pub,
                          const char *peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
@@ -190,6 +192,7 @@ int sig_pqc_get_keys(int policy_id, uint8_t keys[3][32], uint8_t key_ids[3], boo
 void sig_pqc_promote_responder_key(int policy_id);
 void sig_pqc_discard_prev_key(int policy_id);
 void sig_pqc_trigger_retry(int policy_id);
+int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_max);
 
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
 

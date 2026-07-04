@@ -30,7 +30,7 @@ static void get_iso8601_time(char *buf, size_t len) {
     }
 }
 
-void sig_pqc_write_log(int policy_id, const char *level, const char *status, const char *msg) {
+void sig_pqc_write_log(int policy_id, const char *key_id, const char *level, const char *status, const char *msg) {
     pthread_mutex_lock(&g_log_mutex);
 
     // 1. Ensure log directory exists
@@ -101,8 +101,8 @@ void sig_pqc_write_log(int policy_id, const char *level, const char *status, con
     fp = fopen(LOG_FILE, "w");
     if (fp) {
         // Write newest entry
-        fprintf(fp, "%s [%s] [Policy: %d] Status: %s | MSG: %s\n", 
-                time_str, level, policy_id, status, msg);
+        fprintf(fp, "%s [%s] [Policy: %d] [Key_id: %s] Status: %s | MSG: %s\n", 
+                time_str, level, policy_id, key_id ? key_id : "N/A", status, msg);
         
         // Write kept old entries (limit to MAX_LOG_LINES - 1 to account for the new one)
         for (int i = 0; i < saved_count && i < (MAX_LOG_LINES - 1); i++) {
