@@ -7,7 +7,7 @@ CFLAGS = -D_GNU_SOURCE -Iinc -Isig_encrypt/inc -Ifailover/inc -I/usr/local/inclu
 
 # Quan trọng: Thêm -L/usr/local/lib và -Lsig_encrypt/lib để Linker tìm thấy thư viện.
 # Thêm -Wl,-rpath để chương trình tìm thấy file .so lúc chạy mà không cần ldconfig.
-LDFLAGS = -L/usr/local/lib -Lsig_encrypt/lib -lxdp -lbpf -lpthread -lssl -lcrypto -lpq -Wl,-rpath,$(shell pwd)/sig_encrypt/lib
+LDFLAGS = -L/usr/local/lib -Lsig_encrypt/lib -lxdp -lbpf -lpthread -lssl -lcrypto -lscrypt -lpq -Wl,-rpath,$(shell pwd)/sig_encrypt/lib
 
 BPF_CFLAGS = -O2 -target bpf -g
 KERNEL_HEADERS = /usr/include

@@ -349,6 +349,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
     bool is_bridge_mode = (strlen(wan_ifname) > 0 && 
                           (strlen(peer_ip) == 0 || strcmp(peer_ip, "0.0.0.0") == 0));
+    if (b->is_tunnel) {
+        is_bridge_mode = false;
+    }
 
     const char *initial_role = (b->role_mode == PQC_ROLE_INITIATOR) ? "INITIATOR" :
                                (b->role_mode == PQC_ROLE_RESPONDER) ? "RESPONDER" : "DYNAMIC (resolving...)";
@@ -573,6 +576,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
                     usleep(500000);
                 } else {
+                    uint64_t now = get_time_ms_hs();
+                    if (!b->rotation_give_up && (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS + 15000)) {
+                        fprintf(stderr, "[PQC-HS-L2] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
+                        sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed. No handshake request received from Peer.");
+                        pthread_mutex_lock(&g_key_mutex);
+                        b->rotation_give_up = true;
+                        pthread_mutex_unlock(&g_key_mutex);
+                    }
+
                     uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                     pqc_rx_pkt_info_t info;
                     int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -868,6 +880,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
                     usleep(500000);
                 } else {
+                    uint64_t now = get_time_ms_hs();
+                    if (!b->rotation_give_up && (now - b->last_rotation_time > KEY_ROTATION_INTERVAL_MS + 15000)) {
+                        fprintf(stderr, "[PQC-HS-L3] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
+                        sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed. No handshake request received from Peer.");
+                        pthread_mutex_lock(&g_key_mutex);
+                        b->rotation_give_up = true;
+                        pthread_mutex_unlock(&g_key_mutex);
+                    }
+
                     uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                     pqc_rx_pkt_info_t info;
                     int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -1193,7 +1214,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_fg, const char *wan_ifname,
                          const char *key_id,
                          const char *local_priv, const char *local_pub,
-                         const char *peer_pub) {
+                         const char *peer_pub, bool is_tunnel) {
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
@@ -1251,7 +1272,12 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         }
         strncpy(b->peer_ip, peer_ip ? peer_ip : "", sizeof(b->peer_ip) - 1);
         b->peer_ip[sizeof(b->peer_ip) - 1] = '\0';
-        strncpy(b->local_fingerprint, local_fg ? local_fg : "", sizeof(b->local_fingerprint) - 1);
+        char clean_local_fg[16] = "";
+        if (local_fg) {
+            strncpy(clean_local_fg, local_fg, 8);
+            clean_local_fg[8] = '\0';
+        }
+        strncpy(b->local_fingerprint, clean_local_fg, sizeof(b->local_fingerprint) - 1);
         b->local_fingerprint[sizeof(b->local_fingerprint) - 1] = '\0';
         strncpy(b->peer_fingerprint, peer_fg ? peer_fg : "", sizeof(b->peer_fingerprint) - 1);
         b->peer_fingerprint[sizeof(b->peer_fingerprint) - 1] = '\0';
@@ -1259,6 +1285,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->wan_ifname[sizeof(b->wan_ifname) - 1] = '\0';
         strncpy(b->key_id, key_id ? key_id : "", sizeof(b->key_id) - 1);
         b->key_id[sizeof(b->key_id) - 1] = '\0';
+        b->is_tunnel = is_tunnel;
 
         if (b->local_priv) free(b->local_priv);
         if (b->local_pub) free(b->local_pub);
@@ -1282,9 +1309,14 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
 }
 
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub) {
+    if (!fingerprint) return -1;
+    char clean_fg[16] = "";
+    strncpy(clean_fg, fingerprint, 8);
+    clean_fg[8] = '\0';
+
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
-        if (strcmp(g_identity_registry[i].fingerprint, fingerprint) == 0) {
+        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
             if (out_priv) *out_priv = g_identity_registry[i].priv_key;
             if (out_pub) *out_pub = g_identity_registry[i].pub_key;
             pthread_mutex_unlock(&g_key_mutex);
@@ -1534,6 +1566,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
     char peer_ip[64] = "0.0.0.0";
     char wan_ifname_buf[64] = "";
     const char *wan_ifname = "";
+    bool is_tunnel = false;
 
     char policy_id_str[32];
     snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
@@ -1549,6 +1582,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         1, NULL, pqc_params, NULL, NULL, 0);
 
     if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
+        is_tunnel = true;
         const char *t_name = PQgetvalue(tunnel_res, 0, 0);
         const char *client_ip = PQgetvalue(tunnel_res, 0, 1);
         const char *peer_ip_db = PQgetvalue(tunnel_res, 0, 2);
@@ -1662,7 +1696,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         }
 
         if (valid) {
-            sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, key_id, found_priv, found_pub, deobf_pub);
+            sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, key_id, found_priv, found_pub, deobf_pub, is_tunnel);
         } else {
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
             sig_pqc_write_log(db_policy_id, key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");

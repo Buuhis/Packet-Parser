@@ -97,6 +97,7 @@ typedef struct {
     bool handshake_give_up;
     bool rotation_give_up;
     bool send_poke;
+    bool is_tunnel;
 } policy_key_binding_t;
 
 typedef struct {
@@ -172,7 +173,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *peer_fg, const char *wan_ifname,
                          const char *key_id,
                          const char *local_priv, const char *local_pub,
-                         const char *peer_pub);
+                         const char *peer_pub, bool is_tunnel);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 void sig_pqc_load_keys_from_disk(void);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
