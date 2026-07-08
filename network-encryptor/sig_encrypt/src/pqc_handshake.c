@@ -1292,14 +1292,24 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
             if (b->role_mode != role_mode) changed = true;
 
             if (changed) {
-                fprintf(stderr, "[PQC-BIND] Configuration change detected for Policy %d. Stopping old handshake worker...\n", policy_id);
+                fprintf(stderr, "[PQC-BIND-DBG] Policy %d: change detected, thread_started=%d, about to wait for worker exit...\n",
+                        policy_id, (int)b->thread_started);
                 if (b->thread_started) {
+                    uint64_t wait_start = get_time_ms_hs();
                     b->thread_exit_sig = true;
+                    int wait_iters = 0;
                     while (b->thread_started) {
                         pthread_mutex_unlock(&g_key_mutex);
                         usleep(1000);
                         pthread_mutex_lock(&g_key_mutex);
+                        wait_iters++;
+                        if (wait_iters % 500 == 0) {
+                            fprintf(stderr, "[PQC-BIND-DBG] Policy %d: STILL waiting for worker exit... (%dms elapsed)\n",
+                                    policy_id, (int)(get_time_ms_hs() - wait_start));
+                        }
                     }
+                    fprintf(stderr, "[PQC-BIND-DBG] Policy %d: worker exited after %dms. Proceeding.\n",
+                            policy_id, (int)(get_time_ms_hs() - wait_start));
                     b->thread_exit_sig = false;
                 }
                 b->key_ready = false;
@@ -1652,6 +1662,9 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
     const struct app_config *cfg = (const struct app_config *)cfg_ptr;
     (void)profile_idx;
     (void)cfg;
+    fprintf(stderr, "[DB-PQC-DBG] ENTER load_and_bind_policy: policy=%d profile=%d conn_status=%s\n",
+            db_policy_id, profile_id,
+            conn ? PQstatus(conn) == CONNECTION_OK ? "OK" : "BAD" : "NULL");
 
     char peer_ip[64] = "0.0.0.0";
     char wan_ifname_buf[64] = "";
@@ -1671,6 +1684,9 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         "JOIN ne_policies p ON r.profile_id = p.profile_id "
         "WHERE p.id = $1",
         1, NULL, pqc_params, NULL, NULL, 0);
+    fprintf(stderr, "[DB-PQC-DBG] policy=%d tunnel query status=%s ntuples=%d err='%s'\n",
+            db_policy_id, PQresStatus(PQresultStatus(tunnel_res)),
+            PQntuples(tunnel_res), PQresultErrorMessage(tunnel_res));
 
     if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
         is_tunnel = true;
@@ -1787,7 +1803,9 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         }
 
         if (valid) {
+            fprintf(stderr, "[DB-PQC-DBG] CALLING sig_pqc_bind_policy for policy=%d...\n", db_policy_id);
             sig_pqc_bind_policy(db_policy_id, profile_id, role_mode, peer_ip, local_fg, peer_fg_buf, wan_ifname, key_id, found_priv, found_pub, deobf_pub, is_tunnel);
+            fprintf(stderr, "[DB-PQC-DBG] sig_pqc_bind_policy RETURNED for policy=%d\n", db_policy_id);
         } else {
             fprintf(stderr, "[DB-PQC] ERROR: Policy %d PQC config is invalid or keys are missing. PQC Handshake will NOT start.\n", db_policy_id);
             sig_pqc_write_log(db_policy_id, key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Security configuration error.");
