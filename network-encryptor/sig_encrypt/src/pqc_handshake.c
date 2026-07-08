@@ -36,6 +36,7 @@ static policy_key_binding_t g_policy_bindings[MAX_POLICY_BINDINGS];
 static int g_policy_bindings_count = 0;
 static volatile int g_policy_key_version[MAX_POLICY_BINDINGS] = {0};
 static volatile int g_datapath_key_version[MAX_POLICY_BINDINGS] = {0};
+static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 
 static bool g_dispatcher_running = false;
 
@@ -344,6 +345,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         if (my_priv) free(my_priv);
         if (my_pub) free(my_pub);
         if (peer_pub) free(peer_pub);
+        pthread_mutex_lock(&g_key_mutex);
+        b->thread_started = false;
+        pthread_mutex_unlock(&g_key_mutex);
         return NULL;
     }
 
@@ -367,10 +371,13 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         if (pqc_l2_init_peer(&peer, wan_ifname) < 0) {
             fprintf(stderr, "[PQC-WORKER] Policy %d: Failed to init L2 peer on %s\n", policy_id, wan_ifname);
             free(my_priv); free(my_pub); free(peer_pub);
+            pthread_mutex_lock(&g_key_mutex);
+            b->thread_started = false;
+            pthread_mutex_unlock(&g_key_mutex);
             return NULL;
         }
 
-        while (g_dispatcher_running) {
+        while (g_dispatcher_running && !b->thread_exit_sig) {
             if (b->handshake_give_up) {
                 usleep(500000);
                 continue;
@@ -378,14 +385,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             if (!b->key_ready) {
                 if (b->role_mode == PQC_ROLE_DYNAMIC || is_initiator) {
                     fprintf(stderr, "[PQC-WORKER] Policy %d: Initiator peer MAC discovery...\n", policy_id);
-                    while (g_dispatcher_running && !b->key_ready) {
+                    while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
                         if (pqc_l2_discover_peer_mac(&peer, 5) == 0) {
                             break;
                         }
                         usleep(1000000);
                     }
 
-                    if (!g_dispatcher_running) {
+                    if (!g_dispatcher_running || b->thread_exit_sig) {
                         break;
                     }
 
@@ -431,7 +438,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         uint32_t msg_id = 10000 + policy_id;
                         int retry_cnt = 0;
 
-                        while (g_dispatcher_running && !b->key_ready) {
+                        while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
                             if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                                 fprintf(stderr, "[PQC-HS-L2] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                         PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
@@ -443,7 +450,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             pqc_l2_send_payload_fragmented(&peer, msg_id, buffer, payload_tot_sz);
 
                             uint64_t start_rx = get_time_ms_hs();
-                            while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+                            while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready && !b->thread_exit_sig) {
                                 uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                                 pqc_rx_pkt_info_t info;
                                 int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -479,7 +486,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 }
                 if (!is_initiator && g_dispatcher_running && !b->key_ready) {
                     fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) listening for HELLO...\n", policy_id);
-                    while (g_dispatcher_running && !b->key_ready) {
+                    while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
                         pthread_mutex_lock(&g_key_mutex);
                         if (b->send_poke) {
                             b->send_poke = false;
@@ -659,6 +666,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         if (sockfd < 0) {
             perror("[PQC-WORKER] UDP Socket creation failed");
             free(my_priv); free(my_pub); free(peer_pub);
+            pthread_mutex_lock(&g_key_mutex);
+            b->thread_started = false;
+            pthread_mutex_unlock(&g_key_mutex);
             return NULL;
         }
 
@@ -668,7 +678,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         peeraddr.sin_port = htons(PQC_HS_PORT);
         inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr);
 
-        while (g_dispatcher_running) {
+        while (g_dispatcher_running && !b->thread_exit_sig) {
             if (b->handshake_give_up) {
                 usleep(500000);
                 continue;
@@ -739,7 +749,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     pthread_mutex_unlock(&g_key_mutex);
 
                     int retry_cnt = 0;
-                    while (g_dispatcher_running && !b->key_ready) {
+                    while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
                         if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                             fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Policy %d.\n",
                                     PQC_HS_GIVEUP_TIMEOUT_MS / 1000, policy_id);
@@ -752,7 +762,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
 
                         uint64_t start_rx = get_time_ms_hs();
-                        while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready) {
+                        while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready && !b->thread_exit_sig) {
                             uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                             pqc_rx_pkt_info_t info;
                             int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -787,7 +797,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
                 } else {
                     fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) listening for HELLO...\n", policy_id);
-                    while (g_dispatcher_running && !b->key_ready) {
+                    while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
                         pthread_mutex_lock(&g_key_mutex);
                         if (b->send_poke) {
                             b->send_poke = false;
@@ -960,6 +970,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     free(my_priv);
     free(my_pub);
     free(peer_pub);
+    pthread_mutex_lock(&g_key_mutex);
+    b->thread_started = false;
+    pthread_mutex_unlock(&g_key_mutex);
     return NULL;
 }
 
@@ -1219,9 +1232,11 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
 
     pthread_mutex_lock(&g_key_mutex);
     policy_key_binding_t *b = NULL;
+    bool is_existing = false;
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings[i].policy_id == policy_id) {
             b = &g_policy_bindings[i];
+            is_existing = true;
             break;
         }
     }
@@ -1252,6 +1267,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         b->rotation_start_time = 0;
         b->rotation_give_up = false;
         b->send_poke = false;
+        b->thread_exit_sig = false;
         for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
             memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
             b->key_ids[slot] = 0;
@@ -1259,6 +1275,41 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         }
     }
     if (b) {
+        if (is_existing) {
+            bool changed = false;
+            if (b->local_priv && local_priv && strcmp(b->local_priv, local_priv) != 0) changed = true;
+            if (b->local_pub && local_pub && strcmp(b->local_pub, local_pub) != 0) changed = true;
+            if (b->peer_pub && deobf_peer && strcmp(b->peer_pub, deobf_peer) != 0) changed = true;
+            
+            if ((b->local_priv == NULL) != (local_priv == NULL)) changed = true;
+            if ((b->local_pub == NULL) != (local_pub == NULL)) changed = true;
+            if ((b->peer_pub == NULL) != (deobf_peer == NULL)) changed = true;
+
+            if (strcmp(b->peer_ip, peer_ip ? peer_ip : "") != 0) changed = true;
+            if (strcmp(b->wan_ifname, wan_ifname ? wan_ifname : "") != 0) changed = true;
+            if (strcmp(b->key_id, key_id ? key_id : "") != 0) changed = true;
+            if (b->is_tunnel != is_tunnel) changed = true;
+            if (b->role_mode != role_mode) changed = true;
+
+            if (changed) {
+                fprintf(stderr, "[PQC-BIND] Configuration change detected for Policy %d. Stopping old handshake worker...\n", policy_id);
+                if (b->thread_started) {
+                    b->thread_exit_sig = true;
+                    while (b->thread_started) {
+                        pthread_mutex_unlock(&g_key_mutex);
+                        usleep(1000);
+                        pthread_mutex_lock(&g_key_mutex);
+                    }
+                    b->thread_exit_sig = false;
+                }
+                b->key_ready = false;
+                b->handshake_give_up = false;
+                b->handshake_start_time = 0;
+                b->rotation_give_up = false;
+                b->rotation_start_time = 0;
+                b->send_poke = true;
+            }
+        }
         b->policy_id = policy_id;
         b->profile_id = profile_id;
         b->role_mode = role_mode;
@@ -1303,6 +1354,7 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
         int idx = b - g_policy_bindings;
         if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
             g_policy_key_version[idx]++;
+            g_policy_bindings_active[idx] = true;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
@@ -1401,6 +1453,44 @@ void sig_pqc_load_keys_from_disk(void) {
         }
     }
     closedir(dir);
+}
+
+void sig_pqc_prepare_reload(void) {
+    pthread_mutex_lock(&g_key_mutex);
+    memset(g_policy_bindings_active, 0, sizeof(g_policy_bindings_active));
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+void sig_pqc_finalize_reload(void) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (!g_policy_bindings_active[i]) {
+            policy_key_binding_t *b = &g_policy_bindings[i];
+            if (b->local_priv || b->local_pub || b->peer_pub || b->key_ready || b->thread_started) {
+                fprintf(stderr, "[PQC-RECONCILE] Policy %d PQC binding is no longer active. Deactivating and clearing keys.\n", b->policy_id);
+                if (b->thread_started) {
+                    b->thread_exit_sig = true;
+                    while (b->thread_started) {
+                        pthread_mutex_unlock(&g_key_mutex);
+                        usleep(1000);
+                        pthread_mutex_lock(&g_key_mutex);
+                    }
+                    b->thread_exit_sig = false;
+                }
+                b->key_ready = false;
+                if (b->local_priv) { free(b->local_priv); b->local_priv = NULL; }
+                if (b->local_pub) { free(b->local_pub); b->local_pub = NULL; }
+                if (b->peer_pub) { free(b->peer_pub); b->peer_pub = NULL; }
+                memset(b->encrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+                memset(b->decrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
+                for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
+                    memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
+                    b->key_slots_valid[slot] = false;
+                }
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
 }
 
 void sig_pqc_record_sent(int policy_id) {
@@ -1568,18 +1658,17 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
     const char *wan_ifname = "";
     bool is_tunnel = false;
 
-    char policy_id_str[32];
-    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
-    const char *pqc_params[1] = { policy_id_str };
+    char profile_id_str[32];
+    snprintf(profile_id_str, sizeof(profile_id_str), "%d", profile_id);
+    const char *pqc_tunnel_params[1] = { profile_id_str };
 
     // Query to get the tunnel parameters from pqc_exchange_tunnels
     PGresult *tunnel_res = PQexecParams(conn,
         "SELECT t.tunnel_name, t.client_tunnel_ip::text, t.peer_tunnel_ip::text "
         "FROM pqc_exchange_tunnels t "
         "JOIN profile_tunnel_ref r ON t.id = r.tunnel_id "
-        "JOIN ne_policies p ON r.profile_id = p.profile_id "
-        "WHERE p.id = $1",
-        1, NULL, pqc_params, NULL, NULL, 0);
+        "WHERE r.profile_id = $1",
+        1, NULL, pqc_tunnel_params, NULL, NULL, 0);
 
     if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
         is_tunnel = true;
@@ -1623,6 +1712,10 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         fprintf(stderr, "[DB-PQC] Warning: No tunnel configuration found for policy %d\n", db_policy_id);
     }
     PQclear(tunnel_res);
+
+    char policy_id_str[32];
+    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
+    const char *pqc_params[1] = { policy_id_str };
 
     PGresult *peer_res = PQexecParams(conn,
         "SELECT k.local, k.remote, k.key_id "

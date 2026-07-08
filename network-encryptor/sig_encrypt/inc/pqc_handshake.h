@@ -98,6 +98,7 @@ typedef struct {
     bool rotation_give_up;
     bool send_poke;
     bool is_tunnel;
+    volatile bool thread_exit_sig;
 } policy_key_binding_t;
 
 typedef struct {
@@ -194,6 +195,9 @@ void sig_pqc_promote_responder_key(int policy_id);
 void sig_pqc_discard_prev_key(int policy_id);
 void sig_pqc_trigger_retry(int policy_id);
 int sig_pqc_trigger_retry_with_info(int policy_id, char *out_info, size_t out_max);
+
+void sig_pqc_prepare_reload(void);
+void sig_pqc_finalize_reload(void);
 
 void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profile_idx, int db_policy_id, int profile_id);
 

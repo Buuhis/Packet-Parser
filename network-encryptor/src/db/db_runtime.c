@@ -1,6 +1,7 @@
 #include "../../inc/db_runtime.h"
 
 #include "../../inc/db_config.h"
+#include "../../sig_encrypt/inc/pqc_handshake.h"
 
 #include <libpq-fe.h>
 #include <stdio.h>
@@ -308,6 +309,7 @@ static int merge_one_config(struct app_config *dst, const struct app_config *src
 }
 
 int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count, const char *db_pass) {
+    sig_pqc_prepare_reload();
     struct app_config merged;
     memset(&merged, 0, sizeof(merged));
     strncpy(merged.bpf_file, "bpf/xdp_redirect.o", sizeof(merged.bpf_file) - 1);
@@ -354,5 +356,6 @@ int build_merged_config(struct app_config *out_cfg, const int *ids, int id_count
     if (config_validate(&merged) != 0)
         return -1;
     *out_cfg = merged;
+    sig_pqc_finalize_reload();
     return 0;
 }
