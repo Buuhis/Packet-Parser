@@ -1658,17 +1658,19 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
     const char *wan_ifname = "";
     bool is_tunnel = false;
 
-    char profile_id_str[32];
-    snprintf(profile_id_str, sizeof(profile_id_str), "%d", profile_id);
-    const char *pqc_tunnel_params[1] = { profile_id_str };
+    char policy_id_str[32];
+    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
+    const char *pqc_params[1] = { policy_id_str };
 
     // Query to get the tunnel parameters from pqc_exchange_tunnels
+    // Use db_policy_id -> JOIN ne_policies to map profile correctly
     PGresult *tunnel_res = PQexecParams(conn,
         "SELECT t.tunnel_name, t.client_tunnel_ip::text, t.peer_tunnel_ip::text "
         "FROM pqc_exchange_tunnels t "
         "JOIN profile_tunnel_ref r ON t.id = r.tunnel_id "
-        "WHERE r.profile_id = $1",
-        1, NULL, pqc_tunnel_params, NULL, NULL, 0);
+        "JOIN ne_policies p ON r.profile_id = p.profile_id "
+        "WHERE p.id = $1",
+        1, NULL, pqc_params, NULL, NULL, 0);
 
     if (PQresultStatus(tunnel_res) == PGRES_TUPLES_OK && PQntuples(tunnel_res) > 0) {
         is_tunnel = true;
@@ -1712,10 +1714,6 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         fprintf(stderr, "[DB-PQC] Warning: No tunnel configuration found for policy %d\n", db_policy_id);
     }
     PQclear(tunnel_res);
-
-    char policy_id_str[32];
-    snprintf(policy_id_str, sizeof(policy_id_str), "%d", db_policy_id);
-    const char *pqc_params[1] = { policy_id_str };
 
     PGresult *peer_res = PQexecParams(conn,
         "SELECT k.local, k.remote, k.key_id "
