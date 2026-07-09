@@ -550,6 +550,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         pthread_mutex_unlock(&g_key_mutex);
 
                                         forwarder_pre_diversify_pqc_keys(profile_id);
+                                    } else {
+                                        fprintf(stderr, "[PQC-HS-L2] Handshake signature verification failed for Policy %d. Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                        sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake signature verification failed. Mismatched authentication keys.");
                                     }
                                 }
                             }
@@ -638,6 +641,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                     pthread_mutex_unlock(&g_key_mutex);
 
                                     forwarder_pre_diversify_pqc_keys(profile_id);
+                                } else {
+                                    fprintf(stderr, "[PQC-HS-L2] Handshake signature verification failed for Policy %d (Online state). Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                    sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake signature verification failed. Mismatched authentication keys.");
                                 }
                             }
                         } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
@@ -857,6 +863,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         pthread_mutex_unlock(&g_key_mutex);
 
                                         forwarder_pre_diversify_pqc_keys(profile_id);
+                                    } else {
+                                        fprintf(stderr, "[PQC-HS-L3] Handshake signature verification failed for Policy %d. Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                        sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake signature verification failed. Mismatched authentication keys.");
                                     }
                                 }
                             }
@@ -943,6 +952,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                     pthread_mutex_unlock(&g_key_mutex);
 
                                     forwarder_pre_diversify_pqc_keys(profile_id);
+                                } else {
+                                    fprintf(stderr, "[PQC-HS-L3] Handshake signature verification failed for Policy %d (Online state). Mismatched authentication keys or packet corrupted.\n", policy_id);
+                                    sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake signature verification failed. Mismatched authentication keys.");
                                 }
                             }
                         } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
@@ -1678,7 +1690,7 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
     // Query to get the tunnel parameters from pqc_exchange_tunnels
     // Use db_policy_id -> JOIN ne_policies to map profile correctly
     PGresult *tunnel_res = PQexecParams(conn,
-        "SELECT t.tunnel_name, t.client_tunnel_ip::text, t.peer_tunnel_ip::text "
+        "SELECT t.tunnel_name, t.tunnel_ip::text, t.peer_tunnel_ip::text "
         "FROM pqc_exchange_tunnels t "
         "JOIN profile_tunnel_ref r ON t.id = r.tunnel_id "
         "JOIN ne_policies p ON r.profile_id = p.profile_id "
