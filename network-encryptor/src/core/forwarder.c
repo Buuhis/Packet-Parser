@@ -1783,6 +1783,11 @@ int forwarder_reload_config(struct forwarder *fwd, struct app_config *cfg) {
     }
 
     atomic_store_explicit(&g_reload_pause, 0, memory_order_release);
+
+    if (crypto_enabled) {
+        pqc_handshake_start_all_profiles(cfg);
+    }
+
     fprintf(stderr, "[RELOAD] hot reload applied in-place (crypto=%s, forwarding=%s)\n",
             need_crypto_reload ? "yes" : "no",
             need_forwarding_reload ? "yes" : "no");

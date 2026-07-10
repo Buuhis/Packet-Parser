@@ -485,8 +485,17 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     }
                 }
                 if (!is_initiator && g_dispatcher_running && !b->key_ready) {
+                    if (b->handshake_start_time == 0) {
+                        b->handshake_start_time = get_time_ms_hs();
+                    }
                     fprintf(stderr, "[PQC-WORKER-L2] Responder (Policy %d) listening for HELLO...\n", policy_id);
                     while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                        if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
+                            fprintf(stderr, "[PQC-HS-L2] Responder timed out waiting for HELLO on Policy %d.\n", policy_id);
+                            sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake timeout. No HELLO received from Peer.");
+                            b->handshake_give_up = true;
+                            break;
+                        }
                         pthread_mutex_lock(&g_key_mutex);
                         if (b->send_poke) {
                             b->send_poke = false;
@@ -575,10 +584,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             if (b->rotation_start_time == 0) {
                                 b->rotation_start_time = now;
                             }
-                            if (now - b->rotation_start_time > 300000) {
-                                fprintf(stderr, "[PQC-HS-L2] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                            if (now - b->rotation_start_time > 15000) {
+                                fprintf(stderr, "[PQC-HS-L2] Key rotation timed out after 15 seconds. Giving up on Policy %d.\n", policy_id);
                                 sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
-                                b->rotation_give_up = true;
+                                pthread_mutex_lock(&g_key_mutex);
+                                b->key_ready = false;
+                                b->handshake_give_up = true;
+                                b->rotation_start_time = 0;
+                                b->rotation_give_up = false;
+                                pthread_mutex_unlock(&g_key_mutex);
                             } else {
                                 initiate_key_rotation(b, &peer, -1, NULL, my_priv, peer_pub, profile_id, true);
                             }
@@ -591,7 +605,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         fprintf(stderr, "[PQC-HS-L2] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
                         sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed. No handshake request received from Peer.");
                         pthread_mutex_lock(&g_key_mutex);
-                        b->rotation_give_up = true;
+                        b->key_ready = false;
+                        b->handshake_give_up = true;
+                        b->rotation_give_up = false;
                         pthread_mutex_unlock(&g_key_mutex);
                     }
 
@@ -802,8 +818,17 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         retry_cnt++;
                     }
                 } else {
+                    if (b->handshake_start_time == 0) {
+                        b->handshake_start_time = get_time_ms_hs();
+                    }
                     fprintf(stderr, "[PQC-WORKER-L3] Responder (Policy %d) listening for HELLO...\n", policy_id);
                     while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                        if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
+                            fprintf(stderr, "[PQC-HS-L3] Responder timed out waiting for HELLO on Policy %d.\n", policy_id);
+                            sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake timeout. No HELLO received from Peer.");
+                            b->handshake_give_up = true;
+                            break;
+                        }
                         pthread_mutex_lock(&g_key_mutex);
                         if (b->send_poke) {
                             b->send_poke = false;
@@ -888,10 +913,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             if (b->rotation_start_time == 0) {
                                 b->rotation_start_time = now;
                             }
-                            if (now - b->rotation_start_time > 300000) {
-                                fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 5 minutes. Giving up on Policy %d.\n", policy_id);
+                            if (now - b->rotation_start_time > 15000) {
+                                fprintf(stderr, "[PQC-HS-L3] Key rotation timed out after 15 seconds. Giving up on Policy %d.\n", policy_id);
                                 sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed.");
-                                b->rotation_give_up = true;
+                                pthread_mutex_lock(&g_key_mutex);
+                                b->key_ready = false;
+                                b->handshake_give_up = true;
+                                b->rotation_start_time = 0;
+                                b->rotation_give_up = false;
+                                pthread_mutex_unlock(&g_key_mutex);
                             } else {
                                 initiate_key_rotation(b, NULL, sockfd, &peeraddr, my_priv, peer_pub, profile_id, false);
                             }
@@ -904,7 +934,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         fprintf(stderr, "[PQC-HS-L3] Key rotation timed out on Responder side (Policy %d). No HELLO received from Peer.\n", policy_id);
                         sig_pqc_write_log(policy_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_ROTATION_FAILED, "Session key rotation failed. No handshake request received from Peer.");
                         pthread_mutex_lock(&g_key_mutex);
-                        b->rotation_give_up = true;
+                        b->key_ready = false;
+                        b->handshake_give_up = true;
+                        b->rotation_give_up = false;
                         pthread_mutex_unlock(&g_key_mutex);
                     }
 
