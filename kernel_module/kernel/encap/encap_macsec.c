@@ -108,6 +108,27 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
     /* 1. Perform TCP MSS Clamping to fit within MACsec MTU */
     mwan_clamp_mss(skb, target_dev);
 
+    /* Checksum Fix: Force software checksum calculation before MACsec encapsulation */
+    if (skb->ip_summed == CHECKSUM_PARTIAL || skb->ip_summed == CHECKSUM_UNNECESSARY) {
+        if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
+            struct iphdr *iph = ip_hdr(skb);
+            if (iph->protocol == IPPROTO_TCP) {
+                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                skb->csum_offset = offsetof(struct tcphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            } else if (iph->protocol == IPPROTO_UDP) {
+                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                skb->csum_offset = offsetof(struct udphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            }
+        }
+        if (skb->ip_summed == CHECKSUM_PARTIAL) {
+            if (skb_checksum_help(skb)) {
+                return NF_ACCEPT;
+            }
+        }
+    }
+
     /* 2. Optional: Check MTU and send ICMP Frag Needed if too large (TODO later for UDP) */
     
     /* 3. Handle MAC Resolution and Injection (Same as encap_none) */
@@ -165,6 +186,7 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
         skb_set_queue_mapping(skb, q_idx);
     }
 
+    // pr_info("mwan_kmod: AFTER (MACSEC) - Redirecting to: %s\n", target_dev->name);
     skb->dev = target_dev;
     dev_queue_xmit(skb);
 

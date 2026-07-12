@@ -99,6 +99,7 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     tfm = cfg->tfm;
     iph = ip_hdr(skb);
     iph_len = iph->ihl * 4;
+    payload_len = ntohs(iph->tot_len) - iph_len;
     if (payload_len <= 0) return mwan_handle_encap_none(skb, tun);
 
     /* Entropy Fix: Calculate the flow hash of the plaintext packet BEFORE encryption.
@@ -118,9 +119,23 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
     /* Checksum Fix (Step 1): Resolve partial checksums before we encrypt the payload.
      * If we don't do this, the ciphertext will contain an invalid (likely 0) checksum,
      * or worse, the NIC will try to calculate it later and corrupt the ciphertext. */
-    if (skb->ip_summed == CHECKSUM_PARTIAL) {
-        if (skb_checksum_help(skb)) {
-            return NF_ACCEPT;
+    if (skb->ip_summed == CHECKSUM_PARTIAL || skb->ip_summed == CHECKSUM_UNNECESSARY) {
+        if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
+            struct iphdr *iph = ip_hdr(skb);
+            if (iph->protocol == IPPROTO_TCP) {
+                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                skb->csum_offset = offsetof(struct tcphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            } else if (iph->protocol == IPPROTO_UDP) {
+                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                skb->csum_offset = offsetof(struct udphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            }
+        }
+        if (skb->ip_summed == CHECKSUM_PARTIAL) {
+            if (skb_checksum_help(skb)) {
+                return NF_ACCEPT;
+            }
         }
     }
 
@@ -215,6 +230,7 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
         skb_set_queue_mapping(skb, smp_processor_id() % target_dev->real_num_tx_queues);
     }
 
+    // pr_info("mwan_kmod: AFTER (L3) - Redirecting to: %s\n", target_dev->name);
     skb->dev = target_dev;
     dev_queue_xmit(skb);
     return NF_STOLEN;

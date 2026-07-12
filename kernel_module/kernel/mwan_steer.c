@@ -39,6 +39,11 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
+    // if (state->out) {
+    //     pr_info("mwan_kmod: BEFORE - Dest: %pI4, skb->dev: %s, state->out: %s\n",
+    //             &iph->daddr, skb->dev ? skb->dev->name : "NULL", state->out->name);
+    // }
+
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     

@@ -2,6 +2,8 @@
 #include "../mwan_proto.h"
 #include <linux/netfilter.h>
 #include <linux/ip.h>
+#include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/scatterlist.h>
 #include <crypto/aead.h>
 
@@ -118,7 +120,39 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
         skb_trim(skb, iph_len + plaintext_len);
 
         skb_set_transport_header(skb, iph_len);
-        skb->ip_summed = CHECKSUM_UNNECESSARY;
+        
+        /* Recalculate TCP/UDP checksum in software and set ip_summed to CHECKSUM_NONE */
+        {
+            int tcplen = plaintext_len;
+            if (iph->protocol == IPPROTO_TCP) {
+                struct tcphdr *tcph = (struct tcphdr *)((u8 *)iph + iph_len);
+                if (pskb_may_pull(skb, iph_len + sizeof(struct tcphdr))) {
+                    iph = ip_hdr(skb);
+                    tcph = (struct tcphdr *)((u8 *)iph + iph_len);
+                    tcph->check = 0;
+                    tcph->check = csum_tcpudp_magic(iph->saddr, iph->daddr, tcplen, IPPROTO_TCP,
+                                                    skb_checksum(skb, iph_len, tcplen, 0));
+                    skb->ip_summed = CHECKSUM_NONE;
+                } else {
+                    skb->ip_summed = CHECKSUM_UNNECESSARY;
+                }
+            } else if (iph->protocol == IPPROTO_UDP) {
+                struct udphdr *udph = (struct udphdr *)((u8 *)iph + iph_len);
+                if (pskb_may_pull(skb, iph_len + sizeof(struct udphdr))) {
+                    iph = ip_hdr(skb);
+                    udph = (struct udphdr *)((u8 *)iph + iph_len);
+                    udph->check = 0;
+                    udph->check = csum_tcpudp_magic(iph->saddr, iph->daddr, tcplen, IPPROTO_UDP,
+                                                    skb_checksum(skb, iph_len, tcplen, 0));
+                    if (udph->check == 0) udph->check = 0xffff;
+                    skb->ip_summed = CHECKSUM_NONE;
+                } else {
+                    skb->ip_summed = CHECKSUM_UNNECESSARY;
+                }
+            } else {
+                skb->ip_summed = CHECKSUM_UNNECESSARY;
+            }
+        }
     }
 
     return MWAN_DECAP_CONTINUE;

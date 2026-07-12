@@ -67,6 +67,7 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb, struct mwan_tunnel *tun
         skb_set_queue_mapping(skb, q_idx);
     }
 
+    // pr_info("mwan_kmod: AFTER (NONE) - Redirecting to: %s\n", target_dev->name);
     skb->dev = target_dev;
     dev_queue_xmit(skb);
 

@@ -27,11 +27,11 @@ if ip addr show dev "$VX1_DEV" 2>/dev/null | grep -q "$PATH1_IP_A"; then
     VX2_LOCAL="$PATH2_IP_A";  VX2_REMOTE="$PATH2_IP_B"
     
     # Separated Overlay Subnets to prevent routing conflict
-    VX1_IP="172.16.25.1/24"
-    VX2_IP="172.16.25.3/24"
+    VX1_IP="172.16.23.1/24"
+    VX2_IP="172.16.25.1/24"
     
     # Custom Unique MAC Addresses for Server 1
-    VX1_MAC="02:00:00:00:23:01"
+    VX1_MAC="02:00:00:01:23:01"
     VX2_MAC="02:00:00:00:25:01"
     
     # MACsec Config for Server 1
@@ -46,8 +46,8 @@ elif ip addr show dev "$VX1_DEV" 2>/dev/null | grep -q "$PATH1_IP_B"; then
     VX2_LOCAL="$PATH2_IP_B";  VX2_REMOTE="$PATH2_IP_A"
     
     # Separated Overlay Subnets to prevent routing conflict
-    VX1_IP="172.16.25.2/24"  
-    VX2_IP="172.16.25.4/24"  
+    VX1_IP="172.16.23.2/24"  
+    VX2_IP="172.16.25.2/24"  
     
     # Custom Unique MAC Addresses for Server 2
     VX1_MAC="02:00:00:00:23:02"
@@ -105,7 +105,7 @@ start_macsec() {
     log "Configuring MACsec security over VXLAN for $SERVER_ROLE..."
 
     if [ ! -d "/sys/class/net/$VX1_NAME" ] || [ ! -d "/sys/class/net/$VX2_NAME" ]; then
-        warn "VXLAN interfaces are not found. Please run 'start' action first."
+        echo -e "\e[1;31m[ERROR]\e[0m VXLAN interfaces $VX1_NAME or $VX2_NAME not found. Please run '$0 start' first to create tunnels."
         exit 1
     fi
 
@@ -117,6 +117,13 @@ start_macsec() {
         ip macsec add "$MS1_NAME" rx port 1 sa 0 pn 1 on key "$MS1_CKN" "$MS1_CAK"
         ip link set "$MS1_NAME" up
         log "MACsec enabled on $VX1_NAME -> Device: $MS1_NAME"
+        
+        # Move IP from parent VXLAN to MACsec device
+        if ip addr show dev "$VX1_NAME" 2>/dev/null | grep -q "${VX1_IP%/*}"; then
+            ip addr del "$VX1_IP" dev "$VX1_NAME"
+            ip addr add "$VX1_IP" dev "$MS1_NAME"
+            log "Moved IP $VX1_IP from $VX1_NAME to $MS1_NAME"
+        fi
     else
         warn "MACsec on $VX1_NAME ($MS1_NAME) is already configured."
     fi
@@ -129,6 +136,13 @@ start_macsec() {
         ip macsec add "$MS2_NAME" rx port 1 sa 0 pn 1 on key "$MS2_CKN" "$MS2_CAK"
         ip link set "$MS2_NAME" up
         log "MACsec enabled on $VX2_NAME -> Device: $MS2_NAME"
+        
+        # Move IP from parent VXLAN to MACsec device
+        if ip addr show dev "$VX2_NAME" 2>/dev/null | grep -q "${VX2_IP%/*}"; then
+            ip addr del "$VX2_IP" dev "$VX2_NAME"
+            ip addr add "$VX2_IP" dev "$MS2_NAME"
+            log "Moved IP $VX2_IP from $VX2_NAME to $MS2_NAME"
+        fi
     else
         warn "MACsec on $VX2_NAME ($MS2_NAME) is already configured."
     fi
@@ -136,8 +150,33 @@ start_macsec() {
 
 stop_macsec() {
     log "Removing MACsec security layer..."
-    [ -d "/sys/class/net/$MS1_NAME" ] && ip link del "$MS1_NAME" && log "Removed MACsec: $MS1_NAME"
-    [ -d "/sys/class/net/$MS2_NAME" ] && ip link del "$MS2_NAME" && log "Removed MACsec: $MS2_NAME"
+    
+    if [ ! -d "/sys/class/net/$VX1_NAME" ] || [ ! -d "/sys/class/net/$VX2_NAME" ]; then
+        echo -e "\e[1;31m[ERROR]\e[0m VXLAN interfaces $VX1_NAME or $VX2_NAME not found. Please run '$0 start' first."
+        exit 1
+    fi
+
+    # MACsec Tunnel 1
+    if [ -d "/sys/class/net/$MS1_NAME" ]; then
+        if ip addr show dev "$MS1_NAME" 2>/dev/null | grep -q "${VX1_IP%/*}"; then
+            ip addr del "$VX1_IP" dev "$MS1_NAME"
+            ip addr add "$VX1_IP" dev "$VX1_NAME"
+            log "Moved IP $VX1_IP back to $VX1_NAME"
+        fi
+        ip link del "$MS1_NAME"
+        log "Removed MACsec: $MS1_NAME"
+    fi
+
+    # MACsec Tunnel 2
+    if [ -d "/sys/class/net/$MS2_NAME" ]; then
+        if ip addr show dev "$MS2_NAME" 2>/dev/null | grep -q "${VX2_IP%/*}"; then
+            ip addr del "$VX2_IP" dev "$MS2_NAME"
+            ip addr add "$VX2_IP" dev "$VX2_NAME"
+            log "Moved IP $VX2_IP back to $VX2_NAME"
+        fi
+        ip link del "$MS2_NAME"
+        log "Removed MACsec: $MS2_NAME"
+    fi
 }
 
 # --- ACTION ROUTER ---
