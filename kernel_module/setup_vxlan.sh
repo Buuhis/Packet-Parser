@@ -77,6 +77,7 @@ start_vxlan() {
         ip link add "$VX1_NAME" address "$VX1_MAC" mtu 1450 type vxlan id $VX1_ID remote $VX1_REMOTE local $VX1_LOCAL dev $VX1_DEV dstport $VX1_PORT
         ip addr add $VX1_IP dev "$VX1_NAME"
         ip link set "$VX1_NAME" up
+        bridge fdb append to 00:00:00:00:00:00 dev "$VX1_NAME" dst "$VX1_REMOTE"
         log "Successfully created $VX1_NAME (MAC: $VX1_MAC | Local: $VX1_LOCAL -> Remote: $VX1_REMOTE)"
     else
         warn "$VX1_NAME already exists."
@@ -88,10 +89,20 @@ start_vxlan() {
         ip link add "$VX2_NAME" address "$VX2_MAC" mtu 1450 type vxlan id $VX2_ID remote $VX2_REMOTE local $VX2_LOCAL dev $VX2_DEV dstport $VX2_PORT
         ip addr add $VX2_IP dev "$VX2_NAME"
         ip link set "$VX2_NAME" up
+        bridge fdb append to 00:00:00:00:00:00 dev "$VX2_NAME" dst "$VX2_REMOTE"
         log "Successfully created $VX2_NAME (MAC: $VX2_MAC | Local: $VX2_LOCAL -> Remote: $VX2_REMOTE)"
     else
         warn "$VX2_NAME already exists."
     fi
+
+    # Configure routing automatically
+    if [ "$SERVER_ROLE" = "SERVER_1" ]; then
+        PEER_SUBNET="192.168.100.0/24"
+    else
+        PEER_SUBNET="192.168.200.0/24"
+    fi
+    ip route replace "$PEER_SUBNET" dev "$VX1_NAME"
+    log "Added route: $PEER_SUBNET dev $VX1_NAME"
 }
 
 stop_vxlan() {
@@ -146,6 +157,15 @@ start_macsec() {
     else
         warn "MACsec on $VX2_NAME ($MS2_NAME) is already configured."
     fi
+
+    # Configure routing automatically for MACsec
+    if [ "$SERVER_ROLE" = "SERVER_1" ]; then
+        PEER_SUBNET="192.168.100.0/24"
+    else
+        PEER_SUBNET="192.168.200.0/24"
+    fi
+    ip route replace "$PEER_SUBNET" dev "$MS1_NAME"
+    log "Updated route: $PEER_SUBNET dev $MS1_NAME (MACsec)"
 }
 
 stop_macsec() {
@@ -176,6 +196,17 @@ stop_macsec() {
         fi
         ip link del "$MS2_NAME"
         log "Removed MACsec: $MS2_NAME"
+    fi
+
+    # Restore routing to parent VXLAN interface
+    if [ -d "/sys/class/net/$VX1_NAME" ]; then
+        if [ "$SERVER_ROLE" = "SERVER_1" ]; then
+            PEER_SUBNET="192.168.100.0/24"
+        else
+            PEER_SUBNET="192.168.200.0/24"
+        fi
+        ip route replace "$PEER_SUBNET" dev "$VX1_NAME"
+        log "Restored route: $PEER_SUBNET dev $VX1_NAME"
     fi
 }
 
