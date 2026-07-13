@@ -70,6 +70,29 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         /* Cache net_device */
         tun->dev = dev_get_by_index(&init_net, tun->ifindex);
         if (tun->dev) {
+            struct net_device *upper_dev;
+            struct list_head *iter;
+            struct net_device *macsec_dev = NULL;
+
+            /* Check if there is an upper MACsec device stacked on top of this device */
+            rcu_read_lock();
+            netdev_for_each_upper_dev_rcu(tun->dev, upper_dev, iter) {
+                if (upper_dev->rtnl_link_ops && upper_dev->rtnl_link_ops->kind &&
+                    strcmp(upper_dev->rtnl_link_ops->kind, "macsec") == 0) {
+                    macsec_dev = upper_dev;
+                    dev_hold(macsec_dev);
+                    break;
+                }
+            }
+            rcu_read_unlock();
+
+            if (macsec_dev) {
+                /* Replace tun->dev with the MACsec device */
+                dev_put(tun->dev);
+                tun->dev = macsec_dev;
+                tun->ifindex = macsec_dev->ifindex;
+            }
+
             tun->is_ethernet = (tun->dev->type == ARPHRD_ETHER);
             
             if (tun->dev->rtnl_link_ops && tun->dev->rtnl_link_ops->kind &&
@@ -79,6 +102,17 @@ int mwan_state_update(struct mwan_config *new_cfg) {
                 tun->encap_type = MWAN_ENCAP_L3_CUSTOM;
             } else {
                 tun->encap_type = MWAN_ENCAP_NONE;
+            }
+            
+            {
+                const char *encap_str = "NONE";
+                if (tun->encap_type == MWAN_ENCAP_MACSEC) {
+                    encap_str = "MACsec (L2)";
+                } else if (tun->encap_type == MWAN_ENCAP_L3_CUSTOM) {
+                    encap_str = "Custom L3 (AES-GCM)";
+                }
+                pr_info("mwan_kmod: Resolved tunnel interface %s (ifindex %d) - Encap Type: %s\n",
+                        tun->dev->name, tun->ifindex, encap_str);
             }
             
             /* Attempt to resolve MAC if it's an ethernet device */

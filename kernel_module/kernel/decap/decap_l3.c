@@ -33,6 +33,9 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
     int err;
 
     iph = ip_hdr(skb);
+    if (iph->protocol != MWAN_FAKE_PROTOCOL)
+        return MWAN_DECAP_CONTINUE;
+
     iph_len = iph->ihl * 4;
     total_len = ntohs(iph->tot_len);
 
@@ -102,7 +105,10 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
         return NF_DROP;
     }
 
-    /* Decryption success: Remove crypto header and tag.
+    /* Decryption success: Restore the original protocol */
+    iph->protocol = chdr->proto;
+
+    /* Remove crypto header and tag.
      * Shift decrypted payload up to overwrite crypto header. */
     {
         int plaintext_len = ciphertext_len - MWAN_GCM_TAG_LEN;

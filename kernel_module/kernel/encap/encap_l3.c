@@ -146,11 +146,14 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
         memmove(payload_start + MWAN_CRYPTO_HDR_LEN, payload_start, payload_len);
         chdr = (struct mwan_crypto_hdr *)payload_start;
         chdr->magic = htons(MWAN_CRYPTO_MAGIC);
+        chdr->proto = iph->protocol;
+        chdr->reserved = 0;
         chdr->seq = cpu_to_be64(seq);
     }
 
     /* Finalize IP Header before encryption AAD (though we use CryptoHdr as AAD now) */
     iph = ip_hdr(skb);
+    iph->protocol = MWAN_FAKE_PROTOCOL;
     iph->tot_len = htons(iph_len + MWAN_CRYPTO_HDR_LEN + payload_len + MWAN_GCM_TAG_LEN);
     iph->check = 0;
     iph->check = ip_fast_csum((u8 *)iph, iph->ihl);

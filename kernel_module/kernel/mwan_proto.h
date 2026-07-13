@@ -8,11 +8,12 @@
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
-#define MWAN_CRYPTO_HDR_LEN 10       /* 2 (magic) + 8 (seq) */
+#define MWAN_CRYPTO_HDR_LEN 12       /* 2 (magic) + 1 (proto) + 1 (reserved) + 8 (seq) */
 #define MWAN_GCM_TAG_LEN    16       /* AES-GCM Authentication Tag */
 #define MWAN_GCM_IV_LEN     12       /* 4 (salt) + 8 (seq) */
 #define MWAN_MAX_KEY_LEN    32       /* AES-256 = 32 bytes */
 #define MWAN_SALT_LEN        4
+#define MWAN_FAKE_PROTOCOL  99       /* Fake L4 Protocol to hide real protocol (TCP/UDP) */
 
 /* ---- Crypto Type Enum ---- */
 enum mwan_crypt_type {
@@ -23,6 +24,8 @@ enum mwan_crypt_type {
 /* ---- MWAN Crypto Header (prepended to encrypted payload) ---- */
 struct mwan_crypto_hdr {
     __be16 magic;      /* 0x4D57 ("MW") */
+    __u8 proto;        /* Original IP L4 protocol */
+    __u8 reserved;     /* Reserved for padding/alignment */
     __be64 seq;        /* Sequence number (dynamic part of IV) */
 } __attribute__((packed));
 
