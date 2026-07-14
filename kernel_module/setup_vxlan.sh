@@ -35,9 +35,8 @@ if ip addr show dev "$VX1_DEV" 2>/dev/null | grep -q "$PATH1_IP_A"; then
     VX1_PEER_MAC="02:00:00:00:23:02"
     VX2_PEER_MAC="02:00:00:00:25:02"
     
-    MS1_CAK="00112233445566778899aabbccddeeff"
-    MS2_CAK="aabbccddeeff00112233445566778899"
-    
+    MS1_CAK="00112233445566778899aabbccddeeff"; MS1_CKN="112233445566778899aabbccddeeff00"
+    MS2_CAK="aabbccddeeff00112233445566778899"; MS2_CKN="eeddccbbaa99887766554433221100ff"
 elif ip addr show dev "$VX1_DEV" 2>/dev/null | grep -q "$PATH1_IP_B"; then
     SERVER_ROLE="SERVER_2"
     
@@ -54,8 +53,8 @@ elif ip addr show dev "$VX1_DEV" 2>/dev/null | grep -q "$PATH1_IP_B"; then
     VX1_PEER_MAC="02:00:00:01:23:01"
     VX2_PEER_MAC="02:00:00:00:25:01"
     
-    MS1_CAK="00112233445566778899aabbccddeeff"
-    MS2_CAK="aabbccddeeff00112233445566778899"
+    MS1_CAK="00112233445566778899aabbccddeeff"; MS1_CKN="112233445566778899aabbccddeeff00"
+    MS2_CAK="aabbccddeeff00112233445566778899"; MS2_CKN="eeddccbbaa99887766554433221100ff"
 else
     echo -e "\e[1;31m[ERROR]\e[0m Could not detect Server identity based on $VX1_DEV IP address."
     exit 1
@@ -112,9 +111,9 @@ start_macsec() {
 
     # Configure MACsec (ne_tunnel1) on top of l2tun1
     ip link add link l2tun1 name "$VX1_NAME" type macsec port 1 encrypt on replay on window 64 cipher gcm-aes-128
-    ip macsec add "$VX1_NAME" tx sa 0 xpn 1 on key 01 "$MS1_CAK"
-    ip macsec add "$VX1_NAME" rx address "$VX1_PEER_MAC" port 1
-    ip macsec add "$VX1_NAME" rx address "$VX1_PEER_MAC" port 1 sa 0 xpn 1 on key 01 "$MS1_CAK"
+    ip macsec add "$VX1_NAME" tx sa 0 pn 1 on key "$MS1_CKN" "$MS1_CAK"
+    ip macsec add "$VX1_NAME" rx port 1 address "$VX1_PEER_MAC"
+    ip macsec add "$VX1_NAME" rx port 1 address "$VX1_PEER_MAC" sa 0 pn 1 on key "$MS1_CKN" "$MS1_CAK"
     ip link set "$VX1_NAME" up
     ip addr add "$VX1_IP" dev "$VX1_NAME"
     log "Successfully created MACsec $VX1_NAME stacked on l2tun1"
@@ -128,9 +127,9 @@ start_macsec() {
 
     # Configure MACsec (ne_tunnel2) on top of l2tun2
     ip link add link l2tun2 name "$VX2_NAME" type macsec port 2 encrypt on replay on window 64 cipher gcm-aes-128
-    ip macsec add "$VX2_NAME" tx sa 0 xpn 1 on key 01 "$MS2_CAK"
-    ip macsec add "$VX2_NAME" rx address "$VX2_PEER_MAC" port 2
-    ip macsec add "$VX2_NAME" rx address "$VX2_PEER_MAC" port 2 sa 0 xpn 1 on key 01 "$MS2_CAK"
+    ip macsec add "$VX2_NAME" tx sa 0 pn 1 on key "$MS2_CKN" "$MS2_CAK"
+    ip macsec add "$VX2_NAME" rx port 2 address "$VX2_PEER_MAC"
+    ip macsec add "$VX2_NAME" rx port 2 address "$VX2_PEER_MAC" sa 0 pn 1 on key "$MS2_CKN" "$MS2_CAK"
     ip link set "$VX2_NAME" up
     ip addr add "$VX2_IP" dev "$VX2_NAME"
     log "Successfully created MACsec $VX2_NAME stacked on l2tun2"
