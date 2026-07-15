@@ -211,6 +211,15 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry for Policy %d.\n", policy_id);
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
+            } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
+                if (b->handshake_give_up) {
+                    b->handshake_give_up = false;
+                    b->handshake_start_time = 0;
+                    b->rotation_give_up = false;
+                    b->rotation_start_time = 0;
+                    b->key_ready = false;
+                    fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder for Policy %d.\n", policy_id);
+                }
             }
             pqc_feed_packet_to_policy_l2(b, payload, len, src_mac);
             pthread_mutex_unlock(&g_key_mutex);
@@ -859,7 +868,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 pthread_mutex_unlock(&g_key_mutex);
 
                                 if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                                    if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                    peeraddr = info.src_addr;
+                                     if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                                         struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                                         resp->magic = PQC_HS_MAGIC;
                                         resp->msg_type = PQC_HS_MSG_RESP;
@@ -955,7 +965,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             pthread_mutex_unlock(&g_key_mutex);
 
                             if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                                if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                peeraddr = info.src_addr;
+                                 if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                                     resp->magic = PQC_HS_MAGIC;
                                     resp->msg_type = PQC_HS_MSG_RESP;
@@ -1434,6 +1445,20 @@ int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_p
 }
 
 void sig_pqc_load_keys_from_disk(void) {
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_registry_count; i++) {
+        if (g_identity_registry[i].priv_key) {
+            free(g_identity_registry[i].priv_key);
+            g_identity_registry[i].priv_key = NULL;
+        }
+        if (g_identity_registry[i].pub_key) {
+            free(g_identity_registry[i].pub_key);
+            g_identity_registry[i].pub_key = NULL;
+        }
+    }
+    g_registry_count = 0;
+    pthread_mutex_unlock(&g_key_mutex);
+
     DIR *dir = opendir("/dev/shm/.enc_config");
     if (!dir) return;
 
