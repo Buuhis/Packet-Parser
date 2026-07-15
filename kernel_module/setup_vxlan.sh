@@ -73,6 +73,7 @@ start_vxlan() {
 
     # Tunnel 1
     ip link add "$VX1_NAME" type vxlan id $VX1_ID dev $VX1_DEV local $VX1_LOCAL remote $VX1_REMOTE dstport $VX1_PORT
+    ip link set "$VX1_NAME" address "$VX1_MAC"
     bridge fdb append to 00:00:00:00:00:00 dst "$VX1_REMOTE" dev "$VX1_NAME"
     ip link set "$VX1_NAME" up
     ip addr add "$VX1_IP" dev "$VX1_NAME"
@@ -80,6 +81,7 @@ start_vxlan() {
 
     # Tunnel 2
     ip link add "$VX2_NAME" type vxlan id $VX2_ID dev $VX2_DEV local $VX2_LOCAL remote $VX2_REMOTE dstport $VX2_PORT
+    ip link set "$VX2_NAME" address "$VX2_MAC"
     bridge fdb append to 00:00:00:00:00:00 dst "$VX2_REMOTE" dev "$VX2_NAME"
     ip link set "$VX2_NAME" up
     ip addr add "$VX2_IP" dev "$VX2_NAME"

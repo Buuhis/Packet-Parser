@@ -27,25 +27,6 @@ static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
     return false;
 }
 
-static u32 mwan_get_flow_hash(struct sk_buff *skb)
-{
-    struct iphdr *iph = ip_hdr(skb);
-    u32 ports = 0;
-
-    if (!iph)
-        return 0;
-
-    if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
-        int iph_len = iph->ihl * 4;
-        /* Ensure the L4 ports (first 4 bytes of transport header) are readable */
-        if (likely(skb->len >= iph_len + 4)) {
-            ports = *(__be32 *)((u8 *)iph + iph_len);
-        }
-    }
-
-    return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0);
-}
-
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -77,14 +58,18 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         return NF_ACCEPT;
     }
 
-    /* 2. Hash: Use custom 4-tuple jhash for guaranteed traffic distribution */
-    hash = mwan_get_flow_hash(skb);
+    /* 2. Hash: Use kernel-cached or hardware RSS hash for flow affinity */
+    hash = skb_get_hash(skb);
     
     /* 3. Steer: Choose a tunnel based on the weight-proportional LUT (O(1)) */
     if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
         u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
         
+        pr_info_ratelimited("mwan_kmod: steer packet to %pI4 - hash: 0x%x, lut_idx: %d, tunnel: %s, mac_resolved: %d, dev_ptr: %px\n",
+                            &iph->daddr, hash, hash & (MWAN_LUT_SIZE - 1), 
+                            tun->dev ? tun->dev->name : "NULL", tun->mac_resolved, tun->dev);
+
         unsigned int ret = NF_ACCEPT;
         
         switch (tun->encap_type) {

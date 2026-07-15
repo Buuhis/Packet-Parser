@@ -2,6 +2,7 @@
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
+#include <linux/ip.h>
 #include <net/neighbour.h>
 #include <net/arp.h>
 
@@ -65,6 +66,13 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb, struct mwan_tunnel *tun
         u16 q_idx = cpu_id % target_dev->real_num_tx_queues;
         
         skb_set_queue_mapping(skb, q_idx);
+    }
+
+    {
+        struct iphdr *iph = ip_hdr(skb);
+        if (iph) {
+            skb_set_transport_header(skb, iph->ihl * 4);
+        }
     }
 
     // pr_info("mwan_kmod: AFTER (NONE) - Redirecting to: %s\n", target_dev->name);

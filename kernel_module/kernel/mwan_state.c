@@ -155,6 +155,14 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         while (current_slot < MWAN_LUT_SIZE) {
             new_cfg->tunnel_idx_lut[current_slot++] = new_cfg->num_tunnels - 1;
         }
+
+        pr_info("mwan_kmod: Config updated - num_tunnels: %u, total_weight: %u\n", 
+                new_cfg->num_tunnels, new_cfg->total_weight);
+        for (i = 0; i < new_cfg->num_tunnels; i++) {
+            struct mwan_tunnel *t = &new_cfg->tunnels[i];
+            pr_info("  [Tunnel %d] name: %s, ifindex: %u, weight: %u, mac_resolved: %d, dev_ptr: %px\n",
+                    i, t->dev ? t->dev->name : "NULL", t->ifindex, t->weight, t->mac_resolved, t->dev);
+        }
     }
     /* Phase 1.75: Initialize Crypto Engine if encryption is enabled */
     if (new_cfg->encrypt_on && new_cfg->encrypt_key_len > 0) {

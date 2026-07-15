@@ -186,6 +186,13 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
         skb_set_queue_mapping(skb, q_idx);
     }
 
+    {
+        struct iphdr *iph = ip_hdr(skb);
+        if (iph) {
+            skb_set_transport_header(skb, iph->ihl * 4);
+        }
+    }
+
     // pr_info("mwan_kmod: AFTER (MACSEC) - Redirecting to: %s\n", target_dev->name);
     skb->dev = target_dev;
     dev_queue_xmit(skb);

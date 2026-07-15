@@ -11,6 +11,12 @@
 #include <net/tcp.h>
 #include <net/arp.h>
 #include <net/dst.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#include <net/gso.h>
+#else
+#include <linux/skbuff.h>
+#endif
 
 /* Helper to update TCP checksum after MSS modification */
 static inline void mwan_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, struct tcphdr *tcph)
@@ -72,7 +78,41 @@ static void mwan_clamp_mss(struct sk_buff *skb, struct net_device *dev)
     }
 }
 
+static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan_tunnel *tun);
+
 unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
+{
+    if (skb_is_gso(skb)) {
+        struct sk_buff *segs, *nskb, *next;
+        netdev_features_t features = netif_skb_features(skb);
+
+        /* Force software segmentation by clearing all GSO features */
+        segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+        if (IS_ERR(segs) || !segs) {
+            return NF_DROP;
+        }
+
+        nskb = segs;
+        while (nskb) {
+            next = nskb->next;
+            nskb->next = NULL;
+
+            /* Each segment must be processed and transmitted. 
+             * If processing fails, we must free it to avoid memory leaks. */
+            if (mwan_handle_encap_l3_single(nskb, tun) != NF_STOLEN) {
+                kfree_skb(nskb);
+            }
+
+            nskb = next;
+        }
+        consume_skb(skb);
+        return NF_STOLEN;
+    }
+
+    return mwan_handle_encap_l3_single(skb, tun);
+}
+
+static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct net_device *target_dev = tun->dev;
     struct mwan_config *cfg;
@@ -231,6 +271,11 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
 
     if (likely(target_dev->real_num_tx_queues > 1)) {
         skb_set_queue_mapping(skb, smp_processor_id() % target_dev->real_num_tx_queues);
+    }
+
+    iph = ip_hdr(skb);
+    if (iph) {
+        skb_set_transport_header(skb, iph->ihl * 4);
     }
 
     // pr_info("mwan_kmod: AFTER (L3) - Redirecting to: %s\n", target_dev->name);
