@@ -868,8 +868,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 pthread_mutex_unlock(&g_key_mutex);
 
                                 if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                                    peeraddr = info.src_addr;
-                                     if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                    if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                                         struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                                         resp->magic = PQC_HS_MAGIC;
                                         resp->msg_type = PQC_HS_MSG_RESP;
@@ -965,8 +964,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             pthread_mutex_unlock(&g_key_mutex);
 
                             if (trf_dsa_verify_payload(raw_pub, raw_pub_sz, msg->payload, msg->data_len, msg->payload + msg->data_len, msg->sig_len) == TRF_PQC_OK) {
-                                peeraddr = info.src_addr;
-                                 if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
+                                if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) == TRF_PQC_OK) {
                                     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)buffer;
                                     resp->magic = PQC_HS_MAGIC;
                                     resp->msg_type = PQC_HS_MSG_RESP;
@@ -1430,6 +1428,21 @@ int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_p
     char clean_fg[16] = "";
     strncpy(clean_fg, fingerprint, 8);
     clean_fg[8] = '\0';
+
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_registry_count; i++) {
+        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
+            if (out_priv) *out_priv = g_identity_registry[i].priv_key;
+            if (out_pub) *out_pub = g_identity_registry[i].pub_key;
+            pthread_mutex_unlock(&g_key_mutex);
+            return 0;
+        }
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+
+    // Fallback: key not in RAM, scan disk to see if it was newly created
+    fprintf(stderr, "[PQC-HS] Fingerprint [%s] not found in RAM registry. Reloading from disk...\n", clean_fg);
+    sig_pqc_load_keys_from_disk();
 
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
