@@ -16,6 +16,49 @@
 #include <net/ip.h>
 #include <net/neighbour.h>
 #include <net/arp.h>
+#include <linux/inetdevice.h>
+
+bool mwan_resolve_gateway_mac(struct mwan_tunnel *tun, struct net_device *dev, u8 *mac_out)
+{
+    struct neighbour *n;
+    bool resolved = false;
+    struct in_device *in_dev;
+
+    /* Enforce rp_filter = 0 dynamically */
+    rcu_read_lock();
+    in_dev = __in_dev_get_rcu(dev);
+    if (in_dev && in_dev->cnf.data[IPV4_DEVCONF_RP_FILTER - 1] != 0) {
+        in_dev->cnf.data[IPV4_DEVCONF_RP_FILTER - 1] = 0;
+    }
+    rcu_read_unlock();
+
+    /* Look up gateway MAC locklessly in kernel's neighbour table */
+    n = __ipv4_neigh_lookup_noref(dev, tun->gateway);
+    if (n) {
+        if (n->nud_state & NUD_VALID) {
+            read_lock_bh(&n->lock);
+            ether_addr_copy(mac_out, n->ha);
+            read_unlock_bh(&n->lock);
+            resolved = true;
+        } else {
+            neigh_event_send(n, NULL);
+        }
+    } else {
+        n = neigh_create(&arp_tbl, &tun->gateway, dev);
+        if (n && !IS_ERR(n)) {
+            neigh_event_send(n, NULL);
+            neigh_release(n);
+        }
+    }
+
+    /* Fallback: If neighbour state is pending/invalid but we already have a cached non-zero MAC, use it! */
+    if (!resolved && !is_zero_ether_addr(tun->gateway_mac)) {
+        ether_addr_copy(mac_out, tun->gateway_mac);
+        resolved = true;
+    }
+
+    return resolved;
+}
 
 static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 {
@@ -39,10 +82,9 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
 
-    // if (state->out) {
-    //     pr_info("mwan_kmod: BEFORE - Dest: %pI4, skb->dev: %s, state->out: %s\n",
-    //             &iph->daddr, skb->dev ? skb->dev->name : "NULL", state->out->name);
-    // }
+    // pr_info_ratelimited("mwan_kmod: POST_ROUTING hit: dest %pI4, out_dev: %s (ifindex: %d)\n",
+    //                     &iph->daddr, state->out ? state->out->name : "NULL",
+    //                     state->out ? state->out->ifindex : -1);
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
@@ -52,11 +94,14 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         return NF_ACCEPT;
     }
 
-    /* 1. Filter: Check if Destination IP matches our Overlay CIDR */
-    if ((iph->daddr & cfg->cidr_mask) != (cfg->cidr_ip & cfg->cidr_mask)) {
+    /* 1. Filter: Check if Outbound Interface is managed by MWAN */
+    if (!state->out || !is_mwan_tunnel(cfg, state->out->ifindex)) {
         rcu_read_unlock();
         return NF_ACCEPT;
     }
+
+    pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
+                        state->out->name, state->out->ifindex);
 
     /* 2. Hash: Use kernel-cached or hardware RSS hash for flow affinity */
     hash = skb_get_hash(skb);
@@ -66,9 +111,9 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
         
-        pr_info_ratelimited("mwan_kmod: steer packet to %pI4 - hash: 0x%x, lut_idx: %d, tunnel: %s, mac_resolved: %d, dev_ptr: %px\n",
-                            &iph->daddr, hash, hash & (MWAN_LUT_SIZE - 1), 
-                            tun->dev ? tun->dev->name : "NULL", tun->mac_resolved, tun->dev);
+        // pr_info_ratelimited("mwan_kmod: steer packet to %pI4 - hash: 0x%x, lut_idx: %d, tunnel: %s, mac_resolved: %d, dev_ptr: %px\n",
+        //                     &iph->daddr, hash, hash & (MWAN_LUT_SIZE - 1), 
+        //                     tun->dev ? tun->dev->name : "NULL", tun->mac_resolved, tun->dev);
 
         unsigned int ret = NF_ACCEPT;
         
@@ -110,54 +155,24 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
 
-    if (!cfg || !cfg->local_dev) {
+    if (!cfg) {
         rcu_read_unlock();
         return NF_ACCEPT;
     }
 
     /* 1. Check if packet is coming from one of our WAN tunnels */
     if (is_mwan_tunnel(cfg, skb->dev->ifindex)) {
+        pr_info_ratelimited("mwan_kmod: PRE_ROUTING hit from tunnel %s, proto %d, saddr %pI4, daddr %pI4\n",
+                            skb->dev->name, iph->protocol, &iph->saddr, &iph->daddr);
         
-        /* 1.5. Decrypt if encryption is enabled */
+        /* 2. Decrypt if encryption is enabled (L3 custom mode) */
         if (cfg->encrypt_on && cfg->tfm) {
             int dec_ret = mwan_handle_decap_l3(skb, cfg);
             if (dec_ret != MWAN_DECAP_CONTINUE) {
+                pr_info_ratelimited("mwan_kmod: PRE_ROUTING decryption failed/drop with ret %d\n", dec_ret);
                 rcu_read_unlock();
                 return (unsigned int)dec_ret;
             }
-            /* Reload iph after potential decryption modifications */
-            iph = ip_hdr(skb);
-        }
-
-        /* 2. Check if Destination IP matches our Local CIDR */
-        if ((iph->daddr & cfg->local_mask) == (cfg->local_ip & cfg->local_mask)) {
-            /* 3. Steering: Route to Local Interface */
-            
-            /* We let the kernel handle the L2 (ARP/MAC) for the client 
-             * because the user preferred the kernel to handle it. */
-            /* Debug log: Capture info BEFORE switching device */
-            if (skb->dev) {
-                struct iphdr *iph_dbg = ip_hdr(skb);
-                u16 frag_off = ntohs(iph_dbg->frag_off);
-                bool is_frag = (frag_off & IP_MF) || (frag_off & IP_OFFSET);
-
-                // pr_info_ratelimited("mwan_kmod: INBOUND [CPU %u] from %s (RXQ: %u) Proto: %u Frag: %s -> To %s\n",
-                //                     smp_processor_id(),
-                //                     skb->dev->name, 
-                //                     skb_rx_queue_recorded(skb) ? skb_get_rx_queue(skb) : 0,
-                //                     iph_dbg->protocol,
-                //                     is_frag ? "YES" : "NO",
-                //                     cfg->local_dev->name);
-            }
-
-            skb->dev = cfg->local_dev;
-            
-            /* Important: Clear any stale L2 header remains to avoid corruption */
-            skb_pull(skb, skb_network_offset(skb));
-            skb_reset_mac_header(skb);
-
-            /* We return NF_ACCEPT to let the kernel finish routing/delivery locally 
-             * to the destination client, now that we've set the correct skb->dev. */
         }
     }
 

@@ -14,5 +14,6 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
 unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun);
 
 int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg);
+bool mwan_resolve_gateway_mac(struct mwan_tunnel *tun, struct net_device *dev, u8 *mac_out);
 
 #endif /* MWAN_STEER_H */

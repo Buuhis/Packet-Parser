@@ -120,9 +120,6 @@ static void usage(const char *prog) {
 
 /* ---------- main ---------- */
 int main(int argc, char **argv) {
-    const char *env_sock = getenv("SDWAN_SOCKET_PATH");
-    if (env_sock) strncpy(socket_path, env_sock, sizeof(socket_path)-1);
-    
     log_set_level(LOG_INFO);
 
     int client_mode = 0, node_id = 0, reset_mode = 0;

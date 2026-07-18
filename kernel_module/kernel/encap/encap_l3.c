@@ -152,9 +152,9 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
     memcpy(iv, cfg->encrypt_salt, MWAN_SALT_LEN);
     *(__be64 *)(iv + MWAN_SALT_LEN) = cpu_to_be64(seq);
 
+    if (skb_linearize(skb)) return NF_ACCEPT;
     if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + MWAN_CRYPTO_HDR_LEN)) return NF_ACCEPT;
     if (pskb_expand_head(skb, 0, MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN, GFP_ATOMIC)) return NF_ACCEPT;
-    if (skb_linearize(skb)) return NF_ACCEPT;
 
     /* Checksum Fix (Step 1): Resolve partial checksums before we encrypt the payload.
      * If we don't do this, the ciphertext will contain an invalid (likely 0) checksum,
@@ -236,19 +236,8 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
 
     /* Handle L2 injection */
     if (tun->is_ethernet) {
-        if (unlikely(!tun->mac_resolved)) {
-            struct neighbour *n = neigh_lookup(&arp_tbl, &tun->gateway, target_dev);
-            if (!n) n = neigh_create(&arp_tbl, &tun->gateway, target_dev);
-            if (n && !IS_ERR(n)) {
-                if (n->nud_state & NUD_VALID) {
-                    read_lock_bh(&n->lock);
-                    ether_addr_copy(tun->gateway_mac, n->ha);
-                    read_unlock_bh(&n->lock);
-                    tun->mac_resolved = true;
-                } else neigh_event_send(n, NULL);
-                neigh_release(n);
-            }
-            if (!tun->mac_resolved) return NF_ACCEPT;
+        if (unlikely(!mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac))) {
+            return NF_DROP;
         }
 
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
