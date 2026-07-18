@@ -103,8 +103,18 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
                         state->out->name, state->out->ifindex);
 
-    /* 2. Hash: Use kernel-cached or hardware RSS hash for flow affinity */
-    hash = skb_get_hash(skb);
+    /* MTU Protection: Let kernel IP stack fragment non-GSO packets that exceed the tunnel MTU */
+    if (!skb_is_gso(skb) && skb->len > state->out->mtu) {
+        rcu_read_unlock();
+        return NF_ACCEPT;
+    }
+
+    /* 2. Hash: Use kernel-cached/hardware RSS hash, but fallback to custom L3-only hash for IP fragments */
+    if (iph->frag_off & htons(IP_MF | IP_OFFSET)) {
+        hash = (__force u32)iph->saddr ^ (__force u32)iph->daddr;
+    } else {
+        hash = skb_get_hash(skb);
+    }
     
     /* 3. Steer: Choose a tunnel based on the weight-proportional LUT (O(1)) */
     if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
@@ -151,6 +161,18 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     
     iph = ip_hdr(skb);
     if (!iph) return NF_ACCEPT;
+
+    // if (skb->dev && (strncmp(skb->dev->name, "ne_", 3) == 0 ||
+    //                  strncmp(skb->dev->name, "l2tun", 5) == 0 ||
+    //                  strncmp(skb->dev->name, "enp", 3) == 0 ||
+    //                  strncmp(skb->dev->name, "eno", 3) == 0)) {
+    //     static int rx_debug_count = 0;
+    //     if (rx_debug_count < 100) {
+    //         rx_debug_count++;
+    //         pr_info("mwan_kmod: [RX debug %d] dev %s, proto %d, len %d, saddr %pI4, daddr %pI4\n",
+    //                 rx_debug_count, skb->dev->name, iph->protocol, skb->len, &iph->saddr, &iph->daddr);
+    //     }
+    // }
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);

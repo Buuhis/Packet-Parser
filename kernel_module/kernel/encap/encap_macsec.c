@@ -124,27 +124,29 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
     /* 1. Perform TCP MSS Clamping to fit within MACsec MTU */
     mwan_clamp_mss(skb, target_dev);
 
-    /* Checksum Fix: Force software checksum calculation before MACsec encapsulation, but skip for GSO packets */
-    if (!skb_is_gso(skb) && (skb->ip_summed == CHECKSUM_PARTIAL || skb->ip_summed == CHECKSUM_UNNECESSARY)) {
-        pr_info_ratelimited("mwan_kmod: [Checksum Help] Resolving ip_summed %d in software\n", skb->ip_summed);
-        if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
-            struct iphdr *iph = ip_hdr(skb);
-            if (iph->protocol == IPPROTO_TCP) {
-                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
-                skb->csum_offset = offsetof(struct tcphdr, check);
-                skb->ip_summed = CHECKSUM_PARTIAL;
-            } else if (iph->protocol == IPPROTO_UDP) {
-                skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
-                skb->csum_offset = offsetof(struct udphdr, check);
-                skb->ip_summed = CHECKSUM_PARTIAL;
+    /* Checksum Fix: Force software checksum calculation before MACsec encapsulation, but skip for GSO packets. Only applies to TCP/UDP. */
+    struct iphdr *iph = ip_hdr(skb);
+    if (iph && (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
+        if (!skb_is_gso(skb) && (skb->ip_summed == CHECKSUM_PARTIAL || skb->ip_summed == CHECKSUM_UNNECESSARY)) {
+            pr_info_ratelimited("mwan_kmod: [Checksum Help] Resolving ip_summed %d in software\n", skb->ip_summed);
+            if (skb->ip_summed == CHECKSUM_UNNECESSARY) {
+                if (iph->protocol == IPPROTO_TCP) {
+                    skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                    skb->csum_offset = offsetof(struct tcphdr, check);
+                    skb->ip_summed = CHECKSUM_PARTIAL;
+                } else if (iph->protocol == IPPROTO_UDP) {
+                    skb->csum_start = ((u8 *)iph + (iph->ihl * 4)) - skb->head;
+                    skb->csum_offset = offsetof(struct udphdr, check);
+                    skb->ip_summed = CHECKSUM_PARTIAL;
+                }
             }
-        }
-        if (skb->ip_summed == CHECKSUM_PARTIAL) {
-            if (skb_checksum_help(skb)) {
-                pr_info_ratelimited("mwan_kmod: macsec skb_checksum_help failed\n");
-                return NF_ACCEPT;
+            if (skb->ip_summed == CHECKSUM_PARTIAL) {
+                if (skb_checksum_help(skb)) {
+                    pr_info_ratelimited("mwan_kmod: macsec skb_checksum_help failed\n");
+                    return NF_ACCEPT;
+                }
+                pr_info_ratelimited("mwan_kmod: [Checksum Help] skb_checksum_help success, ip_summed is now %d\n", skb->ip_summed);
             }
-            pr_info_ratelimited("mwan_kmod: [Checksum Help] skb_checksum_help success, ip_summed is now %d\n", skb->ip_summed);
         }
     }
 
@@ -199,9 +201,11 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
         }
     }
 
-    pr_info_ratelimited("mwan_kmod: macsec redirecting packet to %s (dev_queue_xmit)\n", target_dev->name);
-    skb->dev = target_dev;
-    dev_queue_xmit(skb);
-
-    return NF_STOLEN;
+    {
+        int ret;
+        skb->dev = target_dev;
+        ret = dev_queue_xmit(skb);
+        pr_info_ratelimited("mwan_kmod: macsec redirecting packet to %s, dev_queue_xmit returned %d\n", target_dev->name, ret);
+        return NF_STOLEN;
+    }
 }
