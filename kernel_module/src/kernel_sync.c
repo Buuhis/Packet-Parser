@@ -10,21 +10,6 @@
 #include <arpa/inet.h>
 #include "../kernel/mwan_proto.h"
 
-/* Helper to parse CIDR "192.168.182.0/24" into numeric IP and bitmask */
-static void parse_cidr(const char *cidr, uint32_t *ip, uint32_t *mask) {
-    char buf[32];
-    strncpy(buf, cidr, sizeof(buf)-1);
-    char *slash = strchr(buf, '/');
-    int prefix = 24;
-    if (slash) {
-        *slash = '\0';
-        prefix = atoi(slash + 1);
-    }
-    struct in_addr addr;
-    inet_aton(buf, &addr);
-    *ip = addr.s_addr;
-    *mask = (prefix == 0) ? 0 : htonl(~((1U << (32 - prefix)) - 1));
-}
 
 int kernel_sync_push_config(const app_context_t *ctx) {
     struct nl_sock *sock;
@@ -59,12 +44,7 @@ int kernel_sync_push_config(const app_context_t *ctx) {
 
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MWAN_CMD_SET_CONFIG, MWAN_GENL_VERSION);
 
-    uint32_t ip, mask;
-    parse_cidr(ctx->cfg.remote_cidr, &ip, &mask);
-
     nla_put_u32(msg, MWAN_ATTR_NODE_ID, ctx->cfg.node_id);
-    nla_put_u32(msg, MWAN_ATTR_CIDR_IP, ip);
-    nla_put_u32(msg, MWAN_ATTR_CIDR_MASK, mask);
     
     /* Sync Local Network for Inbound Steering */
     if (ctx->cfg.local_ip > 0) {
@@ -100,11 +80,18 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     /* Sync Encryption Config */
     if (ctx->cfg.encrypt.enabled) {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   1);
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_LAYER, ctx->cfg.encrypt.layer);
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  ctx->cfg.encrypt.type);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   ctx->cfg.encrypt.key_len, ctx->cfg.encrypt.key);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     ctx->cfg.encrypt.salt);
-        log_info("  [+] Sync Encryption: ON (type: %s, key_len: %zu)",
-                 ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" : "AES-GCM-256",
+        
+        const char *type_str = "AES-GCM-128";
+        if (ctx->cfg.encrypt.type == 1) type_str = "AES-GCM-256";
+        else if (ctx->cfg.encrypt.type == 2) type_str = "PQC-GCM";
+
+        log_info("  [+] Sync Encryption: ON (layer: %u, type: %s, key_len: %zu)",
+                 ctx->cfg.encrypt.layer,
+                 type_str,
                  ctx->cfg.encrypt.key_len);
     } else {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   0);

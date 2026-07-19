@@ -95,11 +95,14 @@ int mwan_state_update(struct mwan_config *new_cfg) {
 
             tun->is_ethernet = (tun->dev->type == ARPHRD_ETHER);
             
-            if (tun->dev->rtnl_link_ops && tun->dev->rtnl_link_ops->kind &&
-                strcmp(tun->dev->rtnl_link_ops->kind, "macsec") == 0) {
-                tun->encap_type = MWAN_ENCAP_MACSEC;
-            } else if (new_cfg->encrypt_on) {
-                tun->encap_type = MWAN_ENCAP_L3_CUSTOM;
+            if (new_cfg->encrypt_on) {
+                if (new_cfg->encrypt_layer == 2) {
+                    tun->encap_type = MWAN_ENCAP_MACSEC;
+                } else if (new_cfg->encrypt_layer == 3) {
+                    tun->encap_type = MWAN_ENCAP_L3_CUSTOM;
+                } else {
+                    tun->encap_type = MWAN_ENCAP_NONE;
+                }
             } else {
                 tun->encap_type = MWAN_ENCAP_NONE;
             }

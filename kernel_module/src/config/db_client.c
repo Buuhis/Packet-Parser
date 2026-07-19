@@ -68,8 +68,8 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     const char *paramValues[1] = { id_str };
     
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT local_if, remote_cidr, loopback_ip, "
-        "encryption_enabled, encrypt_type, encrypt_key, encrypt_nonce "
+        "SELECT local_if, "
+        "encryption_enabled, encrypt_type, encrypt_key, encrypt_layer "
         "FROM public.nodes WHERE node_id = $1",
         1,       /* nParams */
         NULL,    /* paramTypes */
@@ -95,21 +95,24 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     memset(cfg, 0, sizeof(*cfg));
     cfg->node_id = node_id;
     strncpy(cfg->local_if, PQgetvalue(res, 0, 0), sizeof(cfg->local_if) - 1);
-    strncpy(cfg->remote_cidr, PQgetvalue(res, 0, 1), sizeof(cfg->remote_cidr) - 1);
-    strncpy(cfg->loopback_ip, PQgetvalue(res, 0, 2), sizeof(cfg->loopback_ip) - 1);
     
     /* Parse encryption config */
-    const char *enc_enabled = PQgetvalue(res, 0, 3);
-    const char *enc_type    = PQgetvalue(res, 0, 4);
-    const char *enc_key_hex = PQgetvalue(res, 0, 5);
-    const char *enc_salt_hex = PQgetvalue(res, 0, 6);
+    const char *enc_enabled = PQgetvalue(res, 0, 1);
+    const char *enc_type    = PQgetvalue(res, 0, 2);
+    const char *enc_key_hex = PQgetvalue(res, 0, 3);
+    const char *enc_layer    = PQgetvalue(res, 0, 4);
     
     cfg->encrypt.enabled = (enc_enabled && strcmp(enc_enabled, "t") == 0);
     
     if (cfg->encrypt.enabled) {
+        /* Set layer (default L3) */
+        cfg->encrypt.layer = enc_layer ? atoi(enc_layer) : 3;
+
         /* Map string type to enum */
         if (enc_type && strcmp(enc_type, "aes-gcm-256") == 0) {
             cfg->encrypt.type = 1;  /* MWAN_CRYPT_AES_GCM_256 */
+        } else if (enc_type && strcmp(enc_type, "pqc-gcm") == 0) {
+            cfg->encrypt.type = 2;  /* MWAN_CRYPT_PQC_GCM */
         } else {
             cfg->encrypt.type = 0;  /* MWAN_CRYPT_AES_GCM_128 (default) */
         }
@@ -121,15 +124,6 @@ int db_client_load_config(int node_id, app_config_t *cfg)
                 cfg->encrypt.key_len = (size_t)klen;
             } else {
                 log_error("Invalid encrypt_key hex string");
-                cfg->encrypt.enabled = false;
-            }
-        }
-        
-        /* Convert hex salt to binary */
-        if (enc_salt_hex && strlen(enc_salt_hex) > 0) {
-            int slen = hex_to_bytes(enc_salt_hex, cfg->encrypt.salt, MAX_ENCRYPT_SALT_LEN);
-            if (slen != MAX_ENCRYPT_SALT_LEN) {
-                log_error("Invalid encrypt_nonce: expected %d bytes, got %d", MAX_ENCRYPT_SALT_LEN, slen);
                 cfg->encrypt.enabled = false;
             }
         }
@@ -222,4 +216,42 @@ void db_client_report_error(int node_id, const char *err_msg) {
         PQclear(res);
     }
     pthread_mutex_unlock(&g_db_mutex);
+}
+
+int db_client_load_pqc_identity(int node_id, char *local_fg_out, char *peer_pub_out) {
+    pthread_mutex_lock(&g_db_mutex);
+    if (!g_db_conn) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    char id_str[16];
+    snprintf(id_str, sizeof(id_str), "%d", node_id);
+    const char *paramValues[1] = { id_str };
+
+    PGresult *res = PQexecParams(g_db_conn,
+        "SELECT local_identity_fingerprint, peer_pub FROM public.pqc_identities WHERE node_id = $1",
+        1, NULL, paramValues, NULL, NULL, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        log_error("SELECT pqc_identities failed: %s", PQerrorMessage(g_db_conn));
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -2; // Not found (might not be using PQC)
+    }
+
+    strncpy(local_fg_out, PQgetvalue(res, 0, 0), 31);
+    local_fg_out[31] = '\0';
+    strncpy(peer_pub_out, PQgetvalue(res, 0, 1), 255);
+    peer_pub_out[255] = '\0';
+
+    PQclear(res);
+    pthread_mutex_unlock(&g_db_mutex);
+    return 0;
 }

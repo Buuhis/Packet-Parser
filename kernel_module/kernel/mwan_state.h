@@ -33,8 +33,6 @@ struct mwan_tunnel {
 
 struct mwan_config {
     u32 node_id;
-    __be32 cidr_ip;
-    __be32 cidr_mask;
     u32 num_tunnels;
     u32 total_weight; /* Pre-calculated total weight */
     
@@ -51,6 +49,7 @@ struct mwan_config {
 
     /* Encryption (AES-GCM) */
     bool encrypt_on;
+    u8   encrypt_layer;                   /* 2=L2 (MACsec), 3=L3 (Overlay) */
     u8   encrypt_type;                    /* enum mwan_crypt_type */
     u8   encrypt_key[MWAN_MAX_KEY_LEN];
     u8   encrypt_key_len;                 /* 16 (128-bit) or 32 (256-bit) */

@@ -19,6 +19,7 @@
 enum mwan_crypt_type {
     MWAN_CRYPT_AES_GCM_128 = 0,
     MWAN_CRYPT_AES_GCM_256 = 1,
+    MWAN_CRYPT_PQC_GCM = 2,
 };
 
 /* ---- MWAN Crypto Header (prepended to encrypted payload) ---- */
@@ -41,8 +42,6 @@ enum mwan_genl_cmds {
 enum mwan_genl_attrs {
     MWAN_ATTR_UNSPEC = 0,
     MWAN_ATTR_NODE_ID,    /* u32 */
-    MWAN_ATTR_CIDR_IP,    /* u32 (network byte order) */
-    MWAN_ATTR_CIDR_MASK,  /* u32 (network byte order) */
     MWAN_ATTR_TUNNELS,    /* Nested array of tunnels */
     MWAN_ATTR_LOCAL_IP,   /* u32 (network byte order) */
     MWAN_ATTR_LOCAL_MASK, /* u32 (network byte order) */
@@ -51,6 +50,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_ENCRYPT_TYPE,  /* u8: enum mwan_crypt_type */
     MWAN_ATTR_ENCRYPT_KEY,   /* NLA_BINARY: raw key bytes (16 or 32) */
     MWAN_ATTR_ENCRYPT_SALT,  /* NLA_BINARY: 4 bytes salt */
+    MWAN_ATTR_ENCRYPT_LAYER, /* u8: 2=L2 (MACsec), 3=L3 (Overlay) */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

@@ -8,8 +8,6 @@
 /* Netlink Policy for parsing payload */
 static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NODE_ID]   = { .type = NLA_U32 },
-    [MWAN_ATTR_CIDR_IP]   = { .type = NLA_U32 },
-    [MWAN_ATTR_CIDR_MASK] = { .type = NLA_U32 },
     [MWAN_ATTR_TUNNELS]   = { .type = NLA_NESTED },
     [MWAN_ATTR_LOCAL_IP]   = { .type = NLA_U32 },
     [MWAN_ATTR_LOCAL_MASK] = { .type = NLA_U32 },
@@ -18,6 +16,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_ENCRYPT_TYPE] = { .type = NLA_U8 },
     [MWAN_ATTR_ENCRYPT_KEY]  = { .type = NLA_BINARY, .len = MWAN_MAX_KEY_LEN },
     [MWAN_ATTR_ENCRYPT_SALT] = { .type = NLA_BINARY, .len = MWAN_SALT_LEN },
+    [MWAN_ATTR_ENCRYPT_LAYER] = { .type = NLA_U8 },
 };
 
 /* Callback to handle SET_CONFIG message */
@@ -28,9 +27,7 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     struct nlattr *tun;
     int rem, err, ret;
 
-    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
-        !info->attrs[MWAN_ATTR_CIDR_IP] ||
-        !info->attrs[MWAN_ATTR_CIDR_MASK]) {
+    if (!info->attrs[MWAN_ATTR_NODE_ID]) {
         return -EINVAL;
     }
 
@@ -38,8 +35,6 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     if (!new_cfg) return -ENOMEM;
 
     new_cfg->node_id   = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
-    new_cfg->cidr_ip   = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_CIDR_IP]);
-    new_cfg->cidr_mask = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_CIDR_MASK]);
     new_cfg->num_tunnels = 0;
 
     if (info->attrs[MWAN_ATTR_LOCAL_IP])
@@ -79,6 +74,11 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
         new_cfg->encrypt_on = (nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_ON]) != 0);
         
         if (new_cfg->encrypt_on) {
+            if (info->attrs[MWAN_ATTR_ENCRYPT_LAYER])
+                new_cfg->encrypt_layer = nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_LAYER]);
+            else
+                new_cfg->encrypt_layer = 3; // Default L3
+
             if (info->attrs[MWAN_ATTR_ENCRYPT_TYPE])
                 new_cfg->encrypt_type = nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_TYPE]);
             
@@ -94,8 +94,8 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 memcpy(new_cfg->encrypt_salt, nla_data(info->attrs[MWAN_ATTR_ENCRYPT_SALT]), MWAN_SALT_LEN);
             }
             
-            pr_info("mwan_kmod: Encryption ON (type: %u, key_len: %u)\n",
-                    new_cfg->encrypt_type, new_cfg->encrypt_key_len);
+            pr_info("mwan_kmod: Encryption ON (layer: %u, type: %u, key_len: %u)\n",
+                    new_cfg->encrypt_layer, new_cfg->encrypt_type, new_cfg->encrypt_key_len);
         }
     }
 

@@ -4,6 +4,12 @@
 #include "system/cpu_tune.h"
 #include "config/db_client.h"
 #include "utils/logger.h"
+#include "cli/cli_handler.h"
+#include "pqc_handshake.h"
+#include "pqc_ipc.h"
+#include "pqc_logger.h"
+#include "traffic_crypto.h"
+#include "../kernel/mwan_proto.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +35,7 @@ static char socket_path[256] = "/var/run/sd-wan.sock";
 static app_context_t running_ctx;
 
 /* ---------- startup config persistence ---------- */
-static void save_node_id(int node_id) {
+void save_node_id(int node_id) {
     mkdir(NODE_INFO_DIR, 0755); // Ignore error if exists
     FILE *f = fopen(NODE_INFO_FILE, "w");
     if (f) {
@@ -95,6 +101,7 @@ static void handle_signal(int sig) {
     cpu_tune_restore();
     kernel_sync_cleanup();
     db_client_stop_heartbeat();
+    trf_pqc_cleanup();
     if (unix_server_fd >= 0) {
         close(unix_server_fd);
         unix_server_fd = -1;
@@ -102,15 +109,125 @@ static void handle_signal(int sig) {
     }
 }
 
+void pqc_bind_node(int node_id) {
+    char local_fg_db[32] = {0};
+    char peer_pub_name[256] = {0};
+
+    // Load PQC identity config from DB
+    if (db_client_load_pqc_identity(node_id, local_fg_db, peer_pub_name) != 0) {
+        log_warn("[PQC] No PQC configuration or database identity found for Node ID: %d", node_id);
+        return;
+    }
+
+    // Strip .key suffix from fingerprint name if present to get the 8-char fingerprint
+    char local_fg[16] = {0};
+    strncpy(local_fg, local_fg_db, 8);
+
+    // Resolve WAN info from the active tunnels configured in running_ctx
+    char peer_ip[64] = "0.0.0.0";
+    const char *wan_ifname = "";
+    if (running_ctx.cfg.ne_tunnel_count > 0) {
+        peer_ip[0] = '\0';
+        strncpy(peer_ip, running_ctx.cfg.ne_tunnels[0].gateway, sizeof(peer_ip) - 1);
+        wan_ifname = running_ctx.cfg.ne_tunnels[0].ifname;
+    }
+
+    // Read peer public key
+    char peer_pub_path[512];
+    snprintf(peer_pub_path, sizeof(peer_pub_path), "/etc/.dec_config/%s", peer_pub_name);
+    
+    char peer_fg_buf[16] = "";
+    char *deobf_pub = NULL;
+    bool valid = true;
+
+    FILE *fp_pub = fopen(peer_pub_path, "r");
+    if (!fp_pub) {
+        log_error("[PQC] ERROR: Node %d peer_pub key file [%s] could not be opened!", node_id, peer_pub_path);
+        valid = false;
+    } else {
+        char file_content[8192];
+        memset(file_content, 0, sizeof(file_content));
+        if (fgets(file_content, sizeof(file_content) - 1, fp_pub) != NULL) {
+            file_content[strcspn(file_content, "\r\n")] = '\0';
+            if (strlen(file_content) < 8) {
+                log_error("[PQC] ERROR: Node %d peer_pub file [%s] is invalid (too short)!", node_id, peer_pub_path);
+                valid = false;
+            } else {
+                strncpy(peer_fg_buf, file_content, 8);
+                peer_fg_buf[8] = '\0';
+                const char *obf_pub = file_content + 8;
+                deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
+                if (!deobf_pub) {
+                    log_error("[PQC] ERROR: Node %d peer_pub file [%s] deobfuscation failed!", node_id, peer_pub_path);
+                    valid = false;
+                }
+            }
+        } else {
+            log_error("[PQC] ERROR: Peer public key file [%s] is empty!", peer_pub_path);
+            valid = false;
+        }
+        fclose(fp_pub);
+    }
+
+    char *found_priv = NULL;
+    char *found_pub = NULL;
+    if (valid) {
+        sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
+        if (!found_priv || !found_pub) {
+            log_error("[PQC] ERROR: Local keys for fingerprint [%s] (Node %d) not loaded in memory registry!", local_fg, node_id);
+            valid = false;
+        }
+    }
+
+    if (valid) {
+        // We use PQC_ROLE_DYNAMIC (2) to negotiate the handshake role automatically
+        sig_pqc_bind_profile(node_id, 2, peer_ip, local_fg, peer_fg_buf, wan_ifname, found_priv, found_pub, deobf_pub);
+        
+        // Start/kickoff the handshake by spinning up the background worker thread for this policy
+        sig_pqc_handshake_start(node_id, wan_ifname, peer_ip);
+        
+        log_info("[PQC] Handshake worker initiated for Node %d on WAN %s to Peer IP %s", node_id, wan_ifname, peer_ip);
+    } else {
+        log_error("[PQC] PQC Handshake will NOT start for Node %d due to errors.", node_id);
+    }
+
+    if (deobf_pub) free(deobf_pub);
+}
+
+void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
+    log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
+    
+    // Check if this matches the currently running Node configuration
+    if (running_ctx.cfg.node_id == profile_id && running_ctx.cfg.encrypt.enabled) {
+        // Copy the dynamic key to the active configuration
+        memcpy(running_ctx.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
+        running_ctx.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
+        
+        // Push configuration to kernel datapath via Netlink
+        if (kernel_sync_push_config(&running_ctx) == 0) {
+            log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
+        } else {
+            log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
+        }
+    } else {
+        log_warn("[PQC] Handshake key ready for Node %d but no active tunnel/encryption is configured for it.", profile_id);
+    }
+}
+
 /* ---------- usage ---------- */
 static void usage(const char *prog) {
     printf("=========================================================\n");
-    printf("         MULTI-WAN PACKET FORWARDER (sd-wan)            \n");
+    printf("                 SD-WAN            \n");
     printf("=========================================================\n");
     printf("Client Mode (Control running daemon):\n");
-    printf("  %s -id <node_id>    Send config request to the daemon\n", prog);
-    printf("  %s -reset           Clear the node_id startup configuration\n", prog);
-    printf("  %s --help | -h      Show this help message and exit\n", prog);
+    printf("  %s -id <node_id>                       Send config request to the daemon\n", prog);
+    printf("  %s -gi <node_id>                       Generate PQC identity keys for node\n", prog);
+    printf("  %s -r <node_id>                        Retry PQC handshake for node\n", prog);
+    printf("  %s -a/--add <profile_id> <if_name>     Add a tunnel dynamically\n", prog);
+    printf("  %s -d/--delete <profile_id> <if_name>  Delete a tunnel dynamically\n", prog);
+    printf("  %s -e/--edit <profile_id> <table.field> Edit a config field\n", prog);
+    printf("  %s -reset                              Clear the node_id startup configuration\n", prog);
+    printf("  %s --help | -h                         Show this help message and exit\n", prog);
     printf("\n");
     printf("Daemon Mode (Start the background service):\n");
     printf("  Run without arguments to start the daemon.\n");
@@ -122,52 +239,28 @@ static void usage(const char *prog) {
 int main(int argc, char **argv) {
     log_set_level(LOG_INFO);
 
-    int client_mode = 0, node_id = 0, reset_mode = 0;
+    /* Handle --help / -h first */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             usage(argv[0]); return 0;
-        } else if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
-            client_mode = 1; node_id = atoi(argv[++i]);
-        } else if (strcmp(argv[i], "-reset") == 0) {
-            reset_mode = 1;
-        } else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]); usage(argv[0]); return 1;
         }
     }
 
-    if (reset_mode) {
-        clear_node_id();
-        return 0;
-    }
-
-    if (client_mode) {
-        if (node_id <= 0) {
-            fprintf(stderr, "Error: Invalid ID\n"); return 1;
-        }
-        int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-        if (fd < 0) return 1;
-        struct sockaddr_un addr = {.sun_family = AF_UNIX};
-        strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path)-1);
-        if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-            fprintf(stderr, "[-] Connection refused! Is daemon running?\n"); close(fd); return 1;
-        }
-        char id_str[16]; snprintf(id_str, sizeof(id_str), "%d", node_id);
-        send(fd, id_str, strlen(id_str), 0);
-        
-        char reply[512] = {0};
-        int rn = recv(fd, reply, sizeof(reply)-1, 0);
-        if (rn > 0) {
-            printf("%s\n", reply);
-            close(fd);
-            return (strstr(reply, "\"code\": 200") != NULL) ? 0 : 1;
-        } else {
-            printf("[-] No reply from daemon\n");
-            close(fd); 
-            return 1;
+    /* Handle -reset */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-reset") == 0) {
+            clear_node_id();
+            return 0;
         }
     }
 
-    /* DAEMON MODE */
+    /* Delegate client-mode commands to cli_handler */
+    int cli_result = cli_handle_client_args(argc, argv, socket_path);
+    if (cli_result >= 0) {
+        return cli_result;
+    }
+
+    /* ======================== DAEMON MODE ======================== */
     const char *db_h = getenv("POSTGRES_HOST"); 
     const char *db_p = getenv("POSTGRES_PORT"); 
     const char *db_u = getenv("POSTGRES_USER"); 
@@ -181,6 +274,15 @@ int main(int argc, char **argv) {
         log_error("Failed to connect to DB! Exiting."); return 1;
     }
 
+    // Initialize global PQC crypto library resources
+    if (trf_pqc_init_global() != TRF_PQC_OK) {
+        log_error("Failed to initialize PQC cryptography! Exiting.");
+        return 1;
+    }
+
+    // Load PQC identities from disk
+    sig_pqc_load_keys_from_disk();
+
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
@@ -189,7 +291,7 @@ int main(int argc, char **argv) {
     if (unix_server_fd < 0) return 1;
     unlink(socket_path);
     struct sockaddr_un saddr = {.sun_family = AF_UNIX};
-    strncpy(saddr.sun_path, socket_path, sizeof(saddr.sun_path)-1);
+    snprintf(saddr.sun_path, sizeof(saddr.sun_path), "%s", socket_path);
     if (bind(unix_server_fd, (struct sockaddr*)&saddr, sizeof(saddr)) < 0 || listen(unix_server_fd, 5) < 0) {
         log_error("Socket bind/listen failed"); return 1;
     }
@@ -215,8 +317,12 @@ int main(int argc, char **argv) {
                 db_client_report_error(saved_node_id, "Startup config Netlink error");
             } else {
                 cpu_tune_apply(&running_ctx);
+                save_node_id(saved_node_id);
                 log_info("Startup config successfully restored.");
                 db_client_start_heartbeat(saved_node_id);
+                if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+                    pqc_bind_node(saved_node_id);
+                }
             }
         } else {
             log_error("Failed to load startup config from DB.");
@@ -226,45 +332,19 @@ int main(int argc, char **argv) {
         log_info("No startup config found. Waiting for provisioning (-id) via socket...");
     }
 
+    /* ======================== MAIN LOOP ======================== */
     while(running_server) {
         int client_fd = accept(unix_server_fd, NULL, NULL);
         if (client_fd < 0) continue;
-        char buf[128] = {0};
+        char buf[256] = {0};
         int n = recv(client_fd, buf, sizeof(buf)-1, 0);
         if (n <= 0) { close(client_fd); continue; }
         
         while(n > 0 && (buf[n-1] == '\r' || buf[n-1] == '\n')) buf[--n] = '\0';
-        int req_id = atoi(buf);
-        log_info(">>> Received configure request for Node ID: %d", req_id);
-        
-        app_config_t new_cfg;
-        if (db_client_load_config(req_id, &new_cfg) == 0) {
-            if (resolve_local_network(&new_cfg) == 0) {
-                struct in_addr addr = { .s_addr = new_cfg.local_ip };
-                log_info("[+] Auto-discovered Local Network: %s", inet_ntoa(addr));
-            } else {
-                log_warn("[-] Could not resolve local network for interface %s", new_cfg.local_if);
-            }
-            
-            app_context_dump(&(app_context_t){new_cfg});
-            running_ctx.cfg = new_cfg;
-            if (kernel_sync_push_config(&running_ctx) != 0) {
-                log_error("Failed to push config to kernel");
-                db_client_report_error(req_id, "Netlink push error");
-                char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 500, \"message\": \"Netlink push error\"}");
-                send(client_fd, reply, strlen(reply), 0);
-            } else {
-                cpu_tune_apply(&running_ctx);
-                save_node_id(req_id);
-                db_client_start_heartbeat(req_id);
-                char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 200, \"message\": \"Success\"}");
-                send(client_fd, reply, strlen(reply), 0);
-            }
-        } else {
-            db_client_report_error(req_id, "Failed to load config from DB");
-            char reply[256]; snprintf(reply, sizeof(reply), "{\"code\": 404, \"message\": \"Failed to load config from DB\"}");
-            send(client_fd, reply, strlen(reply), 0);
-        }
+
+        /* Delegate all message handling to cli_handler */
+        cli_handle_daemon_message(client_fd, buf, &running_ctx);
+
         close(client_fd);
     }
     

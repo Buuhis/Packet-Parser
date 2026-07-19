@@ -6,6 +6,7 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
 #include <linux/ip.h>
+#include <linux/udp.h>
 #include <linux/netdevice.h>
 #include <linux/jhash.h>
 #include <linux/if_ether.h>
@@ -70,6 +71,28 @@ static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
     return false;
 }
 
+/* Helper function to check if packet is PQC handshake traffic (UDP port 7090) */
+static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *iph)
+{
+    if (iph && iph->protocol == IPPROTO_UDP) {
+        int ip_hlen = iph->ihl * 4;
+        struct udphdr *udph;
+        
+        // Ensure we can access the UDP header safely
+        if (!pskb_may_pull(skb, ip_hlen + sizeof(struct udphdr)))
+            return false;
+        
+        // Reload iph/udph after pskb_may_pull as skb header pointers may change
+        iph = ip_hdr(skb);
+        udph = (struct udphdr *)(skb_network_header(skb) + ip_hlen);
+        
+        if (udph->dest == htons(7090) || udph->source == htons(7090)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -98,6 +121,23 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     if (!state->out || !is_mwan_tunnel(cfg, state->out->ifindex)) {
         rcu_read_unlock();
         return NF_ACCEPT;
+    }
+
+    /* Bypass PQC handshake traffic (UDP port 7090) */
+    if (is_pqc_handshake_packet(skb, iph)) {
+        int i;
+        struct mwan_tunnel *tun = NULL;
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            if (cfg->tunnels[i].ifindex == state->out->ifindex) {
+                tun = &cfg->tunnels[i];
+                break;
+            }
+        }
+        if (tun) {
+            unsigned int ret = mwan_handle_encap_none(skb, tun);
+            rcu_read_unlock();
+            return ret;
+        }
     }
 
     pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
@@ -184,6 +224,11 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
 
     /* 1. Check if packet is coming from one of our WAN tunnels */
     if (is_mwan_tunnel(cfg, skb->dev->ifindex)) {
+        /* Bypass decryption for PQC handshake packets */
+        if (is_pqc_handshake_packet(skb, iph)) {
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
         pr_info_ratelimited("mwan_kmod: PRE_ROUTING hit from tunnel %s, proto %d, saddr %pI4, daddr %pI4\n",
                             skb->dev->name, iph->protocol, &iph->saddr, &iph->daddr);
         

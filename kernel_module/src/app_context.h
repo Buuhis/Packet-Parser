@@ -27,7 +27,8 @@ typedef struct {
 
 typedef struct {
     bool     enabled;
-    uint8_t  type;                              /* 0=aes-gcm-128, 1=aes-gcm-256 */
+    uint8_t  layer;                             /* 2=L2 (MACsec), 3=L3 (Overlay) */
+    uint8_t  type;                              /* 0=aes-gcm-128, 1=aes-gcm-256, 2=pqc-gcm */
     uint8_t  key[MAX_ENCRYPT_KEY_LEN];          /* Raw binary key */
     size_t   key_len;                           /* 16 (128-bit) or 32 (256-bit) */
     uint8_t  salt[MAX_ENCRYPT_SALT_LEN];        /* 4 bytes static salt */
@@ -39,9 +40,6 @@ typedef struct {
     char local_if[16];
     unsigned int local_ip;   /* Network byte order */
     unsigned int local_mask; /* Network byte order */
-    char remote_cidr[32];
-    char loopback_ip[32];
-
 
     size_t wan_count;
     wan_cfg_t wans[MAX_WANS];
