@@ -14,6 +14,8 @@ enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
     MWAN_ENCAP_MACSEC,
     MWAN_ENCAP_L3_CUSTOM,
+    MWAN_ENCAP_L3_PQC,      /* L3 AES-GCM with PQC-derived session key */
+    MWAN_ENCAP_L2_PQC,      /* L2 AES-GCM with PQC-derived session key */
 };
 
 struct mwan_tunnel;

@@ -418,6 +418,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
                 int retry_cnt = 0;
                 while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                    if (b->handshake_start_time == 0) {
+                        b->handshake_start_time = get_time_ms_hs();
+                        retry_cnt = 0;
+                    }
                     if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                         fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Profile %d.\n",
                                 PQC_HS_GIVEUP_TIMEOUT_MS / 1000, profile_id);
@@ -469,6 +473,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 }
                 fprintf(stderr, "[PQC-WORKER-L3] Responder (Profile %d) listening for HELLO...\n", profile_id);
                 while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                    if (b->handshake_start_time == 0) {
+                        b->handshake_start_time = get_time_ms_hs();
+                    }
                     if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                         fprintf(stderr, "[PQC-HS-L3] Responder timed out waiting for HELLO on Profile %d.\n", profile_id);
                         sig_pqc_write_log(profile_id, b->key_id, PQC_LOG_LEVEL_ERROR, PQC_LOG_STATUS_FAILED, "Handshake timeout. No HELLO received from Peer.");
@@ -949,6 +956,15 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
                             profile_id, (int)(get_time_ms_hs() - wait_start));
                     b->thread_exit_sig = false;
                 }
+                b->key_ready = false;
+                b->handshake_give_up = false;
+                b->handshake_start_time = 0;
+                b->rotation_give_up = false;
+                b->rotation_start_time = 0;
+                b->send_poke = true;
+            } else {
+                /* If configuration is identical but bind is re-requested (e.g. via -id CLI),
+                 * we reset the handshake state to trigger a fresh 15-second retry attempt. */
                 b->key_ready = false;
                 b->handshake_give_up = false;
                 b->handshake_start_time = 0;

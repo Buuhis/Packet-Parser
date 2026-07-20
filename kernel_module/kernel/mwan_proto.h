@@ -14,6 +14,7 @@
 #define MWAN_MAX_KEY_LEN    32       /* AES-256 = 32 bytes */
 #define MWAN_SALT_LEN        4
 #define MWAN_FAKE_PROTOCOL  99       /* Fake L4 Protocol to hide real protocol (TCP/UDP) */
+#define MWAN_L2_PQC_ETHERTYPE 0x88B5 /* Custom EtherType for L2-PQC packets */
 
 /* ---- Crypto Type Enum ---- */
 enum mwan_crypt_type {

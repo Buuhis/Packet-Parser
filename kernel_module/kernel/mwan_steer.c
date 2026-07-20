@@ -177,6 +177,12 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             case MWAN_ENCAP_L3_CUSTOM:
                 ret = mwan_handle_encap_l3(skb, tun);
                 break;
+            case MWAN_ENCAP_L3_PQC:
+                ret = mwan_handle_encap_l3_pqc(skb, tun);
+                break;
+            case MWAN_ENCAP_L2_PQC:
+                ret = mwan_handle_encap_l2_pqc(skb, tun);
+                break;
             default:
                 ret = mwan_handle_encap_none(skb, tun);
                 break;
@@ -232,9 +238,16 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
         pr_info_ratelimited("mwan_kmod: PRE_ROUTING hit from tunnel %s, proto %d, saddr %pI4, daddr %pI4\n",
                             skb->dev->name, iph->protocol, &iph->saddr, &iph->daddr);
         
-        /* 2. Decrypt if encryption is enabled (L3 custom mode) */
+        /* 2. Decrypt if encryption is enabled */
         if (cfg->encrypt_on && cfg->tfm) {
-            int dec_ret = mwan_handle_decap_l3(skb, cfg);
+            int dec_ret;
+            if (cfg->encrypt_type == MWAN_CRYPT_PQC_GCM) {
+                /* L3-PQC: cfg->tfm holds PQC session key */
+                dec_ret = (int)mwan_handle_decap_l3_pqc(skb, NULL);
+            } else {
+                /* L3-Custom: cfg->tfm holds static AES-GCM key */
+                dec_ret = mwan_handle_decap_l3(skb, cfg);
+            }
             if (dec_ret != MWAN_DECAP_CONTINUE) {
                 pr_info_ratelimited("mwan_kmod: PRE_ROUTING decryption failed/drop with ret %d\n", dec_ret);
                 rcu_read_unlock();
@@ -265,11 +278,17 @@ static struct nf_hook_ops mwan_nf_ops[] = {
 
 /* Hook Registration */
 int mwan_steer_init(void) {
+    int err;
     pr_info("mwan_kmod: Registering Netfilter steering hooks\n");
-    return nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    err = nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    if (err)
+        return err;
+    mwan_decap_l2_pqc_init();
+    return 0;
 }
 
 void mwan_steer_cleanup(void) {
     pr_info("mwan_kmod: Unregistering steering hooks\n");
     nf_unregister_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    mwan_decap_l2_pqc_cleanup();
 }

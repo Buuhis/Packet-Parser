@@ -97,7 +97,14 @@ int mwan_state_update(struct mwan_config *new_cfg) {
             
             if (new_cfg->encrypt_on) {
                 if (new_cfg->encrypt_layer == 2) {
-                    tun->encap_type = MWAN_ENCAP_MACSEC;
+                    if (new_cfg->encrypt_type == MWAN_CRYPT_PQC_GCM) {
+                        tun->encap_type = MWAN_ENCAP_L2_PQC;
+                    } else {
+                        tun->encap_type = MWAN_ENCAP_MACSEC;
+                    }
+                } else if (new_cfg->encrypt_layer == 3 &&
+                           new_cfg->encrypt_type == MWAN_CRYPT_PQC_GCM) {
+                    tun->encap_type = MWAN_ENCAP_L3_PQC;
                 } else if (new_cfg->encrypt_layer == 3) {
                     tun->encap_type = MWAN_ENCAP_L3_CUSTOM;
                 } else {
@@ -111,8 +118,12 @@ int mwan_state_update(struct mwan_config *new_cfg) {
                 const char *encap_str = "NONE";
                 if (tun->encap_type == MWAN_ENCAP_MACSEC) {
                     encap_str = "MACsec (L2)";
+                } else if (tun->encap_type == MWAN_ENCAP_L2_PQC) {
+                    encap_str = "L2 PQC (AES-GCM + PQC session key)";
                 } else if (tun->encap_type == MWAN_ENCAP_L3_CUSTOM) {
-                    encap_str = "Custom L3 (AES-GCM)";
+                    encap_str = "Custom L3 (AES-GCM static key)";
+                } else if (tun->encap_type == MWAN_ENCAP_L3_PQC) {
+                    encap_str = "L3 PQC (AES-GCM + PQC session key)";
                 }
                 pr_info("mwan_kmod: Resolved tunnel interface %s (ifindex %d) - Encap Type: %s\n",
                         tun->dev->name, tun->ifindex, encap_str);
