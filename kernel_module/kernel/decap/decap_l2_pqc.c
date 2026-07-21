@@ -134,22 +134,11 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     }
 
     {
-        struct scatterlist sg[MAX_SKB_FRAGS + 3];
-        int nents;
+        struct scatterlist sg[2];
 
-        sg_init_table(sg, ARRAY_SIZE(sg));
+        sg_init_table(sg, 2);
         sg_set_buf(&sg[0], skb->data, MWAN_CRYPTO_HDR_LEN); // AAD
-        
-        nents = skb_to_sgvec(skb, &sg[1], MWAN_CRYPTO_HDR_LEN, ciphertext_len);
-        if (unlikely(nents < 0)) {
-            pr_warn("mwan_kmod DBG Decap: skb_to_sgvec failed\n");
-            aead_request_free(req);
-            rcu_read_unlock();
-            if (pulled_bytes > 0) {
-                skb_push(skb, pulled_bytes);
-            }
-            return -EIO;
-        }
+        sg_set_buf(&sg[1], skb->data + MWAN_CRYPTO_HDR_LEN, ciphertext_len); // Ciphertext + Tag
 
         aead_request_set_crypt(req, sg, sg, ciphertext_len, iv_buf);
         aead_request_set_ad(req, MWAN_CRYPTO_HDR_LEN);
