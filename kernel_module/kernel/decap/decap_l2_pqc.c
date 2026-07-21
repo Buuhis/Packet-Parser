@@ -101,13 +101,23 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 
     // Validate we have enough data in the skb
     if (skb->len < MWAN_CRYPTO_HDR_LEN + ciphertext_len) {
-        pr_warn("mwan_kmod DBG Decap: skb->len (%d) < required (%d)\n",
-                skb->len, MWAN_CRYPTO_HDR_LEN + ciphertext_len);
+        static int decap_len_err_count = 0;
+        if (decap_len_err_count < 10) {
+            decap_len_err_count++;
+            int dump_len = skb->len < 64 ? skb->len : 64;
+            pr_warn("mwan_kmod DBG Decap: skb->len (%d) < required (%d) [orig_len=%d], dev=%s\n",
+                    skb->len, MWAN_CRYPTO_HDR_LEN + ciphertext_len, orig_len,
+                    skb->dev ? skb->dev->name : "NULL");
+            pr_warn("mwan_kmod DBG Decap: data=%*phN\n", dump_len, skb->data);
+            if (skb_mac_header_was_set(skb)) {
+                pr_warn("mwan_kmod DBG Decap: mac_header=%*phN\n", 14, skb_mac_header(skb));
+            }
+        }
         rcu_read_unlock();
         if (pulled_bytes > 0) {
             skb_push(skb, pulled_bytes);
         }
-        return -EINVAL;
+        return L2_PQC_DECAP_BYPASS;
     }
 
     // Trim trailing Ethernet padding if any
