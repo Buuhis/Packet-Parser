@@ -11,18 +11,19 @@
 static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 {
     struct mwan_config *cfg;
-    struct mwan_crypto_hdr *chdr;
     int ciphertext_len;
     u8 iv_buf[MWAN_GCM_IV_LEN];
     struct aead_request *req;
     int err;
     bool has_eth_hdr = false;
 
-    // Detect if skb->data points to the Ethernet header by checking EtherType at offset 12
-    if (skb->len >= ETH_HLEN && 
-        *(u16 *)(skb->data + 12) == htons(MWAN_L2_PQC_ETHERTYPE)) {
-        has_eth_hdr = true;
-        skb_pull(skb, ETH_HLEN);
+    // Detect if skb->data points to the Ethernet header by directly reading bytes 12 & 13
+    if (skb->len >= ETH_HLEN) {
+        u16 eth_type = ((u16)skb->data[12] << 8) | skb->data[13];
+        if (eth_type == MWAN_L2_PQC_ETHERTYPE) {
+            has_eth_hdr = true;
+            skb_pull(skb, ETH_HLEN);
+        }
     }
 
     // Validate minimum packet length for header + tag
@@ -64,12 +65,11 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         }
     }
 
-    chdr = (struct mwan_crypto_hdr *)skb->data;
-
-    // Check custom magic identifier
-    if (ntohs(chdr->magic) != MWAN_CRYPTO_MAGIC) {
+    // Check custom magic identifier (by directly reading bytes 0 & 1)
+    u16 magic = ((u16)skb->data[0] << 8) | skb->data[1];
+    if (magic != MWAN_CRYPTO_MAGIC) {
         pr_warn("mwan_kmod DBG Decap: magic mismatch (got 0x%04x, expected 0x%04x), skb->len=%d\n",
-                ntohs(chdr->magic), MWAN_CRYPTO_MAGIC, skb->len);
+                magic, MWAN_CRYPTO_MAGIC, skb->len);
         
         // Print hex dump of the packet to see what it is
         int dump_len = skb->len < 64 ? skb->len : 64;
@@ -97,12 +97,14 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         return -ENODEV;
     }
 
-    // Build IV: salt (4B) + sequence (8B)
+    // Build IV: salt (4B) + sequence (8B) from skb->data+4
     memcpy(iv_buf, cfg->encrypt_salt, MWAN_SALT_LEN);
-    memcpy(iv_buf + MWAN_SALT_LEN, &chdr->seq, 8);
+    memcpy(iv_buf + MWAN_SALT_LEN, skb->data + 4, 8);
 
-    // Extract plaintext length from proto and reserved fields
-    u16 orig_len = ((u16)chdr->proto << 8) | chdr->reserved;
+    // Extract plaintext length from proto and reserved fields (bytes 2 & 3)
+    u8 proto = skb->data[2];
+    u8 reserved = skb->data[3];
+    u16 orig_len = ((u16)proto << 8) | reserved;
     ciphertext_len = orig_len + MWAN_GCM_TAG_LEN;
 
     // Validate we have enough data in the skb
@@ -134,7 +136,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         int nents;
 
         sg_init_table(sg, ARRAY_SIZE(sg));
-        sg_set_buf(&sg[0], (u8 *)chdr, MWAN_CRYPTO_HDR_LEN); // AAD
+        sg_set_buf(&sg[0], skb->data, MWAN_CRYPTO_HDR_LEN); // AAD
         
         nents = skb_to_sgvec(skb, &sg[1], MWAN_CRYPTO_HDR_LEN, ciphertext_len);
         if (unlikely(nents < 0)) {
@@ -169,7 +171,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
                 pr_warn("mwan_kmod DBG [Decap L2 PQC %d]: iv=%*phN\n", 
                         decap_print_count, MWAN_GCM_IV_LEN, iv_buf);
                 pr_warn("mwan_kmod DBG [Decap L2 PQC %d]: chdr AAD=%*phN\n", 
-                        decap_print_count, MWAN_CRYPTO_HDR_LEN, chdr);
+                        decap_print_count, MWAN_CRYPTO_HDR_LEN, skb->data);
                 if (skb->len >= MWAN_CRYPTO_HDR_LEN + 16) {
                     pr_warn("mwan_kmod DBG [Decap L2 PQC %d]: ciphertext (first 16B)=%*phN\n", 
                             decap_print_count, 16, skb->data + MWAN_CRYPTO_HDR_LEN);
@@ -282,7 +284,7 @@ static struct packet_type l2_pqc_packet_type __read_mostly = {
 void mwan_decap_l2_pqc_init(void)
 {
     dev_add_pack(&l2_pqc_packet_type);
-    pr_info("mwan_kmod: Registered L2-PQC packet handler (0x%04x)\n", MWAN_L2_PQC_ETHERTYPE);
+    pr_info("mwan_kmod: Registered L2-PQC packet handler (0x%04x) - RAW_BYTE_ACCESS_V3\n", MWAN_L2_PQC_ETHERTYPE);
 
     if (nf_register_net_hooks(&init_net, l2_pqc_decap_ops, ARRAY_SIZE(l2_pqc_decap_ops)) < 0) {
         pr_err("mwan_kmod: Failed to register L2-PQC bridge Netfilter hook\n");
