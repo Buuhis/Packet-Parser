@@ -20,24 +20,31 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     int err;
     int pulled_bytes = 0;
 
+    pr_info_ratelimited("mwan_kmod DBG Decap: entered. skb->len=%d, dev=%s\n", skb->len, skb->dev ? skb->dev->name : "NULL");
+
     // Adaptive Offset Detection:
     // Case 1: skb->data starts at Ethernet header (offset 0). EtherType is at bytes 12 & 13.
     if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0xB5) {
+        pr_info_ratelimited("mwan_kmod DBG Decap: Case 1 matched. MAC Header: %*phN\n", 14, skb->data);
         pulled_bytes = ETH_HLEN;
         skb_pull(skb, ETH_HLEN);
     }
     // Case 2: skb->data is shifted by 10 bytes (starts at last 2 bytes of Src MAC). EtherType is at bytes 2 & 3.
     else if (skb->len >= 4 && skb->data[2] == 0x88 && skb->data[3] == 0xB5) {
+        pr_info_ratelimited("mwan_kmod DBG Decap: Case 2 matched. Data: %*phN\n", 4, skb->data);
         pulled_bytes = 4;
         skb_pull(skb, 4);
     }
     // Case 3: skb->data already points directly to the Crypto Header (starts with Magic 0x4D57).
     else if (skb->len >= 2 && skb->data[0] == 0x4D && skb->data[1] == 0x57) {
+        pr_info_ratelimited("mwan_kmod DBG Decap: Case 3 matched. Magic: %*phN\n", 2, skb->data);
         pulled_bytes = 0;
     }
     // Otherwise, this packet does not match our expected formats.
     // We treat it as a bypass packet.
     else {
+        pr_info_ratelimited("mwan_kmod DBG Decap: No case matched, bypass. First 14B: %*phN\n", 
+                            skb->len < 14 ? skb->len : 14, skb->data);
         return L2_PQC_DECAP_BYPASS;
     }
 
@@ -53,6 +60,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     // Check custom magic identifier
     u16 magic = ((u16)skb->data[0] << 8) | skb->data[1];
     if (magic != MWAN_CRYPTO_MAGIC) {
+        pr_info_ratelimited("mwan_kmod DBG Decap: Magic mismatch: 0x%04x (expected 0x%04x)\n", magic, MWAN_CRYPTO_MAGIC);
         if (pulled_bytes > 0) {
             skb_push(skb, pulled_bytes);
         }
@@ -191,6 +199,12 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     skb_reset_network_header(skb);
     skb->ip_summed = CHECKSUM_NONE;
 
+    {
+        struct iphdr *iph = ip_hdr(skb);
+        pr_info("mwan_kmod DBG Decap SUCCESS: Dst MAC=%pM, Src MAC=%pM, Dst IP=%pI4, Src IP=%pI4, proto=%d\n",
+                eth->h_dest, eth->h_source, &iph->daddr, &iph->saddr, iph->protocol);
+    }
+
     rcu_read_unlock();
     return L2_PQC_DECAP_SUCCESS;
 }
@@ -213,6 +227,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     }
 
     // Push packet back into the receive stack
+    pr_info("mwan_kmod DBG Decap: calling netif_rx on skb\n");
     netif_rx(skb);
     return NET_RX_SUCCESS;
 }
