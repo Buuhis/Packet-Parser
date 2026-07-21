@@ -73,21 +73,39 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         }
     }
 
+    u8 tmp_src[ETH_ALEN], tmp_dst[ETH_ALEN];
+    bool has_mac = false;
+
+    // Check if the skb already has a valid MAC header (bridged packet)
+    if (skb_mac_header_was_set(skb) && 
+        skb_mac_header(skb) >= skb->head && 
+        skb_mac_header(skb) < skb->data) {
+        struct ethhdr *orig_eth = eth_hdr(skb);
+        ether_addr_copy(tmp_src, orig_eth->h_source);
+        ether_addr_copy(tmp_dst, orig_eth->h_dest);
+        has_mac = true;
+    }
+
     // Prepend Ethernet + Crypto Header
     skb_push(skb, ETH_HLEN + MWAN_CRYPTO_HDR_LEN);
     skb_reset_mac_header(skb);
 
     // Write Ethernet Header
     struct ethhdr *eth = eth_hdr(skb);
-    if (target_dev->dev_addr)
-        ether_addr_copy(eth->h_source, target_dev->dev_addr);
-    else
-        eth_zero_addr(eth->h_source);
-    
-    if (tun->is_ethernet)
-        ether_addr_copy(eth->h_dest, tun->gateway_mac);
-    else
-        eth_zero_addr(eth->h_dest);
+    if (has_mac) {
+        ether_addr_copy(eth->h_source, tmp_src);
+        ether_addr_copy(eth->h_dest, tmp_dst);
+    } else {
+        if (target_dev->dev_addr)
+            ether_addr_copy(eth->h_source, target_dev->dev_addr);
+        else
+            eth_zero_addr(eth->h_source);
+        
+        if (tun->is_ethernet)
+            ether_addr_copy(eth->h_dest, tun->gateway_mac);
+        else
+            eth_zero_addr(eth->h_dest);
+    }
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
     // Write Crypto Header
@@ -157,6 +175,5 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
     rcu_read_unlock();
 
-    dev_queue_xmit(skb);
-    return NF_STOLEN;
+    return NF_ACCEPT;
 }
