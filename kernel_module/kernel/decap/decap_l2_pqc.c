@@ -5,9 +5,10 @@
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
 #include <crypto/aead.h>
+#include <linux/netfilter.h>
+#include <linux/netfilter_bridge.h>
 
-static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
-                            struct packet_type *pt, struct net_device *orig_dev)
+static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 {
     struct mwan_config *cfg;
     struct mwan_crypto_hdr *chdr;
@@ -16,25 +17,19 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     struct aead_request *req;
     int err;
 
-    if (!skb)
-        return NET_RX_DROP;
-
     // Validate minimum packet length for header + tag
     if (skb->len < MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN) {
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -EINVAL;
     }
 
     // Ensure skb head/fragments are write-safe
     if (skb_cow(skb, 0)) {
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -ENOMEM;
     }
 
     if (skb_is_nonlinear(skb)) {
         if (unlikely(skb_linearize(skb))) {
-            kfree_skb(skb);
-            return NET_RX_DROP;
+            return -ENOMEM;
         }
     }
 
@@ -42,16 +37,14 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
 
     // Check custom magic identifier
     if (ntohs(chdr->magic) != MWAN_CRYPTO_MAGIC) {
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -EINVAL;
     }
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->tfm || !cfg->encrypt_on) {
         rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -ENODEV;
     }
 
     // Build IV: salt (4B) + sequence (8B)
@@ -65,8 +58,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     // Validate we have enough data in the skb
     if (skb->len < MWAN_CRYPTO_HDR_LEN + ciphertext_len) {
         rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -EINVAL;
     }
 
     // Trim trailing Ethernet padding if any
@@ -76,8 +68,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
     if (!req) {
         rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -ENOMEM;
     }
 
     {
@@ -91,8 +82,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         if (unlikely(nents < 0)) {
             aead_request_free(req);
             rcu_read_unlock();
-            kfree_skb(skb);
-            return NET_RX_DROP;
+            return -EIO;
         }
 
         aead_request_set_crypt(req, sg, sg, ciphertext_len, iv_buf);
@@ -126,8 +116,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         }
         pr_warn_ratelimited("mwan_kmod: L2 PQC RX decrypt FAILED (err=%d) - DROP\n", err);
         rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return err;
     }
 
     // Decryption success: shift Ethernet header to close the crypto header gap
@@ -147,11 +136,76 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     skb->ip_summed = CHECKSUM_NONE;
 
     rcu_read_unlock();
+    return 0;
+}
+
+static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
+                             struct packet_type *pt, struct net_device *orig_dev)
+{
+    int ret;
+
+    if (!skb)
+        return NET_RX_DROP;
+
+    ret = l2_pqc_decrypt_skb(skb);
+    if (ret) {
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
 
     // Push packet back into the receive stack
     netif_rx(skb);
     return NET_RX_SUCCESS;
 }
+
+static unsigned int l2_pqc_bridge_decap_hook(void *priv,
+                                            struct sk_buff *skb,
+                                            const struct nf_hook_state *state)
+{
+    struct mwan_config *cfg;
+    bool is_tunnel = false;
+    int i, ret;
+
+    if (!skb)
+        return NF_ACCEPT;
+
+    // Check if the packet has our EtherType (located at Ethernet Header protocol field)
+    if (eth_hdr(skb)->h_proto != htons(MWAN_L2_PQC_ETHERTYPE))
+        return NF_ACCEPT;
+
+    // We only process packets from our managed tunnel interfaces
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg) {
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            if (cfg->tunnels[i].ifindex == state->in->ifindex) {
+                is_tunnel = true;
+                break;
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    if (!is_tunnel)
+        return NF_ACCEPT;
+
+    ret = l2_pqc_decrypt_skb(skb);
+    if (ret) {
+        kfree_skb(skb);
+        return NF_STOLEN;
+    }
+
+    return NF_ACCEPT;
+}
+
+static struct nf_hook_ops l2_pqc_decap_ops[] __read_mostly = {
+    {
+        .hook     = l2_pqc_bridge_decap_hook,
+        .pf       = NFPROTO_BRIDGE,
+        .hooknum  = NF_BR_PRE_ROUTING,
+        .priority = NF_BR_PRI_FIRST,
+    },
+};
 
 static struct packet_type l2_pqc_packet_type __read_mostly = {
     .type = cpu_to_be16(MWAN_L2_PQC_ETHERTYPE),
@@ -162,10 +216,19 @@ void mwan_decap_l2_pqc_init(void)
 {
     dev_add_pack(&l2_pqc_packet_type);
     pr_info("mwan_kmod: Registered L2-PQC packet handler (0x%04x)\n", MWAN_L2_PQC_ETHERTYPE);
+
+    if (nf_register_net_hooks(&init_net, l2_pqc_decap_ops, ARRAY_SIZE(l2_pqc_decap_ops)) < 0) {
+        pr_err("mwan_kmod: Failed to register L2-PQC bridge Netfilter hook\n");
+    } else {
+        pr_info("mwan_kmod: Registered L2-PQC bridge Netfilter hook\n");
+    }
 }
 
 void mwan_decap_l2_pqc_cleanup(void)
 {
     dev_remove_pack(&l2_pqc_packet_type);
     pr_info("mwan_kmod: Unregistered L2-PQC packet handler\n");
+
+    nf_unregister_net_hooks(&init_net, l2_pqc_decap_ops, ARRAY_SIZE(l2_pqc_decap_ops));
+    pr_info("mwan_kmod: Unregistered L2-PQC bridge Netfilter hook\n");
 }
