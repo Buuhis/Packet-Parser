@@ -8,6 +8,9 @@
 #include <linux/netfilter.h>
 #include <linux/netfilter_bridge.h>
 
+#define L2_PQC_DECAP_SUCCESS 0
+#define L2_PQC_DECAP_BYPASS  1
+
 static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 {
     struct mwan_config *cfg;
@@ -32,36 +35,28 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     else if (skb->len >= 2 && skb->data[0] == 0x4D && skb->data[1] == 0x57) {
         pulled_bytes = 0;
     }
-    // Otherwise, this packet does not have our markers
+    // Otherwise, this packet does not match our expected formats.
+    // We treat it as a bypass packet.
     else {
-        static int decap_unknown_count = 0;
-        if (decap_unknown_count < 5) {
-            decap_unknown_count++;
-            int dump_len = skb->len < 64 ? skb->len : 64;
-            pr_warn("mwan_kmod DBG Decap: Unknown packet format (len=%d, data=%*phN)\n", 
-                    skb->len, dump_len, skb->data);
-        }
-        return -EINVAL;
+        return L2_PQC_DECAP_BYPASS;
     }
 
-    // Validate minimum packet length for header + tag
+    // Check if the remaining packet is too short to be an encrypted packet (12B header + 16B tag = 28B minimum).
+    // Discovery/handshake/keepalive frames are short and will be bypassed here.
     if (skb->len < MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN) {
-        pr_warn("mwan_kmod DBG Decap: skb->len (%d) < min required (%d)\n",
-                skb->len, MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN);
-        
-        // Print hex dump of short packet to see what it is
-        int dump_len = skb->len < 64 ? skb->len : 64;
-        pr_warn("mwan_kmod DBG Decap SHORT PKT: skb->len=%d, data=%*phN\n", 
-                skb->len, dump_len, skb->data);
-        if (skb_mac_header_was_set(skb)) {
-            pr_warn("mwan_kmod DBG Decap SHORT PKT: mac_header=%*phN\n", 
-                    14, skb_mac_header(skb));
-        }
-        
         if (pulled_bytes > 0) {
             skb_push(skb, pulled_bytes);
         }
-        return -EINVAL;
+        return L2_PQC_DECAP_BYPASS;
+    }
+
+    // Check custom magic identifier
+    u16 magic = ((u16)skb->data[0] << 8) | skb->data[1];
+    if (magic != MWAN_CRYPTO_MAGIC) {
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
+        }
+        return L2_PQC_DECAP_BYPASS;
     }
 
     // Ensure skb head/fragments are write-safe
@@ -81,27 +76,6 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
             }
             return -ENOMEM;
         }
-    }
-
-    // Check custom magic identifier (by directly reading bytes 0 & 1)
-    u16 magic = ((u16)skb->data[0] << 8) | skb->data[1];
-    if (magic != MWAN_CRYPTO_MAGIC) {
-        pr_warn("mwan_kmod DBG Decap: magic mismatch (got 0x%04x, expected 0x%04x), skb->len=%d\n",
-                magic, MWAN_CRYPTO_MAGIC, skb->len);
-        
-        // Print hex dump of the packet to see what it is
-        int dump_len = skb->len < 64 ? skb->len : 64;
-        pr_warn("mwan_kmod DBG Decap MISMATCH PKT: data=%*phN\n", 
-                dump_len, skb->data);
-        if (skb_mac_header_was_set(skb)) {
-            pr_warn("mwan_kmod DBG Decap MISMATCH PKT: mac_header=%*phN\n", 
-                    14, skb_mac_header(skb));
-        }
-        
-        if (pulled_bytes > 0) {
-            skb_push(skb, pulled_bytes);
-        }
-        return -EINVAL;
     }
 
     rcu_read_lock();
@@ -219,7 +193,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     skb->ip_summed = CHECKSUM_NONE;
 
     rcu_read_unlock();
-    return 0;
+    return L2_PQC_DECAP_SUCCESS;
 }
 
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
@@ -231,9 +205,12 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
 
     ret = l2_pqc_decrypt_skb(skb);
-    if (ret) {
+    if (ret < 0) {
         kfree_skb(skb);
         return NET_RX_DROP;
+    } else if (ret == L2_PQC_DECAP_BYPASS) {
+        consume_skb(skb);
+        return NET_RX_SUCCESS;
     }
 
     // Push packet back into the receive stack
@@ -274,9 +251,11 @@ static unsigned int l2_pqc_bridge_decap_hook(void *priv,
     }
 
     ret = l2_pqc_decrypt_skb(skb);
-    if (ret) {
+    if (ret < 0) {
         kfree_skb(skb);
         return NF_STOLEN;
+    } else if (ret == L2_PQC_DECAP_BYPASS) {
+        return NF_ACCEPT;
     }
 
     // Decryption succeeded: move skb->data back to the restored Ethernet header
