@@ -10,48 +10,8 @@
 #include <net/arp.h>
 #include <net/dst.h>
 #include <crypto/aead.h>
-#include <linux/version.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
-#include <net/gso.h>
-#else
-#include <linux/skbuff.h>
-#endif
-
-static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *tun)
-{
-    if (skb_is_gso(skb)) {
-        struct sk_buff *segs, *nskb, *next;
-        netdev_features_t features = netif_skb_features(skb);
-
-        /* Force software segmentation by clearing all GSO features */
-        segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
-        if (IS_ERR(segs) || !segs) {
-            return NF_DROP;
-        }
-
-        nskb = segs;
-        while (nskb) {
-            next = nskb->next;
-            nskb->next = NULL;
-
-            /* Each segment must be processed and transmitted. 
-             * If processing fails, we must free it to avoid memory leaks. */
-            if (mwan_handle_encap_l2_pqc_single(nskb, tun) != NF_STOLEN) {
-                kfree_skb(nskb);
-            }
-
-            nskb = next;
-        }
-        consume_skb(skb);
-        return NF_STOLEN;
-    }
-
-    return mwan_handle_encap_l2_pqc_single(skb, tun);
-}
-
-static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct mwan_config *cfg;
     struct net_device *target_dev = tun->dev;
@@ -69,9 +29,9 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    if (unlikely(!cfg || !cfg->tfm || !cfg->encrypt_on)) {
+    if (unlikely(!cfg || !cfg->tfm)) {
         rcu_read_unlock();
-        return mwan_handle_encap_none(skb, tun);
+        return NF_ACCEPT;
     }
 
     tfm = cfg->tfm;
@@ -113,39 +73,21 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         }
     }
 
-    u8 tmp_src[ETH_ALEN], tmp_dst[ETH_ALEN];
-    bool has_mac = false;
-
-    // Check if the skb already has a valid MAC header (bridged packet)
-    if (skb_mac_header_was_set(skb) && 
-        skb_mac_header(skb) >= skb->head && 
-        skb_mac_header(skb) < skb->data) {
-        struct ethhdr *orig_eth = eth_hdr(skb);
-        ether_addr_copy(tmp_src, orig_eth->h_source);
-        ether_addr_copy(tmp_dst, orig_eth->h_dest);
-        has_mac = true;
-    }
-
     // Prepend Ethernet + Crypto Header
     skb_push(skb, ETH_HLEN + MWAN_CRYPTO_HDR_LEN);
     skb_reset_mac_header(skb);
 
     // Write Ethernet Header
     struct ethhdr *eth = eth_hdr(skb);
-    if (has_mac) {
-        ether_addr_copy(eth->h_source, tmp_src);
-        ether_addr_copy(eth->h_dest, tmp_dst);
-    } else {
-        if (target_dev->dev_addr)
-            ether_addr_copy(eth->h_source, target_dev->dev_addr);
-        else
-            eth_zero_addr(eth->h_source);
-        
-        if (tun->is_ethernet)
-            ether_addr_copy(eth->h_dest, tun->gateway_mac);
-        else
-            eth_zero_addr(eth->h_dest);
-    }
+    if (target_dev->dev_addr)
+        ether_addr_copy(eth->h_source, target_dev->dev_addr);
+    else
+        eth_zero_addr(eth->h_source);
+    
+    if (tun->is_ethernet)
+        ether_addr_copy(eth->h_dest, tun->gateway_mac);
+    else
+        eth_zero_addr(eth->h_dest);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
     // Write Crypto Header
