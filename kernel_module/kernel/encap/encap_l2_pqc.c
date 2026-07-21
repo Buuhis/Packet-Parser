@@ -10,8 +10,48 @@
 #include <net/arp.h>
 #include <net/dst.h>
 #include <crypto/aead.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#include <net/gso.h>
+#else
+#include <linux/skbuff.h>
+#endif
+
+static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *tun)
+{
+    if (skb_is_gso(skb)) {
+        struct sk_buff *segs, *nskb, *next;
+        netdev_features_t features = netif_skb_features(skb);
+
+        /* Force software segmentation by clearing all GSO features */
+        segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+        if (IS_ERR(segs) || !segs) {
+            return NF_DROP;
+        }
+
+        nskb = segs;
+        while (nskb) {
+            next = nskb->next;
+            nskb->next = NULL;
+
+            /* Each segment must be processed and transmitted. 
+             * If processing fails, we must free it to avoid memory leaks. */
+            if (mwan_handle_encap_l2_pqc_single(nskb, tun) != NF_STOLEN) {
+                kfree_skb(nskb);
+            }
+
+            nskb = next;
+        }
+        consume_skb(skb);
+        return NF_STOLEN;
+    }
+
+    return mwan_handle_encap_l2_pqc_single(skb, tun);
+}
+
+static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct mwan_config *cfg;
     struct net_device *target_dev = tun->dev;
@@ -29,9 +69,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    if (unlikely(!cfg || !cfg->tfm)) {
+    if (unlikely(!cfg || !cfg->tfm || !cfg->encrypt_on)) {
         rcu_read_unlock();
-        return NF_ACCEPT;
+        return mwan_handle_encap_none(skb, tun);
     }
 
     tfm = cfg->tfm;
@@ -175,5 +215,6 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
     rcu_read_unlock();
 
-    return NF_ACCEPT;
+    dev_queue_xmit(skb);
+    return NF_STOLEN;
 }
