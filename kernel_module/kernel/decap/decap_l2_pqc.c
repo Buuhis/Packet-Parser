@@ -15,15 +15,33 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     u8 iv_buf[MWAN_GCM_IV_LEN];
     struct aead_request *req;
     int err;
-    bool has_eth_hdr = false;
+    int pulled_bytes = 0;
 
-    // Detect if skb->data points to the Ethernet header by directly reading bytes 12 & 13
-    if (skb->len >= ETH_HLEN) {
-        u16 eth_type = ((u16)skb->data[12] << 8) | skb->data[13];
-        if (eth_type == MWAN_L2_PQC_ETHERTYPE) {
-            has_eth_hdr = true;
-            skb_pull(skb, ETH_HLEN);
+    // Adaptive Offset Detection:
+    // Case 1: skb->data starts at Ethernet header (offset 0). EtherType is at bytes 12 & 13.
+    if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0xB5) {
+        pulled_bytes = ETH_HLEN;
+        skb_pull(skb, ETH_HLEN);
+    }
+    // Case 2: skb->data is shifted by 10 bytes (starts at last 2 bytes of Src MAC). EtherType is at bytes 2 & 3.
+    else if (skb->len >= 4 && skb->data[2] == 0x88 && skb->data[3] == 0xB5) {
+        pulled_bytes = 4;
+        skb_pull(skb, 4);
+    }
+    // Case 3: skb->data already points directly to the Crypto Header (starts with Magic 0x4D57).
+    else if (skb->len >= 2 && skb->data[0] == 0x4D && skb->data[1] == 0x57) {
+        pulled_bytes = 0;
+    }
+    // Otherwise, this packet does not have our markers
+    else {
+        static int decap_unknown_count = 0;
+        if (decap_unknown_count < 5) {
+            decap_unknown_count++;
+            int dump_len = skb->len < 64 ? skb->len : 64;
+            pr_warn("mwan_kmod DBG Decap: Unknown packet format (len=%d, data=%*phN)\n", 
+                    skb->len, dump_len, skb->data);
         }
+        return -EINVAL;
     }
 
     // Validate minimum packet length for header + tag
@@ -40,8 +58,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
                     14, skb_mac_header(skb));
         }
         
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -EINVAL;
     }
@@ -49,8 +67,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     // Ensure skb head/fragments are write-safe
     if (skb_cow(skb, 0)) {
         pr_warn("mwan_kmod DBG Decap: skb_cow failed\n");
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -ENOMEM;
     }
@@ -58,8 +76,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     if (skb_is_nonlinear(skb)) {
         if (unlikely(skb_linearize(skb))) {
             pr_warn("mwan_kmod DBG Decap: skb_linearize failed\n");
-            if (has_eth_hdr) {
-                skb_push(skb, ETH_HLEN);
+            if (pulled_bytes > 0) {
+                skb_push(skb, pulled_bytes);
             }
             return -ENOMEM;
         }
@@ -80,8 +98,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
                     14, skb_mac_header(skb));
         }
         
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -EINVAL;
     }
@@ -91,8 +109,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     if (!cfg || !cfg->tfm || !cfg->encrypt_on) {
         pr_warn("mwan_kmod DBG Decap: config invalid or encrypt_on is false\n");
         rcu_read_unlock();
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -ENODEV;
     }
@@ -112,8 +130,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         pr_warn("mwan_kmod DBG Decap: skb->len (%d) < required (%d)\n",
                 skb->len, MWAN_CRYPTO_HDR_LEN + ciphertext_len);
         rcu_read_unlock();
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -EINVAL;
     }
@@ -125,8 +143,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
     if (!req) {
         rcu_read_unlock();
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return -ENOMEM;
     }
@@ -143,8 +161,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
             pr_warn("mwan_kmod DBG Decap: skb_to_sgvec failed\n");
             aead_request_free(req);
             rcu_read_unlock();
-            if (has_eth_hdr) {
-                skb_push(skb, ETH_HLEN);
+            if (pulled_bytes > 0) {
+                skb_push(skb, pulled_bytes);
             }
             return -EIO;
         }
@@ -180,8 +198,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         }
         pr_warn_ratelimited("mwan_kmod: L2 PQC RX decrypt FAILED (err=%d) - DROP\n", err);
         rcu_read_unlock();
-        if (has_eth_hdr) {
-            skb_push(skb, ETH_HLEN);
+        if (pulled_bytes > 0) {
+            skb_push(skb, pulled_bytes);
         }
         return err;
     }
@@ -284,7 +302,7 @@ static struct packet_type l2_pqc_packet_type __read_mostly = {
 void mwan_decap_l2_pqc_init(void)
 {
     dev_add_pack(&l2_pqc_packet_type);
-    pr_info("mwan_kmod: Registered L2-PQC packet handler (0x%04x) - RAW_BYTE_ACCESS_V3\n", MWAN_L2_PQC_ETHERTYPE);
+    pr_info("mwan_kmod: Registered L2-PQC packet handler (0x%04x) - ADAPTIVE_ETH_PULL_V4\n", MWAN_L2_PQC_ETHERTYPE);
 
     if (nf_register_net_hooks(&init_net, l2_pqc_decap_ops, ARRAY_SIZE(l2_pqc_decap_ops)) < 0) {
         pr_err("mwan_kmod: Failed to register L2-PQC bridge Netfilter hook\n");
