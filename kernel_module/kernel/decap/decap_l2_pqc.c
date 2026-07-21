@@ -17,18 +17,24 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     struct aead_request *req;
     int err;
 
+    pr_info("mwan_kmod DBG Decap: Entering l2_pqc_decrypt_skb, skb->len=%d\n", skb->len);
+
     // Validate minimum packet length for header + tag
     if (skb->len < MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN) {
+        pr_warn("mwan_kmod DBG Decap: skb->len (%d) < min required (%d)\n",
+                skb->len, MWAN_CRYPTO_HDR_LEN + MWAN_GCM_TAG_LEN);
         return -EINVAL;
     }
 
     // Ensure skb head/fragments are write-safe
     if (skb_cow(skb, 0)) {
+        pr_warn("mwan_kmod DBG Decap: skb_cow failed\n");
         return -ENOMEM;
     }
 
     if (skb_is_nonlinear(skb)) {
         if (unlikely(skb_linearize(skb))) {
+            pr_warn("mwan_kmod DBG Decap: skb_linearize failed\n");
             return -ENOMEM;
         }
     }
@@ -37,12 +43,15 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 
     // Check custom magic identifier
     if (ntohs(chdr->magic) != MWAN_CRYPTO_MAGIC) {
+        pr_warn("mwan_kmod DBG Decap: magic mismatch (got 0x%04x, expected 0x%04x)\n",
+                ntohs(chdr->magic), MWAN_CRYPTO_MAGIC);
         return -EINVAL;
     }
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->tfm || !cfg->encrypt_on) {
+        pr_warn("mwan_kmod DBG Decap: config invalid or encrypt_on is false\n");
         rcu_read_unlock();
         return -ENODEV;
     }
@@ -55,8 +64,13 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     u16 orig_len = ((u16)chdr->proto << 8) | chdr->reserved;
     ciphertext_len = orig_len + MWAN_GCM_TAG_LEN;
 
+    pr_info("mwan_kmod DBG Decap: magic matched, seq=%llu, orig_len=%d, ciphertext_len=%d\n",
+            be64_to_cpu(chdr->seq), orig_len, ciphertext_len);
+
     // Validate we have enough data in the skb
     if (skb->len < MWAN_CRYPTO_HDR_LEN + ciphertext_len) {
+        pr_warn("mwan_kmod DBG Decap: skb->len (%d) < required (%d)\n",
+                skb->len, MWAN_CRYPTO_HDR_LEN + ciphertext_len);
         rcu_read_unlock();
         return -EINVAL;
     }
@@ -80,6 +94,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         
         nents = skb_to_sgvec(skb, &sg[1], MWAN_CRYPTO_HDR_LEN, ciphertext_len);
         if (unlikely(nents < 0)) {
+            pr_warn("mwan_kmod DBG Decap: skb_to_sgvec failed\n");
             aead_request_free(req);
             rcu_read_unlock();
             return -EIO;
@@ -119,9 +134,9 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         return err;
     }
 
+    pr_info("mwan_kmod DBG Decap: Decryption SUCCESS!\n");
+
     // Decryption success: shift Ethernet header to close the crypto header gap
-    // Ethernet header is at skb->data - ETH_HLEN. We shift it right by MWAN_CRYPTO_HDR_LEN
-    // so it sits right before the decrypted IP payload.
     memmove(skb->data + MWAN_CRYPTO_HDR_LEN - ETH_HLEN, skb->data - ETH_HLEN, ETH_HLEN);
     skb_pull(skb, MWAN_CRYPTO_HDR_LEN);
     skb_trim(skb, skb->len - MWAN_GCM_TAG_LEN);
@@ -147,6 +162,9 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     if (!skb)
         return NET_RX_DROP;
 
+    pr_info("mwan_kmod DBG Decap: RX handler called (dev: %s, orig_dev: %s)\n",
+            dev ? dev->name : "NULL", orig_dev ? orig_dev->name : "NULL");
+
     ret = l2_pqc_decrypt_skb(skb);
     if (ret) {
         kfree_skb(skb);
@@ -169,15 +187,25 @@ static unsigned int l2_pqc_bridge_decap_hook(void *priv,
     if (!skb)
         return NF_ACCEPT;
 
+    // Log hook entry for debugging
+    pr_info_ratelimited("mwan_kmod DBG Decap: Bridge hook entry (in dev: %s, proto: 0x%04x)\n",
+                        state->in ? state->in->name : "NULL",
+                        ntohs(eth_hdr(skb)->h_proto));
+
     // Check if the packet has our EtherType (located at Ethernet Header protocol field)
     if (eth_hdr(skb)->h_proto != htons(MWAN_L2_PQC_ETHERTYPE))
         return NF_ACCEPT;
+
+    pr_info("mwan_kmod DBG Decap: Bridge hook matched EtherType 0x88B5 on dev %s!\n",
+            state->in ? state->in->name : "NULL");
 
     // We only process packets from our managed tunnel interfaces
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg) {
         for (i = 0; i < cfg->num_tunnels; i++) {
+            pr_info("mwan_kmod DBG Decap: Comparing dev ifindex %d with tunnel[%d] ifindex %d\n",
+                    state->in->ifindex, i, cfg->tunnels[i].ifindex);
             if (cfg->tunnels[i].ifindex == state->in->ifindex) {
                 is_tunnel = true;
                 break;
@@ -186,15 +214,23 @@ static unsigned int l2_pqc_bridge_decap_hook(void *priv,
     }
     rcu_read_unlock();
 
-    if (!is_tunnel)
+    if (!is_tunnel) {
+        pr_info("mwan_kmod DBG Decap: dev %s is NOT a managed tunnel!\n",
+                state->in ? state->in->name : "NULL");
         return NF_ACCEPT;
+    }
+
+    pr_info("mwan_kmod DBG Decap: Proceeding with decryption for packet from dev %s\n",
+            state->in->name);
 
     ret = l2_pqc_decrypt_skb(skb);
     if (ret) {
+        pr_warn("mwan_kmod DBG Decap: Decryption failed, dropping packet\n");
         kfree_skb(skb);
         return NF_STOLEN;
     }
 
+    pr_info("mwan_kmod DBG Decap: Hook returning NF_ACCEPT after successful decryption\n");
     return NF_ACCEPT;
 }
 
