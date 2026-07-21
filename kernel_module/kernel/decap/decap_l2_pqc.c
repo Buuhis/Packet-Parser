@@ -4,6 +4,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
+#include <net/ip.h>
 #include <crypto/aead.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_bridge.h>
@@ -194,8 +195,16 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 
     {
         struct iphdr *iph = ip_hdr(skb);
-        pr_info("mwan_kmod DBG Decap SUCCESS: Dst MAC=%pM, Src MAC=%pM, Dst IP=%pI4, Src IP=%pI4, proto=%d\n",
-                eth->h_dest, eth->h_source, &iph->daddr, &iph->saddr, iph->protocol);
+        u16 old_check = iph->check;
+        u16 calc_check;
+        iph->check = 0;
+        calc_check = ip_fast_csum((u8 *)iph, iph->ihl);
+        iph->check = old_check;
+
+        pr_info("mwan_kmod DBG Decap SUCCESS: Dst MAC=%pM, Src MAC=%pM, Dst IP=%pI4, Src IP=%pI4, proto=%d, cksum_hdr=0x%04x, cksum_calc=0x%04x (%s)\n",
+                eth->h_dest, eth->h_source, &iph->daddr, &iph->saddr, iph->protocol,
+                ntohs(old_check), ntohs(calc_check),
+                (old_check == calc_check) ? "VALID" : "INVALID");
     }
 
     rcu_read_unlock();
