@@ -61,14 +61,19 @@ bool mwan_resolve_gateway_mac(struct mwan_tunnel *tun, struct net_device *dev, u
     return resolved;
 }
 
-static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
+static struct mwan_tunnel *find_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 {
     int i;
     for (i = 0; i < cfg->num_tunnels; i++) {
         if (cfg->tunnels[i].ifindex == ifindex)
-            return true;
+            return &cfg->tunnels[i];
     }
-    return false;
+    return NULL;
+}
+
+static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
+{
+    return find_mwan_tunnel(cfg, ifindex) != NULL;
 }
 
 /* Helper function to check if packet is PQC handshake traffic (UDP port 7090) */
@@ -229,7 +234,16 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     }
 
     /* 1. Check if packet is coming from one of our WAN tunnels */
-    if (is_mwan_tunnel(cfg, skb->dev->ifindex)) {
+    struct mwan_tunnel *tun = find_mwan_tunnel(cfg, skb->dev->ifindex);
+    if (tun) {
+        /* If this tunnel is configured for L2 PQC encapsulation,
+         * we bypass L3 decryption completely because the packet
+         * was already decrypted at the L2 layer handler. */
+        if (tun->encap_type == MWAN_ENCAP_L2_PQC) {
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
+
         /* Bypass decryption for PQC handshake packets */
         if (is_pqc_handshake_packet(skb, iph)) {
             rcu_read_unlock();
