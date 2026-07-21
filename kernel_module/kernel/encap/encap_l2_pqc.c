@@ -4,6 +4,7 @@
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <net/neighbour.h>
 #include <net/tcp.h>
 #include <net/arp.h>
@@ -38,6 +39,13 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     if (ip_pkt_len <= 0) {
         rcu_read_unlock();
         return NF_ACCEPT;
+    }
+
+    if (skb_is_nonlinear(skb)) {
+        if (unlikely(skb_linearize(skb))) {
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
     }
 
     // Dynamic resolution of gateway MAC for L2 tunnel if ethernet
@@ -85,8 +93,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     // Write Crypto Header
     chdr = (struct mwan_crypto_hdr *)(skb->data + ETH_HLEN);
     chdr->magic = htons(MWAN_CRYPTO_MAGIC);
-    chdr->proto = 0; // L2 frame
-    chdr->reserved = 0;
+    // Store original IP packet length in proto and reserved fields (16-bit value)
+    chdr->proto = (ip_pkt_len >> 8) & 0xFF;
+    chdr->reserved = ip_pkt_len & 0xFF;
     chdr->seq = cpu_to_be64(seq);
 
     // Put Tag space at the tail
@@ -120,6 +129,18 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         if (err) {
             rcu_read_unlock();
             return NF_ACCEPT;
+        }
+
+        {
+            static int encap_print_count = 0;
+            if (encap_print_count < 5) {
+                encap_print_count++;
+                pr_info("mwan_kmod DBG [Encap L2 PQC %d]: ip_pkt_len=%d, seq=%llu\n", encap_print_count, ip_pkt_len, seq);
+                pr_info("mwan_kmod DBG [Encap L2 PQC %d]: key_len=%d, key=%*phN\n", encap_print_count, cfg->encrypt_key_len, cfg->encrypt_key_len, cfg->encrypt_key);
+                pr_info("mwan_kmod DBG [Encap L2 PQC %d]: salt=%*phN\n", encap_print_count, MWAN_SALT_LEN, cfg->encrypt_salt);
+                pr_info("mwan_kmod DBG [Encap L2 PQC %d]: iv=%*phN\n", encap_print_count, MWAN_GCM_IV_LEN, iv);
+                pr_info("mwan_kmod DBG [Encap L2 PQC %d]: chdr AAD=%*phN\n", encap_print_count, MWAN_CRYPTO_HDR_LEN, chdr);
+            }
         }
     }
 
