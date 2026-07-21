@@ -20,6 +20,18 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     int err;
     int pulled_bytes = 0;
 
+    // Linearize and COW first so that skb->data is contiguous and safe to read
+    if (skb_is_nonlinear(skb)) {
+        if (unlikely(skb_linearize(skb))) {
+            pr_warn("mwan_kmod DBG Decap: skb_linearize failed at entry\n");
+            return -ENOMEM;
+        }
+    }
+    if (skb_cow(skb, 0)) {
+        pr_warn("mwan_kmod DBG Decap: skb_cow failed at entry\n");
+        return -ENOMEM;
+    }
+
     pr_info_ratelimited("mwan_kmod DBG Decap: entered. skb->len=%d, dev=%s\n", skb->len, skb->dev ? skb->dev->name : "NULL");
 
     // Adaptive Offset Detection:
@@ -65,25 +77,6 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
             skb_push(skb, pulled_bytes);
         }
         return L2_PQC_DECAP_BYPASS;
-    }
-
-    // Ensure skb head/fragments are write-safe
-    if (skb_cow(skb, 0)) {
-        pr_warn("mwan_kmod DBG Decap: skb_cow failed\n");
-        if (pulled_bytes > 0) {
-            skb_push(skb, pulled_bytes);
-        }
-        return -ENOMEM;
-    }
-
-    if (skb_is_nonlinear(skb)) {
-        if (unlikely(skb_linearize(skb))) {
-            pr_warn("mwan_kmod DBG Decap: skb_linearize failed\n");
-            if (pulled_bytes > 0) {
-                skb_push(skb, pulled_bytes);
-            }
-            return -ENOMEM;
-        }
     }
 
     rcu_read_lock();
