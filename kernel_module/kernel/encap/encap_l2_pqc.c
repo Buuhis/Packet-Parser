@@ -41,8 +41,17 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         return NF_ACCEPT;
     }
 
+    skb = skb_unshare(skb, GFP_ATOMIC);
+    if (unlikely(!skb)) {
+        rcu_read_unlock();
+        return NF_DROP;
+    }
+
     if (skb_is_nonlinear(skb)) {
         if (unlikely(skb_linearize(skb))) {
+            struct iphdr *iph = ip_hdr(skb);
+            pr_warn_ratelimited("mwan_kmod DBG BYPASS [skb_linearize]: len=%d, proto=%d\n",
+                                ip_pkt_len, iph ? iph->protocol : -1);
             rcu_read_unlock();
             return NF_ACCEPT;
         }
@@ -52,8 +61,35 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     if (tun->is_ethernet) {
         resolved = mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac);
         if (unlikely(!resolved)) {
+            pr_warn_ratelimited("mwan_kmod DBG DROP [gateway_mac]: resolution failed\n");
             rcu_read_unlock();
             return NF_DROP;
+        }
+    }
+
+    /* Safe Checksum Fix: Use skb->data directly as IP header base pointer */
+    if (skb->ip_summed == CHECKSUM_PARTIAL || skb->ip_summed == CHECKSUM_UNNECESSARY) {
+        struct iphdr *iph = (struct iphdr *)skb->data;
+        if (iph && iph->ihl >= 5 && (skb->len >= (iph->ihl * 4))) {
+            u32 ip_hdr_len = iph->ihl * 4;
+            if (iph->protocol == IPPROTO_TCP && skb->len >= ip_hdr_len + sizeof(struct tcphdr)) {
+                skb->csum_start = (skb->data + ip_hdr_len) - skb->head;
+                skb->csum_offset = offsetof(struct tcphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            } else if (iph->protocol == IPPROTO_UDP && skb->len >= ip_hdr_len + sizeof(struct udphdr)) {
+                skb->csum_start = (skb->data + ip_hdr_len) - skb->head;
+                skb->csum_offset = offsetof(struct udphdr, check);
+                skb->ip_summed = CHECKSUM_PARTIAL;
+            }
+        }
+        if (skb->ip_summed == CHECKSUM_PARTIAL) {
+            if (skb_checksum_help(skb)) {
+                struct iphdr *iph = (struct iphdr *)skb->data;
+                pr_warn_ratelimited("mwan_kmod DBG DROP [checksum_help]: len=%d, proto=%d\n",
+                                    ip_pkt_len, iph ? iph->protocol : -1);
+                rcu_read_unlock();
+                return NF_DROP;
+            }
         }
     }
 
@@ -63,11 +99,17 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
     // Expand skb headroom/tailroom for Ethernet header + Crypto header + Tag
     if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN + MWAN_CRYPTO_HDR_LEN)) {
+        struct iphdr *iph = ip_hdr(skb);
+        pr_warn_ratelimited("mwan_kmod DBG BYPASS [skb_cow]: len=%d, proto=%d\n",
+                            ip_pkt_len, iph ? iph->protocol : -1);
         rcu_read_unlock();
         return NF_ACCEPT;
     }
     if (skb_tailroom(skb) < MWAN_GCM_TAG_LEN) {
         if (pskb_expand_head(skb, 0, MWAN_GCM_TAG_LEN, GFP_ATOMIC)) {
+            struct iphdr *iph = ip_hdr(skb);
+            pr_warn_ratelimited("mwan_kmod DBG BYPASS [pskb_expand_head]: len=%d, proto=%d\n",
+                                ip_pkt_len, iph ? iph->protocol : -1);
             rcu_read_unlock();
             return NF_ACCEPT;
         }
@@ -103,6 +145,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
     req = aead_request_alloc(tfm, GFP_ATOMIC);
     if (!req) {
+        struct iphdr *iph = (struct iphdr *)(skb->data + ETH_HLEN + MWAN_CRYPTO_HDR_LEN);
+        pr_warn_ratelimited("mwan_kmod DBG BYPASS [aead_alloc]: len=%d, proto=%d\n",
+                            ip_pkt_len, iph ? iph->protocol : -1);
         rcu_read_unlock();
         return NF_ACCEPT;
     }
@@ -116,6 +161,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         
         nents = skb_to_sgvec(skb, &sg[1], ETH_HLEN + MWAN_CRYPTO_HDR_LEN, ip_pkt_len + MWAN_GCM_TAG_LEN);
         if (unlikely(nents < 0)) {
+            struct iphdr *iph = (struct iphdr *)(skb->data + ETH_HLEN + MWAN_CRYPTO_HDR_LEN);
+            pr_warn_ratelimited("mwan_kmod DBG BYPASS [skb_to_sgvec]: len=%d, proto=%d\n",
+                                ip_pkt_len, iph ? iph->protocol : -1);
             aead_request_free(req);
             rcu_read_unlock();
             return NF_ACCEPT;
@@ -127,6 +175,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         err = crypto_aead_encrypt(req);
         aead_request_free(req);
         if (err) {
+            struct iphdr *iph = (struct iphdr *)(skb->data + ETH_HLEN + MWAN_CRYPTO_HDR_LEN);
+            pr_warn_ratelimited("mwan_kmod DBG BYPASS [encrypt_err=%d]: len=%d, proto=%d\n",
+                                err, ip_pkt_len, iph ? iph->protocol : -1);
             rcu_read_unlock();
             return NF_ACCEPT;
         }
