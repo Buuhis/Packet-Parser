@@ -35,28 +35,27 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 
     pr_info_ratelimited("mwan_kmod DBG Decap: entered. skb->len=%d, dev=%s\n", skb->len, skb->dev ? skb->dev->name : "NULL");
 
-    // Adaptive Offset Detection:
-    // Case 1: skb->data starts at Ethernet header (offset 0). EtherType is at bytes 12 & 13.
-    if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0xB5) {
-        pr_info_ratelimited("mwan_kmod DBG Decap: Case 1 matched. MAC Header: %*phN\n", 14, skb->data);
-        pulled_bytes = ETH_HLEN;
-        skb_pull(skb, ETH_HLEN);
-    }
-    // Case 2: skb->data is shifted by 10 bytes (starts at last 2 bytes of Src MAC). EtherType is at bytes 2 & 3.
-    else if (skb->len >= 4 && skb->data[2] == 0x88 && skb->data[3] == 0xB5) {
-        pr_info_ratelimited("mwan_kmod DBG Decap: Case 2 matched. Data: %*phN\n", 4, skb->data);
-        pulled_bytes = 4;
-        skb_pull(skb, 4);
-    }
-    // Case 3: skb->data already points directly to the Crypto Header (starts with Magic 0x4D57).
-    else if (skb->len >= 2 && skb->data[0] == 0x4D && skb->data[1] == 0x57) {
-        pr_info_ratelimited("mwan_kmod DBG Decap: Case 3 matched. Magic: %*phN\n", 2, skb->data);
+    // Robust Dynamic Offset Alignment:
+    // Search for signature 0x88 0xB5 0x4D 0x57 ([EtherType 0x88B5] + [Magic 0x4D57])
+    // or direct Magic 0x4D 0x57 at offset 0.
+    pulled_bytes = -1;
+    if (skb->len >= 2 && skb->data[0] == 0x4D && skb->data[1] == 0x57) {
         pulled_bytes = 0;
+    } else {
+        int max_search = (skb->len < 32) ? (skb->len - 3) : 28;
+        int i;
+        for (i = 0; i < max_search; i++) {
+            if (skb->data[i] == 0x88 && skb->data[i+1] == 0xB5 &&
+                skb->data[i+2] == 0x4D && skb->data[i+3] == 0x57) {
+                pulled_bytes = i + 2;
+                skb_pull(skb, i + 2);
+                break;
+            }
+        }
     }
-    // Otherwise, this packet does not match our expected formats.
-    // We treat it as a bypass packet.
-    else {
-        pr_info_ratelimited("mwan_kmod DBG Decap: No case matched, bypass. First 14B: %*phN\n", 
+
+    if (pulled_bytes < 0) {
+        pr_info_ratelimited("mwan_kmod DBG Decap: Signature search failed, bypass. First 14B: %*phN\n", 
                             skb->len < 14 ? skb->len : 14, skb->data);
         return L2_PQC_DECAP_BYPASS;
     }
