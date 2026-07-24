@@ -148,11 +148,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
                         state->out->name, state->out->ifindex);
 
-    /* MTU Protection: Let kernel IP stack fragment non-GSO packets that exceed the tunnel MTU */
-    if (!skb_is_gso(skb) && skb->len > state->out->mtu) {
-        rcu_read_unlock();
-        return NF_ACCEPT;
-    }
+    /* Steer & Encrypt all matched tunnel traffic */
 
     /* 2. Hash: Use kernel-cached/hardware RSS hash, but fallback to custom L3-only hash for IP fragments */
     if (iph->frag_off & htons(IP_MF | IP_OFFSET)) {

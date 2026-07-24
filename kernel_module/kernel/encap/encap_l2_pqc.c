@@ -140,6 +140,10 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     }
 
     skb->ip_summed = CHECKSUM_NONE;
+    skb_shinfo(skb)->gso_size = 0;
+    skb_shinfo(skb)->gso_type = 0;
+    skb_shinfo(skb)->gso_segs = 0;
+    skb->encapsulation = 0;
 
     if (likely(target_dev->real_num_tx_queues > 1)) {
         u16 cpu_id = smp_processor_id();

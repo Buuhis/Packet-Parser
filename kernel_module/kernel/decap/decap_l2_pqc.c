@@ -7,6 +7,7 @@
 #include <net/ip.h>
 #include <crypto/aead.h>
 #include <linux/netfilter.h>
+#include <linux/ktime.h>
 
 #define MWAN_L2_HDR_LEN 8 /* 8 Bytes Sequence Number */
 
@@ -103,15 +104,24 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                              struct packet_type *pt, struct net_device *orig_dev)
 {
     int ret;
+    u64 ns_entry, ns_exit;
 
     if (!skb)
         return NET_RX_DROP;
+
+    ns_entry = ktime_get_real_ns();
+    pr_info("mwan_kmod DBG Decap [ENTRY]: skb_ptr=%px, time_ns=%llu, dev=%s, len=%d, proto=0x%04x (ENCRYPTED 88b5)\n",
+            skb, ns_entry, dev ? dev->name : "NULL", skb->len, ntohs(skb->protocol));
 
     ret = l2_pqc_decrypt_skb(skb);
     if (ret < 0) {
         kfree_skb(skb);
         return NET_RX_DROP;
     }
+
+    ns_exit = ktime_get_real_ns();
+    pr_info("mwan_kmod DBG Decap [RE-INJECT netif_rx]: skb_ptr=%px, time_ns=%llu, delta_ns=%llu, dev=%s, len=%d, proto=0x%04x (DECRYPTED 0800)\n",
+            skb, ns_exit, ns_exit - ns_entry, skb->dev ? skb->dev->name : "NULL", skb->len, ntohs(skb->protocol));
 
     // Re-inject clean plaintext packet into the receive stack for kernel IP routing
     netif_rx(skb);
