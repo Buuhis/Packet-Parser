@@ -176,7 +176,9 @@ void sig_pqc_bind_policy(int policy_id, int profile_id, int role_mode,
                          const char *local_priv, const char *local_pub,
                          const char *peer_pub, bool is_tunnel);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
-void sig_pqc_load_keys_from_disk(void);
+int  sig_pqc_load_keys_from_vault(const char *target_fg,
+                                   char *out_priv, size_t priv_sz,
+                                   char *out_pub,  size_t pub_sz);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
 
 /**

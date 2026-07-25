@@ -201,8 +201,6 @@ static int find_wan_index_by_ifname(const struct app_config *cfg, const char *if
 }
 
 static int load_profiles_and_policies(struct app_config *cfg, PGconn *conn, int config_id) {
-    // Unconditionally scan and load any newly generated keys from RAM-disk (/dev/shm) into registry
-    sig_pqc_load_keys_from_disk();
 
     char id_str[32];
     snprintf(id_str, sizeof(id_str), "%d", config_id);
@@ -878,7 +876,6 @@ int db_check_identities(const char *conn_str) {
     }
 
     printf("\n=== PQC IDENTITY INTEGRITY CHECK ===\n");
-    sig_pqc_load_keys_from_disk();
 
     PGresult *p_res = PQexec(conn, 
         "SELECT c.id AS policy_id, p.profile_name, i.local_identity_fingerprint, i.peer_pub "
@@ -910,9 +907,11 @@ int db_check_identities(const char *conn_str) {
             printf("  - Local Key Fingerprint: [%s]\n", local_fg);
             sig_pqc_find_identity(local_fg, &found_priv, &found_pub);
             if (found_priv) {
-                printf("    -> Found matching local ML-DSA key in RAM Registry.\n");
+                printf("    -> Found matching local ML-DSA key in HashiCorp Vault.\n");
+                free(found_priv);
+                if (found_pub) free(found_pub);
             } else {
-                printf("    -> Warning: Local ML-DSA key NOT found in RAM Registry.\n");
+                printf("    -> Warning: Local ML-DSA key NOT found in HashiCorp Vault.\n");
             }
         } else {
             printf("  - Local Key Fingerprint: NOT ASSIGNED\n");

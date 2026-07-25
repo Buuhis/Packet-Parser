@@ -19,6 +19,7 @@
 #include "sig_encrypt/inc/traffic_crypto.h"
 #include "sig_encrypt/inc/pqc_handshake.h"
 #include "sig_encrypt/inc/pqc_ipc.h"
+#include "sig_encrypt/inc/pqc_vault.h"
 #include "cfm_diag.h"
 
 #define NOTIFY_CHANNEL "xdp_start"
@@ -229,6 +230,7 @@ int main(int argc, char **argv) {
     signal(SIGINT, handle_shutdown_signal);
 
     sig_pqc_start_ipc_server();
+    sig_pqc_init_vault();
 
     libbpf_set_print(libbpf_print_silent);
     PGconn *listen_conn = PQconnectdbParams(keywords, values, 0);
