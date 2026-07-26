@@ -160,15 +160,6 @@ void trf_base64_decode_obfuscated(const char *src, const char *seed, unsigned ch
     }
 }
 
-int trf_save_key_to_file(const char *filename, const char *data, int mode) {
-    int fd = open(filename, O_WRONLY | O_CREAT | O_TRUNC, mode);
-    if (fd < 0) return -1;
-    ssize_t written = write(fd, data, strlen(data));
-    write(fd, "\n", 1);
-    close(fd);
-    return (written > 0) ? 0 : -1;
-}
-
 // =========================================================
 // DATA PLANE: ENCRYPTION
 // =========================================================

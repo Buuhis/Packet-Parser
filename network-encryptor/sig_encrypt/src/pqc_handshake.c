@@ -1171,99 +1171,7 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
-    if (!obf_pub_str || strlen(obf_pub_str) == 0) return NULL;
 
-    // Clean up input string (trim whitespace/newlines)
-    char clean_obf[8192];
-    strncpy(clean_obf, obf_pub_str, sizeof(clean_obf) - 1);
-    clean_obf[sizeof(clean_obf) - 1] = '\0';
-    
-    size_t len = strlen(clean_obf);
-    while (len > 0 && (clean_obf[len - 1] == '\r' || clean_obf[len - 1] == '\n' || clean_obf[len - 1] == ' ')) {
-        clean_obf[len - 1] = '\0';
-        len--;
-    }
-
-    // Method 0: If fingerprint is provided in DB, de-obfuscate directly!
-    if (peer_fingerprint && strlen(peer_fingerprint) > 0) {
-        unsigned char raw_pub[4096];
-        size_t raw_pub_len = 0;
-        trf_base64_decode_obfuscated(clean_obf, peer_fingerprint, raw_pub, &raw_pub_len);
-
-        char *plain_b64_pub = malloc(8192);
-        memset(plain_b64_pub, 0, 8192);
-        trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-        
-        fprintf(stderr, "[PQC-HS] De-obfuscated peer pub key using DB fingerprint [%s].\n", peer_fingerprint);
-        return plain_b64_pub;
-    }
-
-    // Method 1: Scan /etc/.dec_config/ for matching public key file to get fingerprint (Fallback)
-    DIR *dir = opendir("/etc/.dec_config");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            size_t name_len = strlen(entry->d_name);
-            if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
-                char fingerprint[16];
-                memset(fingerprint, 0, sizeof(fingerprint));
-                strncpy(fingerprint, entry->d_name, 8);
-
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "/etc/.dec_config/%s", entry->d_name);
-                FILE *fp = fopen(filepath, "r");
-                if (fp) {
-                    char file_content[8192];
-                    memset(file_content, 0, sizeof(file_content));
-                    if (fgets(file_content, sizeof(file_content) - 1, fp) != NULL) {
-                        file_content[strcspn(file_content, "\r\n")] = '\0';
-                        if (strncmp(file_content, fingerprint, 8) == 0) {
-                            const char *obf_pub = file_content + 8;
-                            if (strcmp(obf_pub, clean_obf) == 0) {
-                                fclose(fp);
-                                closedir(dir);
-                                
-                                unsigned char raw_pub[4096];
-                                size_t raw_pub_len = 0;
-                                trf_base64_decode_obfuscated(clean_obf, fingerprint, raw_pub, &raw_pub_len);
-
-                                char *plain_b64_pub = malloc(8192);
-                                memset(plain_b64_pub, 0, 8192);
-                                trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-                                
-                                fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
-                                return plain_b64_pub;
-                            }
-                        }
-                    }
-                    fclose(fp);
-                }
-            }
-        }
-        closedir(dir);
-    }
-
-    // Method 2: Check registry to see if we already have a fingerprint that matches (Fallback)
-    for (int i = 0; i < g_registry_count; i++) {
-        unsigned char raw_pub[4096];
-        size_t raw_pub_len = 0;
-        trf_base64_decode_obfuscated(clean_obf, g_identity_registry[i].fingerprint, raw_pub, &raw_pub_len);
-
-        char plain_b64_pub[8192];
-        memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
-        trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-
-        if (strcmp(plain_b64_pub, g_identity_registry[i].pub_key) == 0) {
-            fprintf(stderr, "[PQC-HS] Found matching peer pub key in RAM Registry. De-obfuscated peer pub key using fingerprint [%s].\n", g_identity_registry[i].fingerprint);
-            return strdup(plain_b64_pub);
-        }
-    }
-
-    // Fallback: If we couldn't de-obfuscate it, return the original string
-    fprintf(stderr, "[PQC-HS] Warning: Could not find matching fingerprint for peer public key. Using original string.\n");
-    return strdup(obf_pub_str);
-}
 bool sig_pqc_has_identity(const char *fingerprint) {
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
@@ -1751,51 +1659,22 @@ void sig_pqc_load_and_bind_policy(void *conn_ptr, const void *cfg_ptr, int profi
         const char *peer_pub_path = PQgetvalue(peer_res, 0, 1);
         const char *key_id = PQgetvalue(peer_res, 0, 2);
 
-        char resolved_peer_pub_path[512] = "";
-        if (peer_pub_path && strlen(peer_pub_path) > 0) {
-            if (peer_pub_path[0] == '/') {
-                strncpy(resolved_peer_pub_path, peer_pub_path, sizeof(resolved_peer_pub_path) - 1);
-            } else {
-                snprintf(resolved_peer_pub_path, sizeof(resolved_peer_pub_path), "/etc/.dec_config/%s", peer_pub_path);
-            }
-        }
-
         char peer_fg_buf[16] = "";
         char *deobf_pub = NULL;
         bool valid = true;
 
-        if (strlen(resolved_peer_pub_path) == 0) {
-            fprintf(stderr, "[DB-PQC] ERROR: Policy %d is missing peer_pub key file path in DB!\n", db_policy_id);
-            valid = false;
+        // Query peer public key 100% directly from HashiCorp Vault (kv/PQC_Key/remote_public/<peer_pub>)
+        char vault_peer_pub_buf[8192] = "";
+        if (peer_pub_path && strlen(peer_pub_path) > 0 &&
+            sig_pqc_vault_read_key(VAULT_PATH_REMOTE_PUBLIC, peer_pub_path, vault_peer_pub_buf, sizeof(vault_peer_pub_buf)) == 0) {
+            fprintf(stderr, "[PQC-VAULT-LOG] SUCCESS: Loaded peer public key [%s] 100%% from HashiCorp Vault (remote_public).\n", peer_pub_path);
+            deobf_pub = strdup(vault_peer_pub_buf);
+            strncpy(peer_fg_buf, peer_pub_path, 8);
+            peer_fg_buf[8] = '\0';
         } else {
-            FILE *fp_pub = fopen(resolved_peer_pub_path, "r");
-            if (!fp_pub) {
-                fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] could not be opened!\n", db_policy_id, resolved_peer_pub_path);
-                valid = false;
-            } else {
-                char file_content[8192];
-                memset(file_content, 0, sizeof(file_content));
-                if (fgets(file_content, sizeof(file_content) - 1, fp_pub) == NULL) {
-                    fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] is empty!\n", db_policy_id, resolved_peer_pub_path);
-                    valid = false;
-                } else {
-                    file_content[strcspn(file_content, "\r\n")] = '\0';
-                    if (strlen(file_content) < 8) {
-                        fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] has invalid format (too short)!\n", db_policy_id, resolved_peer_pub_path);
-                        valid = false;
-                    } else {
-                        strncpy(peer_fg_buf, file_content, 8);
-                        peer_fg_buf[8] = '\0';
-                        const char *obf_pub = file_content + 8;
-                        deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
-                        if (!deobf_pub) {
-                            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key file [%s] deobfuscation failed!\n", db_policy_id, resolved_peer_pub_path);
-                            valid = false;
-                        }
-                    }
-                }
-                fclose(fp_pub);
-            }
+            fprintf(stderr, "[DB-PQC] ERROR: Policy %d peer_pub key [%s] NOT found in HashiCorp Vault (remote_public)!\n",
+                    db_policy_id, peer_pub_path ? peer_pub_path : "N/A");
+            valid = false;
         }
 
         int role_mode = PQC_USE_DYNAMIC_ROLE ? PQC_ROLE_DYNAMIC : PQC_ROLE_RESPONDER;
