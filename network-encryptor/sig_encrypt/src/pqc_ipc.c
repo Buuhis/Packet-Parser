@@ -155,6 +155,7 @@ void sig_pqc_handle_gen_identity(void) {
         sig_pqc_init_vault();
         if (sig_pqc_vault_write_key(VAULT_PATH_LOCAL_PUBLIC, key_filename, b64_pub) == 0 &&
             sig_pqc_vault_write_key(VAULT_PATH_LOCAL_PRIVATE, key_filename, b64_priv) == 0) {
+            printf("[PQC-GI] Public Key Exported: kv/PQC_Key/local_public/%s\n", key_filename);
             printf("[PQC-GI] Successfully exported identity [%s] to HashiCorp Vault (kv/PQC_Key/local_public & local_private).\n", fingerprint);
         } else {
             fprintf(stderr, "[PQC-GI] WARNING: Failed to export identity [%s] to HashiCorp Vault.\n", fingerprint);

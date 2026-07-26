@@ -10,7 +10,6 @@
 #include <netdb.h>
 
 #define ENV_FILE_PATH     ".env"
-#define ENV_FILE_PATH_ALT "../.env"
 
 static char g_vault_addr[256] = "http://127.0.0.1:8200";
 static char g_vault_host[128] = "127.0.0.1";
@@ -73,13 +72,9 @@ static void parse_vault_url(const char *url) {
 }
 
 static void load_env_file(void) {
-    // Try opening .env from current directory or parent directory
     FILE *fp = fopen(ENV_FILE_PATH, "r");
     if (!fp) {
-        fp = fopen(ENV_FILE_PATH_ALT, "r");
-    }
-    if (!fp) {
-        // Fallback to environment variables if .env file not found
+        // fprintf(stderr, "[PQC-VAULT-ENV] Could not open file '%s'. Checking environment variables...\n", ENV_FILE_PATH);
         const char *e_addr = getenv("VAULT_ADDR");
         const char *e_token = getenv("VAULT_TOKEN");
         const char *e_k1 = getenv("UNSEAL_KEY1");
@@ -96,12 +91,17 @@ static void load_env_file(void) {
         return;
     }
 
+    // fprintf(stderr, "[PQC-VAULT-ENV] Successfully opened '%s' file. Parsing variables...\n", ENV_FILE_PATH);
+
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         // Skip comments and empty lines
         char *p = line;
         while (*p == ' ' || *p == '\t') p++;
         if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+
+        // Skip "export " prefix if present
+        if (strncmp(p, "export ", 7) == 0) p += 7;
 
         char *eq = strchr(p, '=');
         if (!eq) continue;
@@ -114,8 +114,11 @@ static void load_env_file(void) {
 
         if (strcmp(key, "VAULT_ADDR") == 0) {
             parse_vault_url(val);
+            // fprintf(stderr, "[PQC-VAULT-ENV] Loaded VAULT_ADDR: %s\n", g_vault_addr);
         } else if (strcmp(key, "VAULT_TOKEN") == 0) {
             strncpy(g_vault_token, val, sizeof(g_vault_token) - 1);
+            // g_vault_token[sizeof(g_vault_token) - 1] = '\0';
+            // fprintf(stderr, "[PQC-VAULT-ENV] Loaded VAULT_TOKEN: [%s] (len=%zu)\n", g_vault_token, strlen(g_vault_token));
         } else if (strcmp(key, "UNSEAL_KEY1") == 0) {
             strncpy(g_unseal_key1, val, sizeof(g_unseal_key1) - 1);
         } else if (strcmp(key, "UNSEAL_KEY2") == 0) {
@@ -264,8 +267,8 @@ int sig_pqc_init_vault(void) {
     if (g_vault_initialized) return 0;
 
     load_env_file();
-    fprintf(stderr, "[PQC-VAULT] Initializing Vault client (Address: %s, Host: %s:%d)\n",
-            g_vault_addr, g_vault_host, g_vault_port);
+    // fprintf(stderr, "[PQC-VAULT] Initializing Vault client (Address: %s, Host: %s:%d, Full Token: '%s')\n",
+    //         g_vault_addr, g_vault_host, g_vault_port, g_vault_token[0] ? g_vault_token : "EMPTY");
 
     if (sig_pqc_vault_ensure_unsealed() != 0) {
         fprintf(stderr, "[PQC-VAULT] WARNING: Vault server is not ready/unsealed.\n");
@@ -371,6 +374,20 @@ int sig_pqc_vault_write_key(const char *path_type, const char *fingerprint_filen
         return 0;
     }
 
-    fprintf(stderr, "[PQC-VAULT] ERROR: Failed to write key to Vault: [kv/PQC_Key/%s/%s]\n", path_type, clean_filename);
+    // Extract first line of response for error diagnostics
+    char status_line[128] = "";
+    const char *line_end = strchr(response, '\r');
+    if (!line_end) line_end = strchr(response, '\n');
+    if (line_end) {
+        size_t slen = line_end - response;
+        if (slen >= sizeof(status_line)) slen = sizeof(status_line) - 1;
+        strncpy(status_line, response, slen);
+        status_line[slen] = '\0';
+    } else {
+        snprintf(status_line, sizeof(status_line), "%.127s", response);
+    }
+
+    fprintf(stderr, "[PQC-VAULT] ERROR: Failed to write key to Vault: [kv/PQC_Key/%s/%s] - Response: %s\n",
+            path_type, clean_filename, status_line[0] ? status_line : "No response from server");
     return -1;
 }
