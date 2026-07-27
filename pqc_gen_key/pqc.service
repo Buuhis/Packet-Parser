@@ -1,0 +1,13 @@
+[Unit]
+Description=PQC Key Generation Service Daemon
+After=network.target vault.service
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=/opt/.env
+ExecStart=/usr/local/bin/pqc --daemon
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
