@@ -199,7 +199,14 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 b->rotation_give_up = false;
                 b->rotation_start_time = 0;
                 b->key_ready = false;
-                fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry for Profile %d.\n", profile_id);
+                pthread_mutex_lock(&b->rx_mutex);
+                for (int q = 0; q < PQC_RX_QUEUE_SIZE; q++) {
+                    if (b->rx_queue[q]) { free(b->rx_queue[q]); b->rx_queue[q] = NULL; }
+                    b->rx_len[q] = 0;
+                }
+                b->rx_head = 0; b->rx_tail = 0;
+                pthread_mutex_unlock(&b->rx_mutex);
+                fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry and flushing rx queue for Profile %d.\n", profile_id);
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
@@ -209,7 +216,14 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                     b->rotation_give_up = false;
                     b->rotation_start_time = 0;
                     b->key_ready = false;
-                    fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder for Profile %d.\n", profile_id);
+                    pthread_mutex_lock(&b->rx_mutex);
+                    for (int q = 0; q < PQC_RX_QUEUE_SIZE; q++) {
+                        if (b->rx_queue[q]) { free(b->rx_queue[q]); b->rx_queue[q] = NULL; }
+                        b->rx_len[q] = 0;
+                    }
+                    b->rx_head = 0; b->rx_tail = 0;
+                    pthread_mutex_unlock(&b->rx_mutex);
+                    fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder and flushing rx queue for Profile %d.\n", profile_id);
                 }
             }
             pqc_feed_packet_to_binding_queue(b, payload, len);
@@ -408,6 +422,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 memcpy(msg->payload, pk, pk_sz);
 
                 pthread_mutex_lock(&g_key_mutex);
+                if (b->local_priv && strlen(b->local_priv) > 0) {
+                    if (my_priv) free(my_priv);
+                    my_priv = strdup(b->local_priv);
+                }
+                if (b->peer_pub && strlen(b->peer_pub) > 0) {
+                    if (peer_pub) free(peer_pub);
+                    peer_pub = strdup(b->peer_pub);
+                }
                 size_t raw_priv_sz = 0;
                 uint8_t raw_priv[8192];
                 trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
@@ -506,6 +528,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         struct pqc_hs_msg *msg = (struct pqc_hs_msg *)rx_buf;
                         if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_HELLO) {
                             pthread_mutex_lock(&g_key_mutex);
+                            if (b->peer_pub && strlen(b->peer_pub) > 0) {
+                                if (peer_pub) free(peer_pub);
+                                peer_pub = strdup(b->peer_pub);
+                            }
+                            if (b->local_priv && strlen(b->local_priv) > 0) {
+                                if (my_priv) free(my_priv);
+                                my_priv = strdup(b->local_priv);
+                            }
                             size_t raw_pub_sz = 0;
                             uint8_t raw_pub[8192];
                             trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
@@ -522,6 +552,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                     memcpy(resp->payload, ct, ct_sz);
 
                                     pthread_mutex_lock(&g_key_mutex);
+                                    if (b->local_priv && strlen(b->local_priv) > 0) {
+                                        if (my_priv) free(my_priv);
+                                        my_priv = strdup(b->local_priv);
+                                    }
                                     size_t raw_priv_sz = 0;
                                     uint8_t raw_priv[8192];
                                     trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
@@ -602,6 +636,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         fprintf(stderr, "[PQC-HS-L3] Responder received HELLO while ONLINE. Peer might have restarted! Re-handshaking for Profile %d...\n", profile_id);
 
                         pthread_mutex_lock(&g_key_mutex);
+                        if (b->peer_pub && strlen(b->peer_pub) > 0) {
+                            if (peer_pub) free(peer_pub);
+                            peer_pub = strdup(b->peer_pub);
+                        }
+                        if (b->local_priv && strlen(b->local_priv) > 0) {
+                            if (my_priv) free(my_priv);
+                            my_priv = strdup(b->local_priv);
+                        }
                         size_t raw_pub_sz = 0;
                         uint8_t raw_pub[8192];
                         trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
@@ -645,6 +687,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     } else if (msg->magic == PQC_HS_MAGIC && msg->msg_type == PQC_HS_MSG_KEEPALIVE) {
                         fprintf(stderr, "[PQC-HS-L3] Responder received KEEPALIVE for Profile %d. Verifying signature...\n", profile_id);
                         pthread_mutex_lock(&g_key_mutex);
+                        if (b->peer_pub && strlen(b->peer_pub) > 0) {
+                            if (peer_pub) free(peer_pub);
+                            peer_pub = strdup(b->peer_pub);
+                        }
+                        if (b->local_priv && strlen(b->local_priv) > 0) {
+                            if (my_priv) free(my_priv);
+                            my_priv = strdup(b->local_priv);
+                        }
                         size_t raw_pub_sz = 0;
                         uint8_t raw_pub[8192];
                         trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
