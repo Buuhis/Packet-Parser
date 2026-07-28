@@ -3,8 +3,8 @@
 #include "kernel_sync.h"
 #include "system/cpu_tune.h"
 #include "utils/logger.h"
-#include "pqc_ipc.h"
 #include "pqc_handshake.h"
+#include "pqc_vault.h"
 #include "../kernel/mwan_proto.h"
 
 #include <stdio.h>
@@ -83,10 +83,6 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
             return client_send_and_print(socket_path, msg);
         }
 
-        /* ----- -gi --------------------------------------------------------- */
-        if (strcmp(argv[i], "-gi") == 0) {
-            return client_send_and_print(socket_path, "-gi");
-        }
 
         /* ----- -r <node_id> ------------------------------------------------- */
         if (strcmp(argv[i], "-r") == 0 && i + 1 < argc) {
@@ -151,19 +147,6 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
 /*  DAEMON-SIDE HANDLERS                                              */
 /* ================================================================== */
 
-/* ---------- handle: -gi ------------------------------------------- */
-static void handle_gi(int client_fd)
-{
-    log_info(">>> Received PQC identity generation request");
-    char fingerprint[16] = {0};
-    if (sig_pqc_handle_gen_identity(fingerprint) == 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg), "Success. Generated identity fingerprint: %s", fingerprint);
-        reply_json(client_fd, 200, msg);
-    } else {
-        reply_json(client_fd, 500, "Failed to generate identity keys");
-    }
-}
 
 /* ---------- handle: -r <node_id> ---------------------------------- */
 static void handle_retry(int client_fd, int req_id)
@@ -443,7 +426,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 
     if (trigger_pqc_handshake) {
         log_info("[EDIT] PQC credentials/config updated — triggering key re-handshake for profile %d", profile_id);
-        sig_pqc_load_keys_from_disk();
+        sig_pqc_init_vault();
         pqc_bind_node(profile_id);
     }
 
@@ -455,11 +438,6 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 /* ================================================================== */
 void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *running_ctx)
 {
-    /* -gi */
-    if (strcmp(buf, "-gi") == 0) {
-        handle_gi(client_fd);
-        return;
-    }
 
     /* -r <id> */
     if (strncmp(buf, "-r ", 3) == 0) {

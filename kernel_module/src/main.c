@@ -6,8 +6,8 @@
 #include "utils/logger.h"
 #include "cli/cli_handler.h"
 #include "pqc_handshake.h"
-#include "pqc_ipc.h"
 #include "pqc_logger.h"
+#include "pqc_vault.h"
 #include "traffic_crypto.h"
 #include "../kernel/mwan_proto.h"
 
@@ -119,9 +119,16 @@ void pqc_bind_node(int node_id) {
         return;
     }
 
-    // Strip .key suffix from fingerprint name if present to get the 8-char fingerprint
     char local_fg[16] = {0};
     strncpy(local_fg, local_fg_db, 8);
+    local_fg[8] = '\0';
+
+    char local_key_name[64];
+    snprintf(local_key_name, sizeof(local_key_name), "%s.key", local_fg);
+
+    // Initialize Vault and load local identity keypair from Vault into RAM registry
+    sig_pqc_init_vault();
+    sig_pqc_load_key_from_vault(local_key_name);
 
     // Resolve WAN info from the active tunnels configured in running_ctx
     char peer_ip[64] = "0.0.0.0";
@@ -132,41 +139,21 @@ void pqc_bind_node(int node_id) {
         wan_ifname = running_ctx.cfg.ne_tunnels[0].ifname;
     }
 
-    // Read peer public key
-    char peer_pub_path[512];
-    snprintf(peer_pub_path, sizeof(peer_pub_path), "/etc/.dec_config/%s", peer_pub_name);
-    
+    // Read peer public key 100% directly from HashiCorp Vault (remote_public)
     char peer_fg_buf[16] = "";
     char *deobf_pub = NULL;
     bool valid = true;
 
-    FILE *fp_pub = fopen(peer_pub_path, "r");
-    if (!fp_pub) {
-        log_error("[PQC] ERROR: Node %d peer_pub key file [%s] could not be opened!", node_id, peer_pub_path);
-        valid = false;
+    char vault_peer_pub_buf[8192] = "";
+    if (peer_pub_name[0] != '\0' &&
+        sig_pqc_vault_read_key(VAULT_PATH_REMOTE_PUBLIC, peer_pub_name, vault_peer_pub_buf, sizeof(vault_peer_pub_buf)) == 0) {
+        log_info("[PQC-VAULT] SUCCESS: Loaded peer public key [%s] 100%% directly from HashiCorp Vault.", peer_pub_name);
+        deobf_pub = strdup(vault_peer_pub_buf);
+        strncpy(peer_fg_buf, peer_pub_name, 8);
+        peer_fg_buf[8] = '\0';
     } else {
-        char file_content[8192];
-        memset(file_content, 0, sizeof(file_content));
-        if (fgets(file_content, sizeof(file_content) - 1, fp_pub) != NULL) {
-            file_content[strcspn(file_content, "\r\n")] = '\0';
-            if (strlen(file_content) < 8) {
-                log_error("[PQC] ERROR: Node %d peer_pub file [%s] is invalid (too short)!", node_id, peer_pub_path);
-                valid = false;
-            } else {
-                strncpy(peer_fg_buf, file_content, 8);
-                peer_fg_buf[8] = '\0';
-                const char *obf_pub = file_content + 8;
-                deobf_pub = sig_pqc_deobfuscate_peer_pub(obf_pub, peer_fg_buf);
-                if (!deobf_pub) {
-                    log_error("[PQC] ERROR: Node %d peer_pub file [%s] deobfuscation failed!", node_id, peer_pub_path);
-                    valid = false;
-                }
-            }
-        } else {
-            log_error("[PQC] ERROR: Peer public key file [%s] is empty!", peer_pub_path);
-            valid = false;
-        }
-        fclose(fp_pub);
+        log_error("[PQC-VAULT] ERROR: Node %d peer_pub key [%s] NOT found in HashiCorp Vault (remote_public)!", node_id, peer_pub_name);
+        valid = false;
     }
 
     char *found_priv = NULL;
@@ -281,7 +268,7 @@ int main(int argc, char **argv) {
     }
 
     // Load PQC identities from disk
-    sig_pqc_load_keys_from_disk();
+    sig_pqc_init_vault();
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);

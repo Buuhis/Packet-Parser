@@ -175,7 +175,7 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
                           const char *local_priv, const char *local_pub,
                           const char *peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
-void sig_pqc_load_keys_from_disk(void);
+int sig_pqc_load_key_from_vault(const char *fingerprint_key);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
 
 /**

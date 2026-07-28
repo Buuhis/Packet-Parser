@@ -1,6 +1,7 @@
 #include "../inc/pqc_handshake.h"
 #include "../inc/traffic_crypto.h"
 #include "../inc/pqc_logger.h"
+#include "../inc/pqc_vault.h"
 #include <sys/stat.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -826,87 +827,6 @@ void sig_pqc_add_to_registry(const char *fingerprint, const char *priv, const ch
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint) {
-    if (!obf_pub_str) return NULL;
-    
-    // Remote suffix '.key' if present in peer_fingerprint
-    char clean_fg[16] = "";
-    if (peer_fingerprint) {
-        strncpy(clean_fg, peer_fingerprint, 8);
-        clean_fg[8] = '\0';
-    }
-
-    const char *clean_obf = obf_pub_str;
-    if (strncmp(obf_pub_str, clean_fg, strlen(clean_fg)) == 0) {
-        clean_obf = obf_pub_str + strlen(clean_fg);
-    }
-
-    // Method 1: Scan /etc/.dec_config/ for matching public key file to get fingerprint (Fallback)
-    DIR *dir = opendir("/etc/.dec_config");
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            size_t name_len = strlen(entry->d_name);
-            if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
-                char fingerprint[16];
-                memset(fingerprint, 0, sizeof(fingerprint));
-                strncpy(fingerprint, entry->d_name, 8);
-
-                char filepath[512];
-                snprintf(filepath, sizeof(filepath), "/etc/.dec_config/%s", entry->d_name);
-                FILE *fp = fopen(filepath, "r");
-                if (fp) {
-                    char file_content[8192];
-                    memset(file_content, 0, sizeof(file_content));
-                    if (fgets(file_content, sizeof(file_content) - 1, fp) != NULL) {
-                        file_content[strcspn(file_content, "\r\n")] = '\0';
-                        if (strncmp(file_content, fingerprint, 8) == 0) {
-                            const char *obf_pub = file_content + 8;
-                            if (strcmp(obf_pub, clean_obf) == 0) {
-                                fclose(fp);
-                                closedir(dir);
-                                
-                                unsigned char raw_pub[4096];
-                                size_t raw_pub_len = 0;
-                                trf_base64_decode_obfuscated(clean_obf, fingerprint, raw_pub, &raw_pub_len);
-
-                                char *plain_b64_pub = malloc(8192);
-                                memset(plain_b64_pub, 0, 8192);
-                                trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-                                
-                                fprintf(stderr, "[PQC-HS] Found matching peer pub key file on disk. De-obfuscated peer pub key using fingerprint [%s].\n", fingerprint);
-                                return plain_b64_pub;
-                            }
-                        }
-                    }
-                    fclose(fp);
-                }
-            }
-        }
-        closedir(dir);
-    }
-
-    // Method 2: Check registry to see if we already have a fingerprint that matches (Fallback)
-    for (int i = 0; i < g_registry_count; i++) {
-        unsigned char raw_pub[4096];
-        size_t raw_pub_len = 0;
-        trf_base64_decode_obfuscated(clean_obf, g_identity_registry[i].fingerprint, raw_pub, &raw_pub_len);
-
-        char plain_b64_pub[8192];
-        memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
-        trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-
-        if (strcmp(plain_b64_pub, g_identity_registry[i].pub_key) == 0) {
-            fprintf(stderr, "[PQC-HS] Found matching peer pub key in RAM Registry. De-obfuscated peer pub key using fingerprint [%s].\n", g_identity_registry[i].fingerprint);
-            return strdup(plain_b64_pub);
-        }
-    }
-
-    // Fallback: If we couldn't de-obfuscate it, return the original string
-    fprintf(stderr, "[PQC-HS] Warning: Could not find matching fingerprint for peer public key. Using original string.\n");
-    return strdup(obf_pub_str);
-}
-
 bool sig_pqc_has_identity(const char *fingerprint) {
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_registry_count; i++) {
@@ -1089,111 +1009,39 @@ int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_p
     }
     pthread_mutex_unlock(&g_key_mutex);
 
-    // Fallback: key not in RAM, scan disk to see if it was newly created
-    fprintf(stderr, "[PQC-HS] Fingerprint [%s] not found in RAM registry. Reloading from disk...\n", clean_fg);
-    sig_pqc_load_keys_from_disk();
-
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_registry_count; i++) {
-        if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
-            if (out_priv) *out_priv = g_identity_registry[i].priv_key;
-            if (out_pub) *out_pub = g_identity_registry[i].pub_key;
-            pthread_mutex_unlock(&g_key_mutex);
-            return 0;
+    // Fallback: key not in RAM, try loading directly from Vault
+    char key_filename[64];
+    snprintf(key_filename, sizeof(key_filename), "%s.key", clean_fg);
+    if (sig_pqc_load_key_from_vault(key_filename) == 0) {
+        pthread_mutex_lock(&g_key_mutex);
+        for (int i = 0; i < g_registry_count; i++) {
+            if (strcmp(g_identity_registry[i].fingerprint, clean_fg) == 0) {
+                if (out_priv) *out_priv = g_identity_registry[i].priv_key;
+                if (out_pub) *out_pub = g_identity_registry[i].pub_key;
+                pthread_mutex_unlock(&g_key_mutex);
+                return 0;
+            }
         }
+        pthread_mutex_unlock(&g_key_mutex);
     }
-    pthread_mutex_unlock(&g_key_mutex);
     return -1;
 }
 
-void sig_pqc_load_keys_from_disk(void) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_registry_count; i++) {
-        if (g_identity_registry[i].priv_key) {
-            free(g_identity_registry[i].priv_key);
-            g_identity_registry[i].priv_key = NULL;
-        }
-        if (g_identity_registry[i].pub_key) {
-            free(g_identity_registry[i].pub_key);
-            g_identity_registry[i].pub_key = NULL;
-        }
+int sig_pqc_load_key_from_vault(const char *fingerprint_key) {
+    char pub_b64[8192] = "";
+    char priv_b64[8192] = "";
+
+    if (sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PUBLIC, fingerprint_key, pub_b64, sizeof(pub_b64)) == 0 &&
+        sig_pqc_vault_read_key(VAULT_PATH_LOCAL_PRIVATE, fingerprint_key, priv_b64, sizeof(priv_b64)) == 0) {
+        
+        char fg[16] = "";
+        strncpy(fg, fingerprint_key, 8);
+        fg[8] = '\0';
+        sig_pqc_add_to_registry(fg, priv_b64, pub_b64);
+        fprintf(stderr, "[PQC-VAULT-LOG] SUCCESS: Loaded local identity [%s] 100%% from Vault into RAM.\n", fg);
+        return 0;
     }
-    g_registry_count = 0;
-    pthread_mutex_unlock(&g_key_mutex);
-
-    DIR *dir = opendir("/dev/shm/.enc_config");
-    if (!dir) return;
-
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        size_t name_len = strlen(entry->d_name);
-        if (name_len == 12 && strcmp(entry->d_name + 8, ".key") == 0) {
-            char fingerprint[16];
-            memset(fingerprint, 0, sizeof(fingerprint));
-            strncpy(fingerprint, entry->d_name, 8);
-
-            char priv_path[512];
-            char pub_path[512];
-            snprintf(priv_path, sizeof(priv_path), "/dev/shm/.enc_config/%s", entry->d_name);
-            snprintf(pub_path, sizeof(pub_path), "/etc/.enc_config/%s", entry->d_name);
-
-            FILE *fp_priv = fopen(priv_path, "r");
-            if (!fp_priv) continue;
-            char raw_file_priv[8192];
-            memset(raw_file_priv, 0, sizeof(raw_file_priv));
-            if (fgets(raw_file_priv, sizeof(raw_file_priv) - 1, fp_priv) == NULL) {
-                fclose(fp_priv);
-                continue;
-            }
-            fclose(fp_priv);
-            raw_file_priv[strcspn(raw_file_priv, "\r\n")] = '\0';
-
-            // Verify embedded fingerprint matches
-            if (strncmp(raw_file_priv, fingerprint, 8) != 0) {
-                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in private key %s\n", entry->d_name);
-                continue;
-            }
-            const char *obf_priv = raw_file_priv + 8;
-
-            FILE *fp_pub = fopen(pub_path, "r");
-            if (!fp_pub) continue;
-            char raw_file_pub[8192];
-            memset(raw_file_pub, 0, sizeof(raw_file_pub));
-            if (fgets(raw_file_pub, sizeof(raw_file_pub) - 1, fp_pub) == NULL) {
-                fclose(fp_pub);
-                continue;
-            }
-            fclose(fp_pub);
-            raw_file_pub[strcspn(raw_file_pub, "\r\n")] = '\0';
-
-            // Verify embedded fingerprint matches
-            if (strncmp(raw_file_pub, fingerprint, 8) != 0) {
-                fprintf(stderr, "[PQC-LOAD] WARNING: Embedded fingerprint mismatch in public key %s\n", pub_path);
-                continue;
-            }
-            const char *obf_pub = raw_file_pub + 8;
-
-            unsigned char raw_priv[4096];
-            size_t raw_priv_len = 0;
-            trf_base64_decode_obfuscated(obf_priv, fingerprint, raw_priv, &raw_priv_len);
-
-            char plain_b64_priv[8192];
-            memset(plain_b64_priv, 0, sizeof(plain_b64_priv));
-            trf_base64_encode(raw_priv, raw_priv_len, plain_b64_priv);
-
-            unsigned char raw_pub[4096];
-            size_t raw_pub_len = 0;
-            trf_base64_decode_obfuscated(obf_pub, fingerprint, raw_pub, &raw_pub_len);
-
-            char plain_b64_pub[8192];
-            memset(plain_b64_pub, 0, sizeof(plain_b64_pub));
-            trf_base64_encode(raw_pub, raw_pub_len, plain_b64_pub);
-
-            sig_pqc_add_to_registry(fingerprint, plain_b64_priv, plain_b64_pub);
-            fprintf(stderr, "[PQC-LOAD] Loaded Local Identity Fingerprint [%s] from secure RAM-disk (/dev/shm) into RAM.\n", fingerprint);
-        }
-    }
-    closedir(dir);
+    return -1;
 }
 
 void sig_pqc_prepare_reload(void) {
