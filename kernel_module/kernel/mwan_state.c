@@ -183,10 +183,10 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         struct crypto_aead *tfm;
         int err;
 
-        /* Force synchronous algorithm to avoid -EINPROGRESS in SoftIRQ/Netfilter hooks */
-        tfm = crypto_alloc_aead("gcm(aes)", 0, CRYPTO_ALG_ASYNC);
+        /* Allocate hardware-accelerated RFC4106 AES-GCM driver */
+        tfm = crypto_alloc_aead("rfc4106(gcm(aes))", 0, CRYPTO_ALG_ASYNC);
         if (IS_ERR(tfm)) {
-            pr_err("mwan_kmod: Failed to allocate synchronous AES-GCM transform: %ld\n", PTR_ERR(tfm));
+            pr_err("mwan_kmod: Failed to allocate AES-GCM transform: %ld\n", PTR_ERR(tfm));
             /* Cleanup and fail */
             for (i = 0; i < new_cfg->num_tunnels; i++) {
                 if (new_cfg->tunnels[i].dev)
@@ -197,9 +197,14 @@ int mwan_state_update(struct mwan_config *new_cfg) {
             return -ENOMEM;
         }
 
-        err = crypto_aead_setauthsize(tfm, MWAN_GCM_TAG_LEN);
+        /* RFC4106 requires crypto_aead_setkey to be called BEFORE crypto_aead_setauthsize!
+         * Key buffer = 32B AES-256 Key + 4B Salt = 36 bytes total */
+        u8 key_and_salt[MWAN_MAX_KEY_LEN + MWAN_SALT_LEN];
+        memcpy(key_and_salt, new_cfg->encrypt_key, new_cfg->encrypt_key_len);
+        memcpy(key_and_salt + new_cfg->encrypt_key_len, new_cfg->encrypt_salt, MWAN_SALT_LEN);
+        err = crypto_aead_setkey(tfm, key_and_salt, new_cfg->encrypt_key_len + MWAN_SALT_LEN);
         if (err) {
-            pr_err("mwan_kmod: Failed to set auth tag size: %d\n", err);
+            pr_err("mwan_kmod: Failed to set encryption key: %d\n", err);
             crypto_free_aead(tfm);
             for (i = 0; i < new_cfg->num_tunnels; i++) {
                 if (new_cfg->tunnels[i].dev)
@@ -210,9 +215,9 @@ int mwan_state_update(struct mwan_config *new_cfg) {
             return err;
         }
 
-        err = crypto_aead_setkey(tfm, new_cfg->encrypt_key, new_cfg->encrypt_key_len);
+        err = crypto_aead_setauthsize(tfm, MWAN_GCM_TAG_LEN);
         if (err) {
-            pr_err("mwan_kmod: Failed to set encryption key: %d\n", err);
+            pr_err("mwan_kmod: Failed to set auth tag size: %d\n", err);
             crypto_free_aead(tfm);
             for (i = 0; i < new_cfg->num_tunnels; i++) {
                 if (new_cfg->tunnels[i].dev)

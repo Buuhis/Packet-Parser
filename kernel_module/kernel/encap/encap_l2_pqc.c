@@ -10,10 +10,108 @@
 #include <net/arp.h>
 #include <net/dst.h>
 #include <crypto/aead.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#include <net/gso.h>
+#else
+#include <linux/skbuff.h>
+#endif
 
-#define MWAN_L2_HDR_LEN 8 /* 8 Bytes Sequence Number */
+#define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
+
+/* Helper to update TCP checksum after MSS modification */
+static inline void mwan_l2_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, struct tcphdr *tcph)
+{
+    int tcplen = ntohs(iph->tot_len) - (iph->ihl * 4);
+    tcph->check = 0;
+    tcph->check = csum_tcpudp_magic(iph->saddr, iph->daddr, tcplen, IPPROTO_TCP,
+                                    csum_partial(tcph, tcplen, 0));
+}
+
+/* Performs TCP MSS Clamping to account for L2-PQC 24-byte encryption overhead.
+ * This ensures packets don't exceed MTU after encryption. */
+static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
+{
+    struct iphdr *iph;
+    struct tcphdr *tcph;
+    u8 *opt;
+    int optlen, i;
+    u16 new_mss, old_mss;
+    u16 max_mss = dev->mtu - 40 - (ETH_HLEN + MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN); 
+
+    if (!skb || skb->protocol != htons(ETH_P_IP)) return;
+    iph = ip_hdr(skb);
+    if (!iph || iph->protocol != IPPROTO_TCP) return;
+
+    if (!pskb_may_pull(skb, (iph->ihl * 4) + sizeof(struct tcphdr))) return;
+    iph = ip_hdr(skb);
+    tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
+    if (!tcph->syn) return;
+
+    if (!pskb_may_pull(skb, (iph->ihl * 4) + (tcph->doff * 4))) return;
+    iph = ip_hdr(skb);
+    tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
+
+    optlen = (tcph->doff * 4) - sizeof(struct tcphdr);
+    opt = (u8 *)(tcph + 1);
+
+    for (i = 0; i < optlen; ) {
+        if (opt[i] == TCPOPT_EOL) break;
+        if (opt[i] == TCPOPT_NOP) { i++; continue; }
+        if (i + 1 >= optlen || i + opt[i + 1] > optlen) break;
+
+        if (opt[i] == TCPOPT_MSS && opt[i + 1] == TCPOLEN_MSS) {
+            old_mss = (opt[i + 2] << 8) | opt[i + 3];
+            if (old_mss > max_mss) {
+                new_mss = max_mss;
+                if (skb_ensure_writable(skb, (iph->ihl * 4) + (tcph->doff * 4))) return;
+                iph = ip_hdr(skb);
+                tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
+                opt = (u8 *)(tcph + 1);
+                opt[i + 2] = (new_mss >> 8) & 0xFF;
+                opt[i + 3] = new_mss & 0xFF;
+                mwan_l2_tcp_update_csum(skb, iph, tcph);
+            }
+            break;
+        }
+        i += opt[i + 1];
+    }
+}
+
+static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *tun)
+{
+    if (skb_is_gso(skb)) {
+        struct sk_buff *segs, *nskb, *next;
+        netdev_features_t features = netif_skb_features(skb);
+
+        /* Force software segmentation by clearing all GSO features.
+         * This splits 64KB GSO super-packets into MTU-compliant SKBs */
+        segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+        if (IS_ERR(segs) || !segs) {
+            return NF_DROP;
+        }
+
+        nskb = segs;
+        while (nskb) {
+            next = nskb->next;
+            nskb->next = NULL;
+
+            if (mwan_handle_encap_l2_pqc_single(nskb, tun) != NF_STOLEN) {
+                kfree_skb(nskb);
+            }
+
+            nskb = next;
+        }
+        consume_skb(skb);
+        return NF_STOLEN;
+    }
+
+    return mwan_handle_encap_l2_pqc_single(skb, tun);
+}
+
+static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct mwan_config *cfg;
     struct net_device *target_dev = tun->dev;
@@ -36,6 +134,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         return NF_ACCEPT;
     }
 
+    /* Clamp TCP MSS on SYN packets before encryption */
+    mwan_l2_clamp_mss(skb, target_dev);
+
     tfm = cfg->tfm;
     ip_pkt_len = skb->len;
     if (ip_pkt_len <= 0) {
@@ -50,13 +151,14 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         }
     }
 
-    // Dynamic resolution of gateway MAC for L2 tunnel if ethernet
-    if (tun->is_ethernet) {
+    // Fast-path MAC resolution: only resolve if MAC is not cached yet or invalid
+    if (tun->is_ethernet && unlikely(!tun->mac_resolved)) {
         resolved = mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac);
         if (unlikely(!resolved)) {
             rcu_read_unlock();
             return NF_DROP;
         }
+        tun->mac_resolved = true;
     }
 
     /* Only run skb_checksum_help if checksum is partial (locally generated packet).
@@ -69,8 +171,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     }
 
     seq = (u64)atomic64_inc_return(&cfg->encrypt_seq);
-    memcpy(iv, cfg->encrypt_salt, MWAN_SALT_LEN);
-    *(__be64 *)(iv + MWAN_SALT_LEN) = cpu_to_be64(seq);
+    *(__be64 *)iv = cpu_to_be64(seq);
 
     // Expand skb headroom/tailroom for Ethernet header + 8B Seq + Tag
     if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN + MWAN_L2_HDR_LEN)) {
@@ -101,9 +202,10 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         eth_zero_addr(eth->h_dest);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    // Write 8-byte Sequence Header
+    // Write 16-byte L2 Header (8B Sequence Number + 8B Reserved) for RFC4106 AAD=16
     seq_hdr = (__be64 *)(skb->data + ETH_HLEN);
-    *seq_hdr = cpu_to_be64(seq);
+    seq_hdr[0] = cpu_to_be64(seq);
+    seq_hdr[1] = 0;
 
     // Put Tag space at the tail
     skb_put(skb, MWAN_GCM_TAG_LEN);
@@ -119,7 +221,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         int nents;
 
         sg_init_table(sg, ARRAY_SIZE(sg));
-        sg_set_buf(&sg[0], (u8 *)seq_hdr, MWAN_L2_HDR_LEN); // AAD = 8B Seq
+        sg_set_buf(&sg[0], (u8 *)seq_hdr, MWAN_L2_HDR_LEN); // AAD = 16B for RFC4106
 
         nents = skb_to_sgvec(skb, &sg[1], ETH_HLEN + MWAN_L2_HDR_LEN, ip_pkt_len + MWAN_GCM_TAG_LEN);
         if (unlikely(nents < 0)) {

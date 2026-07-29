@@ -145,8 +145,8 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         }
     }
 
-    pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
-                        state->out->name, state->out->ifindex);
+    // pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
+    //                     state->out->name, state->out->ifindex);
 
     /* Steer & Encrypt all matched tunnel traffic */
 

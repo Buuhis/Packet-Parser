@@ -7,9 +7,8 @@
 #include <net/ip.h>
 #include <crypto/aead.h>
 #include <linux/netfilter.h>
-#include <linux/ktime.h>
 
-#define MWAN_L2_HDR_LEN 8 /* 8 Bytes Sequence Number */
+#define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
 
 static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 {
@@ -40,9 +39,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     // Read 8-byte Sequence Number from start of skb->data
     seq = be64_to_cpu(*(__be64 *)skb->data);
 
-    // Rebuild IV: 4B Salt + 8B Sequence Number
-    memcpy(iv_buf, cfg->encrypt_salt, MWAN_SALT_LEN);
-    *(__be64 *)(iv_buf + MWAN_SALT_LEN) = cpu_to_be64(seq);
+    // RFC 4106 IV: 8 Bytes Sequence Number
+    *(__be64 *)iv_buf = cpu_to_be64(seq);
 
     ciphertext_len = skb->len - MWAN_L2_HDR_LEN; // Everything after 8B Seq header
     plaintext_len = ciphertext_len - MWAN_GCM_TAG_LEN; // Original IP packet len
@@ -103,25 +101,19 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                              struct packet_type *pt, struct net_device *orig_dev)
 {
+    (void)dev;
+    (void)pt;
+    (void)orig_dev;
     int ret;
-    u64 ns_entry, ns_exit;
 
     if (!skb)
         return NET_RX_DROP;
-
-    ns_entry = ktime_get_real_ns();
-    pr_info("mwan_kmod DBG Decap [ENTRY]: skb_ptr=%px, time_ns=%llu, dev=%s, len=%d, proto=0x%04x (ENCRYPTED 88b5)\n",
-            skb, ns_entry, dev ? dev->name : "NULL", skb->len, ntohs(skb->protocol));
 
     ret = l2_pqc_decrypt_skb(skb);
     if (ret < 0) {
         kfree_skb(skb);
         return NET_RX_DROP;
     }
-
-    ns_exit = ktime_get_real_ns();
-    pr_info("mwan_kmod DBG Decap [RE-INJECT netif_rx]: skb_ptr=%px, time_ns=%llu, delta_ns=%llu, dev=%s, len=%d, proto=0x%04x (DECRYPTED 0800)\n",
-            skb, ns_exit, ns_exit - ns_entry, skb->dev ? skb->dev->name : "NULL", skb->len, ntohs(skb->protocol));
 
     // Re-inject clean plaintext packet into the receive stack for kernel IP routing
     netif_rx(skb);
