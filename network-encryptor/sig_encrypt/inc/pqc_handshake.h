@@ -103,6 +103,7 @@ typedef struct {
     bool thread_started;
     bool handshake_give_up;
     bool rotation_give_up;
+    bool giveup_logged;
     bool send_poke;
     bool is_tunnel;
     volatile bool thread_exit_sig;
