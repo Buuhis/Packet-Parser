@@ -98,16 +98,47 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     return 0;
 }
 
+static void mwan_drain_reorder_ring(struct mwan_config *cfg)
+{
+    if (!spin_trylock_bh(&cfg->rx_reorder.drain_lock))
+        return;
+
+    while (1) {
+        u64 expected = (u64)atomic64_read(&cfg->rx_reorder.expected_seq);
+        u32 slot = expected & MWAN_REORDER_RING_MASK;
+        struct sk_buff *skb = cfg->rx_reorder.ring[slot];
+
+        if (!skb)
+            break;
+
+        cfg->rx_reorder.ring[slot] = NULL;
+        atomic64_inc(&cfg->rx_reorder.expected_seq);
+        netif_rx(skb);
+    }
+
+    spin_unlock_bh(&cfg->rx_reorder.drain_lock);
+}
+
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                              struct packet_type *pt, struct net_device *orig_dev)
 {
     (void)dev;
     (void)pt;
     (void)orig_dev;
+    struct mwan_config *cfg;
+    u64 seq;
     int ret;
 
     if (!skb)
         return NET_RX_DROP;
+
+    if (skb->len < MWAN_L2_HDR_LEN) {
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+
+    // Read sequence number before decrypting
+    seq = be64_to_cpu(*(__be64 *)skb->data);
 
     ret = l2_pqc_decrypt_skb(skb);
     if (ret < 0) {
@@ -115,8 +146,23 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
     }
 
-    // Re-inject clean plaintext packet into the receive stack for kernel IP routing
-    netif_rx(skb);
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg && cfg->encrypt_on) {
+        u32 slot = seq & MWAN_REORDER_RING_MASK;
+        
+        /* If sequence number is out of ring window or slot is occupied, flush directly */
+        if (unlikely(cfg->rx_reorder.ring[slot] != NULL)) {
+            netif_rx(skb);
+        } else {
+            cfg->rx_reorder.ring[slot] = skb;
+            mwan_drain_reorder_ring(cfg);
+        }
+    } else {
+        netif_rx(skb);
+    }
+    rcu_read_unlock();
+
     return NET_RX_SUCCESS;
 }
 

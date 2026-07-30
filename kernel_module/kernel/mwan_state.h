@@ -5,9 +5,14 @@
 #include <linux/rcupdate.h>
 #include <linux/atomic.h>
 #include <crypto/aead.h>
+#include <linux/workqueue.h>
+#include <linux/skbuff.h>
+#include <linux/spinlock.h>
 #include "mwan_proto.h"
 
-#define MAX_MWAN_TUNNELS 8
+#define MWAN_REORDER_RING_SIZE 1024
+#define MWAN_REORDER_RING_MASK (MWAN_REORDER_RING_SIZE - 1)
+#define MAX_MWAN_TUNNELS 100
 #define MWAN_LUT_SIZE    256
 
 enum mwan_encap_type {
@@ -31,6 +36,19 @@ struct mwan_tunnel {
     bool mac_resolved;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
+};
+
+struct mwan_reorder_ring {
+    struct sk_buff *ring[MWAN_REORDER_RING_SIZE];
+    atomic64_t expected_seq;
+    spinlock_t drain_lock;
+};
+
+struct mwan_tx_work {
+    struct work_struct work;
+    struct sk_buff *skb;
+    struct mwan_tunnel tun;
+    int target_cpu;
 };
 
 struct mwan_config {
@@ -59,6 +77,11 @@ struct mwan_config {
     struct crypto_aead *tfm;              /* Crypto transform context */
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
+    struct workqueue_struct *tx_wq;
+    struct mwan_reorder_ring rx_reorder;
+    int num_workers;
+    int worker_start_cpu;
+
     struct rcu_head rcu;
 };
 

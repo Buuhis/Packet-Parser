@@ -276,15 +276,27 @@ static void setup_xps(const char *ifname, int num_cpus)
     }
 }
 
-/* RPS: Distribute RX processing across Software Worker cores (5-9) */
+/* RPS: Distribute RX processing across Software Worker cores */
 static void setup_rps(const char *ifname, int num_cpus)
 {
-    (void)num_cpus;
     int num_rx = count_queues(ifname, "rx-");
     if (num_rx == 0) return;
 
-    /* Worker cores: 5, 6, 7, 8, 9 (5 cores) */
-    unsigned int worker_mask = 0x3ff; 
+    int worker_start = 0;
+    int num_workers = num_cpus;
+    if (num_cpus >= 8) {
+        worker_start = 2; /* Reserve Core 0 & 1 for system/control plane */
+        num_workers = num_cpus - 2;
+    } else if (num_cpus >= 4) {
+        worker_start = 1; /* Reserve Core 0 for system */
+        num_workers = num_cpus - 1;
+    }
+
+    unsigned int worker_mask = 0;
+    for (int w = 0; w < num_workers; w++) {
+        worker_mask |= (1U << (worker_start + w));
+    }
+
     char path[256], mask[16];
     snprintf(mask, sizeof(mask), "%x", worker_mask);
 
@@ -292,7 +304,8 @@ static void setup_rps(const char *ifname, int num_cpus)
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_cpus", ifname, i);
         if (write_sysfs(path, mask) == 0)
-            log_info("    RPS: %s rx-%d -> Worker CPUs (mask %s)", ifname, i, mask);
+            log_info("    RPS: %s rx-%d -> Worker CPUs (mask %s, start=%d, count=%d)",
+                     ifname, i, mask, worker_start, num_workers);
 
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_flow_cnt", ifname, i);
@@ -361,13 +374,14 @@ static void setup_mq_qdisc(const char *ifname)
     log_info("    Qdisc: %s -> mq (%d queues)", ifname, num_tx);
 }
 
-/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS */
+/* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS */
 static void tune_physical_nic(const char *ifname, int num_cpus)
 {
     setup_multiqueue(ifname, num_cpus);
     setup_rss_hash(ifname);
     setup_irq_affinity(ifname, num_cpus);
     setup_xps(ifname, num_cpus);
+    setup_rps(ifname, num_cpus);
     setup_mq_qdisc(ifname);
 }
 

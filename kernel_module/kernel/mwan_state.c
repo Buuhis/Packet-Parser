@@ -31,6 +31,15 @@ static void mwan_config_free_rcu(struct rcu_head *rcu) {
     if (cfg->tfm) {
         crypto_free_aead(cfg->tfm);
     }
+    if (cfg->tx_wq) {
+        destroy_workqueue(cfg->tx_wq);
+    }
+    for (i = 0; i < MWAN_REORDER_RING_SIZE; i++) {
+        if (cfg->rx_reorder.ring[i]) {
+            kfree_skb(cfg->rx_reorder.ring[i]);
+            cfg->rx_reorder.ring[i] = NULL;
+        }
+    }
     kfree(cfg);
 }
 
@@ -228,9 +237,32 @@ int mwan_state_update(struct mwan_config *new_cfg) {
             return err;
         }
 
+        /* Calculate dynamic worker core count & reservation */
+        int num_cpus = num_online_cpus();
+        int worker_start = 0;
+        int num_workers = num_cpus;
+        if (num_cpus >= 8) {
+            worker_start = 2; /* Reserve Core 0 & 1 for system/control plane */
+            num_workers = num_cpus - 2;
+        } else if (num_cpus >= 4) {
+            worker_start = 1; /* Reserve Core 0 for system */
+            num_workers = num_cpus - 1;
+        }
+        new_cfg->worker_start_cpu = worker_start;
+        new_cfg->num_workers = num_workers;
+
+        /* Allocate high-priority unbound workqueue for TX multi-core offload */
+        new_cfg->tx_wq = alloc_workqueue("mwan_tx_wq", WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 0);
+
+        /* Initialize RX Reorder Ring Buffer */
+        memset(new_cfg->rx_reorder.ring, 0, sizeof(new_cfg->rx_reorder.ring));
+        atomic64_set(&new_cfg->rx_reorder.expected_seq, 1);
+        spin_lock_init(&new_cfg->rx_reorder.drain_lock);
+
         new_cfg->tfm = tfm;
         atomic64_set(&new_cfg->encrypt_seq, 0);
-        pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u)\n", new_cfg->encrypt_key_len);
+        pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u, workers=%d, start_cpu=%d)\n",
+                new_cfg->encrypt_key_len, new_cfg->num_workers, new_cfg->worker_start_cpu);
     }
 
     /* Phase 2: Atomic update */
