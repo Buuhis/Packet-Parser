@@ -80,6 +80,12 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     }
 
     // Decryption success!
+    // Ensure headroom has at least 14 bytes allocated space before memmove
+    if (unlikely(skb_cow(skb, ETH_HLEN))) {
+        rcu_read_unlock();
+        return -ENOMEM;
+    }
+
     // Move Ethernet header 8 bytes forward to overwrite the 8-byte Seq header
     memmove(skb->data + MWAN_L2_HDR_LEN - ETH_HLEN, skb->data - ETH_HLEN, ETH_HLEN);
     skb_pull(skb, MWAN_L2_HDR_LEN);
@@ -98,25 +104,43 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     return 0;
 }
 
-static void mwan_drain_reorder_ring(struct mwan_config *cfg)
+void mwan_reorder_timeout(struct timer_list *t)
 {
-    if (!spin_trylock_bh(&cfg->rx_reorder.drain_lock))
-        return;
+    struct mwan_config *cfg = container_of(t, struct mwan_config, rx_reorder.timer);
+    bool restart = false;
+    int i;
+
+    spin_lock_bh(&cfg->rx_reorder.drain_lock);
 
     while (1) {
-        u64 expected = (u64)atomic64_read(&cfg->rx_reorder.expected_seq);
-        u32 slot = expected & MWAN_REORDER_RING_MASK;
+        u32 slot = (u32)(atomic64_read(&cfg->rx_reorder.expected_seq) & MWAN_REORDER_RING_MASK);
         struct sk_buff *skb = cfg->rx_reorder.ring[slot];
 
-        if (!skb)
+        if (skb) {
+            cfg->rx_reorder.ring[slot] = NULL;
+            cfg->rx_reorder.slot_time[slot] = 0;
+            atomic64_inc(&cfg->rx_reorder.expected_seq);
+            netif_rx(skb);
+        } else if (cfg->rx_reorder.slot_time[slot] &&
+                   time_after(jiffies, cfg->rx_reorder.slot_time[slot] + MWAN_REORDER_TIMEOUT)) {
+            /* Timeout: this sequence number is lost on WAN -> skip it */
+            cfg->rx_reorder.slot_time[slot] = 0;
+            atomic64_inc(&cfg->rx_reorder.expected_seq);
+        } else {
             break;
-
-        cfg->rx_reorder.ring[slot] = NULL;
-        atomic64_inc(&cfg->rx_reorder.expected_seq);
-        netif_rx(skb);
+        }
     }
 
+    for (i = 0; i < MWAN_REORDER_RING_SIZE; i++) {
+        if (cfg->rx_reorder.ring[i]) {
+            restart = true;
+            break;
+        }
+    }
     spin_unlock_bh(&cfg->rx_reorder.drain_lock);
+
+    if (restart)
+        mod_timer(&cfg->rx_reorder.timer, jiffies + MWAN_REORDER_TIMEOUT);
 }
 
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
@@ -149,15 +173,44 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg && cfg->encrypt_on) {
-        u32 slot = seq & MWAN_REORDER_RING_MASK;
+        u64 current_exp = (u64)atomic64_read(&cfg->rx_reorder.expected_seq);
         
-        /* If sequence number is out of ring window or slot is occupied, flush directly */
-        if (unlikely(cfg->rx_reorder.ring[slot] != NULL)) {
-            netif_rx(skb);
-        } else {
-            cfg->rx_reorder.ring[slot] = skb;
-            mwan_drain_reorder_ring(cfg);
+        /* First-Packet Auto-Sync: 0ms TCP Handshake start */
+        if (unlikely(current_exp == 1 || seq > current_exp + 512)) {
+            atomic64_set(&cfg->rx_reorder.expected_seq, seq);
         }
+
+        spin_lock_bh(&cfg->rx_reorder.drain_lock);
+
+        u32 slot = seq & MWAN_REORDER_RING_MASK;
+
+        /* If slot already contains a packet (duplicate/overwrite), flush old packet first */
+        if (unlikely(cfg->rx_reorder.ring[slot] != NULL)) {
+            netif_rx(cfg->rx_reorder.ring[slot]);
+            cfg->rx_reorder.ring[slot] = NULL;
+        }
+
+        cfg->rx_reorder.ring[slot] = skb;
+        cfg->rx_reorder.slot_time[slot] = jiffies;
+
+        /* Drain inline while holding drain_lock */
+        while (1) {
+            u64 expected = atomic64_read(&cfg->rx_reorder.expected_seq);
+            u32 s = expected & MWAN_REORDER_RING_MASK;
+            struct sk_buff *pending = cfg->rx_reorder.ring[s];
+
+            if (!pending)
+                break;
+
+            cfg->rx_reorder.ring[s] = NULL;
+            cfg->rx_reorder.slot_time[s] = 0;
+            atomic64_inc(&cfg->rx_reorder.expected_seq);
+            netif_rx(pending);
+        }
+
+        spin_unlock_bh(&cfg->rx_reorder.drain_lock);
+
+        mod_timer(&cfg->rx_reorder.timer, jiffies + MWAN_REORDER_TIMEOUT);
     } else {
         netif_rx(skb);
     }

@@ -16,23 +16,8 @@
 #else
 #include <linux/skbuff.h>
 #endif
-#include <linux/jhash.h>
-#include <linux/workqueue.h>
-#include <linux/slab.h>
 
 #define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
-
-static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
-
-static void mwan_tx_worker_func(struct work_struct *w)
-{
-    struct mwan_tx_work *work = container_of(w, struct mwan_tx_work, work);
-    struct sk_buff *skb = work->skb;
-    struct mwan_tunnel tun = work->tun;
-
-    mwan_handle_encap_l2_pqc_single(skb, &tun);
-    kfree(work);
-}
 
 /* Helper to update TCP checksum after MSS modification */
 static inline void mwan_l2_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, struct tcphdr *tcph)
@@ -121,42 +106,6 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         }
         consume_skb(skb);
         return NF_STOLEN;
-    }
-
-    struct mwan_config *cfg;
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
-    if (cfg && cfg->encrypt_on && cfg->tx_wq && cfg->num_workers > 1) {
-        u32 hash = skb_get_hash(skb);
-        if (hash == 0 && skb->len >= sizeof(struct iphdr)) {
-            struct iphdr *iph = ip_hdr(skb);
-            if (iph && iph->version == 4) {
-                u16 sport = 0, dport = 0;
-                if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
-                    u16 *ports = (u16 *)((u8 *)iph + (iph->ihl * 4));
-                    sport = ports[0];
-                    dport = ports[1];
-                }
-                hash = jhash_3words(iph->saddr, iph->daddr, ((u32)sport << 16) | dport, iph->protocol);
-            }
-        }
-
-        int target_worker_idx = hash % cfg->num_workers;
-        int target_cpu = cfg->worker_start_cpu + target_worker_idx;
-        struct workqueue_struct *wq = cfg->tx_wq;
-        rcu_read_unlock();
-
-        struct mwan_tx_work *work = kmalloc(sizeof(*work), GFP_ATOMIC);
-        if (work) {
-            INIT_WORK(&work->work, mwan_tx_worker_func);
-            work->skb = skb;
-            work->tun = *tun;
-            work->target_cpu = target_cpu;
-            queue_work_on(target_cpu, wq, &work->work);
-            return NF_STOLEN;
-        }
-    } else {
-        rcu_read_unlock();
     }
 
     return mwan_handle_encap_l2_pqc_single(skb, tun);

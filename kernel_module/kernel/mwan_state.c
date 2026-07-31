@@ -1,4 +1,6 @@
 #include "mwan_state.h"
+#include <linux/timer.h>
+#include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/spinlock.h>
 #include <linux/netdevice.h>
@@ -7,6 +9,12 @@
 #include <net/arp.h>
 #include <linux/err.h>
 #include <net/rtnetlink.h>
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+#ifndef del_timer_sync
+#define del_timer_sync(t) timer_delete_sync(t)
+#endif
+#endif
 
 /* Global Configuration Pointer (RCU Protected) */
 struct mwan_config __rcu *g_mwan_cfg = NULL;
@@ -31,9 +39,7 @@ static void mwan_config_free_rcu(struct rcu_head *rcu) {
     if (cfg->tfm) {
         crypto_free_aead(cfg->tfm);
     }
-    if (cfg->tx_wq) {
-        destroy_workqueue(cfg->tx_wq);
-    }
+    del_timer_sync(&cfg->rx_reorder.timer);
     for (i = 0; i < MWAN_REORDER_RING_SIZE; i++) {
         if (cfg->rx_reorder.ring[i]) {
             kfree_skb(cfg->rx_reorder.ring[i]);
@@ -251,13 +257,13 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         new_cfg->worker_start_cpu = worker_start;
         new_cfg->num_workers = num_workers;
 
-        /* Allocate high-priority unbound workqueue for TX multi-core offload */
-        new_cfg->tx_wq = alloc_workqueue("mwan_tx_wq", WQ_UNBOUND | WQ_HIGHPRI | WQ_CPU_INTENSIVE, 0);
-
-        /* Initialize RX Reorder Ring Buffer */
+        /* Initialize RX Reorder Ring Buffer & Timer */
         memset(new_cfg->rx_reorder.ring, 0, sizeof(new_cfg->rx_reorder.ring));
+        memset(new_cfg->rx_reorder.slot_time, 0, sizeof(new_cfg->rx_reorder.slot_time));
         atomic64_set(&new_cfg->rx_reorder.expected_seq, 1);
         spin_lock_init(&new_cfg->rx_reorder.drain_lock);
+        
+        timer_setup(&new_cfg->rx_reorder.timer, mwan_reorder_timeout, 0);
 
         new_cfg->tfm = tfm;
         atomic64_set(&new_cfg->encrypt_seq, 0);

@@ -8,8 +8,11 @@
 #include <linux/workqueue.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
 #include "mwan_proto.h"
 
+#define MWAN_REORDER_TIMEOUT msecs_to_jiffies(50)
 #define MWAN_REORDER_RING_SIZE 1024
 #define MWAN_REORDER_RING_MASK (MWAN_REORDER_RING_SIZE - 1)
 #define MAX_MWAN_TUNNELS 100
@@ -42,13 +45,8 @@ struct mwan_reorder_ring {
     struct sk_buff *ring[MWAN_REORDER_RING_SIZE];
     atomic64_t expected_seq;
     spinlock_t drain_lock;
-};
-
-struct mwan_tx_work {
-    struct work_struct work;
-    struct sk_buff *skb;
-    struct mwan_tunnel tun;
-    int target_cpu;
+    struct timer_list timer;
+    unsigned long slot_time[MWAN_REORDER_RING_SIZE];
 };
 
 struct mwan_config {
@@ -77,7 +75,6 @@ struct mwan_config {
     struct crypto_aead *tfm;              /* Crypto transform context */
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
-    struct workqueue_struct *tx_wq;
     struct mwan_reorder_ring rx_reorder;
     int num_workers;
     int worker_start_cpu;
@@ -92,5 +89,6 @@ extern struct mwan_config __rcu *g_mwan_cfg;
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
+void mwan_reorder_timeout(struct timer_list *t);
 
 #endif /* MWAN_STATE_H */
