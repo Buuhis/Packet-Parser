@@ -22,14 +22,27 @@
 
 static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
 {
-    struct iphdr *iph = ip_hdr(skb);
+    struct iphdr *iph;
     u32 ports = 0;
-    if (iph && (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
-        u8 *l4 = (u8 *)iph + (iph->ihl * 4);
-        ports = *(__be32 *)l4;
+
+    if (unlikely(!pskb_may_pull(skb, sizeof(struct iphdr))))
+        return 0;
+
+    iph = ip_hdr(skb);
+    if (!iph || iph->version != 4)
+        iph = (struct iphdr *)skb->data;
+
+    if (iph && iph->ihl >= 5) {
+        int ip_hlen = iph->ihl * 4;
+        if (pskb_may_pull(skb, ip_hlen + 4)) {
+            iph = (struct iphdr *)skb->data;
+            if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
+                u8 *l4 = (u8 *)iph + ip_hlen;
+                ports = *(__be32 *)l4;
+            }
+            return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0x9e3779b9);
+        }
     }
-    if (iph)
-        return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0x9e3779b9);
     return 0;
 }
 
@@ -164,6 +177,7 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
             return NF_DROP;
         }
     }
+    skb_reset_network_header(skb);
 
     // Fast-path MAC resolution: only resolve if MAC is not cached yet or invalid
     if (tun->is_ethernet && unlikely(!tun->mac_resolved)) {
