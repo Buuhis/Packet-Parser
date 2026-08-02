@@ -12,11 +12,14 @@
 #include <linux/jiffies.h>
 #include "mwan_proto.h"
 
-#define MWAN_REORDER_TIMEOUT msecs_to_jiffies(50)
+#define MWAN_REORDER_TIMEOUT msecs_to_jiffies(30)
 #define MWAN_REORDER_RING_SIZE 1024
 #define MWAN_REORDER_RING_MASK (MWAN_REORDER_RING_SIZE - 1)
 #define MAX_MWAN_TUNNELS 100
 #define MWAN_LUT_SIZE    256
+#define MWAN_FLOW_TABLE_SIZE 256
+#define MWAN_FLOW_RING_SIZE  256
+#define MWAN_FLOW_RING_MASK  (MWAN_FLOW_RING_SIZE - 1)
 
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
@@ -25,8 +28,6 @@ enum mwan_encap_type {
     MWAN_ENCAP_L3_PQC,      /* L3 AES-GCM with PQC-derived session key */
     MWAN_ENCAP_L2_PQC,      /* L2 AES-GCM with PQC-derived session key */
 };
-
-struct mwan_tunnel;
 
 struct mwan_tunnel {
     u32 ifindex;
@@ -39,6 +40,13 @@ struct mwan_tunnel {
     bool mac_resolved;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
+};
+
+struct mwan_per_flow_reorder {
+    struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
+    atomic64_t expected_seq;
+    spinlock_t drain_lock;
+    unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
 struct mwan_reorder_ring {
@@ -75,7 +83,10 @@ struct mwan_config {
     struct crypto_aead *tfm;              /* Crypto transform context */
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
-    struct mwan_reorder_ring rx_reorder;
+    atomic64_t flow_tx_seq[MWAN_FLOW_TABLE_SIZE];
+    struct mwan_per_flow_reorder flow_reorder[MWAN_FLOW_TABLE_SIZE];
+
+    struct timer_list reorder_timer;
     int num_workers;
     int worker_start_cpu;
 

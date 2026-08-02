@@ -39,11 +39,14 @@ static void mwan_config_free_rcu(struct rcu_head *rcu) {
     if (cfg->tfm) {
         crypto_free_aead(cfg->tfm);
     }
-    del_timer_sync(&cfg->rx_reorder.timer);
-    for (i = 0; i < MWAN_REORDER_RING_SIZE; i++) {
-        if (cfg->rx_reorder.ring[i]) {
-            kfree_skb(cfg->rx_reorder.ring[i]);
-            cfg->rx_reorder.ring[i] = NULL;
+    del_timer_sync(&cfg->reorder_timer);
+    for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
+        struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[i];
+        for (int j = 0; j < MWAN_FLOW_RING_SIZE; j++) {
+            if (flow->ring[j]) {
+                kfree_skb(flow->ring[j]);
+                flow->ring[j] = NULL;
+            }
         }
     }
     kfree(cfg);
@@ -257,13 +260,19 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         new_cfg->worker_start_cpu = worker_start;
         new_cfg->num_workers = num_workers;
 
-        /* Initialize RX Reorder Ring Buffer & Timer */
-        memset(new_cfg->rx_reorder.ring, 0, sizeof(new_cfg->rx_reorder.ring));
-        memset(new_cfg->rx_reorder.slot_time, 0, sizeof(new_cfg->rx_reorder.slot_time));
-        atomic64_set(&new_cfg->rx_reorder.expected_seq, 1);
-        spin_lock_init(&new_cfg->rx_reorder.drain_lock);
+        /* Initialize Per-Flow TX Counters and Per-Flow RX Reorder Rings */
+        {
+            int f;
+            for (f = 0; f < MWAN_FLOW_TABLE_SIZE; f++) {
+                atomic64_set(&new_cfg->flow_tx_seq[f], 0);
+                memset(new_cfg->flow_reorder[f].ring, 0, sizeof(new_cfg->flow_reorder[f].ring));
+                memset(new_cfg->flow_reorder[f].slot_time, 0, sizeof(new_cfg->flow_reorder[f].slot_time));
+                atomic64_set(&new_cfg->flow_reorder[f].expected_seq, 1);
+                spin_lock_init(&new_cfg->flow_reorder[f].drain_lock);
+            }
+        }
         
-        timer_setup(&new_cfg->rx_reorder.timer, mwan_reorder_timeout, 0);
+        timer_setup(&new_cfg->reorder_timer, mwan_reorder_timeout, 0);
 
         new_cfg->tfm = tfm;
         atomic64_set(&new_cfg->encrypt_seq, 0);

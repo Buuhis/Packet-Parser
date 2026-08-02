@@ -106,9 +106,29 @@ static int count_queues(const char *ifname, const char *prefix)
 }
 
 /* Detect the underlying physical NIC of a virtual (e.g. VXLAN) interface.
- * Compares ifindex vs iflink — if they differ, iflink points to the lower dev. */
+ * Scans /sys/class/net/<virt_ifname>/ for symlinks starting with lower_ (e.g. lower_enp4s0).
+ * Falls back to ifindex vs iflink comparison if no lower_ symlink is found. */
 static int get_lower_ifname(const char *virt_ifname, char *lower_name, size_t len)
 {
+    char dirpath[256];
+    snprintf(dirpath, sizeof(dirpath), "/sys/class/net/%s", virt_ifname);
+    DIR *d = opendir(dirpath);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            if (strncmp(ent->d_name, "lower_", 6) == 0) {
+                const char *phys_name = ent->d_name + 6;
+                if (strlen(phys_name) > 0 && strlen(phys_name) < len) {
+                    snprintf(lower_name, len, "%s", phys_name);
+                    closedir(d);
+                    return 0;
+                }
+            }
+        }
+        closedir(d);
+    }
+
+    /* Fallback: Compares ifindex vs iflink */
     char path[256], buf[32];
     int own_idx, link_idx;
 
@@ -120,7 +140,6 @@ static int get_lower_ifname(const char *virt_ifname, char *lower_name, size_t le
     if (read_sysfs(path, buf, sizeof(buf)) < 0) return -1;
     link_idx = atoi(buf);
 
-    /* Same index = not a virtual device riding on another */
     if (own_idx == link_idx || link_idx == 0) return -1;
 
     char temp[IF_NAMESIZE];
@@ -218,21 +237,27 @@ static void setup_multiqueue(const char *ifname, int num_cpus)
     }
 }
 
-/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP.
- * Equivalent to: ethtool -N <dev> rx-flow-hash udp4 sdfn */
+/* Set RSS hash to full 4-tuple (src_ip, dst_ip, src_port, dst_port) for UDP & TCP.
+ * Equivalent to: ethtool -N <dev> rx-flow-hash udp4/tcp4 sdfn */
 static void setup_rss_hash(const char *ifname)
 {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd),
-             "ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname);
-    if (system(cmd) == 0)
+    char cmd[256];
+    int res;
+
+    snprintf(cmd, sizeof(cmd), "/sbin/ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null || ethtool -N %s rx-flow-hash udp4 sdfn 2>/dev/null", ifname, ifname);
+    res = system(cmd);
+    if (res == 0)
         log_info("    RSS: %s udp4 -> sdfn (4-tuple)", ifname);
+    else
+        log_warn("    RSS: %s udp4 sdfn configuration returned code %d", ifname, res);
 
     /* Also set for TCP */
-    snprintf(cmd, sizeof(cmd),
-             "ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname);
-    if (system(cmd) == 0)
+    snprintf(cmd, sizeof(cmd), "/sbin/ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null || ethtool -N %s rx-flow-hash tcp4 sdfn 2>/dev/null", ifname, ifname);
+    res = system(cmd);
+    if (res == 0)
         log_info("    RSS: %s tcp4 -> sdfn (4-tuple)", ifname);
+    else
+        log_warn("    RSS: %s tcp4 sdfn configuration returned code %d", ifname, res);
 }
 
 /* ================================================================

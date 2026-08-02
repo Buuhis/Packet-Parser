@@ -5,6 +5,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/jhash.h>
 #include <net/neighbour.h>
 #include <net/tcp.h>
 #include <net/arp.h>
@@ -18,6 +19,19 @@
 #endif
 
 #define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
+
+static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
+{
+    struct iphdr *iph = ip_hdr(skb);
+    u32 ports = 0;
+    if (iph && (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
+        u8 *l4 = (u8 *)iph + (iph->ihl * 4);
+        ports = *(__be32 *)l4;
+    }
+    if (iph)
+        return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0x9e3779b9);
+    return 0;
+}
 
 /* Helper to update TCP checksum after MSS modification */
 static inline void mwan_l2_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, struct tcphdr *tcph)
@@ -170,10 +184,12 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         }
     }
 
-    seq = (u64)atomic64_inc_return(&cfg->encrypt_seq);
+    u32 flow_id = mwan_calc_flow_id(skb);
+    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
+    seq = (u64)atomic64_inc_return(&cfg->flow_tx_seq[flow_idx]);
     *(__be64 *)iv = cpu_to_be64(seq);
 
-    // Expand skb headroom/tailroom for Ethernet header + 8B Seq + Tag
+    // Expand skb headroom/tailroom for Ethernet header + 16B L2 PQC Header + Tag
     if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN + MWAN_L2_HDR_LEN)) {
         rcu_read_unlock();
         return NF_DROP;
@@ -185,7 +201,7 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         }
     }
 
-    // Prepend Ethernet (14B) + Seq Header (8B)
+    // Prepend Ethernet (14B) + L2 PQC Header (16B)
     skb_push(skb, ETH_HLEN + MWAN_L2_HDR_LEN);
     skb_reset_mac_header(skb);
 
@@ -202,10 +218,11 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         eth_zero_addr(eth->h_dest);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    // Write 16-byte L2 Header (8B Sequence Number + 8B Reserved) for RFC4106 AAD=16
-    seq_hdr = (__be64 *)(skb->data + ETH_HLEN);
-    seq_hdr[0] = cpu_to_be64(seq);
-    seq_hdr[1] = 0;
+    // Write 16-byte MACsec-style L2-PQC Header (4B Flow_ID + 8B Flow_Seq + 4B Padding)
+    struct mwan_l2_pqc_hdr *l2_hdr = (struct mwan_l2_pqc_hdr *)(skb->data + ETH_HLEN);
+    l2_hdr->flow_id = cpu_to_be32(flow_id);
+    l2_hdr->flow_seq = cpu_to_be64(seq);
+    l2_hdr->reserved = 0;
 
     // Put Tag space at the tail
     skb_put(skb, MWAN_GCM_TAG_LEN);

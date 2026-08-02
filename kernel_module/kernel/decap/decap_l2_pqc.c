@@ -10,13 +10,13 @@
 
 #define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
 
-static int l2_pqc_decrypt_skb(struct sk_buff *skb)
+static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_flow_seq)
 {
     struct mwan_config *cfg;
     u8 iv_buf[MWAN_GCM_IV_LEN];
     struct aead_request *req;
-    int err, ciphertext_len, plaintext_len;
-    u64 seq;
+    int err, ciphertext_len;
+    struct mwan_l2_pqc_hdr *l2_hdr;
 
     if (skb_is_nonlinear(skb)) {
         if (unlikely(skb_linearize(skb)))
@@ -25,7 +25,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     if (skb_cow(skb, 0))
         return -ENOMEM;
 
-    // Packet must have at least 8B Seq + 16B GCM Tag = 24 Bytes
+    // Packet must have at least 16B L2 Header + 16B GCM Tag = 32 Bytes
     if (skb->len < MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN)
         return -EINVAL;
 
@@ -36,14 +36,15 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         return -ENODEV;
     }
 
-    // Read 8-byte Sequence Number from start of skb->data
-    seq = be64_to_cpu(*(__be64 *)skb->data);
+    // Read MACsec-style L2-PQC Header (4B Flow_ID + 8B Flow_Seq)
+    l2_hdr = (struct mwan_l2_pqc_hdr *)skb->data;
+    if (out_flow_id) *out_flow_id = be32_to_cpu(l2_hdr->flow_id);
+    if (out_flow_seq) *out_flow_seq = be64_to_cpu(l2_hdr->flow_seq);
 
-    // RFC 4106 IV: 8 Bytes Sequence Number
-    *(__be64 *)iv_buf = cpu_to_be64(seq);
+    // RFC 4106 IV: 8 Bytes Flow Sequence Number
+    *(__be64 *)iv_buf = l2_hdr->flow_seq;
 
-    ciphertext_len = skb->len - MWAN_L2_HDR_LEN; // Everything after 8B Seq header
-    plaintext_len = ciphertext_len - MWAN_GCM_TAG_LEN; // Original IP packet len
+    ciphertext_len = skb->len - MWAN_L2_HDR_LEN;
 
     req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
     if (!req) {
@@ -56,7 +57,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
         int nents;
 
         sg_init_table(sg, ARRAY_SIZE(sg));
-        sg_set_buf(&sg[0], skb->data, MWAN_L2_HDR_LEN); // AAD = 8B Seq
+        sg_set_buf(&sg[0], skb->data, MWAN_L2_HDR_LEN); // AAD = 16B L2 Header
 
         nents = skb_to_sgvec(skb, &sg[1], MWAN_L2_HDR_LEN, ciphertext_len);
         if (unlikely(nents < 0)) {
@@ -80,13 +81,12 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
     }
 
     // Decryption success!
-    // Ensure headroom has at least 14 bytes allocated space before memmove
     if (unlikely(skb_cow(skb, ETH_HLEN))) {
         rcu_read_unlock();
         return -ENOMEM;
     }
 
-    // Move Ethernet header 8 bytes forward to overwrite the 8-byte Seq header
+    // Move Ethernet header 16 bytes forward to overwrite the 16-byte L2 Header
     memmove(skb->data + MWAN_L2_HDR_LEN - ETH_HLEN, skb->data - ETH_HLEN, ETH_HLEN);
     skb_pull(skb, MWAN_L2_HDR_LEN);
     skb_trim(skb, skb->len - MWAN_GCM_TAG_LEN);
@@ -106,41 +106,44 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb)
 
 void mwan_reorder_timeout(struct timer_list *t)
 {
-    struct mwan_config *cfg = container_of(t, struct mwan_config, rx_reorder.timer);
+    struct mwan_config *cfg = container_of(t, struct mwan_config, reorder_timer);
     bool restart = false;
-    int i;
+    int f;
 
-    spin_lock_bh(&cfg->rx_reorder.drain_lock);
+    for (f = 0; f < MWAN_FLOW_TABLE_SIZE; f++) {
+        struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[f];
+        spin_lock_bh(&flow->drain_lock);
 
-    while (1) {
-        u32 slot = (u32)(atomic64_read(&cfg->rx_reorder.expected_seq) & MWAN_REORDER_RING_MASK);
-        struct sk_buff *skb = cfg->rx_reorder.ring[slot];
+        while (1) {
+            u32 slot = (u32)(atomic64_read(&flow->expected_seq) & MWAN_FLOW_RING_MASK);
+            struct sk_buff *skb = flow->ring[slot];
 
-        if (skb) {
-            cfg->rx_reorder.ring[slot] = NULL;
-            cfg->rx_reorder.slot_time[slot] = 0;
-            atomic64_inc(&cfg->rx_reorder.expected_seq);
-            netif_rx(skb);
-        } else if (cfg->rx_reorder.slot_time[slot] &&
-                   time_after(jiffies, cfg->rx_reorder.slot_time[slot] + MWAN_REORDER_TIMEOUT)) {
-            /* Timeout: this sequence number is lost on WAN -> skip it */
-            cfg->rx_reorder.slot_time[slot] = 0;
-            atomic64_inc(&cfg->rx_reorder.expected_seq);
-        } else {
-            break;
+            if (skb) {
+                flow->ring[slot] = NULL;
+                flow->slot_time[slot] = 0;
+                atomic64_inc(&flow->expected_seq);
+                netif_rx(skb);
+            } else if (flow->slot_time[slot] &&
+                       time_after(jiffies, flow->slot_time[slot] + MWAN_REORDER_TIMEOUT)) {
+                /* Timeout: lost packet in this flow -> skip slot */
+                flow->slot_time[slot] = 0;
+                atomic64_inc(&flow->expected_seq);
+            } else {
+                break;
+            }
         }
-    }
 
-    for (i = 0; i < MWAN_REORDER_RING_SIZE; i++) {
-        if (cfg->rx_reorder.ring[i]) {
-            restart = true;
-            break;
+        for (int i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
+            if (flow->ring[i]) {
+                restart = true;
+                break;
+            }
         }
+        spin_unlock_bh(&flow->drain_lock);
     }
-    spin_unlock_bh(&cfg->rx_reorder.drain_lock);
 
     if (restart)
-        mod_timer(&cfg->rx_reorder.timer, jiffies + MWAN_REORDER_TIMEOUT);
+        mod_timer(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
 }
 
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
@@ -150,7 +153,8 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     (void)pt;
     (void)orig_dev;
     struct mwan_config *cfg;
-    u64 seq;
+    u32 flow_id = 0;
+    u64 flow_seq = 0;
     int ret;
 
     if (!skb)
@@ -161,10 +165,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
     }
 
-    // Read sequence number before decrypting
-    seq = be64_to_cpu(*(__be64 *)skb->data);
-
-    ret = l2_pqc_decrypt_skb(skb);
+    ret = l2_pqc_decrypt_skb(skb, &flow_id, &flow_seq);
     if (ret < 0) {
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -173,44 +174,47 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg && cfg->encrypt_on) {
-        u64 current_exp = (u64)atomic64_read(&cfg->rx_reorder.expected_seq);
+        u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
+        struct mwan_per_flow_reorder *flow_reorder = &cfg->flow_reorder[flow_idx];
+
+        u64 current_exp = (u64)atomic64_read(&flow_reorder->expected_seq);
         
-        /* First-Packet Auto-Sync: 0ms TCP Handshake start */
-        if (unlikely(current_exp == 1 || seq > current_exp + 512)) {
-            atomic64_set(&cfg->rx_reorder.expected_seq, seq);
+        /* Per-Flow First-Packet Auto-Sync: 0ms TCP Handshake start */
+        if (unlikely(current_exp == 1 || flow_seq > current_exp + 128)) {
+            atomic64_set(&flow_reorder->expected_seq, flow_seq);
         }
 
-        spin_lock_bh(&cfg->rx_reorder.drain_lock);
+        spin_lock_bh(&flow_reorder->drain_lock);
 
-        u32 slot = seq & MWAN_REORDER_RING_MASK;
+        u32 slot = flow_seq & MWAN_FLOW_RING_MASK;
 
         /* If slot already contains a packet (duplicate/overwrite), flush old packet first */
-        if (unlikely(cfg->rx_reorder.ring[slot] != NULL)) {
-            netif_rx(cfg->rx_reorder.ring[slot]);
-            cfg->rx_reorder.ring[slot] = NULL;
+        if (unlikely(flow_reorder->ring[slot] != NULL)) {
+            netif_rx(flow_reorder->ring[slot]);
+            flow_reorder->ring[slot] = NULL;
         }
 
-        cfg->rx_reorder.ring[slot] = skb;
-        cfg->rx_reorder.slot_time[slot] = jiffies;
+        flow_reorder->ring[slot] = skb;
+        flow_reorder->slot_time[slot] = jiffies;
 
-        /* Drain inline while holding drain_lock */
+        /* Drain per-flow inline while holding per-flow drain_lock */
         while (1) {
-            u64 expected = atomic64_read(&cfg->rx_reorder.expected_seq);
-            u32 s = expected & MWAN_REORDER_RING_MASK;
-            struct sk_buff *pending = cfg->rx_reorder.ring[s];
+            u64 expected = atomic64_read(&flow_reorder->expected_seq);
+            u32 s = expected & MWAN_FLOW_RING_MASK;
+            struct sk_buff *pending = flow_reorder->ring[s];
 
             if (!pending)
                 break;
 
-            cfg->rx_reorder.ring[s] = NULL;
-            cfg->rx_reorder.slot_time[s] = 0;
-            atomic64_inc(&cfg->rx_reorder.expected_seq);
+            flow_reorder->ring[s] = NULL;
+            flow_reorder->slot_time[s] = 0;
+            atomic64_inc(&flow_reorder->expected_seq);
             netif_rx(pending);
         }
 
-        spin_unlock_bh(&cfg->rx_reorder.drain_lock);
+        spin_unlock_bh(&flow_reorder->drain_lock);
 
-        mod_timer(&cfg->rx_reorder.timer, jiffies + MWAN_REORDER_TIMEOUT);
+        mod_timer(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
     } else {
         netif_rx(skb);
     }

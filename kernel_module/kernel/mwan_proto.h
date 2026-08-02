@@ -31,6 +31,13 @@ struct mwan_crypto_hdr {
     __be64 seq;        /* Sequence number (dynamic part of IV) */
 } __attribute__((packed));
 
+/* ---- MWAN L2-PQC AAD Header (16 Bytes for RFC 4106 MACsec-style Flow Sequencing) ---- */
+struct mwan_l2_pqc_hdr {
+    __be32 flow_id;    /* 4-byte 4-tuple Hash (SCI equivalent) */
+    __be64 flow_seq;   /* 8-byte Per-Flow Sequence Number (PN) */
+    __be32 reserved;   /* 4-byte padding for 16B alignment */
+} __attribute__((packed));
+
 /* ---- Generic Netlink Commands ---- */
 enum mwan_genl_cmds {
     MWAN_CMD_UNSPEC = 0,
