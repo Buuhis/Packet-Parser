@@ -1,4 +1,8 @@
 #!/bin/sh
 set -e
+
+echo "/usr/local/lib/pqc" > /etc/ld.so.conf.d/pqc.conf
+ldconfig || true
+
 systemctl daemon-reload || true
 exit 0
