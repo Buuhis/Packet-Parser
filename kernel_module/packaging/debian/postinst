@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+KERNEL_RELEASE="@KERNEL_RELEASE@"
+
+case "$1" in
+    configure)
+        depmod "$KERNEL_RELEASE" || true
+        ;;
+esac
+
+exit 0

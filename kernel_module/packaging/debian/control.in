@@ -1,0 +1,8 @@
+Package: sd-wan
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: SD-WAN Team
+Description: SD-WAN packet forwarder and kernel datapath
+ Self-contained userspace runtime and a kernel module for @KERNEL_RELEASE@.

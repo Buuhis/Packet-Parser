@@ -1,6 +1,8 @@
 CC      := gcc-12
 CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -Isig_encrypt/inc -I/usr/include/postgresql -I/usr/include/libnl3
-LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3 -Lsig_encrypt/lib -Wl,-rpath,/usr/local/lib -lscrypt -lcrypto
+# Resolve libscrypt.so relative to the installed daemon instead of a development
+# path.  The package installs it in /usr/lib/sd-wan.
+LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3 -Lsig_encrypt/lib -Wl,--disable-new-dtags,-rpath,'$$ORIGIN/../lib/sd-wan' -lscrypt -lcrypto
 
 BIN := sd-wan
 
@@ -19,7 +21,7 @@ SRC := \
 
 OBJ := $(SRC:.c=.o)
 
-.PHONY: all clean install kernel-mod
+.PHONY: all clean install kernel-mod package
 
 all: $(BIN) kernel-mod
 
@@ -45,7 +47,11 @@ install-service:
 	systemctl daemon-reload
 	@echo "Service installed. You can now use: systemctl enable --now sd-wan"
 
+# Binary-only Debian package for the current kernel and architecture.
+# Override VERSION when preparing a release, e.g. make package VERSION=1.2.0.
+package:
+	./packaging/build-deb.sh $(if $(VERSION),--version $(VERSION),)
+
 clean:
 	rm -f $(BIN) $(OBJ)
 	$(MAKE) -C kernel clean
-
