@@ -1,0 +1,8 @@
+Package: pqc-keygen
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: @ARCH@
+Maintainer: SD-WAN Team
+Description: PQC identity key generation daemon
+ Self-contained PQC key generator that writes identities to Vault.

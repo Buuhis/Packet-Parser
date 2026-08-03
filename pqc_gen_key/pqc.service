@@ -6,7 +6,8 @@ After=network.target vault.service
 Type=simple
 User=root
 EnvironmentFile=/opt/.env
-ExecStart=/usr/local/bin/pqc --daemon
+Environment=LD_LIBRARY_PATH=/usr/lib/pqc
+ExecStart=/usr/bin/pqc --daemon
 Restart=always
 
 [Install]

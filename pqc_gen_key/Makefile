@@ -1,12 +1,14 @@
 CC = gcc
 CFLAGS = -D_GNU_SOURCE -Iinc -Wall -O2
-LDFLAGS = -Llib -Wl,-rpath,$(PWD)/lib -Wl,-rpath,/usr/local/lib/pqc -lscrypt -lssl -lcrypto -lpthread
+LDFLAGS = -Llib -Wl,--disable-new-dtags,-rpath,'$$ORIGIN/../lib/pqc' -lscrypt -lssl -lcrypto -lpthread
 
 SRCS = main.c src/traffic_crypto.c src/pqc_vault.c
 OBJS = $(SRCS:.c=.o)
 TARGET = bin/pqc
 
 all: $(TARGET)
+
+.PHONY: all clean package
 
 $(TARGET): $(OBJS)
 	@mkdir -p bin
@@ -20,5 +22,9 @@ install: $(TARGET)
 	install -m 755 $(TARGET) /usr/local/bin/pqc
 	install -m 755 lib/libscrypt.so /usr/local/lib/pqc/libscrypt.so
 
+package:
+	./packaging/build-deb.sh $(if $(VERSION),--version $(VERSION),)
+
 clean:
 	rm -rf bin src/*.o *.o
+	rm -rf dist
