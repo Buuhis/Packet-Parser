@@ -3,6 +3,7 @@
 #include "kernel_sync.h"
 #include "system/cpu_tune.h"
 #include "config/db_client.h"
+#include "config/vault_db_client.h"
 #include "utils/logger.h"
 #include "cli/cli_handler.h"
 #include "pqc_handshake.h"
@@ -248,13 +249,40 @@ int main(int argc, char **argv) {
     }
 
     /* ======================== DAEMON MODE ======================== */
-    const char *db_h = getenv("POSTGRES_HOST"); 
-    const char *db_p = getenv("POSTGRES_PORT"); 
-    const char *db_u = getenv("POSTGRES_USER"); 
-    const char *db_n = getenv("POSTGRES_TABLE");
-    const char *db_pass = getenv("POSTGRES_PASS");
+    char db_s_buf[128] = {0};
+    char db_p_buf[32] = {0};
+    char db_u_buf[64] = {0};
+    char db_n_buf[64] = {0};
+    char db_pass_buf[128] = {0};
+
+    const char *db_h = NULL;
+    const char *db_p = NULL;
+    const char *db_u = NULL;
+    const char *db_n = NULL;
+    const char *db_pass = NULL;
+
+    log_info("Fetching Database credentials from HashiCorp Vault (/v1/kv/data/secret)...");
+    if (vault_db_fetch_config(db_s_buf, sizeof(db_s_buf),
+                            db_p_buf, sizeof(db_p_buf),
+                            db_u_buf, sizeof(db_u_buf),
+                            db_n_buf, sizeof(db_n_buf),
+                            db_pass_buf, sizeof(db_pass_buf)) == 0) {
+        db_h = db_s_buf;
+        db_p = db_p_buf;
+        db_u = db_u_buf;
+        db_n = db_n_buf;
+        db_pass = db_pass_buf;
+    } else {
+        log_warn("Failed to fetch DB config from Vault! Falling back to Environment Variables...");
+        db_h = getenv("POSTGRES_SERVER") ? getenv("POSTGRES_SERVER") : getenv("POSTGRES_HOST"); 
+        db_p = getenv("POSTGRES_PORT"); 
+        db_u = getenv("POSTGRES_USER"); 
+        db_n = getenv("POSTGRES_DB") ? getenv("POSTGRES_DB") : getenv("POSTGRES_TABLE");
+        db_pass = getenv("POSTGRES_PASSWORD") ? getenv("POSTGRES_PASSWORD") : getenv("POSTGRES_PASS");
+    }
+
     if (!db_h || !db_p || !db_u || !db_n) {
-        log_error("Missing DB ENV vars"); usage(argv[0]); return 1;
+        log_error("Missing DB connection parameters from both Vault and ENV!"); usage(argv[0]); return 1;
     }
 
     if (db_client_connect(db_h, db_p, db_u, db_n, db_pass) != 0) {
