@@ -6,14 +6,13 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-# Create this root-only file during provisioning.  It contains POSTGRES_* and
-# any Vault settings; a package must never ship deployment credentials.
-EnvironmentFile=-/etc/sd-wan/sd-wan.env
-Environment=LD_LIBRARY_PATH=/usr/lib/sd-wan
+# Configuration & Environment file
+EnvironmentFile=/opt/.env
+Environment=LD_LIBRARY_PATH=/usr/local/lib/sd-wan:/usr/lib/sd-wan
 
-# Daemon
-ExecStartPre=/sbin/modprobe mwan_kmod
-ExecStart=/usr/sbin/sd-wan
+# Daemon & Kernel Module lifecycle
+ExecStartPre=/bin/sh -c "/sbin/insmod /usr/local/lib/modules/mwan_kmod.ko 2>/dev/null || /sbin/modprobe mwan_kmod 2>/dev/null || true"
+ExecStart=/usr/local/bin/sd-wan
 ExecStopPost=-/sbin/rmmod mwan_kmod
 Restart=always
 

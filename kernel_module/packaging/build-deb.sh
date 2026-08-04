@@ -110,28 +110,39 @@ SCAN_LIB_DIR="$STAGE_DIR/runtime-libs"
 
 install -d \
     "$PKG_DIR/DEBIAN" \
-    "$PKG_DIR/usr/sbin" \
+    "$PKG_DIR/usr/local/bin" \
+    "$PKG_DIR/usr/local/lib/modules" \
+    "$PKG_DIR/usr/local/lib/sd-wan" \
     "$PKG_DIR/usr/lib/sd-wan" \
     "$PKG_DIR/usr/lib/systemd/system" \
+    "$PKG_DIR/etc/systemd/system" \
     "$PKG_DIR/usr/share/sd-wan" \
     "$PKG_DIR/lib/modules/$KERNEL_RELEASE/extra"
 
 install -d "$SCAN_LIB_DIR" "$VENDORED_LIB_DIR"
 
-install -m 0755 "$DAEMON" "$PKG_DIR/usr/sbin/sd-wan"
-install -m 0644 "$SCRYPT_LIB" "$SCAN_LIB_DIR/libscrypt.so"
-install -m 0644 "$MODULE" "$PKG_DIR/lib/modules/$KERNEL_RELEASE/extra/mwan_kmod.ko"
-install -m 0644 "$PROJECT_DIR/systemd/sd-wan.service" "$PKG_DIR/usr/lib/systemd/system/sd-wan.service"
-install -m 0644 "$SCRIPT_DIR/sd-wan.env.example" "$PKG_DIR/usr/share/sd-wan/sd-wan.env.example"
+# Install Binary aligned with Makefile (/usr/local/bin/sd-wan)
+install -m 0755 "$DAEMON" "$PKG_DIR/usr/local/bin/sd-wan"
 
-# Refresh the persistent, reviewable runtime bundle in kernel_module/lib.
-# It contains libscrypt plus every non-core transitive dependency.  The package
-# is then assembled from this directory, so an offline target needs no apt
-# library packages.
+# Install Libraries strictly inside lib/sd-wan/ & Kernel Module
+install -m 0644 "$SCRYPT_LIB" "$SCAN_LIB_DIR/libscrypt.so"
+install -m 0755 "$SCRYPT_LIB" "$PKG_DIR/usr/local/lib/sd-wan/libscrypt.so"
+install -m 0644 "$MODULE" "$PKG_DIR/usr/local/lib/modules/mwan_kmod.ko"
+install -m 0644 "$MODULE" "$PKG_DIR/lib/modules/$KERNEL_RELEASE/extra/mwan_kmod.ko"
+
+# Install Systemd Service File aligned with Makefile
+install -m 0644 "$PROJECT_DIR/systemd/sd-wan.service" "$PKG_DIR/etc/systemd/system/sd-wan.service"
+install -m 0644 "$PROJECT_DIR/systemd/sd-wan.service" "$PKG_DIR/usr/lib/systemd/system/sd-wan.service"
+if [ -f "$SCRIPT_DIR/sd-wan.env.example" ]; then
+    install -m 0644 "$SCRIPT_DIR/sd-wan.env.example" "$PKG_DIR/usr/share/sd-wan/sd-wan.env.example"
+fi
+
+# Refresh runtime dependencies bundle
 export LD_LIBRARY_PATH="$SCAN_LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 bundle_runtime_dependencies "$SCAN_LIB_DIR" \
-    "$PKG_DIR/usr/sbin/sd-wan" "$SCAN_LIB_DIR/libscrypt.so"
+    "$PKG_DIR/usr/local/bin/sd-wan" "$SCAN_LIB_DIR/libscrypt.so"
 cp -a "$SCAN_LIB_DIR/." "$VENDORED_LIB_DIR/"
+cp -a "$VENDORED_LIB_DIR/." "$PKG_DIR/usr/local/lib/sd-wan/"
 cp -a "$VENDORED_LIB_DIR/." "$PKG_DIR/usr/lib/sd-wan/"
 
 sed \

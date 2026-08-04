@@ -38,9 +38,10 @@ install: all
 	install -m 755 $(BIN) /usr/local/bin/
 	mkdir -p /usr/local/lib/modules/
 	install -m 644 kernel/mwan_kmod.ko /usr/local/lib/modules/
-	install -m 755 sig_encrypt/lib/libscrypt.so /usr/local/lib/libscrypt.so
+	mkdir -p /usr/local/lib/sd-wan/
+	install -m 755 sig_encrypt/lib/libscrypt.so /usr/local/lib/sd-wan/libscrypt.so
 	ldconfig
-	@echo "Installed $(BIN), mwan_kmod.ko, and libscrypt.so globally"
+	@echo "Installed $(BIN), mwan_kmod.ko, and libscrypt.so in /usr/local/lib/sd-wan/"
 
 install-service:
 	install -m 644 systemd/sd-wan.service /etc/systemd/system/
