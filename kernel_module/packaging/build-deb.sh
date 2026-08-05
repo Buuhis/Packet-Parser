@@ -121,7 +121,7 @@ install -d \
 
 install -d "$SCAN_LIB_DIR" "$VENDORED_LIB_DIR"
 
-# Install Binary aligned with Makefile (/usr/local/bin/sd-wan)
+# Install Real Binary strictly in /usr/local/bin/sd-wan (matching Makefile)
 install -m 0755 "$DAEMON" "$PKG_DIR/usr/local/bin/sd-wan"
 
 # Install Libraries strictly inside lib/sd-wan/ & Kernel Module
