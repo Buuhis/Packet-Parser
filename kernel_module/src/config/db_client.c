@@ -53,7 +53,7 @@ void db_client_disconnect(void)
     }
 }
 
-int db_client_load_config(int node_id, app_config_t *cfg)
+int db_client_load_config(int profile_id, app_config_t *cfg)
 {
     pthread_mutex_lock(&g_db_mutex);
     if (!g_db_conn) {
@@ -62,94 +62,92 @@ int db_client_load_config(int node_id, app_config_t *cfg)
         return -1;
     }
     
-    /* 1. Fetch node info (including encryption config) */
+    /* 1. Fetch sdwan_profiles info by profile_id */
     char id_str[16];
-    snprintf(id_str, sizeof(id_str), "%d", node_id);
+    snprintf(id_str, sizeof(id_str), "%d", profile_id);
     const char *paramValues[1] = { id_str };
     
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT local_if, "
-        "encryption_enabled, encrypt_type, encrypt_key, encrypt_layer "
-        "FROM public.nodes WHERE node_id = $1",
-        1,       /* nParams */
-        NULL,    /* paramTypes */
-        paramValues,
-        NULL,    /* paramLengths */
-        NULL,    /* paramFormats */
-        0);      /* resultFormat = text */
+        "SELECT action, method, encryption_key, weight_enable, latency_enable, loss_enable, latency_duration, loss_duration "
+        "FROM public.sdwan_profiles WHERE id = $1",
+        1, NULL, paramValues, NULL, NULL, 0);
         
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        log_error("SELECT nodes failed: %s", PQerrorMessage(g_db_conn));
+        log_error("SELECT sdwan_profiles failed: %s", PQerrorMessage(g_db_conn));
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
     
     if (PQntuples(res) == 0) {
-        log_error("No node found with id '%d'", node_id);
+        log_error("No sdwan_profile found with id '%d'", profile_id);
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
     
     memset(cfg, 0, sizeof(*cfg));
-    cfg->node_id = node_id;
-    strncpy(cfg->local_if, PQgetvalue(res, 0, 0), sizeof(cfg->local_if) - 1);
+    cfg->node_id = profile_id;
     
-    /* Parse encryption config */
-    const char *enc_enabled = PQgetvalue(res, 0, 1);
-    const char *enc_type    = PQgetvalue(res, 0, 2);
-    const char *enc_key_hex = PQgetvalue(res, 0, 3);
-    const char *enc_layer    = PQgetvalue(res, 0, 4);
+    const char *action      = PQgetvalue(res, 0, 0);
+    const char *method      = PQgetvalue(res, 0, 1);
+    const char *enc_key_hex = PQgetvalue(res, 0, 2);
     
-    cfg->encrypt.enabled = (enc_enabled && strcmp(enc_enabled, "t") == 0);
+    cfg->encrypt.enabled = (method && strcmp(method, "None") != 0);
     
     if (cfg->encrypt.enabled) {
-        /* Set layer (default L3) */
-        cfg->encrypt.layer = enc_layer ? atoi(enc_layer) : 3;
+        /* Layer mode: '2' -> L2 (PQC), '3' -> L3 (Overlay) */
+        cfg->encrypt.layer = (action && strcmp(action, "2") == 0) ? 2 : 3;
 
-        /* Map string type to enum */
-        if (enc_type && strcmp(enc_type, "aes-gcm-256") == 0) {
+        /* Map string method to enum */
+        if (method && strcmp(method, "aes-gcm-256") == 0) {
             cfg->encrypt.type = 1;  /* MWAN_CRYPT_AES_GCM_256 */
-        } else if (enc_type && strcmp(enc_type, "pqc-gcm") == 0) {
+        } else if (method && strcmp(method, "pqc-gcm") == 0) {
             cfg->encrypt.type = 2;  /* MWAN_CRYPT_PQC_GCM */
         } else {
-            cfg->encrypt.type = 0;  /* MWAN_CRYPT_AES_GCM_128 (default) */
+            cfg->encrypt.type = 0;  /* MWAN_CRYPT_AES_GCM_128 */
         }
         
-        /* Convert hex key to binary */
+        /* Convert static hex key if present */
         if (enc_key_hex && strlen(enc_key_hex) > 0) {
             int klen = hex_to_bytes(enc_key_hex, cfg->encrypt.key, MAX_ENCRYPT_KEY_LEN);
             if (klen > 0) {
                 cfg->encrypt.key_len = (size_t)klen;
-            } else {
-                log_error("Invalid encrypt_key hex string");
-                cfg->encrypt.enabled = false;
             }
         }
     }
     PQclear(res);
     
-    /* 2. Fetch ne_tunnels info */
+    /* 2. Fetch sdwan_tunnels JOIN interfaces info */
     res = PQexecParams(g_db_conn,
-        "SELECT ifname, gateway, weight, port FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
+        "SELECT i.interface, t.remote, t.segment_id, t.tunnel_port, t.weight, "
+        "t.latency_ip, t.latency, t.latency_enable, t.loss_ip, t.loss_percentage, t.loss_enable "
+        "FROM public.sdwan_tunnels t "
+        "JOIN public.interfaces i ON t.local = i.id "
+        "WHERE t.profile_id = $1 ORDER BY t.id",
         1, NULL, paramValues, NULL, NULL, 0);
         
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        log_error("SELECT ne_tunnels failed: %s", PQerrorMessage(g_db_conn));
+        log_error("SELECT sdwan_tunnels JOIN interfaces failed: %s", PQerrorMessage(g_db_conn));
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
     
     int num_tunnels = PQntuples(res);
-    cfg->ne_tunnel_count = (num_tunnels < MAX_NE_TUNNELS) ? num_tunnels : MAX_NE_TUNNELS;
+    cfg->sdwan_tun_count = (num_tunnels < MAX_SDWAN_TUNS) ? num_tunnels : MAX_SDWAN_TUNS;
     
-    for (size_t i = 0; i < cfg->ne_tunnel_count; i++) {
-        strncpy(cfg->ne_tunnels[i].ifname, PQgetvalue(res, i, 0), sizeof(cfg->ne_tunnels[i].ifname) - 1);
-        strncpy(cfg->ne_tunnels[i].gateway, PQgetvalue(res, i, 1), sizeof(cfg->ne_tunnels[i].gateway) - 1);
-        cfg->ne_tunnels[i].weight = atoi(PQgetvalue(res, i, 2));
-        cfg->ne_tunnels[i].port = atoi(PQgetvalue(res, i, 3));
+    for (size_t i = 0; i < cfg->sdwan_tun_count; i++) {
+        /* i.interface is the true host physical network interface (e.g. enp8s0, enp9s0) */
+        strncpy(cfg->sdwan_tuns[i].ifname, PQgetvalue(res, i, 0), sizeof(cfg->sdwan_tuns[i].ifname) - 1);
+        strncpy(cfg->sdwan_tuns[i].gateway, PQgetvalue(res, i, 1), sizeof(cfg->sdwan_tuns[i].gateway) - 1);
+        cfg->sdwan_tuns[i].port = atoi(PQgetvalue(res, i, 3));
+        cfg->sdwan_tuns[i].weight = atoi(PQgetvalue(res, i, 4));
+        
+        /* Store first interface name as local_if if not yet set */
+        if (i == 0) {
+            strncpy(cfg->local_if, cfg->sdwan_tuns[i].ifname, sizeof(cfg->local_if) - 1);
+        }
     }
     PQclear(res);
     
@@ -165,7 +163,6 @@ static void *heartbeat_loop(void *arg) {
             char id_str[16];
             snprintf(id_str, sizeof(id_str), "%d", hb_node_id);
             const char *params[1] = {id_str};
-            // Upsert node status
             const char *query = "INSERT INTO public.node_status (node_id, status, last_seen) "
                                 "VALUES ($1, 'ONLINE', NOW()) "
                                 "ON CONFLICT (node_id) DO UPDATE SET status = 'ONLINE', error_message = NULL, last_seen = NOW()";
@@ -177,8 +174,7 @@ static void *heartbeat_loop(void *arg) {
         }
         pthread_mutex_unlock(&g_db_mutex);
         
-        // Sleep in 1s chunks to allow quick exit
-        for (int i=0; i<30 && hb_running; i++) {
+        for (int i = 0; i < 30 && hb_running; i++) {
             sleep(1);
         }
     }
@@ -218,7 +214,7 @@ void db_client_report_error(int node_id, const char *err_msg) {
     pthread_mutex_unlock(&g_db_mutex);
 }
 
-int db_client_load_pqc_identity(int node_id, char *local_fg_out, char *peer_pub_out) {
+int db_client_load_pqc_identity(int profile_id, char *local_fg_out, char *peer_pub_out) {
     pthread_mutex_lock(&g_db_mutex);
     if (!g_db_conn) {
         pthread_mutex_unlock(&g_db_mutex);
@@ -226,15 +222,19 @@ int db_client_load_pqc_identity(int node_id, char *local_fg_out, char *peer_pub_
     }
 
     char id_str[16];
-    snprintf(id_str, sizeof(id_str), "%d", node_id);
+    snprintf(id_str, sizeof(id_str), "%d", profile_id);
     const char *paramValues[1] = { id_str };
 
+    /* JOIN sdwan_pqc_ref with pqc_keys to get key_id, local, remote (no status field) */
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT local_identity_fingerprint, peer_pub FROM public.pqc_identities WHERE node_id = $1",
+        "SELECT k.key_id, k.local, k.remote "
+        "FROM public.sdwan_pqc_ref r "
+        "JOIN public.pqc_keys k ON r.key_id = k.key_id "
+        "WHERE r.profile_id = $1",
         1, NULL, paramValues, NULL, NULL, 0);
 
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        log_error("SELECT pqc_identities failed: %s", PQerrorMessage(g_db_conn));
+        log_error("SELECT sdwan_pqc_ref JOIN pqc_keys failed: %s", PQerrorMessage(g_db_conn));
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
@@ -243,13 +243,63 @@ int db_client_load_pqc_identity(int node_id, char *local_fg_out, char *peer_pub_
     if (PQntuples(res) == 0) {
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
-        return -2; // Not found (might not be using PQC)
+        return -2; /* Not found */
     }
 
-    strncpy(local_fg_out, PQgetvalue(res, 0, 0), 31);
+    strncpy(local_fg_out, PQgetvalue(res, 0, 1), 31);
     local_fg_out[31] = '\0';
-    strncpy(peer_pub_out, PQgetvalue(res, 0, 1), 255);
+    strncpy(peer_pub_out, PQgetvalue(res, 0, 2), 255);
     peer_pub_out[255] = '\0';
+
+    PQclear(res);
+    pthread_mutex_unlock(&g_db_mutex);
+    return 0;
+}
+
+int db_client_load_pqc_exchange_tunnel(int profile_id, char *tunnel_name, size_t tn_len, char *tunnel_ip, size_t tip_len, char *peer_tunnel_ip, size_t ptip_len) {
+    pthread_mutex_lock(&g_db_mutex);
+    if (!g_db_conn) {
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    char id_str[16];
+    snprintf(id_str, sizeof(id_str), "%d", profile_id);
+    const char *paramValues[1] = { id_str };
+
+    /* JOIN sdwan_tunnel_ref with pqc_exchange_tunnels for the 3 core fields */
+    PGresult *res = PQexecParams(g_db_conn,
+        "SELECT e.tunnel_name, e.tunnel_ip, e.peer_tunnel_ip "
+        "FROM public.sdwan_tunnel_ref r "
+        "JOIN public.pqc_exchange_tunnels e ON r.tunnel_id = e.tunnel_name "
+        "WHERE r.profile_id = $1",
+        1, NULL, paramValues, NULL, NULL, 0);
+
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        log_error("SELECT sdwan_tunnel_ref JOIN pqc_exchange_tunnels failed: %s", PQerrorMessage(g_db_conn));
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
+
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -2; /* Not found */
+    }
+
+    if (tunnel_name && tn_len > 0) {
+        strncpy(tunnel_name, PQgetvalue(res, 0, 0), tn_len - 1);
+        tunnel_name[tn_len - 1] = '\0';
+    }
+    if (tunnel_ip && tip_len > 0) {
+        strncpy(tunnel_ip, PQgetvalue(res, 0, 1), tip_len - 1);
+        tunnel_ip[tip_len - 1] = '\0';
+    }
+    if (peer_tunnel_ip && ptip_len > 0) {
+        strncpy(peer_tunnel_ip, PQgetvalue(res, 0, 2), ptip_len - 1);
+        peer_tunnel_ip[ptip_len - 1] = '\0';
+    }
 
     PQclear(res);
     pthread_mutex_unlock(&g_db_mutex);

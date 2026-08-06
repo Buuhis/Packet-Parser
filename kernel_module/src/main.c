@@ -131,13 +131,23 @@ void pqc_bind_node(int node_id) {
     sig_pqc_init_vault();
     sig_pqc_load_key_from_vault(local_key_name);
 
-    // Resolve WAN info from the active tunnels configured in running_ctx
+    // Resolve WAN / PQC Exchange Tunnel info
     char peer_ip[64] = "0.0.0.0";
     const char *wan_ifname = "";
-    if (running_ctx.cfg.ne_tunnel_count > 0) {
+    char hs_tun_name[64] = "";
+    char hs_tun_ip[64] = "";
+    char hs_peer_tun_ip[64] = "";
+
+    if (db_client_load_pqc_exchange_tunnel(node_id, hs_tun_name, sizeof(hs_tun_name), hs_tun_ip, sizeof(hs_tun_ip), hs_peer_tun_ip, sizeof(hs_peer_tun_ip)) == 0 && hs_peer_tun_ip[0] != '\0') {
+        strncpy(peer_ip, hs_peer_tun_ip, sizeof(peer_ip) - 1);
+        if (running_ctx.cfg.sdwan_tun_count > 0) {
+            wan_ifname = running_ctx.cfg.sdwan_tuns[0].ifname;
+        }
+        log_info("[PQC-TUNNEL] Loaded PQC exchange tunnel [%s]: local_ip=%s, peer_ip=%s", hs_tun_name, hs_tun_ip, hs_peer_tun_ip);
+    } else if (running_ctx.cfg.sdwan_tun_count > 0) {
         peer_ip[0] = '\0';
-        strncpy(peer_ip, running_ctx.cfg.ne_tunnels[0].gateway, sizeof(peer_ip) - 1);
-        wan_ifname = running_ctx.cfg.ne_tunnels[0].ifname;
+        strncpy(peer_ip, running_ctx.cfg.sdwan_tuns[0].gateway, sizeof(peer_ip) - 1);
+        wan_ifname = running_ctx.cfg.sdwan_tuns[0].ifname;
     }
 
     // Read peer public key 100% directly from HashiCorp Vault (remote_public)
