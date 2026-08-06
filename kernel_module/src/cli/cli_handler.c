@@ -163,7 +163,7 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 
     app_config_t new_cfg;
     if (db_client_load_config(req_id, &new_cfg) != 0) {
-        db_client_report_error(req_id, "Failed to load config from DB");
+        // db_client_report_error(req_id, "Failed to load config from DB");
         reply_json(client_fd, 404, "Failed to load config from DB");
         return;
     }
@@ -190,7 +190,7 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 
     if (kernel_sync_push_config(ctx) != 0) {
         log_error("Failed to push config to kernel");
-        db_client_report_error(req_id, "Netlink push error");
+        // db_client_report_error(req_id, "Netlink push error");
         reply_json(client_fd, 500, "Netlink push error");
         return;
     }

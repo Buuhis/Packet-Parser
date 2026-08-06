@@ -339,19 +339,19 @@ int main(int argc, char **argv) {
             running_ctx.cfg = new_cfg;
             if (kernel_sync_push_config(&running_ctx) != 0) {
                 log_error("Failed to push auto-loaded config to kernel");
-                db_client_report_error(saved_node_id, "Startup config Netlink error");
+                // db_client_report_error(saved_node_id, "Startup config Netlink error");
             } else {
                 cpu_tune_apply(&running_ctx);
                 save_node_id(saved_node_id);
                 log_info("Startup config successfully restored.");
-                db_client_start_heartbeat(saved_node_id);
+                // db_client_start_heartbeat(saved_node_id);
                 if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
                     pqc_bind_node(saved_node_id);
                 }
             }
         } else {
             log_error("Failed to load startup config from DB.");
-            db_client_report_error(saved_node_id, "Failed to load config from DB");
+            // db_client_report_error(saved_node_id, "Failed to load config from DB");
         }
     } else {
         log_info("No startup config found. Waiting for provisioning (-id) via socket...");
