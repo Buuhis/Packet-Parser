@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define MAX_WANS           8
-#define MAX_NE_TUNNELS     8
+#define MAX_SDWAN_TUNS     8
 #define MAX_ENCRYPT_KEY_LEN  32  /* AES-256 = 32 bytes */
 #define MAX_ENCRYPT_SALT_LEN  4  /* 4 bytes static salt */
 
@@ -23,7 +23,7 @@ typedef struct {
     char gateway[32];
     int  port;
     int  weight;
-} ne_tunnel_cfg_t;
+} sdwan_tun_cfg_t;
 
 typedef struct {
     bool     enabled;
@@ -44,8 +44,8 @@ typedef struct {
     size_t wan_count;
     wan_cfg_t wans[MAX_WANS];
 
-    size_t ne_tunnel_count;
-    ne_tunnel_cfg_t ne_tunnels[MAX_NE_TUNNELS];
+    size_t sdwan_tun_count;
+    sdwan_tun_cfg_t sdwan_tuns[MAX_SDWAN_TUNS];
 
     encrypt_cfg_t encrypt;
 

@@ -130,26 +130,26 @@ int db_client_load_config(int node_id, app_config_t *cfg)
     }
     PQclear(res);
     
-    /* 2. Fetch ne_tunnels info */
+    /* 2. Fetch sdwan_tuns info */
     res = PQexecParams(g_db_conn,
-        "SELECT ifname, gateway, weight, port FROM public.ne_tunnels WHERE node_id = $1 ORDER BY id",
+        "SELECT ifname, gateway, weight, port FROM public.sdwan_tuns WHERE node_id = $1 ORDER BY id",
         1, NULL, paramValues, NULL, NULL, 0);
         
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        log_error("SELECT ne_tunnels failed: %s", PQerrorMessage(g_db_conn));
+        log_error("SELECT sdwan_tuns failed: %s", PQerrorMessage(g_db_conn));
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
         return -1;
     }
     
     int num_tunnels = PQntuples(res);
-    cfg->ne_tunnel_count = (num_tunnels < MAX_NE_TUNNELS) ? num_tunnels : MAX_NE_TUNNELS;
+    cfg->sdwan_tun_count = (num_tunnels < MAX_SDWAN_TUNS) ? num_tunnels : MAX_SDWAN_TUNS;
     
-    for (size_t i = 0; i < cfg->ne_tunnel_count; i++) {
-        strncpy(cfg->ne_tunnels[i].ifname, PQgetvalue(res, i, 0), sizeof(cfg->ne_tunnels[i].ifname) - 1);
-        strncpy(cfg->ne_tunnels[i].gateway, PQgetvalue(res, i, 1), sizeof(cfg->ne_tunnels[i].gateway) - 1);
-        cfg->ne_tunnels[i].weight = atoi(PQgetvalue(res, i, 2));
-        cfg->ne_tunnels[i].port = atoi(PQgetvalue(res, i, 3));
+    for (size_t i = 0; i < cfg->sdwan_tun_count; i++) {
+        strncpy(cfg->sdwan_tuns[i].ifname, PQgetvalue(res, i, 0), sizeof(cfg->sdwan_tuns[i].ifname) - 1);
+        strncpy(cfg->sdwan_tuns[i].gateway, PQgetvalue(res, i, 1), sizeof(cfg->sdwan_tuns[i].gateway) - 1);
+        cfg->sdwan_tuns[i].weight = atoi(PQgetvalue(res, i, 2));
+        cfg->sdwan_tuns[i].port = atoi(PQgetvalue(res, i, 3));
     }
     PQclear(res);
     

@@ -134,10 +134,10 @@ void pqc_bind_node(int node_id) {
     // Resolve WAN info from the active tunnels configured in running_ctx
     char peer_ip[64] = "0.0.0.0";
     const char *wan_ifname = "";
-    if (running_ctx.cfg.ne_tunnel_count > 0) {
+    if (running_ctx.cfg.sdwan_tun_count > 0) {
         peer_ip[0] = '\0';
-        strncpy(peer_ip, running_ctx.cfg.ne_tunnels[0].gateway, sizeof(peer_ip) - 1);
-        wan_ifname = running_ctx.cfg.ne_tunnels[0].ifname;
+        strncpy(peer_ip, running_ctx.cfg.sdwan_tuns[0].gateway, sizeof(peer_ip) - 1);
+        wan_ifname = running_ctx.cfg.sdwan_tuns[0].ifname;
     }
 
     // Read peer public key 100% directly from HashiCorp Vault (remote_public)

@@ -411,7 +411,7 @@ static void tune_physical_nic(const char *ifname, int num_cpus)
 }
 
 /* Full setup for a tunnel interface: XPS + RPS + mq qdisc */
-static void tune_tunnel(const char *ifname, int num_cpus)
+static void tusdwan_tun(const char *ifname, int num_cpus)
 {
     setup_xps(ifname, num_cpus);
     setup_rps(ifname, num_cpus);
@@ -449,13 +449,13 @@ int cpu_tune_apply(const app_context_t *ctx)
     tune_physical_nic(ctx->cfg.local_if, num_cpus);
 
     /* 3. Tunnel interfaces + auto-detect underlying physical NICs */
-    char tuned_nics[MAX_NE_TUNNELS][IF_NAMESIZE];
+    char tuned_nics[MAX_SDWAN_TUNS][IF_NAMESIZE];
     int  tuned_nic_count = 0;
 
-    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
-        const char *tun = ctx->cfg.ne_tunnels[i].ifname;
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        const char *tun = ctx->cfg.sdwan_tuns[i].ifname;
         log_info("  [Tunnel: %s]", tun);
-        tune_tunnel(tun, num_cpus);
+        tusdwan_tun(tun, num_cpus);
 
         /* Auto-detect and tune the physical NIC underneath the VXLAN */
         char lower[IF_NAMESIZE] = {0};

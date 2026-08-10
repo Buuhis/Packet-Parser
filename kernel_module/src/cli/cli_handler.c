@@ -211,7 +211,7 @@ static void handle_add_tunnel(int client_fd, int profile_id, const char *if_name
 {
     log_info(">>> [ADD] Profile %d: adding tunnel '%s'", profile_id, if_name);
 
-    if (ctx->cfg.ne_tunnel_count >= MAX_NE_TUNNELS) {
+    if (ctx->cfg.sdwan_tun_count >= MAX_SDWAN_TUNS) {
         reply_json(client_fd, 400, "Maximum tunnel count reached");
         return;
     }
@@ -230,7 +230,7 @@ static void handle_add_tunnel(int client_fd, int profile_id, const char *if_name
     const char *params[2] = { id_str, ifname_buf };
 
     PGresult *res = PQexecParams(g_db_conn,
-        "SELECT ifname, gateway, weight, port FROM public.ne_tunnels "
+        "SELECT ifname, gateway, weight, port FROM public.sdwan_tuns "
         "WHERE node_id = $1 AND ifname = $2",
         2, NULL, params, NULL, NULL, 0);
 
@@ -243,20 +243,20 @@ static void handle_add_tunnel(int client_fd, int profile_id, const char *if_name
     }
 
     /* Populate the new tunnel entry */
-    size_t idx = ctx->cfg.ne_tunnel_count;
-    memset(&ctx->cfg.ne_tunnels[idx], 0, sizeof(ne_tunnel_cfg_t));
-    strncpy(ctx->cfg.ne_tunnels[idx].ifname,  PQgetvalue(res, 0, 0), sizeof(ctx->cfg.ne_tunnels[idx].ifname) - 1);
-    strncpy(ctx->cfg.ne_tunnels[idx].gateway, PQgetvalue(res, 0, 1), sizeof(ctx->cfg.ne_tunnels[idx].gateway) - 1);
-    ctx->cfg.ne_tunnels[idx].weight = atoi(PQgetvalue(res, 0, 2));
-    ctx->cfg.ne_tunnels[idx].port   = atoi(PQgetvalue(res, 0, 3));
-    ctx->cfg.ne_tunnel_count++;
+    size_t idx = ctx->cfg.sdwan_tun_count;
+    memset(&ctx->cfg.sdwan_tuns[idx], 0, sizeof(sdwan_tun_cfg_t));
+    strncpy(ctx->cfg.sdwan_tuns[idx].ifname,  PQgetvalue(res, 0, 0), sizeof(ctx->cfg.sdwan_tuns[idx].ifname) - 1);
+    strncpy(ctx->cfg.sdwan_tuns[idx].gateway, PQgetvalue(res, 0, 1), sizeof(ctx->cfg.sdwan_tuns[idx].gateway) - 1);
+    ctx->cfg.sdwan_tuns[idx].weight = atoi(PQgetvalue(res, 0, 2));
+    ctx->cfg.sdwan_tuns[idx].port   = atoi(PQgetvalue(res, 0, 3));
+    ctx->cfg.sdwan_tun_count++;
 
     PQclear(res);
     pthread_mutex_unlock(&g_db_mutex);
 
     /* Sync to kernel */
     if (kernel_sync_push_config(ctx) == 0) {
-        log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)", if_name, ctx->cfg.ne_tunnel_count);
+        log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)", if_name, ctx->cfg.sdwan_tun_count);
         reply_json(client_fd, 200, "Tunnel added successfully");
     } else {
         log_error("[ADD] Netlink push failed after adding tunnel '%s'", if_name);
@@ -270,8 +270,8 @@ static void handle_del_tunnel(int client_fd, int profile_id, const char *if_name
     log_info(">>> [DEL] Profile %d: removing tunnel '%s'", profile_id, if_name);
 
     int found = -1;
-    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
-        if (strcmp(ctx->cfg.ne_tunnels[i].ifname, if_name) == 0) {
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        if (strcmp(ctx->cfg.sdwan_tuns[i].ifname, if_name) == 0) {
             found = (int)i;
             break;
         }
@@ -284,15 +284,15 @@ static void handle_del_tunnel(int client_fd, int profile_id, const char *if_name
     }
 
     /* Shift remaining elements down */
-    for (size_t i = (size_t)found; i < ctx->cfg.ne_tunnel_count - 1; i++) {
-        ctx->cfg.ne_tunnels[i] = ctx->cfg.ne_tunnels[i + 1];
+    for (size_t i = (size_t)found; i < ctx->cfg.sdwan_tun_count - 1; i++) {
+        ctx->cfg.sdwan_tuns[i] = ctx->cfg.sdwan_tuns[i + 1];
     }
-    ctx->cfg.ne_tunnel_count--;
-    memset(&ctx->cfg.ne_tunnels[ctx->cfg.ne_tunnel_count], 0, sizeof(ne_tunnel_cfg_t));
+    ctx->cfg.sdwan_tun_count--;
+    memset(&ctx->cfg.sdwan_tuns[ctx->cfg.sdwan_tun_count], 0, sizeof(sdwan_tun_cfg_t));
 
     /* Sync to kernel */
     if (kernel_sync_push_config(ctx) == 0) {
-        log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)", if_name, ctx->cfg.ne_tunnel_count);
+        log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)", if_name, ctx->cfg.sdwan_tun_count);
         reply_json(client_fd, 200, "Tunnel deleted successfully");
     } else {
         log_error("[DEL] Netlink push failed after removing tunnel '%s'", if_name);
@@ -324,7 +324,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         token_count++;
         if (strncmp(token, "nodes.", 6) == 0) {
             refresh_nodes = true;
-        } else if (strncmp(token, "ne_tunnels.", 11) == 0) {
+        } else if (strncmp(token, "sdwan_tuns.", 11) == 0) {
             refresh_tunnels = true;
         } else if (strncmp(token, "pqc_identities.", 15) == 0) {
             refresh_pqc = true;
@@ -345,7 +345,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     if (unknown_prefix) {
         log_warn("[EDIT] Unknown table prefix in '%s'", unknown_name);
         char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use nodes.<field>, ne_tunnels.<field> or pqc_identities.<field>", unknown_name);
+        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use nodes.<field>, sdwan_tuns.<field> or pqc_identities.<field>", unknown_name);
         reply_json(client_fd, 400, err_msg);
         return;
     }
@@ -378,12 +378,12 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         const char *params[1] = { id_str };
 
         PGresult *res = PQexecParams(g_db_conn,
-            "SELECT ifname, gateway, weight, port FROM public.ne_tunnels "
+            "SELECT ifname, gateway, weight, port FROM public.sdwan_tuns "
             "WHERE node_id = $1 ORDER BY id",
             1, NULL, params, NULL, NULL, 0);
 
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-            log_error("[EDIT] Failed to re-query ne_tunnels: %s", PQerrorMessage(g_db_conn));
+            log_error("[EDIT] Failed to re-query sdwan_tuns: %s", PQerrorMessage(g_db_conn));
             PQclear(res);
             pthread_mutex_unlock(&g_db_mutex);
             reply_json(client_fd, 500, "Failed to reload tunnel config from DB");
@@ -391,14 +391,14 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         }
 
         int num = PQntuples(res);
-        ctx->cfg.ne_tunnel_count = (num < MAX_NE_TUNNELS) ? (size_t)num : MAX_NE_TUNNELS;
+        ctx->cfg.sdwan_tun_count = (num < MAX_SDWAN_TUNS) ? (size_t)num : MAX_SDWAN_TUNS;
 
-        for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
-            memset(&ctx->cfg.ne_tunnels[i], 0, sizeof(ne_tunnel_cfg_t));
-            strncpy(ctx->cfg.ne_tunnels[i].ifname,  PQgetvalue(res, (int)i, 0), sizeof(ctx->cfg.ne_tunnels[i].ifname) - 1);
-            strncpy(ctx->cfg.ne_tunnels[i].gateway, PQgetvalue(res, (int)i, 1), sizeof(ctx->cfg.ne_tunnels[i].gateway) - 1);
-            ctx->cfg.ne_tunnels[i].weight = atoi(PQgetvalue(res, (int)i, 2));
-            ctx->cfg.ne_tunnels[i].port   = atoi(PQgetvalue(res, (int)i, 3));
+        for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+            memset(&ctx->cfg.sdwan_tuns[i], 0, sizeof(sdwan_tun_cfg_t));
+            strncpy(ctx->cfg.sdwan_tuns[i].ifname,  PQgetvalue(res, (int)i, 0), sizeof(ctx->cfg.sdwan_tuns[i].ifname) - 1);
+            strncpy(ctx->cfg.sdwan_tuns[i].gateway, PQgetvalue(res, (int)i, 1), sizeof(ctx->cfg.sdwan_tuns[i].gateway) - 1);
+            ctx->cfg.sdwan_tuns[i].weight = atoi(PQgetvalue(res, (int)i, 2));
+            ctx->cfg.sdwan_tuns[i].port   = atoi(PQgetvalue(res, (int)i, 3));
         }
 
         PQclear(res);

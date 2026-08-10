@@ -56,8 +56,8 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     }
 
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
-    for (size_t i = 0; i < ctx->cfg.ne_tunnel_count; i++) {
-        const ne_tunnel_cfg_t *tun = &ctx->cfg.ne_tunnels[i];
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
         unsigned int idx = if_nametoindex(tun->ifname);
         if (idx == 0) continue;
 
