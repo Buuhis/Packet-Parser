@@ -18,8 +18,6 @@
 #include <linux/skbuff.h>
 #endif
 
-#define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
-
 static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
 {
     struct iphdr *iph;
@@ -32,13 +30,14 @@ static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
     if (!iph || iph->version != 4)
         iph = (struct iphdr *)skb->data;
 
-    if (iph && iph->ihl >= 5) {
+    if (iph && iph->version == 4 && iph->ihl >= 5) {
         int ip_hlen = iph->ihl * 4;
         if (pskb_may_pull(skb, ip_hlen + 4)) {
             iph = (struct iphdr *)skb->data;
-            if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
+            if (!(iph->frag_off & htons(IP_OFFSET)) &&
+                (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
                 u8 *l4 = (u8 *)iph + ip_hlen;
-                ports = *(__be32 *)l4;
+                memcpy(&ports, l4, sizeof(ports));
             }
             return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0x9e3779b9);
         }
@@ -46,40 +45,49 @@ static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
     return 0;
 }
 
-/* Helper to update TCP checksum after MSS modification */
-static inline void mwan_l2_tcp_update_csum(struct sk_buff *skb, struct iphdr *iph, struct tcphdr *tcph)
-{
-    int tcplen = ntohs(iph->tot_len) - (iph->ihl * 4);
-    tcph->check = 0;
-    tcph->check = csum_tcpudp_magic(iph->saddr, iph->daddr, tcplen, IPPROTO_TCP,
-                                    csum_partial(tcph, tcplen, 0));
-}
-
-/* Performs TCP MSS Clamping to account for L2-PQC 24-byte encryption overhead.
+/* Performs TCP MSS Clamping to account for the authenticated L2-PQC header
+ * and GCM tag carried inside the Ethernet payload.
  * This ensures packets don't exceed MTU after encryption. */
 static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 {
     struct iphdr *iph;
     struct tcphdr *tcph;
     u8 *opt;
-    int optlen, i;
+    int ip_hlen, tcp_hlen, tcp_len, total_len, optlen, i;
     u16 new_mss, old_mss;
-    u16 max_mss = dev->mtu - 40 - (ETH_HLEN + MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN); 
+    u16 max_mss;
 
-    if (!skb || skb->protocol != htons(ETH_P_IP)) return;
+    if (!skb || !dev || skb->protocol != htons(ETH_P_IP))
+        return;
+    if (dev->mtu <= 40 + MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN)
+        return;
+    if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+        return;
+
     iph = ip_hdr(skb);
-    if (!iph || iph->protocol != IPPROTO_TCP) return;
+    if (!iph || iph->version != 4 || iph->ihl < 5 ||
+        iph->protocol != IPPROTO_TCP)
+        return;
 
-    if (!pskb_may_pull(skb, (iph->ihl * 4) + sizeof(struct tcphdr))) return;
+    ip_hlen = iph->ihl * 4;
+    total_len = ntohs(iph->tot_len);
+    if (total_len < ip_hlen + sizeof(struct tcphdr) || total_len > skb->len)
+        return;
+    if (!pskb_may_pull(skb, total_len))
+        return;
+
     iph = ip_hdr(skb);
-    tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
-    if (!tcph->syn) return;
+    tcph = (struct tcphdr *)((u8 *)iph + ip_hlen);
+    if (!tcph->syn || tcph->doff < 5)
+        return;
 
-    if (!pskb_may_pull(skb, (iph->ihl * 4) + (tcph->doff * 4))) return;
-    iph = ip_hdr(skb);
-    tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
+    tcp_hlen = tcph->doff * 4;
+    tcp_len = total_len - ip_hlen;
+    if (tcp_hlen > tcp_len)
+        return;
 
-    optlen = (tcph->doff * 4) - sizeof(struct tcphdr);
+    max_mss = dev->mtu - 40 - MWAN_L2_HDR_LEN - MWAN_GCM_TAG_LEN;
+    optlen = tcp_hlen - sizeof(struct tcphdr);
     opt = (u8 *)(tcph + 1);
 
     for (i = 0; i < optlen; ) {
@@ -91,13 +99,18 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
             old_mss = (opt[i + 2] << 8) | opt[i + 3];
             if (old_mss > max_mss) {
                 new_mss = max_mss;
-                if (skb_ensure_writable(skb, (iph->ihl * 4) + (tcph->doff * 4))) return;
+                if (skb_ensure_writable(skb, total_len))
+                    return;
                 iph = ip_hdr(skb);
-                tcph = (struct tcphdr *)((u8 *)iph + (iph->ihl * 4));
+                tcph = (struct tcphdr *)((u8 *)iph + ip_hlen);
                 opt = (u8 *)(tcph + 1);
                 opt[i + 2] = (new_mss >> 8) & 0xFF;
                 opt[i + 3] = new_mss & 0xFF;
-                mwan_l2_tcp_update_csum(skb, iph, tcph);
+                /* CHECKSUM_PARTIAL still contains an offload seed and will be
+                 * completed once below. Other packets already carry a full
+                 * checksum, so adjust only the changed 16-bit MSS word. */
+                if (skb->ip_summed != CHECKSUM_PARTIAL)
+                    csum_replace2(&tcph->check, htons(old_mss), htons(new_mss));
             }
             break;
         }
@@ -144,8 +157,10 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
     struct net_device *target_dev = tun->dev;
     struct crypto_aead *tfm;
     struct aead_request *req;
-    u8 iv[MWAN_GCM_IV_LEN];
-    __be64 *seq_hdr;
+    u8 iv[MWAN_RFC4106_IV_LEN];
+    u64 packet_nonce;
+    __be32 flow_id_be;
+    __be64 seq_be, nonce_be;
     u64 seq;
     int ip_pkt_len, err;
     bool resolved;
@@ -200,10 +215,16 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
 
     u32 flow_id = mwan_calc_flow_id(skb);
     u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    seq = (u64)atomic64_inc_return(&cfg->flow_tx_seq[flow_idx]);
-    *(__be64 *)iv = cpu_to_be64(seq);
+    seq = mwan_l2_next_tx_seq(flow_idx);
+    packet_nonce = mwan_l2_next_packet_nonce();
+    if (unlikely(packet_nonce == 0)) {
+        rcu_read_unlock();
+        return NF_DROP;
+    }
+    nonce_be = cpu_to_be64(packet_nonce);
+    memcpy(iv, &nonce_be, sizeof(nonce_be));
 
-    // Expand skb headroom/tailroom for Ethernet header + 16B L2 PQC Header + Tag
+    // Expand skb headroom/tailroom for Ethernet header + L2-PQC header + tag
     if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN + MWAN_L2_HDR_LEN)) {
         rcu_read_unlock();
         return NF_DROP;
@@ -215,7 +236,7 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         }
     }
 
-    // Prepend Ethernet (14B) + L2 PQC Header (16B)
+    // Prepend Ethernet and the 20-byte L2-PQC RFC4106 prefix.
     skb_push(skb, ETH_HLEN + MWAN_L2_HDR_LEN);
     skb_reset_mac_header(skb);
 
@@ -232,11 +253,13 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         eth_zero_addr(eth->h_dest);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    // Write 16-byte MACsec-style L2-PQC Header (4B Flow_ID + 8B Flow_Seq + 4B Padding)
+    // Write authenticated L2-PQC header (flow ID, reorder sequence, unique nonce)
     struct mwan_l2_pqc_hdr *l2_hdr = (struct mwan_l2_pqc_hdr *)(skb->data + ETH_HLEN);
-    l2_hdr->flow_id = cpu_to_be32(flow_id);
-    l2_hdr->flow_seq = cpu_to_be64(seq);
-    l2_hdr->reserved = 0;
+    flow_id_be = cpu_to_be32(flow_id);
+    seq_be = cpu_to_be64(seq);
+    memcpy(&l2_hdr->flow_id, &flow_id_be, sizeof(flow_id_be));
+    memcpy(&l2_hdr->flow_seq, &seq_be, sizeof(seq_be));
+    memcpy(&l2_hdr->packet_nonce, &nonce_be, sizeof(nonce_be));
 
     // Put Tag space at the tail
     skb_put(skb, MWAN_GCM_TAG_LEN);
@@ -252,7 +275,9 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         int nents;
 
         sg_init_table(sg, ARRAY_SIZE(sg));
-        sg_set_buf(&sg[0], (u8 *)seq_hdr, MWAN_L2_HDR_LEN); // AAD = 16B for RFC4106
+        /* RFC4106 consumes 12 authenticated bytes followed by its 8-byte
+         * explicit IV, for a total associated-data prefix of 20 bytes. */
+        sg_set_buf(&sg[0], (u8 *)l2_hdr, MWAN_L2_HDR_LEN);
 
         nents = skb_to_sgvec(skb, &sg[1], ETH_HLEN + MWAN_L2_HDR_LEN, ip_pkt_len + MWAN_GCM_TAG_LEN);
         if (unlikely(nents < 0)) {

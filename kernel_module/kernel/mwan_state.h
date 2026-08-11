@@ -5,7 +5,6 @@
 #include <linux/rcupdate.h>
 #include <linux/atomic.h>
 #include <crypto/aead.h>
-#include <linux/workqueue.h>
 #include <linux/skbuff.h>
 #include <linux/spinlock.h>
 #include <linux/timer.h>
@@ -83,14 +82,12 @@ struct mwan_config {
     struct crypto_aead *tfm;              /* Crypto transform context */
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
-    atomic64_t flow_tx_seq[MWAN_FLOW_TABLE_SIZE];
     struct mwan_per_flow_reorder flow_reorder[MWAN_FLOW_TABLE_SIZE];
 
     struct timer_list reorder_timer;
     int num_workers;
     int worker_start_cpu;
 
-    struct rcu_head rcu;
 };
 
 /* Global pointer to the current active configuration */
@@ -101,5 +98,7 @@ void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
 void mwan_reorder_timeout(struct timer_list *t);
+u64 mwan_l2_next_tx_seq(u32 flow_idx);
+u64 mwan_l2_next_packet_nonce(void);
 
 #endif /* MWAN_STATE_H */

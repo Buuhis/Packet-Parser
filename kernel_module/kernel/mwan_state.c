@@ -1,93 +1,190 @@
 #include "mwan_state.h"
 #include <linux/timer.h>
-#include <linux/version.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
+#include <linux/random.h>
 #include <net/neighbour.h>
 #include <net/arp.h>
 #include <linux/err.h>
 #include <net/rtnetlink.h>
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
-#ifndef del_timer_sync
-#define del_timer_sync(t) timer_delete_sync(t)
-#endif
-#endif
-
 /* Global Configuration Pointer (RCU Protected) */
 struct mwan_config __rcu *g_mwan_cfg = NULL;
 
-/* Spinlock to protect concurrent updates to the configuration */
-static DEFINE_SPINLOCK(cfg_lock);
+/* Configuration updates run from Generic Netlink process context and may
+ * sleep while waiting for an RCU grace period and shutting down timers. */
+static DEFINE_MUTEX(cfg_lock);
 
-/* Internal helper to free config and release device references */
-static void mwan_config_free_rcu(struct rcu_head *rcu) {
-    struct mwan_config *cfg = container_of(rcu, struct mwan_config, rcu);
+/* Keep reorder sequences and the packet nonce outside mwan_config so pushing
+ * the same config again cannot reset them while the active key is unchanged. */
+static atomic64_t l2_tx_seq[MWAN_FLOW_TABLE_SIZE];
+static atomic64_t l2_packet_nonce;
+
+static void mwan_config_release_devices(struct mwan_config *cfg)
+{
     int i;
 
     for (i = 0; i < cfg->num_tunnels; i++) {
         if (cfg->tunnels[i].dev) {
             dev_put(cfg->tunnels[i].dev);
+            cfg->tunnels[i].dev = NULL;
         }
     }
 
     if (cfg->local_dev) {
         dev_put(cfg->local_dev);
+        cfg->local_dev = NULL;
     }
-    if (cfg->tfm) {
-        crypto_free_aead(cfg->tfm);
-    }
-    del_timer_sync(&cfg->reorder_timer);
+}
+
+/* Destroy only a config that has been published. The caller must first wait
+ * for all RCU readers; timer_shutdown_sync() then prevents timer rearming. */
+static void mwan_config_destroy(struct mwan_config *cfg)
+{
+    int i;
+
+    if (!cfg)
+        return;
+
+    timer_shutdown_sync(&cfg->reorder_timer);
+
     for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
         struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[i];
-        for (int j = 0; j < MWAN_FLOW_RING_SIZE; j++) {
+        int j;
+
+        for (j = 0; j < MWAN_FLOW_RING_SIZE; j++) {
             if (flow->ring[j]) {
                 kfree_skb(flow->ring[j]);
                 flow->ring[j] = NULL;
             }
         }
     }
-    kfree(cfg);
+
+    if (cfg->tfm) {
+        crypto_free_aead(cfg->tfm);
+        cfg->tfm = NULL;
+    }
+
+    mwan_config_release_devices(cfg);
+    kvfree_sensitive(cfg, sizeof(*cfg));
 }
 
-void mwan_state_init(void) {
-    /* Optional: allocate an initial empty config if needed */
+void mwan_state_init(void)
+{
+    int i;
+
+    BUILD_BUG_ON(sizeof(struct mwan_l2_pqc_hdr) != MWAN_L2_HDR_LEN);
+
+    for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++)
+        atomic64_set(&l2_tx_seq[i], 0);
+    atomic64_set(&l2_packet_nonce, get_random_u64());
 }
 
-void mwan_state_cleanup(void) {
+u64 mwan_l2_next_tx_seq(u32 flow_idx)
+{
+    if (WARN_ON_ONCE(flow_idx >= MWAN_FLOW_TABLE_SIZE))
+        flow_idx = 0;
+
+    return (u64)atomic64_inc_return(&l2_tx_seq[flow_idx]);
+}
+
+u64 mwan_l2_next_packet_nonce(void)
+{
+    u64 nonce = (u64)atomic64_inc_return(&l2_packet_nonce);
+
+    /* A full 64-bit wrap is practically unreachable, but zero would prove
+     * nonce reuse after a wrap and must never be used for encryption. */
+    if (WARN_ON_ONCE(nonce == 0))
+        return 0;
+
+    return nonce;
+}
+
+void mwan_state_cleanup(void)
+{
     struct mwan_config *old;
-    
-    spin_lock(&cfg_lock);
+
+    mutex_lock(&cfg_lock);
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
     if (old) {
         RCU_INIT_POINTER(g_mwan_cfg, NULL);
-        call_rcu(&old->rcu, mwan_config_free_rcu);
+        synchronize_rcu();
+        mwan_config_destroy(old);
     }
-    spin_unlock(&cfg_lock);
+    mutex_unlock(&cfg_lock);
 }
 
-int mwan_state_update(struct mwan_config *new_cfg) {
+int mwan_state_update(struct mwan_config *new_cfg)
+{
     struct mwan_config *old;
-    int i;
-    
-    if (!new_cfg) return -EINVAL;
-    
+    struct crypto_aead *tfm = NULL;
+    int i, err = 0;
+
+    if (!new_cfg)
+        return -EINVAL;
+
+    if (new_cfg->num_tunnels > MAX_MWAN_TUNNELS)
+        return -E2BIG;
+
+    if (new_cfg->encrypt_on) {
+        if (new_cfg->encrypt_layer != 2 && new_cfg->encrypt_layer != 3) {
+            pr_err("mwan_kmod: Invalid encryption layer %u\n",
+                   new_cfg->encrypt_layer);
+            return -EINVAL;
+        }
+        if (new_cfg->encrypt_type > MWAN_CRYPT_PQC_GCM) {
+            pr_err("mwan_kmod: Invalid encryption type %u\n",
+                   new_cfg->encrypt_type);
+            return -EINVAL;
+        }
+        if (new_cfg->encrypt_key_len != 16 &&
+            new_cfg->encrypt_key_len != 32) {
+            pr_err("mwan_kmod: Invalid AES key length %u (expected 16 or 32)\n",
+                   new_cfg->encrypt_key_len);
+            return -EINVAL;
+        }
+    }
+
+    /* Initialize this for every publishable config. Destruction can therefore
+     * always use timer_shutdown_sync(), even when encryption is disabled. */
+    timer_setup(&new_cfg->reorder_timer, mwan_reorder_timeout, 0);
+    for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
+        atomic64_set(&new_cfg->flow_reorder[i].expected_seq, 1);
+        spin_lock_init(&new_cfg->flow_reorder[i].drain_lock);
+    }
+
     /* Phase 0: Resolve Local Network Interface */
     if (new_cfg->local_ifindex > 0) {
         new_cfg->local_dev = dev_get_by_index(&init_net, new_cfg->local_ifindex);
+        if (!new_cfg->local_dev) {
+            pr_err("mwan_kmod: Local ifindex %u does not exist\n",
+                   new_cfg->local_ifindex);
+            err = -ENODEV;
+            goto err_release_devices;
+        }
     }
 
     /* Phase 1: Pre-calculate and cache expensive data before publishing */
     new_cfg->total_weight = 0;
     for (i = 0; i < new_cfg->num_tunnels; i++) {
         struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+        if (U32_MAX - new_cfg->total_weight < tun->weight) {
+            pr_err("mwan_kmod: Tunnel weight sum overflow\n");
+            err = -EOVERFLOW;
+            goto err_release_devices;
+        }
         new_cfg->total_weight += tun->weight;
 
         /* Cache net_device */
         tun->dev = dev_get_by_index(&init_net, tun->ifindex);
-        if (tun->dev) {
+        if (!tun->dev) {
+            pr_err("mwan_kmod: Tunnel ifindex %u does not exist\n", tun->ifindex);
+            err = -ENODEV;
+            goto err_release_devices;
+        }
+        {
             struct net_device *upper_dev;
             struct list_head *iter;
             struct net_device *macsec_dev = NULL;
@@ -197,59 +294,45 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         }
     }
     /* Phase 1.75: Initialize Crypto Engine if encryption is enabled */
-    if (new_cfg->encrypt_on && new_cfg->encrypt_key_len > 0) {
-        struct crypto_aead *tfm;
-        int err;
+    if (new_cfg->encrypt_on) {
+        u8 key_and_salt[MWAN_MAX_KEY_LEN + MWAN_SALT_LEN];
+        int num_cpus = num_online_cpus();
+        int worker_start = 0;
+        int num_workers = num_cpus;
 
         /* Allocate hardware-accelerated RFC4106 AES-GCM driver */
         tfm = crypto_alloc_aead("rfc4106(gcm(aes))", 0, CRYPTO_ALG_ASYNC);
         if (IS_ERR(tfm)) {
-            pr_err("mwan_kmod: Failed to allocate AES-GCM transform: %ld\n", PTR_ERR(tfm));
-            /* Cleanup and fail */
-            for (i = 0; i < new_cfg->num_tunnels; i++) {
-                if (new_cfg->tunnels[i].dev)
-                    dev_put(new_cfg->tunnels[i].dev);
-            }
-            if (new_cfg->local_dev)
-                dev_put(new_cfg->local_dev);
-            return -ENOMEM;
+            err = PTR_ERR(tfm);
+            pr_err("mwan_kmod: Failed to allocate AES-GCM transform: %d\n", err);
+            goto err_release_devices;
+        }
+
+        if (crypto_aead_ivsize(tfm) != MWAN_RFC4106_IV_LEN) {
+            pr_err("mwan_kmod: Unexpected RFC4106 IV size %u\n",
+                   crypto_aead_ivsize(tfm));
+            err = -EINVAL;
+            goto err_free_tfm;
         }
 
         /* RFC4106 requires crypto_aead_setkey to be called BEFORE crypto_aead_setauthsize!
          * Key buffer = 32B AES-256 Key + 4B Salt = 36 bytes total */
-        u8 key_and_salt[MWAN_MAX_KEY_LEN + MWAN_SALT_LEN];
         memcpy(key_and_salt, new_cfg->encrypt_key, new_cfg->encrypt_key_len);
         memcpy(key_and_salt + new_cfg->encrypt_key_len, new_cfg->encrypt_salt, MWAN_SALT_LEN);
         err = crypto_aead_setkey(tfm, key_and_salt, new_cfg->encrypt_key_len + MWAN_SALT_LEN);
+        memzero_explicit(key_and_salt, sizeof(key_and_salt));
         if (err) {
             pr_err("mwan_kmod: Failed to set encryption key: %d\n", err);
-            crypto_free_aead(tfm);
-            for (i = 0; i < new_cfg->num_tunnels; i++) {
-                if (new_cfg->tunnels[i].dev)
-                    dev_put(new_cfg->tunnels[i].dev);
-            }
-            if (new_cfg->local_dev)
-                dev_put(new_cfg->local_dev);
-            return err;
+            goto err_free_tfm;
         }
 
         err = crypto_aead_setauthsize(tfm, MWAN_GCM_TAG_LEN);
         if (err) {
             pr_err("mwan_kmod: Failed to set auth tag size: %d\n", err);
-            crypto_free_aead(tfm);
-            for (i = 0; i < new_cfg->num_tunnels; i++) {
-                if (new_cfg->tunnels[i].dev)
-                    dev_put(new_cfg->tunnels[i].dev);
-            }
-            if (new_cfg->local_dev)
-                dev_put(new_cfg->local_dev);
-            return err;
+            goto err_free_tfm;
         }
 
         /* Calculate dynamic worker core count & reservation */
-        int num_cpus = num_online_cpus();
-        int worker_start = 0;
-        int num_workers = num_cpus;
         if (num_cpus >= 8) {
             worker_start = 2; /* Reserve Core 0 & 1 for system/control plane */
             num_workers = num_cpus - 2;
@@ -260,38 +343,29 @@ int mwan_state_update(struct mwan_config *new_cfg) {
         new_cfg->worker_start_cpu = worker_start;
         new_cfg->num_workers = num_workers;
 
-        /* Initialize Per-Flow TX Counters and Per-Flow RX Reorder Rings */
-        {
-            int f;
-            for (f = 0; f < MWAN_FLOW_TABLE_SIZE; f++) {
-                atomic64_set(&new_cfg->flow_tx_seq[f], 0);
-                memset(new_cfg->flow_reorder[f].ring, 0, sizeof(new_cfg->flow_reorder[f].ring));
-                memset(new_cfg->flow_reorder[f].slot_time, 0, sizeof(new_cfg->flow_reorder[f].slot_time));
-                atomic64_set(&new_cfg->flow_reorder[f].expected_seq, 1);
-                spin_lock_init(&new_cfg->flow_reorder[f].drain_lock);
-            }
-        }
-        
-        timer_setup(&new_cfg->reorder_timer, mwan_reorder_timeout, 0);
-
         new_cfg->tfm = tfm;
         atomic64_set(&new_cfg->encrypt_seq, 0);
         pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u, workers=%d, start_cpu=%d)\n",
                 new_cfg->encrypt_key_len, new_cfg->num_workers, new_cfg->worker_start_cpu);
     }
 
-    /* Phase 2: Atomic update */
-    spin_lock(&cfg_lock);
+    /* Phase 2: publish, wait for old readers, stop the old timer and destroy
+     * the old config in this process context. No RCU callback survives module
+     * unload, and no blocking operation runs from softirq context. */
+    mutex_lock(&cfg_lock);
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
-    
-    /* Safely publish the new configuration */
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
-    
-    /* Defer the freeing of the old configuration */
-    if (old) {
-        call_rcu(&old->rcu, mwan_config_free_rcu);
-    }
-    spin_unlock(&cfg_lock);
-    
+    synchronize_rcu();
+    mwan_config_destroy(old);
+    mutex_unlock(&cfg_lock);
+
     return 0;
+
+err_free_tfm:
+    if (tfm)
+        crypto_free_aead(tfm);
+err_release_devices:
+    timer_shutdown_sync(&new_cfg->reorder_timer);
+    mwan_config_release_devices(new_cfg);
+    return err;
 }

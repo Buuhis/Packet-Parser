@@ -8,12 +8,14 @@
 #include <crypto/aead.h>
 #include <linux/netfilter.h>
 
-#define MWAN_L2_HDR_LEN 16 /* 16 Bytes AAD for RFC4106 */
-
 static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_flow_seq)
 {
     struct mwan_config *cfg;
-    u8 iv_buf[MWAN_GCM_IV_LEN];
+    u8 iv_buf[MWAN_RFC4106_IV_LEN];
+    u64 packet_nonce, flow_seq;
+    u32 flow_id;
+    __be32 flow_id_be;
+    __be64 flow_seq_be, nonce_be;
     struct aead_request *req;
     int err, ciphertext_len;
     struct mwan_l2_pqc_hdr *l2_hdr;
@@ -25,7 +27,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_fl
     if (skb_cow(skb, 0))
         return -ENOMEM;
 
-    // Packet must have at least 16B L2 Header + 16B GCM Tag = 32 Bytes
+    // Packet must contain the authenticated L2 header and the GCM tag.
     if (skb->len < MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN)
         return -EINVAL;
 
@@ -36,13 +38,24 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_fl
         return -ENODEV;
     }
 
-    // Read MACsec-style L2-PQC Header (4B Flow_ID + 8B Flow_Seq)
+    // Read the authenticated flow fields and RFC4106 explicit IV.
     l2_hdr = (struct mwan_l2_pqc_hdr *)skb->data;
-    if (out_flow_id) *out_flow_id = be32_to_cpu(l2_hdr->flow_id);
-    if (out_flow_seq) *out_flow_seq = be64_to_cpu(l2_hdr->flow_seq);
+    memcpy(&flow_id_be, &l2_hdr->flow_id, sizeof(flow_id_be));
+    memcpy(&flow_seq_be, &l2_hdr->flow_seq, sizeof(flow_seq_be));
+    memcpy(&nonce_be, &l2_hdr->packet_nonce, sizeof(nonce_be));
+    flow_id = be32_to_cpu(flow_id_be);
+    flow_seq = be64_to_cpu(flow_seq_be);
+    packet_nonce = be64_to_cpu(nonce_be);
+    if (unlikely(packet_nonce == 0)) {
+        rcu_read_unlock();
+        return -EINVAL;
+    }
+    if (out_flow_id)
+        *out_flow_id = flow_id;
+    if (out_flow_seq)
+        *out_flow_seq = flow_seq;
 
-    // RFC 4106 IV: 8 Bytes Flow Sequence Number
-    *(__be64 *)iv_buf = l2_hdr->flow_seq;
+    memcpy(iv_buf, &nonce_be, sizeof(nonce_be));
 
     ciphertext_len = skb->len - MWAN_L2_HDR_LEN;
 
@@ -57,7 +70,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_fl
         int nents;
 
         sg_init_table(sg, ARRAY_SIZE(sg));
-        sg_set_buf(&sg[0], skb->data, MWAN_L2_HDR_LEN); // AAD = 16B L2 Header
+        sg_set_buf(&sg[0], skb->data, MWAN_L2_HDR_LEN);
 
         nents = skb_to_sgvec(skb, &sg[1], MWAN_L2_HDR_LEN, ciphertext_len);
         if (unlikely(nents < 0)) {
@@ -86,7 +99,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_fl
         return -ENOMEM;
     }
 
-    // Move Ethernet header 16 bytes forward to overwrite the 16-byte L2 Header
+    // Move the Ethernet header forward to overwrite the L2-PQC prefix.
     memmove(skb->data + MWAN_L2_HDR_LEN - ETH_HLEN, skb->data - ETH_HLEN, ETH_HLEN);
     skb_pull(skb, MWAN_L2_HDR_LEN);
     skb_trim(skb, skb->len - MWAN_GCM_TAG_LEN);
@@ -123,13 +136,24 @@ void mwan_reorder_timeout(struct timer_list *t)
                 flow->slot_time[slot] = 0;
                 atomic64_inc(&flow->expected_seq);
                 netif_rx(skb);
-            } else if (flow->slot_time[slot] &&
-                       time_after(jiffies, flow->slot_time[slot] + MWAN_REORDER_TIMEOUT)) {
-                /* Timeout: lost packet in this flow -> skip slot */
-                flow->slot_time[slot] = 0;
-                atomic64_inc(&flow->expected_seq);
             } else {
-                break;
+                bool timed_out = false;
+                int i;
+
+                /* A missing expected packet has no slot timestamp of its own.
+                 * Use the age of a later buffered packet to decide when the
+                 * gap may be skipped. */
+                for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
+                    if (flow->ring[i] && flow->slot_time[i] &&
+                        time_after_eq(jiffies,
+                                      flow->slot_time[i] + MWAN_REORDER_TIMEOUT)) {
+                        timed_out = true;
+                        break;
+                    }
+                }
+                if (!timed_out)
+                    break;
+                atomic64_inc(&flow->expected_seq);
             }
         }
 
@@ -177,21 +201,32 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
         struct mwan_per_flow_reorder *flow_reorder = &cfg->flow_reorder[flow_idx];
 
-        u64 current_exp = (u64)atomic64_read(&flow_reorder->expected_seq);
-        
-        /* Per-Flow First-Packet Auto-Sync: 0ms TCP Handshake start */
-        if (unlikely(current_exp == 1 || flow_seq > current_exp + 128)) {
-            atomic64_set(&flow_reorder->expected_seq, flow_seq);
-        }
-
         spin_lock_bh(&flow_reorder->drain_lock);
+
+        {
+            u64 current_exp = (u64)atomic64_read(&flow_reorder->expected_seq);
+
+            /* Per-flow first-packet sync and bounded resync after a large gap. */
+            if (unlikely(current_exp == 1 || flow_seq > current_exp + 128)) {
+                atomic64_set(&flow_reorder->expected_seq, flow_seq);
+                current_exp = flow_seq;
+            }
+
+            if (unlikely(flow_seq < current_exp)) {
+                spin_unlock_bh(&flow_reorder->drain_lock);
+                rcu_read_unlock();
+                kfree_skb(skb);
+                return NET_RX_SUCCESS;
+            }
+        }
 
         u32 slot = flow_seq & MWAN_FLOW_RING_MASK;
 
-        /* If slot already contains a packet (duplicate/overwrite), flush old packet first */
+        /* A collision is stale or duplicate data; never inject it out of order. */
         if (unlikely(flow_reorder->ring[slot] != NULL)) {
-            netif_rx(flow_reorder->ring[slot]);
+            kfree_skb(flow_reorder->ring[slot]);
             flow_reorder->ring[slot] = NULL;
+            flow_reorder->slot_time[slot] = 0;
         }
 
         flow_reorder->ring[slot] = skb;
@@ -214,7 +249,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
 
         spin_unlock_bh(&flow_reorder->drain_lock);
 
-        mod_timer(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+        timer_reduce(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
     } else {
         netif_rx(skb);
     }
