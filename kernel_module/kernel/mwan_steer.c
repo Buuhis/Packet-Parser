@@ -12,12 +12,15 @@
 #include <linux/if_ether.h>
 #include <linux/etherdevice.h>
 
+#include <net/net_namespace.h>
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/ip.h>
 #include <net/neighbour.h>
 #include <net/arp.h>
 #include <linux/inetdevice.h>
+
+extern struct net init_net;
 
 bool mwan_resolve_gateway_mac(struct mwan_tunnel *tun, struct net_device *dev, u8 *mac_out)
 {
@@ -293,7 +296,12 @@ int mwan_steer_init(void) {
     err = nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
     if (err)
         return err;
-    mwan_decap_l2_pqc_init();
+    err = mwan_decap_l2_pqc_init();
+    if (err) {
+        nf_unregister_net_hooks(&init_net, mwan_nf_ops,
+                                ARRAY_SIZE(mwan_nf_ops));
+        return err;
+    }
     return 0;
 }
 

@@ -48,6 +48,9 @@ static void mwan_config_destroy(struct mwan_config *cfg)
     if (!cfg)
         return;
 
+    /* No RCU reader can enqueue into this config now.  Stop its crypto work
+     * before freeing reorder state or the AEAD transforms it references. */
+    mwan_l2_workers_cleanup(cfg);
     timer_shutdown_sync(&cfg->reorder_timer);
 
     for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
@@ -153,6 +156,10 @@ int mwan_state_update(struct mwan_config *new_cfg)
     for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
         atomic64_set(&new_cfg->flow_reorder[i].expected_seq, 1);
         spin_lock_init(&new_cfg->flow_reorder[i].drain_lock);
+        spin_lock_init(&new_cfg->flow_reorder[i].owner_lock);
+        atomic_set(&new_cfg->flow_reorder[i].owner_worker, -1);
+        atomic_set(&new_cfg->flow_reorder[i].pending_crypto, 0);
+        new_cfg->flow_reorder[i].last_seen = 0;
     }
 
     /* Phase 0: Resolve Local Network Interface */
@@ -296,9 +303,6 @@ int mwan_state_update(struct mwan_config *new_cfg)
     /* Phase 1.75: Initialize Crypto Engine if encryption is enabled */
     if (new_cfg->encrypt_on) {
         u8 key_and_salt[MWAN_MAX_KEY_LEN + MWAN_SALT_LEN];
-        int num_cpus = num_online_cpus();
-        int worker_start = 0;
-        int num_workers = num_cpus;
 
         /* Allocate hardware-accelerated RFC4106 AES-GCM driver */
         tfm = crypto_alloc_aead("rfc4106(gcm(aes))", 0, CRYPTO_ALG_ASYNC);
@@ -332,16 +336,14 @@ int mwan_state_update(struct mwan_config *new_cfg)
             goto err_free_tfm;
         }
 
-        /* Crypto runs inline on the CPU selected by RSS/RPS.  Advertise every
-         * online CPU here; optional control-plane isolation is applied by the
-         * userspace CPU tuner through SDWAN_RESERVED_CPUS. */
-        new_cfg->worker_start_cpu = worker_start;
-        new_cfg->num_workers = num_workers;
-
         new_cfg->tfm = tfm;
         atomic64_set(&new_cfg->encrypt_seq, 0);
-        pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u, workers=%d, start_cpu=%d)\n",
-                new_cfg->encrypt_key_len, new_cfg->num_workers, new_cfg->worker_start_cpu);
+        pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u)\n",
+                new_cfg->encrypt_key_len);
+
+        err = mwan_l2_workers_init(new_cfg);
+        if (err)
+            goto err_free_tfm;
     }
 
     /* Phase 2: publish, wait for old readers, stop the old timer and destroy
@@ -357,6 +359,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     return 0;
 
 err_free_tfm:
+    mwan_l2_workers_cleanup(new_cfg);
     if (tfm)
         crypto_free_aead(tfm);
 err_release_devices:

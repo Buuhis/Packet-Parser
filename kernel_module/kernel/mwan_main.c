@@ -24,24 +24,26 @@ static int __init mwan_kmod_init(void)
 
     mwan_state_init();
 
+    /* Bring up the packet path/workqueue before exposing the configuration
+     * API, so a SET_CONFIG request can always create its L2 workers. */
+    ret = mwan_steer_init();
+    if (ret < 0) {
+        pr_err("mwan_kmod: Failed to register packet steering hooks\n");
+        goto err_steer;
+    }
+
     ret = mwan_netlink_init();
     if (ret < 0) {
         pr_err("mwan_kmod: Failed to initialize Netlink listener\n");
-        goto err_nl;
-    }
-
-    ret = mwan_steer_init();
-    if (ret < 0) {
-        pr_err("mwan_kmod: Failed to register Netfilter hook\n");
-        goto err_nf;
+        goto err_netlink;
     }
 
     pr_info("mwan_kmod: Initialization complete.\n");
     return 0;
 
-err_nf:
-    mwan_netlink_cleanup();
-err_nl:
+err_netlink:
+    mwan_steer_cleanup();
+err_steer:
     mwan_state_cleanup();
     return ret;
 }
@@ -49,8 +51,9 @@ err_nl:
 static void __exit mwan_kmod_exit(void)
 {
     pr_info("mwan_kmod: Shutting down...\n");
-    mwan_steer_cleanup();
+    /* Stop config updates before tearing down packet workers and state. */
     mwan_netlink_cleanup();
+    mwan_steer_cleanup();
     mwan_state_cleanup();
     pr_info("mwan_kmod: Unloaded successfully.\n");
 }

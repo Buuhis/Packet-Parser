@@ -9,6 +9,7 @@
 #include <linux/spinlock.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
+#include <linux/workqueue.h>
 #include "mwan_proto.h"
 
 #define MWAN_REORDER_TIMEOUT msecs_to_jiffies(30)
@@ -19,6 +20,9 @@
 #define MWAN_FLOW_TABLE_SIZE 256
 #define MWAN_FLOW_RING_SIZE  256
 #define MWAN_FLOW_RING_MASK  (MWAN_FLOW_RING_SIZE - 1)
+#define MWAN_L2_QUEUE_MAX_PACKETS 4096
+#define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
+#define MWAN_L2_FLOW_IDLE_TIMEOUT (5 * HZ)
 
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
@@ -45,7 +49,35 @@ struct mwan_per_flow_reorder {
     struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
     atomic64_t expected_seq;
     spinlock_t drain_lock;
+    spinlock_t owner_lock;
+    atomic_t owner_worker;
+    atomic_t pending_crypto;
+    unsigned long last_seen;
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
+};
+
+/* One ordered crypto queue per CPU.  A flow bucket is owned by exactly one
+ * worker at a time, so packets in that bucket are decrypted serially while
+ * independent buckets can run in parallel on different CPUs. */
+struct mwan_l2_worker {
+    struct mwan_config *cfg;
+    struct sk_buff_head rx_queue;
+    struct work_struct work;
+    struct crypto_aead *tfm;
+    struct aead_request *req;
+    int cpu;
+
+    atomic64_t queued_packets;
+    atomic64_t queued_bytes;
+    atomic64_t max_queued_packets;
+    atomic64_t max_queued_bytes;
+    atomic64_t enqueued_packets;
+    atomic64_t processed_packets;
+    atomic64_t dropped_packets;
+    atomic64_t decrypt_failures;
+    atomic64_t assigned_flows;
+    atomic64_t processing_ewma_ns;
+    atomic_t busy;
 };
 
 struct mwan_reorder_ring {
@@ -87,6 +119,7 @@ struct mwan_config {
     struct timer_list reorder_timer;
     int num_workers;
     int worker_start_cpu;
+    struct mwan_l2_worker *l2_workers;
 
 };
 
@@ -100,5 +133,7 @@ int mwan_state_update(struct mwan_config *new_cfg);
 void mwan_reorder_timeout(struct timer_list *t);
 u64 mwan_l2_next_tx_seq(u32 flow_idx);
 u64 mwan_l2_next_packet_nonce(void);
+int mwan_l2_workers_init(struct mwan_config *cfg);
+void mwan_l2_workers_cleanup(struct mwan_config *cfg);
 
 #endif /* MWAN_STATE_H */
