@@ -20,29 +20,49 @@
 
 static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
 {
-    struct iphdr *iph;
+    struct iphdr iph_buf;
+    const struct iphdr *iph;
+    __be32 ports_be = 0;
+    const __be32 *ports_ptr;
+    u32 hash;
     u32 ports = 0;
+    int network_offset;
+    int ip_hlen;
 
-    if (unlikely(!pskb_may_pull(skb, sizeof(struct iphdr))))
+    /* Use the kernel flow dissector first.  At POST_ROUTING this is still the
+     * plaintext inner IPv4 packet, so TCP/UDP source and destination ports
+     * are available and ten iperf streams produce ten stable flow hashes. */
+    hash = skb_get_hash(skb);
+    if (likely(hash != 0))
+        return hash;
+
+    /* Defensive fallback for packets for which the flow dissector did not
+     * produce a hash.  skb_header_pointer() uses offsets relative to
+     * skb->data and safely handles non-linear skbs.  Do not reload the IP
+     * header from skb->data: it is not guaranteed to equal network_header. */
+    network_offset = skb_network_offset(skb);
+    if (unlikely(network_offset < 0))
+        return 0;
+    iph = skb_header_pointer(skb, network_offset, sizeof(iph_buf), &iph_buf);
+    if (unlikely(!iph || iph->version != 4 || iph->ihl < 5))
         return 0;
 
-    iph = ip_hdr(skb);
-    if (!iph || iph->version != 4)
-        iph = (struct iphdr *)skb->data;
-
-    if (iph && iph->version == 4 && iph->ihl >= 5) {
-        int ip_hlen = iph->ihl * 4;
-        if (pskb_may_pull(skb, ip_hlen + 4)) {
-            iph = (struct iphdr *)skb->data;
-            if (!(iph->frag_off & htons(IP_OFFSET)) &&
-                (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
-                u8 *l4 = (u8 *)iph + ip_hlen;
-                memcpy(&ports, l4, sizeof(ports));
-            }
-            return jhash_3words((__force u32)iph->saddr, (__force u32)iph->daddr, ports, 0x9e3779b9);
-        }
+    ip_hlen = iph->ihl * 4;
+    ports_ptr = NULL;
+    if (!(iph->frag_off & htons(IP_MF | IP_OFFSET)) &&
+        (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP))
+        ports_ptr = skb_header_pointer(skb, network_offset + ip_hlen,
+                                       sizeof(ports_be), &ports_be);
+    if (ports_ptr) {
+        memcpy(&ports_be, ports_ptr, sizeof(ports_be));
+        ports = (__force u32)ports_be;
     }
-    return 0;
+
+    /* Include the L4 protocol so TCP and UDP with the same addresses/ports
+     * cannot alias solely because their four-tuple bytes are identical. */
+    ports ^= (u32)iph->protocol << 24;
+    return jhash_3words((__force u32)iph->saddr,
+                        (__force u32)iph->daddr, ports, 0x9e3779b9);
 }
 
 /* Performs TCP MSS Clamping to account for the authenticated L2-PQC header

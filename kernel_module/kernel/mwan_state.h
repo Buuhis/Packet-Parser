@@ -77,6 +77,9 @@ struct mwan_l2_worker {
     atomic64_t decrypt_failures;
     atomic64_t assigned_flows;
     atomic64_t processing_ewma_ns;
+    atomic64_t work_runs;
+    atomic64_t schedule_failures;
+    atomic_t scheduled;
     atomic_t busy;
 };
 

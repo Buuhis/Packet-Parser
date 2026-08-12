@@ -272,6 +272,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
     int owner;
     int new_owner;
+    int was_scheduled;
     bool idle;
 
     flow = &cfg->flow_reorder[flow_idx];
@@ -332,6 +333,10 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     atomic64_inc(&worker->enqueued_packets);
     atomic_inc(&flow->pending_crypto);
     flow->last_seen = jiffies;
+    /* Change 0 -> 1 while holding the same queue lock used by the worker's
+     * empty-queue handoff.  This makes queue ownership and scheduled state a
+     * single transition instead of two independently visible operations. */
+    was_scheduled = atomic_cmpxchg(&worker->scheduled, 0, 1);
     mwan_atomic64_update_max(&worker->max_queued_packets,
                              worker->rx_queue.qlen);
     mwan_atomic64_update_max(&worker->max_queued_bytes,
@@ -339,7 +344,9 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     spin_unlock(&worker->rx_queue.lock);
     spin_unlock_bh(&flow->owner_lock);
 
-    queue_work_on(worker->cpu, mwan_l2_wq, &worker->work);
+    if (was_scheduled == 0 &&
+        unlikely(!queue_work_on(worker->cpu, mwan_l2_wq, &worker->work)))
+        atomic64_inc(&worker->schedule_failures);
     return 0;
 }
 
@@ -537,35 +544,47 @@ static void mwan_l2_worker_fn(struct work_struct *work)
     struct sk_buff *skb;
     unsigned int batch = 0;
 
+    atomic64_inc(&worker->work_runs);
     atomic_set(&worker->busy, 1);
-    while ((skb = skb_dequeue(&worker->rx_queue)) != NULL) {
-        u32 flow_idx = MWAN_L2_RX_CB(skb)->flow_idx;
-        u32 accounted_bytes = MWAN_L2_RX_CB(skb)->accounted_bytes;
-        u32 flow_id = 0;
-        u64 flow_seq = 0;
-        u64 start_ns = ktime_get_ns();
-        int ret;
+    for (;;) {
+        while ((skb = skb_dequeue(&worker->rx_queue)) != NULL) {
+            u32 flow_idx = MWAN_L2_RX_CB(skb)->flow_idx;
+            u32 accounted_bytes = MWAN_L2_RX_CB(skb)->accounted_bytes;
+            u32 flow_id = 0;
+            u64 flow_seq = 0;
+            u64 start_ns = ktime_get_ns();
+            int ret;
 
-        atomic64_dec(&worker->queued_packets);
-        atomic64_sub(accounted_bytes, &worker->queued_bytes);
-        ret = l2_pqc_decrypt_skb(skb, worker, &flow_id, &flow_seq);
-        mwan_l2_update_ewma(worker, ktime_get_ns() - start_ns);
-        atomic64_inc(&worker->processed_packets);
+            atomic64_dec(&worker->queued_packets);
+            atomic64_sub(accounted_bytes, &worker->queued_bytes);
+            ret = l2_pqc_decrypt_skb(skb, worker, &flow_id, &flow_seq);
+            mwan_l2_update_ewma(worker, ktime_get_ns() - start_ns);
+            atomic64_inc(&worker->processed_packets);
 
-        memset(skb->cb, 0, sizeof(skb->cb));
-        if (unlikely(ret < 0)) {
-            atomic64_inc(&worker->decrypt_failures);
-            kfree_skb(skb);
-        } else {
-            mwan_l2_deliver_decrypted(cfg, skb, flow_id, flow_seq);
+            memset(skb->cb, 0, sizeof(skb->cb));
+            if (unlikely(ret < 0)) {
+                atomic64_inc(&worker->decrypt_failures);
+                kfree_skb(skb);
+            } else {
+                mwan_l2_deliver_decrypted(cfg, skb, flow_id, flow_seq);
+            }
+
+            if (flow_idx < MWAN_FLOW_TABLE_SIZE)
+                atomic_dec(&cfg->flow_reorder[flow_idx].pending_crypto);
+            if (++batch == 64) {
+                batch = 0;
+                cond_resched();
+            }
         }
 
-        if (flow_idx < MWAN_FLOW_TABLE_SIZE)
-            atomic_dec(&cfg->flow_reorder[flow_idx].pending_crypto);
-        if (++batch == 64) {
-            batch = 0;
-            cond_resched();
+        spin_lock_bh(&worker->rx_queue.lock);
+        if (!skb_queue_empty(&worker->rx_queue)) {
+            spin_unlock_bh(&worker->rx_queue.lock);
+            continue;
         }
+        atomic_set(&worker->scheduled, 0);
+        spin_unlock_bh(&worker->rx_queue.lock);
+        break;
     }
     atomic_set(&worker->busy, 0);
 }
@@ -576,7 +595,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
-    seq_puts(m, "cpu queued_pkts queued_bytes max_pkts max_bytes enqueued processed drops decrypt_fail owned_flows ewma_ns busy score\n");
+    seq_puts(m, "cpu queued_pkts queued_bytes max_pkts max_bytes enqueued processed drops decrypt_fail owned_flows ewma_ns work_runs schedule_fail busy score\n");
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -588,7 +607,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     for (i = 0; i < cfg->num_workers; i++) {
         struct mwan_l2_worker *w = &cfg->l2_workers[i];
 
-        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d %llu\n",
+        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d %llu\n",
                    w->cpu,
                    atomic64_read(&w->queued_packets),
                    atomic64_read(&w->queued_bytes),
@@ -600,6 +619,8 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->decrypt_failures),
                    atomic64_read(&w->assigned_flows),
                    atomic64_read(&w->processing_ewma_ns),
+                   atomic64_read(&w->work_runs),
+                   atomic64_read(&w->schedule_failures),
                    atomic_read(&w->busy),
                    mwan_l2_worker_score(w));
     }
