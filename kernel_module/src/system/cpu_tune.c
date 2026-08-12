@@ -6,9 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <dirent.h>
 #include <net/if.h>
+#include <sched.h>
 
 /* ================================================================
  *  Backup / Restore Infrastructure
@@ -18,10 +20,11 @@
 
 #define MAX_BACKUP_ENTRIES 128
 #define MAX_MODIFIED_IFACES 16
+#define MAX_CPU_MASK_STR ((CPU_SETSIZE / 4) + (CPU_SETSIZE / 32) + 8)
 
 typedef struct {
     char path[256];
-    char original[64];
+    char original[MAX_CPU_MASK_STR];
 } backup_entry_t;
 
 typedef struct {
@@ -49,10 +52,103 @@ static bool g_tuning_applied = false;
  *  Low-level helpers
  * ================================================================ */
 
-static int get_num_cpus(void)
+/* Return the CPU IDs this process is actually allowed to use.  This handles
+ * containers/cpusets and non-contiguous online CPU IDs, unlike assuming that
+ * the available CPUs are always 0..sysconf()-1. */
+static int get_available_cpu_ids(int *cpu_ids, int max_ids)
 {
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    return (n > 0) ? (int)n : 1;
+    cpu_set_t available;
+    int count = 0;
+
+    CPU_ZERO(&available);
+    if (sched_getaffinity(0, sizeof(available), &available) == 0) {
+        for (int cpu = 0; cpu < CPU_SETSIZE && count < max_ids; cpu++) {
+            if (CPU_ISSET(cpu, &available))
+                cpu_ids[count++] = cpu;
+        }
+    }
+
+    if (count == 0) {
+        long online = sysconf(_SC_NPROCESSORS_ONLN);
+        if (online < 1)
+            online = 1;
+        if (online > max_ids)
+            online = max_ids;
+        for (int cpu = 0; cpu < online; cpu++)
+            cpu_ids[count++] = cpu;
+    }
+
+    return count;
+}
+
+/* Use every available CPU by default so independent flows can run in parallel.
+ * Deployments that deliberately isolate control-plane CPUs can set
+ * SDWAN_RESERVED_CPUS=N in the service environment.  cpu_ids is already
+ * ordered, so this also behaves predictably inside a cpuset where CPU 0 may
+ * not be available. */
+static int select_worker_cpu_ids(const int *cpu_ids, int num_cpus,
+                                 int *worker_ids, int max_workers)
+{
+    int reserve = 0;
+    int count = 0;
+    const char *reserve_env = getenv("SDWAN_RESERVED_CPUS");
+
+    if (reserve_env && *reserve_env) {
+        char *end = NULL;
+        long requested = strtol(reserve_env, &end, 10);
+
+        if (end != reserve_env && *end == '\0' && requested >= 0 &&
+            requested < num_cpus)
+            reserve = (int)requested;
+    }
+
+    if (num_cpus - reserve < 1)
+        reserve = 0;
+
+    for (int i = reserve; i < num_cpus && count < max_workers; i++)
+        worker_ids[count++] = cpu_ids[i];
+
+    return count;
+}
+
+/* Linux sysfs cpumasks are comma-separated 32-bit words, most significant
+ * word first (for example CPUs 0 and 33 => "00000002,00000001"). */
+static int format_cpu_mask(const int *cpu_ids, int num_cpus,
+                           char *buf, size_t len)
+{
+    int highest = -1;
+    int groups;
+    size_t used = 0;
+
+    if (!buf || len == 0 || !cpu_ids || num_cpus <= 0)
+        return -1;
+
+    for (int i = 0; i < num_cpus; i++) {
+        if (cpu_ids[i] >= 0 && cpu_ids[i] < CPU_SETSIZE &&
+            cpu_ids[i] > highest)
+            highest = cpu_ids[i];
+    }
+    if (highest < 0)
+        return -1;
+
+    groups = highest / 32 + 1;
+    for (int group = groups - 1; group >= 0; group--) {
+        uint32_t word = 0;
+        int written;
+
+        for (int i = 0; i < num_cpus; i++) {
+            if (cpu_ids[i] / 32 == group)
+                word |= UINT32_C(1) << (cpu_ids[i] % 32);
+        }
+
+        written = snprintf(buf + used, len - used,
+                           group == groups - 1 ? "%x" : ",%08x", word);
+        if (written < 0 || (size_t)written >= len - used)
+            return -1;
+        used += (size_t)written;
+    }
+
+    return 0;
 }
 
 static int read_sysfs(const char *path, char *buf, size_t len)
@@ -260,6 +356,30 @@ static void setup_rss_hash(const char *ifname)
         log_warn("    RSS: %s tcp4 sdfn configuration returned code %d", ifname, res);
 }
 
+/* Spread the NIC RSS indirection table over every queue assigned to a worker
+ * CPU.  A driver may not support changing this table; that is non-fatal and
+ * is reported so the deployed machine can be inspected. */
+static void setup_rss_indirection(const char *ifname, int num_workers)
+{
+    ethtool_queues_t q = get_ethtool_queues(ifname);
+    int queues;
+    char cmd[256];
+    int res;
+
+    if (q.cur_combined <= 1 || num_workers <= 1)
+        return;
+
+    queues = q.cur_combined < num_workers ? q.cur_combined : num_workers;
+    snprintf(cmd, sizeof(cmd),
+             "/sbin/ethtool -X %s equal %d 2>/dev/null || ethtool -X %s equal %d 2>/dev/null",
+             ifname, queues, ifname, queues);
+    res = system(cmd);
+    if (res == 0)
+        log_info("    RSS: %s indirection spread equally over %d queues", ifname, queues);
+    else
+        log_warn("    RSS: %s cannot update indirection table (code %d)", ifname, res);
+}
+
 /* ================================================================
  *  Per-interface CPU tuning functions
  * ================================================================ */
@@ -267,70 +387,48 @@ static void setup_rss_hash(const char *ifname)
 /* XPS: Map TX queues to CPUs.
  * If num_queues < num_cpus (like single-queue tunnels), we map ALL CPUs to that queue 
  * to allow distributed parallel transmission without bottlenecking Core 0. */
-static void setup_xps(const char *ifname, int num_cpus)
+static void setup_xps(const char *ifname, const int *worker_ids, int num_workers)
 {
-    (void)num_cpus;
     int num_tx = count_queues(ifname, "tx-");
-    if (num_tx == 0) return;
+    if (num_tx == 0 || num_workers <= 0) return;
 
-    char path[256], mask[32];
-    
-    /* Optimization: If num_queues is very small (like a 1-queue tunnel),
-     * we limit the XPS mask to a sub-group of CPUs (Hardware Master: Core 0-4). */
-    int xps_limit = 4;
+    char path[256], mask[MAX_CPU_MASK_STR];
 
     for (int i = 0; i < num_tx; i++) {
-        unsigned int cpu_mask = 0;
-        
         if (num_tx == 1) {
-            /* Case: Single queue tunnel. Map to all Master cores (0-4). */
-            cpu_mask = (1U << xps_limit) - 1;
+            /* A single queue cannot select between hardware queues, but
+             * allowing every worker CPU prevents an accidental CPU0-only
+             * restriction on virtual/tunnel devices. */
+            if (format_cpu_mask(worker_ids, num_workers, mask, sizeof(mask)) < 0)
+                continue;
         } else {
-            /* Case: Multi-queue. Distribute evenly across Master cores (0-4). */
-            int target_cpu = i % xps_limit;
-            cpu_mask = (1U << target_cpu);
+            int target_cpu = worker_ids[i % num_workers];
+            if (format_cpu_mask(&target_cpu, 1, mask, sizeof(mask)) < 0)
+                continue;
         }
-        
-        if (cpu_mask == 0) continue;
 
         snprintf(path, sizeof(path), "/sys/class/net/%s/queues/tx-%d/xps_cpus", ifname, i);
-        snprintf(mask, sizeof(mask), "%x", cpu_mask);
-        
         if (write_sysfs(path, mask) == 0)
             log_info("    XPS: %s tx-%d -> CPU Mask %s", ifname, i, mask);
     }
 }
 
 /* RPS: Distribute RX processing across Software Worker cores */
-static void setup_rps(const char *ifname, int num_cpus)
+static void setup_rps(const char *ifname, const int *worker_ids, int num_workers)
 {
     int num_rx = count_queues(ifname, "rx-");
-    if (num_rx == 0) return;
+    if (num_rx == 0 || num_workers <= 0) return;
 
-    int worker_start = 0;
-    int num_workers = num_cpus;
-    if (num_cpus >= 8) {
-        worker_start = 2; /* Reserve Core 0 & 1 for system/control plane */
-        num_workers = num_cpus - 2;
-    } else if (num_cpus >= 4) {
-        worker_start = 1; /* Reserve Core 0 for system */
-        num_workers = num_cpus - 1;
-    }
-
-    unsigned int worker_mask = 0;
-    for (int w = 0; w < num_workers; w++) {
-        worker_mask |= (1U << (worker_start + w));
-    }
-
-    char path[256], mask[16];
-    snprintf(mask, sizeof(mask), "%x", worker_mask);
+    char path[256], mask[MAX_CPU_MASK_STR];
+    if (format_cpu_mask(worker_ids, num_workers, mask, sizeof(mask)) < 0)
+        return;
 
     for (int i = 0; i < num_rx; i++) {
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_cpus", ifname, i);
         if (write_sysfs(path, mask) == 0)
-            log_info("    RPS: %s rx-%d -> Worker CPUs (mask %s, start=%d, count=%d)",
-                     ifname, i, mask, worker_start, num_workers);
+            log_info("    RPS: %s rx-%d -> %d worker CPUs (mask %s)",
+                     ifname, i, num_workers, mask);
 
         snprintf(path, sizeof(path),
                  "/sys/class/net/%s/queues/rx-%d/rps_flow_cnt", ifname, i);
@@ -340,15 +438,16 @@ static void setup_rps(const char *ifname, int num_cpus)
 
 /* IRQ Affinity: Pin each queue's hardware interrupt to a dedicated CPU.
  * Improved to avoid pinning management/link interrupts to extra cores. */
-static void setup_irq_affinity(const char *ifname, int num_cpus)
+static void setup_irq_affinity(const char *ifname,
+                               const int *worker_ids, int num_workers)
 {
     FILE *f = fopen("/proc/interrupts", "r");
-    if (!f) return;
+    if (!f || num_workers <= 0) return;
 
     char line[1024];
     int data_irq_idx = 0;
 
-    while (fgets(line, sizeof(line), f) && data_irq_idx < num_cpus) {
+    while (fgets(line, sizeof(line), f)) {
         if (!strstr(line, ifname)) continue;
 
         /* Skip management/link interrupts if they don't look like data queues.
@@ -365,15 +464,17 @@ static void setup_irq_affinity(const char *ifname, int num_cpus)
         int irq = 0;
         if (sscanf(line, " %d:", &irq) != 1 || irq <= 0) continue;
 
-        char path[128], mask[32];
+        char path[128], mask[MAX_CPU_MASK_STR];
         snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
-        
-        /* Pin to Master Cores (0-4) only */
-        int target_cpu = data_irq_idx % 5;
-        snprintf(mask, sizeof(mask), "%x", 1 << target_cpu);
+
+        /* Keep each hardware queue on one worker CPU and wrap only after all
+         * available workers have received a queue. */
+        int target_cpu = worker_ids[data_irq_idx % num_workers];
+        if (format_cpu_mask(&target_cpu, 1, mask, sizeof(mask)) < 0)
+            continue;
 
         if (write_sysfs(path, mask) == 0)
-            log_info("    IRQ: %s irq=%d -> Master CPU %d", ifname, irq, target_cpu);
+            log_info("    IRQ: %s irq=%d -> Worker CPU %d", ifname, irq, target_cpu);
         
         data_irq_idx++;
     }
@@ -400,21 +501,24 @@ static void setup_mq_qdisc(const char *ifname)
 }
 
 /* Full setup for a physical NIC: multiqueue + sdfn + IRQ + XPS + RPS */
-static void tune_physical_nic(const char *ifname, int num_cpus)
+static void tune_physical_nic(const char *ifname,
+                              const int *worker_ids, int num_workers)
 {
-    setup_multiqueue(ifname, num_cpus);
+    setup_multiqueue(ifname, num_workers);
+    setup_rss_indirection(ifname, num_workers);
     setup_rss_hash(ifname);
-    setup_irq_affinity(ifname, num_cpus);
-    setup_xps(ifname, num_cpus);
-    setup_rps(ifname, num_cpus);
+    setup_irq_affinity(ifname, worker_ids, num_workers);
+    setup_xps(ifname, worker_ids, num_workers);
+    setup_rps(ifname, worker_ids, num_workers);
     setup_mq_qdisc(ifname);
 }
 
 /* Full setup for a tunnel interface: XPS + RPS + mq qdisc */
-static void tusdwan_tun(const char *ifname, int num_cpus)
+static void tusdwan_tun(const char *ifname,
+                        const int *worker_ids, int num_workers)
 {
-    setup_xps(ifname, num_cpus);
-    setup_rps(ifname, num_cpus);
+    setup_xps(ifname, worker_ids, num_workers);
+    setup_rps(ifname, worker_ids, num_workers);
     setup_mq_qdisc(ifname);
 }
 
@@ -424,10 +528,23 @@ static void tusdwan_tun(const char *ifname, int num_cpus)
 
 int cpu_tune_apply(const app_context_t *ctx)
 {
-    int num_cpus = get_num_cpus();
+    int cpu_ids[CPU_SETSIZE];
+    int worker_ids[CPU_SETSIZE];
+    int num_cpus = get_available_cpu_ids(cpu_ids, CPU_SETSIZE);
+    int num_workers = select_worker_cpu_ids(cpu_ids, num_cpus,
+                                            worker_ids, CPU_SETSIZE);
+    char worker_mask[MAX_CPU_MASK_STR] = "";
+
+    if (num_workers <= 0) {
+        log_error("CPU Tuning: no available datapath CPU");
+        return -1;
+    }
+
+    format_cpu_mask(worker_ids, num_workers, worker_mask, sizeof(worker_mask));
 
     log_info("========================================");
-    log_info("  CPU Tuning: %d cores detected", num_cpus);
+    log_info("  CPU Tuning: %d CPUs available, %d datapath workers (mask %s)",
+             num_cpus, num_workers, worker_mask);
     log_info("========================================");
 
     /* 0. Stop irqbalance to prevent it from overriding our pinning */
@@ -446,7 +563,7 @@ int cpu_tune_apply(const app_context_t *ctx)
 
     /* 2. Local interface — physical NIC (e.g. enp6s0) */
     log_info("  [Local NIC: %s]", ctx->cfg.local_if);
-    tune_physical_nic(ctx->cfg.local_if, num_cpus);
+    tune_physical_nic(ctx->cfg.local_if, worker_ids, num_workers);
 
     /* 3. Tunnel interfaces + auto-detect underlying physical NICs */
     char tuned_nics[MAX_SDWAN_TUNS][IF_NAMESIZE];
@@ -455,7 +572,7 @@ int cpu_tune_apply(const app_context_t *ctx)
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
         const char *tun = ctx->cfg.sdwan_tuns[i].ifname;
         log_info("  [Tunnel: %s]", tun);
-        tusdwan_tun(tun, num_cpus);
+        tusdwan_tun(tun, worker_ids, num_workers);
 
         /* Auto-detect and tune the physical NIC underneath the VXLAN */
         char lower[IF_NAMESIZE] = {0};
@@ -468,7 +585,7 @@ int cpu_tune_apply(const app_context_t *ctx)
             /* Also skip if it's the same as local_if (already tuned above) */
             if (!already && strcmp(lower, ctx->cfg.local_if) != 0) {
                 log_info("  [Physical WAN: %s (under %s)]", lower, tun);
-                tune_physical_nic(lower, num_cpus);
+                tune_physical_nic(lower, worker_ids, num_workers);
                 snprintf(tuned_nics[tuned_nic_count++], sizeof(tuned_nics[0]), "%s", lower);
             }
         }

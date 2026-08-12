@@ -332,14 +332,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
             goto err_free_tfm;
         }
 
-        /* Calculate dynamic worker core count & reservation */
-        if (num_cpus >= 8) {
-            worker_start = 2; /* Reserve Core 0 & 1 for system/control plane */
-            num_workers = num_cpus - 2;
-        } else if (num_cpus >= 4) {
-            worker_start = 1; /* Reserve Core 0 for system */
-            num_workers = num_cpus - 1;
-        }
+        /* Crypto runs inline on the CPU selected by RSS/RPS.  Advertise every
+         * online CPU here; optional control-plane isolation is applied by the
+         * userspace CPU tuner through SDWAN_RESERVED_CPUS. */
         new_cfg->worker_start_cpu = worker_start;
         new_cfg->num_workers = num_workers;
 

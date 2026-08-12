@@ -112,6 +112,16 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb, u32 *out_flow_id, u64 *out_fl
     skb->protocol = htons(ETH_P_IP);
     skb_reset_network_header(skb);
     skb->ip_summed = CHECKSUM_NONE;
+    skb->encapsulation = 0;
+
+    /* The skb may still carry an RX hash calculated from the outer VXLAN or
+     * the encrypted L2 frame.  Reusing that value would make RPS send many
+     * unrelated inner TCP/UDP flows to the same CPU.  Drop the stale hash and
+     * calculate a fresh one from the restored IPv4 4-tuple before reinjecting
+     * the packet into the receive stack.  RPS then keeps each inner flow on a
+     * stable CPU while allowing different flows to execute in parallel. */
+    skb_clear_hash(skb);
+    skb_get_hash(skb);
 
     rcu_read_unlock();
     return 0;
