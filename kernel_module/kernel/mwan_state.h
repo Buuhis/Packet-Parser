@@ -141,5 +141,10 @@ u64 mwan_l2_next_tx_seq(u32 flow_idx);
 u64 mwan_l2_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
+void mwan_l2_diag_reset_all(void);
+void mwan_l2_tx_diag_reset(void);
+u32 mwan_l2_diag_generation_get(void);
+u64 mwan_l2_tx_diag_flows_get(void);
+u64 mwan_l2_tx_diag_zero_get(void);
 
 #endif /* MWAN_STATE_H */

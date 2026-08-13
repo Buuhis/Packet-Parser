@@ -6,12 +6,46 @@
 
 bool mwan_l2_diag_enabled;
 unsigned int mwan_l2_diag_limit = 64;
+static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
                  "Log the first L2-PQC TX/RX/worker observation per flow");
 module_param_named(l2_diag_limit, mwan_l2_diag_limit, uint, 0644);
 MODULE_PARM_DESC(l2_diag_limit,
                  "Maximum number of distinct L2-PQC flows logged per stage");
+
+static int mwan_l2_diag_reset_set(const char *val,
+                                  const struct kernel_param *kp)
+{
+    bool requested;
+    int err;
+
+    (void)kp;
+    err = kstrtobool(val, &requested);
+    if (err)
+        return err;
+    if (requested)
+        mwan_l2_diag_reset_all();
+    WRITE_ONCE(mwan_l2_diag_reset_param, false);
+    return 0;
+}
+
+static int mwan_l2_diag_reset_get(char *buffer,
+                                  const struct kernel_param *kp)
+{
+    (void)kp;
+    return sysfs_emit(buffer, "0\n");
+}
+
+static const struct kernel_param_ops mwan_l2_diag_reset_ops = {
+    .set = mwan_l2_diag_reset_set,
+    .get = mwan_l2_diag_reset_get,
+};
+
+module_param_cb(l2_diag_reset, &mwan_l2_diag_reset_ops,
+                &mwan_l2_diag_reset_param, 0644);
+MODULE_PARM_DESC(l2_diag_reset,
+                 "Write 1 to reset L2 diagnostic state and counters");
 
 // Forward declarations for initialization functions we will write later
 int mwan_steer_init(void);

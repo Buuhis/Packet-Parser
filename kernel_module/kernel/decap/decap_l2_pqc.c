@@ -45,8 +45,58 @@ static bool mwan_l2_rx_diag_bucket_valid[MWAN_FLOW_TABLE_SIZE];
 static DEFINE_SPINLOCK(mwan_l2_work_diag_lock);
 static u32 mwan_l2_work_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
 static unsigned int mwan_l2_work_diag_count;
+static atomic_t mwan_l2_diag_generation = ATOMIC_INIT(0);
+static atomic64_t mwan_l2_rx_diag_flows_count;
+static atomic64_t mwan_l2_rx_diag_zero;
+static atomic64_t mwan_l2_rx_diag_collisions;
+static atomic64_t mwan_l2_rx_diag_fid_mismatch;
+static atomic64_t mwan_l2_rx_diag_seq_mismatch;
+static atomic64_t mwan_l2_rx_diag_decrypt_fail;
+static atomic64_t mwan_l2_rx_diag_auth_fail;
+static atomic64_t mwan_l2_rx_diag_cpu_flows[NR_CPUS];
 
 static void mwan_l2_worker_fn(struct work_struct *work);
+
+u32 mwan_l2_diag_generation_get(void)
+{
+    return (u32)atomic_read(&mwan_l2_diag_generation);
+}
+
+void mwan_l2_diag_reset_all(void)
+{
+    int cpu;
+    u32 generation;
+
+    mwan_l2_tx_diag_reset();
+
+    spin_lock_bh(&mwan_l2_rx_diag_lock);
+    memset(mwan_l2_rx_diag_flows, 0, sizeof(mwan_l2_rx_diag_flows));
+    memset(mwan_l2_rx_diag_bucket_flow, 0,
+           sizeof(mwan_l2_rx_diag_bucket_flow));
+    memset(mwan_l2_rx_diag_bucket_valid, 0,
+           sizeof(mwan_l2_rx_diag_bucket_valid));
+    mwan_l2_rx_diag_count = 0;
+    spin_unlock_bh(&mwan_l2_rx_diag_lock);
+
+    spin_lock_bh(&mwan_l2_work_diag_lock);
+    memset(mwan_l2_work_diag_flows, 0,
+           sizeof(mwan_l2_work_diag_flows));
+    mwan_l2_work_diag_count = 0;
+    spin_unlock_bh(&mwan_l2_work_diag_lock);
+
+    atomic64_set(&mwan_l2_rx_diag_flows_count, 0);
+    atomic64_set(&mwan_l2_rx_diag_zero, 0);
+    atomic64_set(&mwan_l2_rx_diag_collisions, 0);
+    atomic64_set(&mwan_l2_rx_diag_fid_mismatch, 0);
+    atomic64_set(&mwan_l2_rx_diag_seq_mismatch, 0);
+    atomic64_set(&mwan_l2_rx_diag_decrypt_fail, 0);
+    atomic64_set(&mwan_l2_rx_diag_auth_fail, 0);
+    for (cpu = 0; cpu < NR_CPUS; cpu++)
+        atomic64_set(&mwan_l2_rx_diag_cpu_flows[cpu], 0);
+
+    generation = (u32)atomic_inc_return(&mwan_l2_diag_generation);
+    pr_info("mwan_kmod: L2D RESET g=%u\n", generation);
+}
 
 static bool mwan_l2_diag_first_flow(u32 flow_id, u32 *flows,
                                     unsigned int *flow_count,
@@ -335,6 +385,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     bool new_diag_flow;
     bool bucket_collision = false;
     u32 bucket_previous_flow = 0;
+    u32 generation = mwan_l2_diag_generation_get();
     unsigned int queued_after;
     const char *owner_reason = "sticky";
     struct mwan_l2_select_diag select_diag = {
@@ -345,12 +396,16 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     new_diag_flow = mwan_l2_diag_first_flow(flow_id, mwan_l2_rx_diag_flows,
                                             &mwan_l2_rx_diag_count,
                                             &mwan_l2_rx_diag_lock);
+    if (READ_ONCE(mwan_l2_diag_enabled) && unlikely(flow_id == 0))
+        atomic64_inc(&mwan_l2_rx_diag_zero);
     if (new_diag_flow) {
+        atomic64_inc(&mwan_l2_rx_diag_flows_count);
         spin_lock_bh(&mwan_l2_rx_diag_lock);
         if (mwan_l2_rx_diag_bucket_valid[flow_idx] &&
             mwan_l2_rx_diag_bucket_flow[flow_idx] != flow_id) {
             bucket_collision = true;
             bucket_previous_flow = mwan_l2_rx_diag_bucket_flow[flow_idx];
+            atomic64_inc(&mwan_l2_rx_diag_collisions);
         } else if (!mwan_l2_rx_diag_bucket_valid[flow_idx]) {
             mwan_l2_rx_diag_bucket_valid[flow_idx] = true;
             mwan_l2_rx_diag_bucket_flow[flow_idx] = flow_id;
@@ -439,12 +494,40 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
         int candidate_b_cpu = select_diag.candidate_b >= 0 ?
             cfg->l2_workers[select_diag.candidate_b].cpu : -1;
 
-        pr_info("mwan_kmod: L2DIAG RX flow=%08x seq=%llu bucket=%u ingress_cpu=%d owner_reason=%s owner_idx=%d owner_cpu=%d candidate_a_idx=%d candidate_a_cpu=%d score_a=%llu candidate_b_idx=%d candidate_b_cpu=%d score_b=%llu queued=%u bucket_collision=%u previous_flow=%08x\n",
-                flow_id, flow_seq, flow_idx, ingress_cpu, owner_reason, owner,
-                worker->cpu, select_diag.candidate_a, candidate_a_cpu,
-                select_diag.score_a, select_diag.candidate_b,
-                candidate_b_cpu, select_diag.score_b, queued_after,
-                bucket_collision, bucket_previous_flow);
+        if (worker->cpu >= 0 && worker->cpu < NR_CPUS)
+            atomic64_inc(&mwan_l2_rx_diag_cpu_flows[worker->cpu]);
+
+        if (bucket_collision)
+            pr_info("mwan_kmod: L2D COLL g=%u b=%u new=%08x prev=%08x owner=%d/%d\n",
+                    generation, flow_idx, flow_id, bucket_previous_flow,
+                    owner, worker->cpu);
+
+        if (select_diag.ran) {
+            if (flow_id == 0)
+                pr_info("mwan_kmod: L2D RX_ZERO g=%u seq=%llu b=%u in=%d reason=%s a=%d/%d/%llu b2=%d/%d/%llu owner=%d/%d q=%u\n",
+                        generation, flow_seq, flow_idx, ingress_cpu,
+                        owner_reason, select_diag.candidate_a,
+                        candidate_a_cpu, select_diag.score_a,
+                        select_diag.candidate_b, candidate_b_cpu,
+                        select_diag.score_b, owner, worker->cpu,
+                        queued_after);
+            else
+                pr_info("mwan_kmod: L2D RX g=%u f=%08x b=%u seq=%llu in=%d reason=%s a=%d/%d/%llu b2=%d/%d/%llu owner=%d/%d q=%u\n",
+                        generation, flow_id, flow_idx, flow_seq, ingress_cpu,
+                        owner_reason, select_diag.candidate_a,
+                        candidate_a_cpu, select_diag.score_a,
+                        select_diag.candidate_b, candidate_b_cpu,
+                        select_diag.score_b, owner, worker->cpu,
+                        queued_after);
+        } else if (flow_id == 0) {
+            pr_info("mwan_kmod: L2D RX_ZERO g=%u seq=%llu b=%u in=%d reason=%s owner=%d/%d q=%u\n",
+                    generation, flow_seq, flow_idx, ingress_cpu,
+                    owner_reason, owner, worker->cpu, queued_after);
+        } else {
+            pr_info("mwan_kmod: L2D RX g=%u f=%08x b=%u seq=%llu in=%d reason=%s owner=%d/%d q=%u\n",
+                    generation, flow_id, flow_idx, flow_seq, ingress_cpu,
+                    owner_reason, owner, worker->cpu, queued_after);
+        }
     }
 
     if (was_scheduled == 0 &&
@@ -666,16 +749,39 @@ static void mwan_l2_worker_fn(struct work_struct *work)
             mwan_l2_update_ewma(worker, ktime_get_ns() - start_ns);
             atomic64_inc(&worker->processed_packets);
 
-            if (mwan_l2_diag_first_flow(dispatch_flow_id,
-                                        mwan_l2_work_diag_flows,
-                                        &mwan_l2_work_diag_count,
-                                        &mwan_l2_work_diag_lock))
-                pr_info("mwan_kmod: L2DIAG WORK dispatch_flow=%08x dispatch_seq=%llu decrypt_flow=%08x decrypt_seq=%llu header_match=%u bucket=%u configured_cpu=%d current_cpu=%u auth=%s err=%d\n",
-                        dispatch_flow_id, dispatch_flow_seq, flow_id, flow_seq,
-                        dispatch_flow_id == flow_id &&
-                        dispatch_flow_seq == flow_seq,
-                        flow_idx, worker->cpu, raw_smp_processor_id(),
-                        ret ? "fail" : "ok", ret);
+            if (READ_ONCE(mwan_l2_diag_enabled)) {
+                bool fid_ok = dispatch_flow_id == flow_id;
+                bool seq_ok = dispatch_flow_seq == flow_seq;
+                bool first_work;
+                u32 generation = mwan_l2_diag_generation_get();
+
+                if (!fid_ok)
+                    atomic64_inc(&mwan_l2_rx_diag_fid_mismatch);
+                if (!seq_ok)
+                    atomic64_inc(&mwan_l2_rx_diag_seq_mismatch);
+                if (ret) {
+                    atomic64_inc(&mwan_l2_rx_diag_decrypt_fail);
+                    if (ret == -EBADMSG)
+                        atomic64_inc(&mwan_l2_rx_diag_auth_fail);
+                }
+
+                first_work = mwan_l2_diag_first_flow(
+                    dispatch_flow_id, mwan_l2_work_diag_flows,
+                    &mwan_l2_work_diag_count, &mwan_l2_work_diag_lock);
+                if (unlikely(ret || !fid_ok || !seq_ok))
+                    pr_info_ratelimited("mwan_kmod: L2D WORK_BAD g=%u dispatch=%08x/%llu decrypt=%08x/%llu cpu=%d/%u fid_ok=%u seq_ok=%u decrypt_status=%s auth=%s err=%d\n",
+                                        generation, dispatch_flow_id,
+                                        dispatch_flow_seq, flow_id, flow_seq,
+                                        worker->cpu, raw_smp_processor_id(),
+                                        fid_ok, seq_ok,
+                                        ret ? "fail" : "ok",
+                                        ret == -EBADMSG ? "fail" :
+                                        (ret ? "na" : "ok"), ret);
+                else if (first_work)
+                    pr_info("mwan_kmod: L2D WORK g=%u f=%08x seq=%llu cpu=%d/%u fid_ok=1 seq_ok=1 auth=ok\n",
+                            generation, flow_id, flow_seq, worker->cpu,
+                            raw_smp_processor_id());
+            }
 
             memset(skb->cb, 0, sizeof(skb->cb));
             if (unlikely(ret < 0)) {
@@ -757,6 +863,50 @@ static const struct file_operations mwan_l2_stats_fops = {
     .release = single_release,
 };
 
+static int mwan_l2_diag_show(struct seq_file *m, void *unused)
+{
+    int cpu;
+
+    (void)unused;
+    seq_printf(m, "generation=%u enabled=%u limit=%u\n",
+               mwan_l2_diag_generation_get(),
+               READ_ONCE(mwan_l2_diag_enabled),
+               min_t(unsigned int, READ_ONCE(mwan_l2_diag_limit),
+                     MWAN_L2_DIAG_MAX_FLOWS));
+    seq_printf(m, "tx_flows=%llu tx_zero_packets=%llu\n",
+               mwan_l2_tx_diag_flows_get(), mwan_l2_tx_diag_zero_get());
+    seq_printf(m, "rx_flows=%lld rx_zero_packets=%lld collisions=%lld\n",
+               atomic64_read(&mwan_l2_rx_diag_flows_count),
+               atomic64_read(&mwan_l2_rx_diag_zero),
+               atomic64_read(&mwan_l2_rx_diag_collisions));
+    seq_printf(m, "fid_mismatch=%lld seq_mismatch=%lld decrypt_fail=%lld auth_fail=%lld\n",
+               atomic64_read(&mwan_l2_rx_diag_fid_mismatch),
+               atomic64_read(&mwan_l2_rx_diag_seq_mismatch),
+               atomic64_read(&mwan_l2_rx_diag_decrypt_fail),
+               atomic64_read(&mwan_l2_rx_diag_auth_fail));
+    seq_puts(m, "cpu_flows:");
+    cpus_read_lock();
+    for_each_online_cpu(cpu)
+        seq_printf(m, " %d=%lld", cpu,
+                   atomic64_read(&mwan_l2_rx_diag_cpu_flows[cpu]));
+    cpus_read_unlock();
+    seq_putc(m, '\n');
+    return 0;
+}
+
+static int mwan_l2_diag_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, mwan_l2_diag_show, inode->i_private);
+}
+
+static const struct file_operations mwan_l2_diag_fops = {
+    .owner = THIS_MODULE,
+    .open = mwan_l2_diag_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
 static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                              struct packet_type *pt,
                              struct net_device *orig_dev)
@@ -811,6 +961,7 @@ static struct packet_type l2_pqc_packet_type __read_mostly = {
 
 int mwan_decap_l2_pqc_init(void)
 {
+    mwan_l2_diag_reset_all();
     mwan_l2_wq = alloc_workqueue("mwan_l2rx",
                                  WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
     if (!mwan_l2_wq)
@@ -823,6 +974,8 @@ int mwan_decap_l2_pqc_init(void)
     } else {
         debugfs_create_file("l2_workers", 0444, mwan_debugfs_dir, NULL,
                             &mwan_l2_stats_fops);
+        debugfs_create_file("l2_diag", 0444, mwan_debugfs_dir, NULL,
+                            &mwan_l2_diag_fops);
     }
     dev_add_pack(&l2_pqc_packet_type);
     pr_info("mwan_kmod: registered load-aware L2-PQC handler (0x%04x)\n",

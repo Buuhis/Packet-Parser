@@ -46,6 +46,28 @@ static DEFINE_SPINLOCK(mwan_l2_tx_diag_lock);
 static struct mwan_l2_tx_diag_key
     mwan_l2_tx_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
 static unsigned int mwan_l2_tx_diag_count;
+static atomic64_t mwan_l2_tx_diag_flow_count;
+static atomic64_t mwan_l2_tx_diag_zero;
+
+void mwan_l2_tx_diag_reset(void)
+{
+    spin_lock_bh(&mwan_l2_tx_diag_lock);
+    memset(mwan_l2_tx_diag_flows, 0, sizeof(mwan_l2_tx_diag_flows));
+    mwan_l2_tx_diag_count = 0;
+    spin_unlock_bh(&mwan_l2_tx_diag_lock);
+    atomic64_set(&mwan_l2_tx_diag_flow_count, 0);
+    atomic64_set(&mwan_l2_tx_diag_zero, 0);
+}
+
+u64 mwan_l2_tx_diag_flows_get(void)
+{
+    return atomic64_read(&mwan_l2_tx_diag_flow_count);
+}
+
+u64 mwan_l2_tx_diag_zero_get(void)
+{
+    return atomic64_read(&mwan_l2_tx_diag_zero);
+}
 
 static bool mwan_l2_tx_diag_first_flow(u32 flow_id,
                                        const struct mwan_l2_tx_diag *diag)
@@ -86,6 +108,7 @@ static bool mwan_l2_tx_diag_first_flow(u32 flow_id,
     if (count < limit) {
         mwan_l2_tx_diag_flows[count] = key;
         mwan_l2_tx_diag_count = count + 1;
+        atomic64_inc(&mwan_l2_tx_diag_flow_count);
         first = true;
     }
 out:
@@ -172,21 +195,45 @@ static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
                                 const struct mwan_tunnel *tun, u32 flow_id,
                                 u32 flow_idx, u64 flow_seq)
 {
-    if (!mwan_l2_tx_diag_first_flow(flow_id, diag))
+    bool first;
+    u32 generation;
+
+    if (!READ_ONCE(mwan_l2_diag_enabled))
+        return;
+    generation = mwan_l2_diag_generation_get();
+    first = mwan_l2_tx_diag_first_flow(flow_id, diag);
+
+    if (unlikely(flow_id == 0)) {
+        atomic64_inc(&mwan_l2_tx_diag_zero);
+        if (diag->tuple_valid)
+            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x cpu=%u tun=%s\n",
+                                generation, flow_seq, &diag->saddr,
+                                ntohs(diag->sport), &diag->daddr,
+                                ntohs(diag->dport), diag->protocol,
+                                diag->hash_source, diag->hash_before,
+                                raw_smp_processor_id(),
+                                tun->dev ? tun->dev->name : "none");
+        else
+            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=invalid hs=%s raw=%08x cpu=%u tun=%s\n",
+                                generation, flow_seq, diag->hash_source,
+                                diag->hash_before, raw_smp_processor_id(),
+                                tun->dev ? tun->dev->name : "none");
+        return;
+    }
+
+    if (!first)
         return;
 
     if (diag->tuple_valid) {
-        pr_info("mwan_kmod: L2DIAG TX flow=%08x bucket=%u seq=%llu tuple=%pI4:%u->%pI4:%u proto=%u hash_source=%s hash_before=%08x cached=%u l4=%u sw=%u tx_cpu=%u tun=%s\n",
-                flow_id, flow_idx, flow_seq, &diag->saddr,
+        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x cpu=%u tun=%s\n",
+                generation, flow_id, flow_idx, flow_seq, &diag->saddr,
                 ntohs(diag->sport), &diag->daddr, ntohs(diag->dport),
                 diag->protocol, diag->hash_source, diag->hash_before,
-                diag->hash_was_cached, diag->hash_is_l4, diag->hash_is_sw,
                 raw_smp_processor_id(), tun->dev ? tun->dev->name : "none");
     } else {
-        pr_info("mwan_kmod: L2DIAG TX flow=%08x bucket=%u seq=%llu tuple=invalid hash_source=%s hash_before=%08x cached=%u l4=%u sw=%u tx_cpu=%u tun=%s\n",
-                flow_id, flow_idx, flow_seq, diag->hash_source,
-                diag->hash_before, diag->hash_was_cached, diag->hash_is_l4,
-                diag->hash_is_sw, raw_smp_processor_id(),
+        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=invalid hs=%s raw=%08x cpu=%u tun=%s\n",
+                generation, flow_id, flow_idx, flow_seq, diag->hash_source,
+                diag->hash_before, raw_smp_processor_id(),
                 tun->dev ? tun->dev->name : "none");
     }
 }
