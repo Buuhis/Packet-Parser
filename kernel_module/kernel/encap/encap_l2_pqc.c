@@ -18,34 +18,103 @@
 #include <linux/skbuff.h>
 #endif
 
-static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
+struct mwan_l2_tx_diag {
+    __be32 saddr;
+    __be32 daddr;
+    __be16 sport;
+    __be16 dport;
+    u32 hash_before;
+    u8 protocol;
+    bool tuple_valid;
+    bool hash_was_cached;
+    bool hash_is_l4;
+    bool hash_is_sw;
+    const char *hash_source;
+};
+
+struct mwan_l2_tx_diag_key {
+    __be32 saddr;
+    __be32 daddr;
+    __be16 sport;
+    __be16 dport;
+    u32 flow_id;
+    u8 protocol;
+    bool tuple_valid;
+};
+
+static DEFINE_SPINLOCK(mwan_l2_tx_diag_lock);
+static struct mwan_l2_tx_diag_key
+    mwan_l2_tx_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
+static unsigned int mwan_l2_tx_diag_count;
+
+static bool mwan_l2_tx_diag_first_flow(u32 flow_id,
+                                       const struct mwan_l2_tx_diag *diag)
+{
+    struct mwan_l2_tx_diag_key key = {
+        .saddr = diag->saddr,
+        .daddr = diag->daddr,
+        .sport = diag->sport,
+        .dport = diag->dport,
+        .flow_id = flow_id,
+        .protocol = diag->protocol,
+        .tuple_valid = diag->tuple_valid,
+    };
+    unsigned int count;
+    unsigned int limit;
+    unsigned int i;
+    bool first = false;
+
+    if (!READ_ONCE(mwan_l2_diag_enabled))
+        return false;
+
+    limit = min_t(unsigned int, READ_ONCE(mwan_l2_diag_limit),
+                  MWAN_L2_DIAG_MAX_FLOWS);
+    spin_lock_bh(&mwan_l2_tx_diag_lock);
+    count = mwan_l2_tx_diag_count;
+    for (i = 0; i < count; i++) {
+        const struct mwan_l2_tx_diag_key *seen = &mwan_l2_tx_diag_flows[i];
+
+        if (key.tuple_valid && seen->tuple_valid &&
+            key.saddr == seen->saddr && key.daddr == seen->daddr &&
+            key.sport == seen->sport && key.dport == seen->dport &&
+            key.protocol == seen->protocol)
+            goto out;
+        if (!key.tuple_valid && !seen->tuple_valid &&
+            key.flow_id == seen->flow_id)
+            goto out;
+    }
+    if (count < limit) {
+        mwan_l2_tx_diag_flows[count] = key;
+        mwan_l2_tx_diag_count = count + 1;
+        first = true;
+    }
+out:
+    spin_unlock_bh(&mwan_l2_tx_diag_lock);
+    return first;
+}
+
+static bool mwan_l2_extract_ipv4_tuple(struct sk_buff *skb,
+                                       struct mwan_l2_tx_diag *diag,
+                                       u32 *ports)
 {
     struct iphdr iph_buf;
     const struct iphdr *iph;
     __be32 ports_be = 0;
     const __be32 *ports_ptr;
-    u32 hash;
-    u32 ports = 0;
     int network_offset;
     int ip_hlen;
 
-    /* Use the kernel flow dissector first.  At POST_ROUTING this is still the
-     * plaintext inner IPv4 packet, so TCP/UDP source and destination ports
-     * are available and ten iperf streams produce ten stable flow hashes. */
-    hash = skb_get_hash(skb);
-    if (likely(hash != 0))
-        return hash;
-
-    /* Defensive fallback for packets for which the flow dissector did not
-     * produce a hash.  skb_header_pointer() uses offsets relative to
-     * skb->data and safely handles non-linear skbs.  Do not reload the IP
-     * header from skb->data: it is not guaranteed to equal network_header. */
     network_offset = skb_network_offset(skb);
     if (unlikely(network_offset < 0))
-        return 0;
+        return false;
     iph = skb_header_pointer(skb, network_offset, sizeof(iph_buf), &iph_buf);
     if (unlikely(!iph || iph->version != 4 || iph->ihl < 5))
-        return 0;
+        return false;
+
+    diag->saddr = iph->saddr;
+    diag->daddr = iph->daddr;
+    diag->protocol = iph->protocol;
+    diag->tuple_valid = true;
 
     ip_hlen = iph->ihl * 4;
     ports_ptr = NULL;
@@ -55,14 +124,71 @@ static inline u32 mwan_calc_flow_id(struct sk_buff *skb)
                                        sizeof(ports_be), &ports_be);
     if (ports_ptr) {
         memcpy(&ports_be, ports_ptr, sizeof(ports_be));
-        ports = (__force u32)ports_be;
+        memcpy(&diag->sport, ports_ptr, sizeof(diag->sport));
+        memcpy(&diag->dport, (const u8 *)ports_ptr + sizeof(diag->sport),
+               sizeof(diag->dport));
+        *ports = (__force u32)ports_be;
+    }
+
+    return true;
+}
+
+static inline u32 mwan_calc_flow_id(struct sk_buff *skb,
+                                    struct mwan_l2_tx_diag *diag)
+{
+    u32 hash;
+    u32 ports = 0;
+
+    memset(diag, 0, sizeof(*diag));
+    diag->hash_before = skb_get_hash_raw(skb);
+    diag->hash_was_cached = skb->l4_hash || skb->sw_hash;
+    diag->hash_is_l4 = skb->l4_hash;
+    diag->hash_is_sw = skb->sw_hash;
+
+    /* Use the kernel flow dissector first. At POST_ROUTING this should still
+     * identify the plaintext inner flow. Diagnostics record whether this was
+     * a pre-existing cached hash or one calculated by the dissector now. */
+    hash = skb_get_hash(skb);
+    if (likely(hash != 0)) {
+        diag->hash_source = diag->hash_was_cached ? "cached" : "dissector";
+        mwan_l2_extract_ipv4_tuple(skb, diag, &ports);
+        return hash;
+    }
+
+    diag->hash_source = "fallback";
+    if (!mwan_l2_extract_ipv4_tuple(skb, diag, &ports)) {
+        diag->hash_source = "invalid";
+        return 0;
     }
 
     /* Include the L4 protocol so TCP and UDP with the same addresses/ports
      * cannot alias solely because their four-tuple bytes are identical. */
-    ports ^= (u32)iph->protocol << 24;
-    return jhash_3words((__force u32)iph->saddr,
-                        (__force u32)iph->daddr, ports, 0x9e3779b9);
+    ports ^= (u32)diag->protocol << 24;
+    return jhash_3words((__force u32)diag->saddr,
+                        (__force u32)diag->daddr, ports, 0x9e3779b9);
+}
+
+static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
+                                const struct mwan_tunnel *tun, u32 flow_id,
+                                u32 flow_idx, u64 flow_seq)
+{
+    if (!mwan_l2_tx_diag_first_flow(flow_id, diag))
+        return;
+
+    if (diag->tuple_valid) {
+        pr_info("mwan_kmod: L2DIAG TX flow=%08x bucket=%u seq=%llu tuple=%pI4:%u->%pI4:%u proto=%u hash_source=%s hash_before=%08x cached=%u l4=%u sw=%u tx_cpu=%u tun=%s\n",
+                flow_id, flow_idx, flow_seq, &diag->saddr,
+                ntohs(diag->sport), &diag->daddr, ntohs(diag->dport),
+                diag->protocol, diag->hash_source, diag->hash_before,
+                diag->hash_was_cached, diag->hash_is_l4, diag->hash_is_sw,
+                raw_smp_processor_id(), tun->dev ? tun->dev->name : "none");
+    } else {
+        pr_info("mwan_kmod: L2DIAG TX flow=%08x bucket=%u seq=%llu tuple=invalid hash_source=%s hash_before=%08x cached=%u l4=%u sw=%u tx_cpu=%u tun=%s\n",
+                flow_id, flow_idx, flow_seq, diag->hash_source,
+                diag->hash_before, diag->hash_was_cached, diag->hash_is_l4,
+                diag->hash_is_sw, raw_smp_processor_id(),
+                tun->dev ? tun->dev->name : "none");
+    }
 }
 
 /* Performs TCP MSS Clamping to account for the authenticated L2-PQC header
@@ -184,6 +310,7 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
     u64 seq;
     int ip_pkt_len, err;
     bool resolved;
+    struct mwan_l2_tx_diag flow_diag;
 
     if (unlikely(!target_dev)) {
         return NF_ACCEPT;
@@ -233,9 +360,10 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         }
     }
 
-    u32 flow_id = mwan_calc_flow_id(skb);
+    u32 flow_id = mwan_calc_flow_id(skb, &flow_diag);
     u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
     seq = mwan_l2_next_tx_seq(flow_idx);
+    mwan_l2_tx_diag_log(&flow_diag, tun, flow_id, flow_idx, seq);
     packet_nonce = mwan_l2_next_packet_nonce();
     if (unlikely(packet_nonce == 0)) {
         rcu_read_unlock();

@@ -4,6 +4,15 @@
 
 #include "mwan_state.h"
 
+bool mwan_l2_diag_enabled;
+unsigned int mwan_l2_diag_limit = 64;
+module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
+MODULE_PARM_DESC(l2_diag,
+                 "Log the first L2-PQC TX/RX/worker observation per flow");
+module_param_named(l2_diag_limit, mwan_l2_diag_limit, uint, 0644);
+MODULE_PARM_DESC(l2_diag_limit,
+                 "Maximum number of distinct L2-PQC flows logged per stage");
+
 // Forward declarations for initialization functions we will write later
 int mwan_steer_init(void);
 void mwan_steer_cleanup(void);

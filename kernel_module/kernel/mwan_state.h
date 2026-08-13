@@ -23,6 +23,7 @@
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
 #define MWAN_L2_FLOW_IDLE_TIMEOUT (5 * HZ)
+#define MWAN_L2_DIAG_MAX_FLOWS    128
 
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
@@ -128,6 +129,8 @@ struct mwan_config {
 
 /* Global pointer to the current active configuration */
 extern struct mwan_config __rcu *g_mwan_cfg;
+extern bool mwan_l2_diag_enabled;
+extern unsigned int mwan_l2_diag_limit;
 
 /* API Functions */
 void mwan_state_init(void);
