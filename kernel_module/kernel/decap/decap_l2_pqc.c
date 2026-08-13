@@ -995,7 +995,8 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                              struct packet_type *pt,
                              struct net_device *orig_dev)
 {
-    struct mwan_l2_pqc_hdr *l2_hdr;
+    struct mwan_l2_pqc_hdr l2_hdr_buf;
+    const struct mwan_l2_pqc_hdr *l2_hdr;
     struct mwan_config *cfg;
     __be32 flow_id_be;
     __be64 flow_seq_be;
@@ -1018,7 +1019,16 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
     }
 
-    l2_hdr = (struct mwan_l2_pqc_hdr *)skb->data;
+    /* A packet_type handler may receive a fully non-linear skb with
+     * skb_headlen(skb) == 0. Read only the authenticated 20-byte prefix here;
+     * skb_header_pointer() returns skb->data on the linear fast path and
+     * copies just the prefix into l2_hdr_buf otherwise. The selected worker
+     * remains responsible for linearizing the encrypted payload. */
+    l2_hdr = skb_header_pointer(skb, 0, sizeof(l2_hdr_buf), &l2_hdr_buf);
+    if (unlikely(!l2_hdr)) {
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
     memcpy(&flow_id_be, &l2_hdr->flow_id, sizeof(flow_id_be));
     memcpy(&flow_seq_be, &l2_hdr->flow_seq, sizeof(flow_seq_be));
     memcpy(&nonce_be, &l2_hdr->packet_nonce, sizeof(nonce_be));
