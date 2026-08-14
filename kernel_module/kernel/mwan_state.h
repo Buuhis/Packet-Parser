@@ -22,7 +22,6 @@
 #define MWAN_FLOW_RING_MASK  (MWAN_FLOW_RING_SIZE - 1)
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
-#define MWAN_L2_FLOW_IDLE_TIMEOUT (5 * HZ)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
 
 enum mwan_encap_type {
@@ -82,6 +81,16 @@ struct mwan_l2_worker {
     atomic64_t schedule_failures;
     atomic_t scheduled;
     atomic_t busy;
+
+    /* Per-CPU softirq admission signal, sampled from kernel CPU accounting.
+     * Values are basis points (10000 == 100%). Only the sampler updates the
+     * previous counters/cooldown; RX admission reads the atomic snapshot. */
+    u64 softirq_prev_total;
+    u64 softirq_prev_time;
+    unsigned int softirq_cool_samples;
+    atomic_t softirq_raw_bp;
+    atomic_t softirq_ewma_bp;
+    atomic_t softirq_blocked;
 };
 
 struct mwan_reorder_ring {
@@ -131,6 +140,9 @@ struct mwan_config {
 extern struct mwan_config __rcu *g_mwan_cfg;
 extern bool mwan_l2_diag_enabled;
 extern unsigned int mwan_l2_diag_limit;
+extern unsigned int mwan_l2_softirq_high_pct;
+extern unsigned int mwan_l2_softirq_low_pct;
+extern unsigned int mwan_l2_softirq_sample_ms;
 
 /* API Functions */
 void mwan_state_init(void);

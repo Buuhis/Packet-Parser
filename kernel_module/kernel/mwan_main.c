@@ -6,6 +6,9 @@
 
 bool mwan_l2_diag_enabled;
 unsigned int mwan_l2_diag_limit = 64;
+unsigned int mwan_l2_softirq_high_pct = 85;
+unsigned int mwan_l2_softirq_low_pct = 70;
+unsigned int mwan_l2_softirq_sample_ms = 50;
 static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
@@ -13,6 +16,16 @@ MODULE_PARM_DESC(l2_diag,
 module_param_named(l2_diag_limit, mwan_l2_diag_limit, uint, 0644);
 MODULE_PARM_DESC(l2_diag_limit,
                  "Maximum number of distinct L2-PQC flows logged per stage");
+module_param_named(l2_softirq_high, mwan_l2_softirq_high_pct, uint, 0644);
+MODULE_PARM_DESC(l2_softirq_high,
+                 "Softirq percent that blocks new-flow admission to a CPU");
+module_param_named(l2_softirq_low, mwan_l2_softirq_low_pct, uint, 0644);
+MODULE_PARM_DESC(l2_softirq_low,
+                 "Softirq percent that begins unblocking a CPU");
+module_param_named(l2_softirq_sample_ms, mwan_l2_softirq_sample_ms, uint,
+                   0644);
+MODULE_PARM_DESC(l2_softirq_sample_ms,
+                 "Per-CPU softirq accounting sample interval in milliseconds");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)

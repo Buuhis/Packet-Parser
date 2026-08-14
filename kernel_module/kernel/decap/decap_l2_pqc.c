@@ -6,7 +6,9 @@
 #include <linux/debugfs.h>
 #include <linux/etherdevice.h>
 #include <linux/jhash.h>
+#include <linux/kernel_stat.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/netdevice.h>
 #include <linux/seq_file.h>
 #include <linux/workqueue.h>
@@ -39,12 +41,18 @@ static struct workqueue_struct *mwan_l2_wq;
 static struct dentry *mwan_debugfs_dir;
 
 struct mwan_l2_select_diag {
-    int candidate_a;
-    int candidate_b;
-    u64 score_a;
-    u64 score_b;
+    unsigned int eligible_cpus;
+    unsigned int chosen_softirq_bp;
+    u64 chosen_assigned_flows;
+    bool all_hot_fallback;
     bool ran;
 };
+
+#define MWAN_L2_SOFTIRQ_BP_MAX          10000U
+#define MWAN_L2_SOFTIRQ_TIE_BP            300U
+#define MWAN_L2_SOFTIRQ_COOL_SAMPLES        3U
+#define MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS       10U
+#define MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS     1000U
 
 static DEFINE_SPINLOCK(mwan_l2_rx_diag_lock);
 static u32 mwan_l2_rx_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
@@ -67,6 +75,12 @@ static atomic64_t mwan_l2_rx_diag_decrypt_fail;
 static atomic64_t mwan_l2_rx_diag_auth_fail;
 static atomic64_t mwan_l2_rx_diag_cpu_flows[NR_CPUS];
 static atomic64_t mwan_l2_diag_cookie;
+static atomic64_t mwan_l2_new_flow_admitted;
+static atomic64_t mwan_l2_all_hot_fallback;
+static DEFINE_SPINLOCK(mwan_l2_admission_lock);
+static void mwan_l2_softirq_sample_fn(struct work_struct *work);
+static DECLARE_DELAYED_WORK(mwan_l2_softirq_sample_work,
+                            mwan_l2_softirq_sample_fn);
 
 static void mwan_l2_worker_fn(struct work_struct *work);
 
@@ -119,6 +133,8 @@ void mwan_l2_diag_reset_all(void)
     atomic64_set(&mwan_l2_rx_diag_decrypt_fail, 0);
     atomic64_set(&mwan_l2_rx_diag_auth_fail, 0);
     atomic64_set(&mwan_l2_diag_cookie, 0);
+    atomic64_set(&mwan_l2_new_flow_admitted, 0);
+    atomic64_set(&mwan_l2_all_hot_fallback, 0);
     for (cpu = 0; cpu < NR_CPUS; cpu++)
         atomic64_set(&mwan_l2_rx_diag_cpu_flows[cpu], 0);
 
@@ -178,6 +194,105 @@ static void mwan_l2_update_ewma(struct mwan_l2_worker *worker, u64 sample_ns)
         old = atomic64_read(&worker->processing_ewma_ns);
         next = old ? old - (old >> 3) + ((s64)sample_ns >> 3) : sample_ns;
     } while (atomic64_cmpxchg(&worker->processing_ewma_ns, old, next) != old);
+}
+
+static void mwan_l2_read_cpu_accounting(int cpu, u64 *total,
+                                        u64 *softirq)
+{
+    struct kernel_cpustat stat;
+    u64 sum = 0;
+    int field;
+
+    kcpustat_cpu_fetch(&stat, cpu);
+    /* Guest time is already included in user/nice accounting. Sum through
+     * steal so the denominator matches elapsed accounted CPU capacity without
+     * double-counting guest time. */
+    for (field = CPUTIME_USER; field < CPUTIME_GUEST; field++)
+        sum += stat.cpustat[field];
+    *total = sum;
+    *softirq = stat.cpustat[CPUTIME_SOFTIRQ];
+}
+
+static void mwan_l2_softirq_update_worker(struct mwan_l2_worker *worker)
+{
+    unsigned int high_pct;
+    unsigned int low_pct;
+    unsigned int high_bp;
+    unsigned int low_bp;
+    unsigned int raw_bp;
+    unsigned int old_ewma;
+    unsigned int ewma_bp;
+    u64 total;
+    u64 softirq;
+    u64 delta_total;
+    u64 delta_softirq;
+
+    if (!cpu_online(worker->cpu)) {
+        atomic_set(&worker->softirq_blocked, 1);
+        worker->softirq_cool_samples = 0;
+        return;
+    }
+
+    mwan_l2_read_cpu_accounting(worker->cpu, &total, &softirq);
+    delta_total = total - worker->softirq_prev_total;
+    delta_softirq = softirq - worker->softirq_prev_time;
+    worker->softirq_prev_total = total;
+    worker->softirq_prev_time = softirq;
+    if (unlikely(delta_total == 0))
+        return;
+
+    raw_bp = min_t(u64, MWAN_L2_SOFTIRQ_BP_MAX,
+                   div64_u64(delta_softirq * MWAN_L2_SOFTIRQ_BP_MAX,
+                             delta_total));
+    old_ewma = (unsigned int)atomic_read(&worker->softirq_ewma_bp);
+    ewma_bp = (old_ewma * 3U + raw_bp) / 4U;
+    atomic_set(&worker->softirq_raw_bp, raw_bp);
+    atomic_set(&worker->softirq_ewma_bp, ewma_bp);
+
+    high_pct = clamp_t(unsigned int,
+                       READ_ONCE(mwan_l2_softirq_high_pct), 1U, 100U);
+    low_pct = min_t(unsigned int,
+                    READ_ONCE(mwan_l2_softirq_low_pct), high_pct - 1U);
+    high_bp = high_pct * 100U;
+    low_bp = low_pct * 100U;
+
+    if (raw_bp >= high_bp || ewma_bp >= high_bp) {
+        atomic_set(&worker->softirq_blocked, 1);
+        worker->softirq_cool_samples = 0;
+    } else if (atomic_read(&worker->softirq_blocked)) {
+        if (raw_bp <= low_bp && ewma_bp <= low_bp) {
+            if (++worker->softirq_cool_samples >=
+                MWAN_L2_SOFTIRQ_COOL_SAMPLES) {
+                atomic_set(&worker->softirq_blocked, 0);
+                worker->softirq_cool_samples = 0;
+            }
+        } else {
+            worker->softirq_cool_samples = 0;
+        }
+    }
+}
+
+static void mwan_l2_softirq_sample_fn(struct work_struct *work)
+{
+    struct mwan_config *cfg;
+    unsigned int sample_ms;
+    int i;
+
+    (void)work;
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg && cfg->l2_workers) {
+        for (i = 0; i < cfg->num_workers; i++)
+            mwan_l2_softirq_update_worker(&cfg->l2_workers[i]);
+    }
+    rcu_read_unlock();
+
+    sample_ms = clamp_t(unsigned int,
+                        READ_ONCE(mwan_l2_softirq_sample_ms),
+                        MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS,
+                        MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS);
+    schedule_delayed_work(&mwan_l2_softirq_sample_work,
+                          msecs_to_jiffies(sample_ms));
 }
 
 static int mwan_l2_worker_set_key(struct mwan_l2_worker *worker,
@@ -267,6 +382,12 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         worker->cpu = cpu;
         skb_queue_head_init(&worker->rx_queue);
         INIT_WORK(&worker->work, mwan_l2_worker_fn);
+        mwan_l2_read_cpu_accounting(cpu, &worker->softirq_prev_total,
+                                    &worker->softirq_prev_time);
+        worker->softirq_cool_samples = 0;
+        atomic_set(&worker->softirq_raw_bp, 0);
+        atomic_set(&worker->softirq_ewma_bp, 0);
+        atomic_set(&worker->softirq_blocked, 0);
 
         err = mwan_l2_worker_set_key(worker, cfg);
         if (err) {
@@ -353,50 +474,112 @@ static u64 mwan_l2_worker_score(const struct mwan_l2_worker *worker)
            (atomic_read(&worker->busy) ? 4096ULL : 0);
 }
 
-static int mwan_l2_next_online_worker(const struct mwan_config *cfg, int start)
+static unsigned int
+mwan_l2_worker_softirq_load(const struct mwan_l2_worker *worker)
 {
-    int i;
+    unsigned int raw = (unsigned int)atomic_read(&worker->softirq_raw_bp);
+    unsigned int ewma = (unsigned int)atomic_read(&worker->softirq_ewma_bp);
 
-    for (i = 0; i < cfg->num_workers; i++) {
-        int idx = (start + i) % cfg->num_workers;
-
-        if (cpu_online(cfg->l2_workers[idx].cpu))
-            return idx;
-    }
-    return -1;
+    return max(raw, ewma);
 }
 
-/* Power-of-Two-Choices: compare two deterministic candidates for a new flow
- * bucket and choose the one with the lower live score. */
+static bool mwan_l2_admission_better(unsigned int load, u64 assigned,
+                                     int best, unsigned int best_load,
+                                     u64 best_assigned)
+{
+    if (best < 0)
+        return true;
+    if (load + MWAN_L2_SOFTIRQ_TIE_BP < best_load)
+        return true;
+    if (best_load + MWAN_L2_SOFTIRQ_TIE_BP < load)
+        return false;
+    return assigned < best_assigned;
+}
+
+/* Admit a flow bucket without an owner to the least-loaded eligible CPU.
+ * All online workers are considered because the system has a small fixed CPU
+ * set and this path runs only when assigning an owner, never for sticky packets.
+ * The short global lock makes the assigned-flow reservation visible before
+ * another concurrent flow scans, preventing a batch from herding onto the
+ * same apparently-idle CPU. */
 static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
+                                 int current_owner,
                                  struct mwan_l2_select_diag *diag)
 {
-    u32 hash_a;
-    u32 hash_b;
-    int a;
-    int b;
+    unsigned int high_pct;
+    unsigned int high_bp;
+    unsigned int best_load = U32_MAX;
+    unsigned int fallback_load = U32_MAX;
+    u64 best_assigned = U64_MAX;
+    u64 fallback_assigned = U64_MAX;
+    int best = -1;
+    int fallback = -1;
+    int start;
+    int offset;
+    int chosen;
 
     if (!cfg->l2_workers || cfg->num_workers <= 0)
         return -1;
 
-    hash_a = jhash_1word(flow_id, 0x9e3779b9);
-    hash_b = jhash_1word(flow_id, 0x85ebca6b);
-    a = mwan_l2_next_online_worker(cfg, hash_a % cfg->num_workers);
-    b = mwan_l2_next_online_worker(cfg, hash_b % cfg->num_workers);
+    high_pct = clamp_t(unsigned int,
+                       READ_ONCE(mwan_l2_softirq_high_pct), 1U, 100U);
+    high_bp = high_pct * 100U;
+    start = jhash_1word(flow_id, 0x9e3779b9) % cfg->num_workers;
+
+    spin_lock(&mwan_l2_admission_lock);
+    for (offset = 0; offset < cfg->num_workers; offset++) {
+        int idx = (start + offset) % cfg->num_workers;
+        const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+        unsigned int load;
+        u64 assigned;
+
+        if (!cpu_online(worker->cpu))
+            continue;
+        load = mwan_l2_worker_softirq_load(worker);
+        assigned = atomic64_read(&worker->assigned_flows);
+
+        if (mwan_l2_admission_better(load, assigned, fallback,
+                                     fallback_load, fallback_assigned)) {
+            fallback = idx;
+            fallback_load = load;
+            fallback_assigned = assigned;
+        }
+
+        if (atomic_read(&worker->softirq_blocked) || load >= high_bp)
+            continue;
+        if (diag)
+            diag->eligible_cpus++;
+        if (mwan_l2_admission_better(load, assigned, best, best_load,
+                                     best_assigned)) {
+            best = idx;
+            best_load = load;
+            best_assigned = assigned;
+        }
+    }
+
+    chosen = best >= 0 ? best : fallback;
+    if (chosen >= 0 && chosen != current_owner) {
+        if (current_owner >= 0 && current_owner < cfg->num_workers)
+            atomic64_dec(&cfg->l2_workers[current_owner].assigned_flows);
+        atomic64_inc(&cfg->l2_workers[chosen].assigned_flows);
+    }
+    if (chosen >= 0 && current_owner < 0)
+        atomic64_inc(&mwan_l2_new_flow_admitted);
+    if (best < 0 && fallback >= 0)
+        atomic64_inc(&mwan_l2_all_hot_fallback);
+
     if (diag) {
         diag->ran = true;
-        diag->candidate_a = a;
-        diag->candidate_b = b;
-        diag->score_a = a >= 0 ? mwan_l2_worker_score(&cfg->l2_workers[a]) : 0;
-        diag->score_b = b >= 0 ? mwan_l2_worker_score(&cfg->l2_workers[b]) : 0;
+        diag->all_hot_fallback = best < 0 && fallback >= 0;
+        if (chosen >= 0) {
+            diag->chosen_softirq_bp =
+                mwan_l2_worker_softirq_load(&cfg->l2_workers[chosen]);
+            diag->chosen_assigned_flows =
+                atomic64_read(&cfg->l2_workers[chosen].assigned_flows);
+        }
     }
-    if (a < 0)
-        return -1;
-    if (b < 0 || a == b)
-        return a;
-
-    return mwan_l2_worker_score(&cfg->l2_workers[a]) <=
-           mwan_l2_worker_score(&cfg->l2_workers[b]) ? a : b;
+    spin_unlock(&mwan_l2_admission_lock);
+    return chosen;
 }
 
 static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
@@ -411,7 +594,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     int owner;
     int new_owner;
     int was_scheduled;
-    bool idle;
     bool new_diag_flow;
     bool bucket_collision = false;
     u32 bucket_previous_flow = 0;
@@ -419,10 +601,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     u64 diag_cookie = 0;
     unsigned int queued_after;
     const char *owner_reason = "sticky";
-    struct mwan_l2_select_diag select_diag = {
-        .candidate_a = -1,
-        .candidate_b = -1,
-    };
+    struct mwan_l2_select_diag select_diag = { 0 };
 
     if (READ_ONCE(mwan_l2_diag_enabled))
         diag_cookie = (u64)atomic64_inc_return(&mwan_l2_diag_cookie);
@@ -455,7 +634,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     flow = &cfg->flow_reorder[flow_idx];
     spin_lock_bh(&flow->owner_lock);
     owner = atomic_read(&flow->owner_worker);
-    idle = time_after(jiffies, flow->last_seen + MWAN_L2_FLOW_IDLE_TIMEOUT);
 
     if (owner < 0 || owner >= cfg->num_workers) {
         if (unlikely(atomic_read(&flow->pending_crypto) != 0)) {
@@ -463,7 +641,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
             return -EBUSY;
         }
         owner_reason = "new";
-        new_owner = mwan_l2_select_worker(cfg, flow_id, &select_diag);
+        new_owner = mwan_l2_select_worker(cfg, flow_id, owner, &select_diag);
     } else if (!cpu_online(cfg->l2_workers[owner].cpu)) {
         /* Never move an active flow while packets may still be executing on
          * the old CPU.  Dropping during the rare hot-unplug transition is
@@ -473,11 +651,10 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
             return -EBUSY;
         }
         owner_reason = "offline";
-        new_owner = mwan_l2_select_worker(cfg, flow_id, &select_diag);
-    } else if (idle && atomic_read(&flow->pending_crypto) == 0) {
-        owner_reason = "idle";
-        new_owner = mwan_l2_select_worker(cfg, flow_id, &select_diag);
+        new_owner = mwan_l2_select_worker(cfg, flow_id, owner, &select_diag);
     } else {
+        /* Load never migrates an owned flow. A hot owner remains sticky and
+         * is merely excluded from admission decisions for other new flows. */
         new_owner = owner;
     }
 
@@ -486,9 +663,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
         return -ENODEV;
     }
     if (new_owner != owner) {
-        if (owner >= 0 && owner < cfg->num_workers)
-            atomic64_dec(&cfg->l2_workers[owner].assigned_flows);
-        atomic64_inc(&cfg->l2_workers[new_owner].assigned_flows);
         atomic_set(&flow->owner_worker, new_owner);
         owner = new_owner;
     }
@@ -538,11 +712,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     spin_unlock_bh(&flow->owner_lock);
 
     if (new_diag_flow) {
-        int candidate_a_cpu = select_diag.candidate_a >= 0 ?
-            cfg->l2_workers[select_diag.candidate_a].cpu : -1;
-        int candidate_b_cpu = select_diag.candidate_b >= 0 ?
-            cfg->l2_workers[select_diag.candidate_b].cpu : -1;
-
         if (worker->cpu >= 0 && worker->cpu < NR_CPUS)
             atomic64_inc(&mwan_l2_rx_diag_cpu_flows[worker->cpu]);
 
@@ -553,24 +722,24 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
 
         if (select_diag.ran) {
             if (flow_id == 0)
-                pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s a=%d/%d/%llu b2=%d/%d/%llu owner=%d/%d q=%u\n",
+                pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u soft_bp=%u flows=%llu fallback=%u owner=%d/%d q=%u\n",
                         generation, diag_cookie, flow_id, flow_seq,
                         packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
-                        ingress_cpu,
-                        owner_reason, select_diag.candidate_a,
-                        candidate_a_cpu, select_diag.score_a,
-                        select_diag.candidate_b, candidate_b_cpu,
-                        select_diag.score_b, owner, worker->cpu,
+                        ingress_cpu, owner_reason,
+                        select_diag.eligible_cpus,
+                        select_diag.chosen_softirq_bp,
+                        select_diag.chosen_assigned_flows,
+                        select_diag.all_hot_fallback, owner, worker->cpu,
                         queued_after);
             else
-                pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s a=%d/%d/%llu b2=%d/%d/%llu owner=%d/%d q=%u\n",
+                pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u soft_bp=%u flows=%llu fallback=%u owner=%d/%d q=%u\n",
                         generation, diag_cookie, flow_id, flow_seq,
                         packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
-                        ingress_cpu,
-                        owner_reason, select_diag.candidate_a,
-                        candidate_a_cpu, select_diag.score_a,
-                        select_diag.candidate_b, candidate_b_cpu,
-                        select_diag.score_b, owner, worker->cpu,
+                        ingress_cpu, owner_reason,
+                        select_diag.eligible_cpus,
+                        select_diag.chosen_softirq_bp,
+                        select_diag.chosen_assigned_flows,
+                        select_diag.all_hot_fallback, owner, worker->cpu,
                         queued_after);
         } else if (flow_id == 0) {
             pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s owner=%d/%d q=%u\n",
@@ -898,7 +1067,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
-    seq_puts(m, "cpu queued_pkts queued_bytes max_pkts max_bytes enqueued processed drops decrypt_fail owned_flows ewma_ns work_runs schedule_fail busy score\n");
+    seq_puts(m, "cpu queued_pkts queued_bytes max_pkts max_bytes enqueued processed drops decrypt_fail owned_flows ewma_ns work_runs schedule_fail busy score soft_raw_bp soft_ewma_bp blocked\n");
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -910,7 +1079,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     for (i = 0; i < cfg->num_workers; i++) {
         struct mwan_l2_worker *w = &cfg->l2_workers[i];
 
-        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d %llu\n",
+        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d %llu %d %d %d\n",
                    w->cpu,
                    atomic64_read(&w->queued_packets),
                    atomic64_read(&w->queued_bytes),
@@ -925,7 +1094,10 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->work_runs),
                    atomic64_read(&w->schedule_failures),
                    atomic_read(&w->busy),
-                   mwan_l2_worker_score(w));
+                   mwan_l2_worker_score(w),
+                   atomic_read(&w->softirq_raw_bp),
+                   atomic_read(&w->softirq_ewma_bp),
+                   atomic_read(&w->softirq_blocked));
     }
     rcu_read_unlock();
     return 0;
@@ -968,6 +1140,19 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     seq_printf(m, "decrypt_fail=%lld auth_fail=%lld\n",
                atomic64_read(&mwan_l2_rx_diag_decrypt_fail),
                atomic64_read(&mwan_l2_rx_diag_auth_fail));
+    seq_printf(m, "softirq_high=%u softirq_low=%u sample_ms=%u admitted=%lld all_hot_fallback=%lld\n",
+               clamp_t(unsigned int,
+                       READ_ONCE(mwan_l2_softirq_high_pct), 1U, 100U),
+               min_t(unsigned int, READ_ONCE(mwan_l2_softirq_low_pct),
+                     clamp_t(unsigned int,
+                             READ_ONCE(mwan_l2_softirq_high_pct),
+                             1U, 100U) - 1U),
+               clamp_t(unsigned int,
+                       READ_ONCE(mwan_l2_softirq_sample_ms),
+                       MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS,
+                       MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS),
+               atomic64_read(&mwan_l2_new_flow_admitted),
+               atomic64_read(&mwan_l2_all_hot_fallback));
     seq_puts(m, "cpu_flows:");
     cpus_read_lock();
     for_each_online_cpu(cpu)
@@ -1081,6 +1266,12 @@ int mwan_decap_l2_pqc_init(void)
                             &mwan_l2_diag_fops);
     }
     dev_add_pack(&l2_pqc_packet_type);
+    schedule_delayed_work(&mwan_l2_softirq_sample_work,
+                          msecs_to_jiffies(clamp_t(
+                              unsigned int,
+                              READ_ONCE(mwan_l2_softirq_sample_ms),
+                              MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS,
+                              MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS)));
     pr_info("mwan_kmod: registered load-aware L2-PQC handler (0x%04x)\n",
             MWAN_L2_PQC_ETHERTYPE);
     return 0;
@@ -1089,6 +1280,7 @@ int mwan_decap_l2_pqc_init(void)
 void mwan_decap_l2_pqc_cleanup(void)
 {
     dev_remove_pack(&l2_pqc_packet_type);
+    cancel_delayed_work_sync(&mwan_l2_softirq_sample_work);
     debugfs_remove_recursive(mwan_debugfs_dir);
     mwan_debugfs_dir = NULL;
     if (mwan_l2_wq) {
