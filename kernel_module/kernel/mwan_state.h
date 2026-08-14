@@ -56,8 +56,17 @@ struct mwan_per_flow_reorder {
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
-/* One ordered crypto queue per CPU.  A flow bucket is owned by exactly one
- * worker at a time, so packets in that bucket are decrypted serially while
+/* TX ownership is independent from RX ownership. Once a flow bucket has an
+ * owner, load changes never migrate it; a hot CPU is only excluded when a
+ * different, previously unseen bucket is admitted. */
+struct mwan_l2_tx_flow {
+    spinlock_t owner_lock;
+    atomic_t owner_worker;
+    atomic_t pending_crypto;
+};
+
+/* Ordered RX/TX crypto queues per CPU. A flow bucket is owned by exactly one
+ * worker in each direction, so its packets are processed serially while
  * independent buckets can run in parallel on different CPUs. */
 struct mwan_l2_worker {
     struct mwan_config *cfg;
@@ -82,9 +91,30 @@ struct mwan_l2_worker {
     atomic_t scheduled;
     atomic_t busy;
 
+    /* TX has a separate queue, work item and AEAD request. RX and TX may run
+     * concurrently on the same CPU, so sharing an aead_request would race. */
+    struct sk_buff_head tx_queue;
+    struct work_struct tx_work;
+    struct crypto_aead *tx_tfm;
+    struct aead_request *tx_req;
+    atomic64_t tx_queued_packets;
+    atomic64_t tx_queued_bytes;
+    atomic64_t tx_max_queued_packets;
+    atomic64_t tx_max_queued_bytes;
+    atomic64_t tx_enqueued_packets;
+    atomic64_t tx_processed_packets;
+    atomic64_t tx_dropped_packets;
+    atomic64_t tx_encrypt_failures;
+    atomic64_t tx_assigned_flows;
+    atomic64_t tx_processing_ewma_ns;
+    atomic64_t tx_work_runs;
+    atomic64_t tx_schedule_failures;
+    atomic_t tx_scheduled;
+    atomic_t tx_busy;
+
     /* Per-CPU softirq admission signal, sampled from kernel CPU accounting.
      * Values are basis points (10000 == 100%). Only the sampler updates the
-     * previous counters/cooldown; RX admission reads the atomic snapshot. */
+     * previous counters/cooldown; RX and TX admission read the snapshot. */
     u64 softirq_prev_total;
     u64 softirq_prev_time;
     unsigned int softirq_cool_samples;
@@ -128,6 +158,7 @@ struct mwan_config {
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
     struct mwan_per_flow_reorder flow_reorder[MWAN_FLOW_TABLE_SIZE];
+    struct mwan_l2_tx_flow tx_flows[MWAN_FLOW_TABLE_SIZE];
 
     struct timer_list reorder_timer;
     int num_workers;
@@ -153,6 +184,10 @@ u64 mwan_l2_next_tx_seq(u32 flow_idx);
 u64 mwan_l2_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
+int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
+                             int current_owner);
+bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
+void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_diag_reset_all(void);
 void mwan_l2_tx_diag_reset(void);
 u32 mwan_l2_diag_generation_get(void);

@@ -160,6 +160,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
         atomic_set(&new_cfg->flow_reorder[i].owner_worker, -1);
         atomic_set(&new_cfg->flow_reorder[i].pending_crypto, 0);
         new_cfg->flow_reorder[i].last_seen = 0;
+        spin_lock_init(&new_cfg->tx_flows[i].owner_lock);
+        atomic_set(&new_cfg->tx_flows[i].owner_worker, -1);
+        atomic_set(&new_cfg->tx_flows[i].pending_crypto, 0);
     }
 
     /* Phase 0: Resolve Local Network Interface */

@@ -6,7 +6,7 @@
 
 bool mwan_l2_diag_enabled;
 unsigned int mwan_l2_diag_limit = 64;
-unsigned int mwan_l2_softirq_high_pct = 85;
+unsigned int mwan_l2_softirq_high_pct = 91;
 unsigned int mwan_l2_softirq_low_pct = 70;
 unsigned int mwan_l2_softirq_sample_ms = 50;
 static bool mwan_l2_diag_reset_param;

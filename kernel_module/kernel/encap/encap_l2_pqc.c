@@ -6,6 +6,8 @@
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/jhash.h>
+#include <linux/cpu.h>
+#include <linux/ktime.h>
 #include <net/neighbour.h>
 #include <net/tcp.h>
 #include <net/arp.h>
@@ -193,7 +195,7 @@ static inline u32 mwan_calc_flow_id(struct sk_buff *skb,
 
 static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
                                 const struct mwan_tunnel *tun, u32 flow_id,
-                                u32 flow_idx, u64 flow_seq)
+                                u32 flow_idx, u64 flow_seq, int owner_cpu)
 {
     bool first;
     u32 generation;
@@ -206,17 +208,18 @@ static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
     if (unlikely(flow_id == 0)) {
         atomic64_inc(&mwan_l2_tx_diag_zero);
         if (diag->tuple_valid)
-            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x cpu=%u tun=%s\n",
+            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                                 generation, flow_seq, &diag->saddr,
                                 ntohs(diag->sport), &diag->daddr,
                                 ntohs(diag->dport), diag->protocol,
                                 diag->hash_source, diag->hash_before,
-                                raw_smp_processor_id(),
+                                raw_smp_processor_id(), owner_cpu,
                                 tun->dev ? tun->dev->name : "none");
         else
-            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=invalid hs=%s raw=%08x cpu=%u tun=%s\n",
+            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=invalid hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                                 generation, flow_seq, diag->hash_source,
                                 diag->hash_before, raw_smp_processor_id(),
+                                owner_cpu,
                                 tun->dev ? tun->dev->name : "none");
         return;
     }
@@ -225,15 +228,16 @@ static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
         return;
 
     if (diag->tuple_valid) {
-        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x cpu=%u tun=%s\n",
+        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                 generation, flow_id, flow_idx, flow_seq, &diag->saddr,
                 ntohs(diag->sport), &diag->daddr, ntohs(diag->dport),
                 diag->protocol, diag->hash_source, diag->hash_before,
-                raw_smp_processor_id(), tun->dev ? tun->dev->name : "none");
+                raw_smp_processor_id(), owner_cpu,
+                tun->dev ? tun->dev->name : "none");
     } else {
-        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=invalid hs=%s raw=%08x cpu=%u tun=%s\n",
+        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=invalid hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                 generation, flow_id, flow_idx, flow_seq, diag->hash_source,
-                diag->hash_before, raw_smp_processor_id(),
+                diag->hash_before, raw_smp_processor_id(), owner_cpu,
                 tun->dev ? tun->dev->name : "none");
     }
 }
@@ -311,7 +315,47 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
     }
 }
 
-static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
+/* skb->cb is private to the module from NF_STOLEN until the TX worker clears
+ * it. Only metadata moves between CPUs; the packet payload is never copied. */
+struct mwan_l2_tx_cb {
+    u64 flow_seq;
+    u32 flow_id;
+    u32 accounted_bytes;
+    u16 tunnel_idx;
+    u16 magic;
+};
+
+#define MWAN_L2_TX_CB_MAGIC 0x4d54U
+#define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
+
+static unsigned int
+mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
+
+static void mwan_l2_tx_update_max(atomic64_t *maximum, u64 value)
+{
+    s64 old = atomic64_read(maximum);
+
+    while (value > (u64)old) {
+        s64 observed = atomic64_cmpxchg(maximum, old, (s64)value);
+
+        if (observed == old)
+            break;
+        old = observed;
+    }
+}
+
+static void mwan_l2_tx_update_ewma(struct mwan_l2_worker *worker,
+                                   u64 sample_ns)
+{
+    s64 old;
+    s64 next;
+
+    do {
+        old = atomic64_read(&worker->tx_processing_ewma_ns);
+        next = old ? old - (old >> 3) + ((s64)sample_ns >> 3) : sample_ns;
+    } while (atomic64_cmpxchg(&worker->tx_processing_ewma_ns, old, next) !=
+             old);
+}
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
@@ -330,6 +374,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
         while (nskb) {
             next = nskb->next;
             nskb->next = NULL;
+            nskb->prev = NULL;
 
             if (mwan_handle_encap_l2_pqc(nskb, tun) != NF_STOLEN) {
                 kfree_skb(nskb);
@@ -344,91 +389,60 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
     return mwan_handle_encap_l2_pqc_single(skb, tun);
 }
 
-static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
+static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
+                                    struct mwan_l2_worker *worker,
+                                    struct mwan_tunnel *tun, u32 flow_id,
+                                    u64 seq)
 {
-    struct mwan_config *cfg;
     struct net_device *target_dev = tun->dev;
-    struct crypto_aead *tfm;
-    struct aead_request *req;
+    struct aead_request *req = worker->tx_req;
     u8 iv[MWAN_RFC4106_IV_LEN];
     u64 packet_nonce;
     __be32 flow_id_be;
     __be64 seq_be, nonce_be;
-    u64 seq;
     int ip_pkt_len, err;
     bool resolved;
-    struct mwan_l2_tx_diag flow_diag;
 
-    if (unlikely(!target_dev)) {
-        return NF_ACCEPT;
-    }
-
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
-    if (unlikely(!cfg || !cfg->tfm)) {
-        rcu_read_unlock();
-        return NF_ACCEPT;
-    }
-
-    /* Clamp TCP MSS on SYN packets before encryption */
-    mwan_l2_clamp_mss(skb, target_dev);
-
-    tfm = cfg->tfm;
+    if (unlikely(!target_dev || !worker->tx_tfm || !req))
+        return -ENODEV;
     ip_pkt_len = skb->len;
-    if (ip_pkt_len <= 0) {
-        rcu_read_unlock();
-        return NF_ACCEPT;
-    }
+    if (ip_pkt_len <= 0)
+        return -EINVAL;
 
     if (skb_is_nonlinear(skb)) {
-        if (unlikely(skb_linearize(skb))) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (unlikely(skb_linearize(skb)))
+            return -ENOMEM;
     }
     skb_reset_network_header(skb);
 
     // Fast-path MAC resolution: only resolve if MAC is not cached yet or invalid
     if (tun->is_ethernet && unlikely(!tun->mac_resolved)) {
         resolved = mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac);
-        if (unlikely(!resolved)) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (unlikely(!resolved))
+            return -EHOSTUNREACH;
         tun->mac_resolved = true;
     }
 
     /* Only run skb_checksum_help if checksum is partial (locally generated packet).
      * For forwarded packets, original TCP/UDP checksum is already complete. */
     if (skb->ip_summed == CHECKSUM_PARTIAL) {
-        if (skb_checksum_help(skb)) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (skb_checksum_help(skb))
+            return -EINVAL;
     }
 
-    u32 flow_id = mwan_calc_flow_id(skb, &flow_diag);
-    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    seq = mwan_l2_next_tx_seq(flow_idx);
-    mwan_l2_tx_diag_log(&flow_diag, tun, flow_id, flow_idx, seq);
     packet_nonce = mwan_l2_next_packet_nonce();
-    if (unlikely(packet_nonce == 0)) {
-        rcu_read_unlock();
-        return NF_DROP;
-    }
+    if (unlikely(packet_nonce == 0))
+        return -EOVERFLOW;
     nonce_be = cpu_to_be64(packet_nonce);
     memcpy(iv, &nonce_be, sizeof(nonce_be));
 
     // Expand skb headroom/tailroom for Ethernet header + L2-PQC header + tag
-    if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN + MWAN_L2_HDR_LEN)) {
-        rcu_read_unlock();
-        return NF_DROP;
-    }
+    if (skb_cow(skb, LL_RESERVED_SPACE(target_dev) + ETH_HLEN +
+                MWAN_L2_HDR_LEN))
+        return -ENOMEM;
     if (skb_tailroom(skb) < MWAN_GCM_TAG_LEN) {
-        if (pskb_expand_head(skb, 0, MWAN_GCM_TAG_LEN, GFP_ATOMIC)) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (pskb_expand_head(skb, 0, MWAN_GCM_TAG_LEN, GFP_ATOMIC))
+            return -ENOMEM;
     }
 
     // Prepend Ethernet and the 20-byte L2-PQC RFC4106 prefix.
@@ -459,12 +473,6 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
     // Put Tag space at the tail
     skb_put(skb, MWAN_GCM_TAG_LEN);
 
-    req = aead_request_alloc(tfm, GFP_ATOMIC);
-    if (!req) {
-        rcu_read_unlock();
-        return NF_DROP;
-    }
-
     {
         struct scatterlist sg[MAX_SKB_FRAGS + 3];
         int nents;
@@ -475,21 +483,15 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
         sg_set_buf(&sg[0], (u8 *)l2_hdr, MWAN_L2_HDR_LEN);
 
         nents = skb_to_sgvec(skb, &sg[1], ETH_HLEN + MWAN_L2_HDR_LEN, ip_pkt_len + MWAN_GCM_TAG_LEN);
-        if (unlikely(nents < 0)) {
-            aead_request_free(req);
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (unlikely(nents < 0))
+            return nents;
 
         aead_request_set_crypt(req, sg, sg, ip_pkt_len, iv);
         aead_request_set_ad(req, MWAN_L2_HDR_LEN);
 
         err = crypto_aead_encrypt(req);
-        aead_request_free(req);
-        if (err) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+        if (err)
+            return err;
     }
 
     skb->ip_summed = CHECKSUM_NONE;
@@ -507,8 +509,185 @@ static unsigned int mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct 
     skb->dev = target_dev;
     skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
 
+    dev_queue_xmit(skb);
+    return 0;
+}
+
+static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
+                              struct mwan_tunnel *tun, u32 flow_id, u64 seq,
+                              int *owner_cpu)
+{
+    struct mwan_l2_tx_flow *flow;
+    struct mwan_l2_worker *worker;
+    unsigned int accounted_bytes = skb->truesize;
+    long tunnel_idx = tun - cfg->tunnels;
+    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
+    int owner;
+    int new_owner;
+    int was_scheduled;
+
+    if (unlikely(tunnel_idx < 0 || tunnel_idx >= cfg->num_tunnels))
+        return -EINVAL;
+
+    flow = &cfg->tx_flows[flow_idx];
+    spin_lock_bh(&flow->owner_lock);
+    owner = atomic_read(&flow->owner_worker);
+    if (owner < 0 || owner >= cfg->num_workers) {
+        if (unlikely(atomic_read(&flow->pending_crypto) != 0)) {
+            spin_unlock_bh(&flow->owner_lock);
+            return -EBUSY;
+        }
+        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
+    } else if (!cpu_online(cfg->l2_workers[owner].cpu)) {
+        if (atomic_read(&flow->pending_crypto) != 0) {
+            spin_unlock_bh(&flow->owner_lock);
+            return -EBUSY;
+        }
+        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
+    } else {
+        /* Never migrate a live TX flow because of load. A worker at or above
+         * the high watermark is excluded only from future admissions. */
+        new_owner = owner;
+    }
+
+    if (new_owner < 0) {
+        spin_unlock_bh(&flow->owner_lock);
+        return -ENODEV;
+    }
+    if (new_owner != owner) {
+        atomic_set(&flow->owner_worker, new_owner);
+        owner = new_owner;
+    }
+
+    worker = &cfg->l2_workers[owner];
+    if (owner_cpu)
+        *owner_cpu = worker->cpu;
+    spin_lock(&worker->tx_queue.lock);
+    if (worker->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
+        atomic64_read(&worker->tx_queued_bytes) + accounted_bytes >
+            MWAN_L2_QUEUE_MAX_BYTES) {
+        spin_unlock(&worker->tx_queue.lock);
+        atomic64_inc(&worker->tx_dropped_packets);
+        spin_unlock_bh(&flow->owner_lock);
+        return -ENOSPC;
+    }
+
+    BUILD_BUG_ON(sizeof(struct mwan_l2_tx_cb) > sizeof(skb->cb));
+    memset(skb->cb, 0, sizeof(skb->cb));
+    MWAN_L2_TX_CB(skb)->flow_seq = seq;
+    MWAN_L2_TX_CB(skb)->flow_id = flow_id;
+    MWAN_L2_TX_CB(skb)->accounted_bytes = accounted_bytes;
+    MWAN_L2_TX_CB(skb)->tunnel_idx = (u16)tunnel_idx;
+    MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
+    __skb_queue_tail(&worker->tx_queue, skb);
+    atomic64_inc(&worker->tx_queued_packets);
+    atomic64_add(accounted_bytes, &worker->tx_queued_bytes);
+    atomic64_inc(&worker->tx_enqueued_packets);
+    atomic_inc(&flow->pending_crypto);
+    was_scheduled = atomic_cmpxchg(&worker->tx_scheduled, 0, 1);
+    mwan_l2_tx_update_max(&worker->tx_max_queued_packets,
+                          worker->tx_queue.qlen);
+    mwan_l2_tx_update_max(&worker->tx_max_queued_bytes,
+                          atomic64_read(&worker->tx_queued_bytes));
+    spin_unlock(&worker->tx_queue.lock);
+    spin_unlock_bh(&flow->owner_lock);
+
+    if (was_scheduled == 0 && unlikely(!mwan_l2_schedule_tx_worker(worker)))
+        atomic64_inc(&worker->tx_schedule_failures);
+    return 0;
+}
+
+static unsigned int
+mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
+{
+    struct mwan_l2_tx_diag flow_diag;
+    struct mwan_config *cfg;
+    struct net_device *target_dev = tun->dev;
+    u32 flow_id;
+    u32 flow_idx;
+    u64 seq;
+    int owner_cpu = -1;
+    int err;
+
+    if (unlikely(!target_dev))
+        return NF_ACCEPT;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (unlikely(!cfg || !cfg->l2_workers || cfg->num_workers <= 0)) {
+        rcu_read_unlock();
+        return NF_ACCEPT;
+    }
+
+    /* The SYN must be adjusted while the inner packet is still plaintext. */
+    mwan_l2_clamp_mss(skb, target_dev);
+    flow_id = mwan_calc_flow_id(skb, &flow_diag);
+    flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
+    seq = mwan_l2_next_tx_seq(flow_idx);
+    err = mwan_l2_tx_enqueue(cfg, skb, tun, flow_id, seq, &owner_cpu);
+    if (!err)
+        mwan_l2_tx_diag_log(&flow_diag, tun, flow_id, flow_idx, seq,
+                            owner_cpu);
     rcu_read_unlock();
 
-    dev_queue_xmit(skb);
-    return NF_STOLEN;
+    return err ? NF_DROP : NF_STOLEN;
+}
+
+void mwan_l2_tx_worker_fn(struct work_struct *work)
+{
+    struct mwan_l2_worker *worker =
+        container_of(work, struct mwan_l2_worker, tx_work);
+    struct mwan_config *cfg = worker->cfg;
+    struct sk_buff *skb;
+    unsigned int batch = 0;
+
+    atomic64_inc(&worker->tx_work_runs);
+    atomic_set(&worker->tx_busy, 1);
+    for (;;) {
+        while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
+            u32 accounted_bytes = MWAN_L2_TX_CB(skb)->accounted_bytes;
+            u32 flow_id = MWAN_L2_TX_CB(skb)->flow_id;
+            u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
+            u64 flow_seq = MWAN_L2_TX_CB(skb)->flow_seq;
+            u16 tunnel_idx = MWAN_L2_TX_CB(skb)->tunnel_idx;
+            bool cb_ok = MWAN_L2_TX_CB(skb)->magic == MWAN_L2_TX_CB_MAGIC;
+            u64 start_ns = ktime_get_ns();
+            int err;
+
+            atomic64_dec(&worker->tx_queued_packets);
+            atomic64_sub(accounted_bytes, &worker->tx_queued_bytes);
+            memset(skb->cb, 0, sizeof(skb->cb));
+
+            if (unlikely(!cb_ok || tunnel_idx >= cfg->num_tunnels))
+                err = -EINVAL;
+            else
+                err = mwan_l2_encrypt_and_xmit(
+                    skb, worker, &cfg->tunnels[tunnel_idx], flow_id,
+                    flow_seq);
+
+            mwan_l2_tx_update_ewma(worker, ktime_get_ns() - start_ns);
+            atomic64_inc(&worker->tx_processed_packets);
+            if (unlikely(err)) {
+                atomic64_inc(&worker->tx_encrypt_failures);
+                atomic64_inc(&worker->tx_dropped_packets);
+                kfree_skb(skb);
+            }
+            atomic_dec(&cfg->tx_flows[flow_idx].pending_crypto);
+
+            if (++batch == 64) {
+                batch = 0;
+                cond_resched();
+            }
+        }
+
+        spin_lock_bh(&worker->tx_queue.lock);
+        if (!skb_queue_empty(&worker->tx_queue)) {
+            spin_unlock_bh(&worker->tx_queue.lock);
+            continue;
+        }
+        atomic_set(&worker->tx_scheduled, 0);
+        spin_unlock_bh(&worker->tx_queue.lock);
+        break;
+    }
+    atomic_set(&worker->tx_busy, 0);
 }
