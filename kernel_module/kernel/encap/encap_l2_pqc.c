@@ -1,4 +1,5 @@
 #include "../mwan_steer.h"
+#include "../mwan_l2_multicore.h"
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -315,19 +316,6 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
     }
 }
 
-/* skb->cb is private to the module from NF_STOLEN until the TX worker clears
- * it. Only metadata moves between CPUs; the packet payload is never copied. */
-struct mwan_l2_tx_cb {
-    u64 flow_seq;
-    u32 flow_id;
-    u32 accounted_bytes;
-    u16 tunnel_idx;
-    u16 magic;
-};
-
-#define MWAN_L2_TX_CB_MAGIC 0x4d54U
-#define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
-
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
 
@@ -517,47 +505,17 @@ static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
                               struct mwan_tunnel *tun, u32 flow_id, u64 seq,
                               int *owner_cpu)
 {
-    struct mwan_l2_tx_flow *flow;
     struct mwan_l2_worker *worker;
     unsigned int accounted_bytes = skb->truesize;
     long tunnel_idx = tun - cfg->tunnels;
-    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
     int owner;
-    int new_owner;
     int was_scheduled;
 
     if (unlikely(tunnel_idx < 0 || tunnel_idx >= cfg->num_tunnels))
         return -EINVAL;
 
-    flow = &cfg->tx_flows[flow_idx];
-    spin_lock_bh(&flow->owner_lock);
-    owner = atomic_read(&flow->owner_worker);
-    if (owner < 0 || owner >= cfg->num_workers) {
-        if (unlikely(atomic_read(&flow->pending_crypto) != 0)) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
-    } else if (!cpu_online(cfg->l2_workers[owner].cpu)) {
-        if (atomic_read(&flow->pending_crypto) != 0) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
-    } else {
-        /* Never migrate a live TX flow because of load. A worker at or above
-         * the high watermark is excluded only from future admissions. */
-        new_owner = owner;
-    }
-
-    if (new_owner < 0) {
-        spin_unlock_bh(&flow->owner_lock);
-        return -ENODEV;
-    }
-    if (new_owner != owner) {
-        atomic_set(&flow->owner_worker, new_owner);
-        owner = new_owner;
-    }
+    if (mwan_l2_tx_owner_acquire(cfg, flow_id, &owner))
+        return -ENOSPC;
 
     worker = &cfg->l2_workers[owner];
     if (owner_cpu)
@@ -568,7 +526,7 @@ static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
             MWAN_L2_QUEUE_MAX_BYTES) {
         spin_unlock(&worker->tx_queue.lock);
         atomic64_inc(&worker->tx_dropped_packets);
-        spin_unlock_bh(&flow->owner_lock);
+        mwan_l2_flow_owner_complete(cfg, flow_id, true);
         return -ENOSPC;
     }
 
@@ -583,14 +541,12 @@ static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
     atomic64_inc(&worker->tx_queued_packets);
     atomic64_add(accounted_bytes, &worker->tx_queued_bytes);
     atomic64_inc(&worker->tx_enqueued_packets);
-    atomic_inc(&flow->pending_crypto);
     was_scheduled = atomic_cmpxchg(&worker->tx_scheduled, 0, 1);
     mwan_l2_tx_update_max(&worker->tx_max_queued_packets,
                           worker->tx_queue.qlen);
     mwan_l2_tx_update_max(&worker->tx_max_queued_bytes,
                           atomic64_read(&worker->tx_queued_bytes));
     spin_unlock(&worker->tx_queue.lock);
-    spin_unlock_bh(&flow->owner_lock);
 
     if (was_scheduled == 0 && unlikely(!mwan_l2_schedule_tx_worker(worker)))
         atomic64_inc(&worker->tx_schedule_failures);
@@ -647,7 +603,6 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
         while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
             u32 accounted_bytes = MWAN_L2_TX_CB(skb)->accounted_bytes;
             u32 flow_id = MWAN_L2_TX_CB(skb)->flow_id;
-            u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
             u64 flow_seq = MWAN_L2_TX_CB(skb)->flow_seq;
             u16 tunnel_idx = MWAN_L2_TX_CB(skb)->tunnel_idx;
             bool cb_ok = MWAN_L2_TX_CB(skb)->magic == MWAN_L2_TX_CB_MAGIC;
@@ -672,7 +627,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
             }
-            atomic_dec(&cfg->tx_flows[flow_idx].pending_crypto);
+            mwan_l2_flow_owner_complete(cfg, flow_id, true);
 
             if (++batch == 64) {
                 batch = 0;

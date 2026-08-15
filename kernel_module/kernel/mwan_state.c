@@ -1,4 +1,5 @@
 #include "mwan_state.h"
+#include "mwan_l2_multicore.h"
 #include <linux/timer.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
@@ -160,9 +161,24 @@ int mwan_state_update(struct mwan_config *new_cfg)
         atomic_set(&new_cfg->flow_reorder[i].owner_worker, -1);
         atomic_set(&new_cfg->flow_reorder[i].pending_crypto, 0);
         new_cfg->flow_reorder[i].last_seen = 0;
-        spin_lock_init(&new_cfg->tx_flows[i].owner_lock);
-        atomic_set(&new_cfg->tx_flows[i].owner_worker, -1);
-        atomic_set(&new_cfg->tx_flows[i].pending_crypto, 0);
+    }
+    for (i = 0; i < MWAN_L2_OWNER_BUCKETS; i++) {
+        int way;
+
+        spin_lock_init(&new_cfg->rx_owners[i].lock);
+        spin_lock_init(&new_cfg->tx_owners[i].lock);
+        for (way = 0; way < MWAN_L2_OWNER_WAYS; way++) {
+            new_cfg->rx_owners[i].ways[way].flow_id = 0;
+            new_cfg->rx_owners[i].ways[way].owner_worker = -1;
+            atomic_set(&new_cfg->rx_owners[i].ways[way].pending_crypto, 0);
+            new_cfg->rx_owners[i].ways[way].last_seen = 0;
+            new_cfg->rx_owners[i].ways[way].valid = false;
+            new_cfg->tx_owners[i].ways[way].flow_id = 0;
+            new_cfg->tx_owners[i].ways[way].owner_worker = -1;
+            atomic_set(&new_cfg->tx_owners[i].ways[way].pending_crypto, 0);
+            new_cfg->tx_owners[i].ways[way].last_seen = 0;
+            new_cfg->tx_owners[i].ways[way].valid = false;
+        }
     }
 
     /* Phase 0: Resolve Local Network Interface */

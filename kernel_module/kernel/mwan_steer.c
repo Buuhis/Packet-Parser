@@ -1,4 +1,5 @@
 #include "mwan_steer.h"
+#include "mwan_l2_multicore.h"
 #include "mwan_state.h"
 #include "mwan_proto.h"
 
@@ -296,8 +297,15 @@ int mwan_steer_init(void) {
     err = nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
     if (err)
         return err;
+    err = mwan_l2_multicore_init();
+    if (err) {
+        nf_unregister_net_hooks(&init_net, mwan_nf_ops,
+                                ARRAY_SIZE(mwan_nf_ops));
+        return err;
+    }
     err = mwan_decap_l2_pqc_init();
     if (err) {
+        mwan_l2_multicore_cleanup();
         nf_unregister_net_hooks(&init_net, mwan_nf_ops,
                                 ARRAY_SIZE(mwan_nf_ops));
         return err;
@@ -309,4 +317,5 @@ void mwan_steer_cleanup(void) {
     pr_info("mwan_kmod: Unregistering steering hooks\n");
     nf_unregister_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
     mwan_decap_l2_pqc_cleanup();
+    mwan_l2_multicore_cleanup();
 }

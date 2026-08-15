@@ -23,6 +23,9 @@
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
+#define MWAN_L2_OWNER_BUCKETS     512
+#define MWAN_L2_OWNER_WAYS        8
+#define MWAN_L2_FLOW_IDLE_TIMEOUT msecs_to_jiffies(5000)
 
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
@@ -56,13 +59,19 @@ struct mwan_per_flow_reorder {
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
-/* TX ownership is independent from RX ownership. Once a flow bucket has an
- * owner, load changes never migrate it; a hot CPU is only excluded when a
- * different, previously unseen bucket is admitted. */
-struct mwan_l2_tx_flow {
-    spinlock_t owner_lock;
-    atomic_t owner_worker;
+/* Full 32-bit flow IDs use an associative owner table instead of sharing the
+ * 8-bit reorder bucket.  Entries with pending work cannot be reclaimed. */
+struct mwan_l2_flow_owner {
+    u32 flow_id;
+    int owner_worker;
     atomic_t pending_crypto;
+    unsigned long last_seen;
+    bool valid;
+};
+
+struct mwan_l2_owner_bucket {
+    spinlock_t lock;
+    struct mwan_l2_flow_owner ways[MWAN_L2_OWNER_WAYS];
 };
 
 /* Ordered RX/TX crypto queues per CPU. A flow bucket is owned by exactly one
@@ -112,15 +121,24 @@ struct mwan_l2_worker {
     atomic_t tx_scheduled;
     atomic_t tx_busy;
 
-    /* Per-CPU softirq admission signal, sampled from kernel CPU accounting.
-     * Values are basis points (10000 == 100%). Only the sampler updates the
-     * previous counters/cooldown; RX and TX admission read the snapshot. */
-    u64 softirq_prev_total;
-    u64 softirq_prev_time;
-    unsigned int softirq_cool_samples;
+    /* Per-CPU accounting snapshots. Values are basis points (10000 == 100%).
+     * Admission blocks immediately below the idle headroom threshold and
+     * requires consecutive cool samples before reopening the CPU. */
+    u64 cpu_prev_total;
+    u64 cpu_prev_system;
+    u64 cpu_prev_softirq;
+    u64 cpu_prev_irq;
+    u64 cpu_prev_idle;
+    unsigned int cpu_cool_samples;
+    atomic_t system_raw_bp;
+    atomic_t system_ewma_bp;
     atomic_t softirq_raw_bp;
     atomic_t softirq_ewma_bp;
-    atomic_t softirq_blocked;
+    atomic_t irq_raw_bp;
+    atomic_t irq_ewma_bp;
+    atomic_t idle_raw_bp;
+    atomic_t idle_ewma_bp;
+    atomic_t cpu_blocked;
 };
 
 struct mwan_reorder_ring {
@@ -158,7 +176,8 @@ struct mwan_config {
     atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
     
     struct mwan_per_flow_reorder flow_reorder[MWAN_FLOW_TABLE_SIZE];
-    struct mwan_l2_tx_flow tx_flows[MWAN_FLOW_TABLE_SIZE];
+    struct mwan_l2_owner_bucket rx_owners[MWAN_L2_OWNER_BUCKETS];
+    struct mwan_l2_owner_bucket tx_owners[MWAN_L2_OWNER_BUCKETS];
 
     struct timer_list reorder_timer;
     int num_workers;
@@ -171,8 +190,8 @@ struct mwan_config {
 extern struct mwan_config __rcu *g_mwan_cfg;
 extern bool mwan_l2_diag_enabled;
 extern unsigned int mwan_l2_diag_limit;
-extern unsigned int mwan_l2_softirq_high_pct;
-extern unsigned int mwan_l2_softirq_low_pct;
+extern unsigned int mwan_l2_idle_min_pct;
+extern unsigned int mwan_l2_idle_recover_pct;
 extern unsigned int mwan_l2_softirq_sample_ms;
 
 /* API Functions */
@@ -182,12 +201,6 @@ int mwan_state_update(struct mwan_config *new_cfg);
 void mwan_reorder_timeout(struct timer_list *t);
 u64 mwan_l2_next_tx_seq(u32 flow_idx);
 u64 mwan_l2_next_packet_nonce(void);
-int mwan_l2_workers_init(struct mwan_config *cfg);
-void mwan_l2_workers_cleanup(struct mwan_config *cfg);
-int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
-                             int current_owner);
-bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
-void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_diag_reset_all(void);
 void mwan_l2_tx_diag_reset(void);
 u32 mwan_l2_diag_generation_get(void);
