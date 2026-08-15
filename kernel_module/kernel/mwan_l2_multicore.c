@@ -13,6 +13,7 @@
 
 #define MWAN_L2_CPU_BP_MAX              10000U
 #define MWAN_L2_CPU_COOL_SAMPLES            3U
+#define MWAN_L2_IDLE_TIE_BP               300U
 #define MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS       10U
 #define MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS     1000U
 
@@ -163,8 +164,10 @@ static void mwan_l2_cpu_sample_fn(struct work_struct *work)
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg && cfg->l2_workers) {
-        for (i = 0; i < cfg->num_workers; i++)
+        for (i = 0; i < cfg->num_workers; i++) {
             mwan_l2_cpu_update_worker(&cfg->l2_workers[i]);
+            atomic_set(&cfg->l2_workers[i].admissions_in_sample, 0);
+        }
         if (time_after_eq(jiffies, READ_ONCE(mwan_l2_next_owner_gc))) {
             WRITE_ONCE(mwan_l2_next_owner_gc, jiffies + HZ);
             mwan_l2_owner_gc(cfg);
@@ -301,6 +304,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         atomic_set(&worker->idle_raw_bp, MWAN_L2_CPU_BP_MAX);
         atomic_set(&worker->idle_ewma_bp, MWAN_L2_CPU_BP_MAX);
         atomic_set(&worker->cpu_blocked, 0);
+        atomic_set(&worker->admissions_in_sample, 0);
 
         err = mwan_l2_worker_set_keys(worker, cfg);
         if (err) {
@@ -416,15 +420,19 @@ static unsigned int mwan_l2_worker_idle(const struct mwan_l2_worker *worker)
     return min(raw, ewma);
 }
 
-static bool mwan_l2_admission_better(unsigned int idle, u64 queue_bytes,
+static bool mwan_l2_admission_better(unsigned int admissions,
+                                     unsigned int idle, u64 queue_bytes,
                                      u64 queue_packets, u64 assigned,
-                                     int best, unsigned int best_idle,
+                                     int best, unsigned int best_admissions,
+                                     unsigned int best_idle,
                                      u64 best_queue_bytes,
                                      u64 best_queue_packets,
                                      u64 best_assigned)
 {
     if (best < 0)
         return true;
+    if (admissions != best_admissions)
+        return admissions < best_admissions;
     if (idle != best_idle)
         return idle > best_idle;
     if (queue_bytes != best_queue_bytes)
@@ -445,28 +453,29 @@ mwan_l2_owner_bucket(struct mwan_config *cfg, u32 flow_id, bool tx)
     return tx ? &cfg->tx_owners[idx] : &cfg->rx_owners[idx];
 }
 
-/* Select and reserve a CPU while holding the global admission lock. The scan
- * has two phases: an eligible CPU without an active flow always wins; only
- * after every eligible CPU is occupied may a new flow share a worker. */
+/* Select and reserve a CPU while holding the global admission lock. The first
+ * pass identifies the highest-idle empty/shared pools. The second pass admits
+ * within a small idle-equivalence band, where reservations made during the
+ * current accounting sample prevent a burst from herding onto one stale idle
+ * snapshot. An empty CPU in this direction always wins before sharing. */
 static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
                                  int current_owner, bool tx, bool new_flow,
                                  struct mwan_l2_select_diag *diag)
 {
     unsigned int min_idle_pct;
     unsigned int min_idle_bp;
-    unsigned int best_idle = 0;
-    unsigned int shared_idle = 0;
+    unsigned int empty_max_idle = 0;
+    unsigned int shared_max_idle = 0;
+    unsigned int pool_max_idle;
+    unsigned int chosen_admissions = U32_MAX;
+    unsigned int chosen_idle = 0;
     u64 best_queue_bytes = U64_MAX;
     u64 best_queue_packets = U64_MAX;
     u64 best_assigned = U64_MAX;
-    u64 shared_queue_bytes = U64_MAX;
-    u64 shared_queue_packets = U64_MAX;
-    u64 shared_assigned = U64_MAX;
-    int best = -1;
-    int shared = -1;
+    bool have_empty = false;
     int start;
     int offset;
-    int chosen;
+    int chosen = -1;
 
     if (!cfg->l2_workers || cfg->num_workers <= 0)
         return -1;
@@ -477,9 +486,42 @@ static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
     start = jhash_1word(flow_id, 0x9e3779b9) % cfg->num_workers;
 
     spin_lock(&mwan_l2_admission_lock);
+    /* Phase 1: find the best measured idle headroom and whether an eligible
+     * CPU without a flow in this direction still exists. */
     for (offset = 0; offset < cfg->num_workers; offset++) {
         int idx = (start + offset) % cfg->num_workers;
         const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+        unsigned int idle;
+        u64 direction_assigned;
+
+        if (!cpu_online(worker->cpu))
+            continue;
+        idle = mwan_l2_worker_idle(worker);
+        if (atomic_read(&worker->cpu_blocked) || idle < min_idle_bp)
+            continue;
+
+        direction_assigned = tx ?
+            atomic64_read(&worker->tx_assigned_flows) :
+            atomic64_read(&worker->assigned_flows);
+        if (diag)
+            diag->eligible_cpus++;
+
+        shared_max_idle = max(shared_max_idle, idle);
+        if (direction_assigned == 0) {
+            have_empty = true;
+            empty_max_idle = max(empty_max_idle, idle);
+        }
+    }
+
+    pool_max_idle = have_empty ? empty_max_idle : shared_max_idle;
+
+    /* Phase 2: choose inside the appropriate pool. Idle remains the capacity
+     * signal; per-sample reservations only arbitrate CPUs whose measured idle
+     * differs by no more than MWAN_L2_IDLE_TIE_BP. */
+    for (offset = 0; offset < cfg->num_workers; offset++) {
+        int idx = (start + offset) % cfg->num_workers;
+        const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+        unsigned int admissions;
         unsigned int idle;
         u64 queue_bytes;
         u64 queue_packets;
@@ -491,44 +533,36 @@ static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
         idle = mwan_l2_worker_idle(worker);
         if (atomic_read(&worker->cpu_blocked) || idle < min_idle_bp)
             continue;
+        direction_assigned = tx ?
+            atomic64_read(&worker->tx_assigned_flows) :
+            atomic64_read(&worker->assigned_flows);
+        if (have_empty && direction_assigned != 0)
+            continue;
+        if (idle + MWAN_L2_IDLE_TIE_BP < pool_max_idle)
+            continue;
 
+        admissions = (unsigned int)
+            atomic_read(&worker->admissions_in_sample);
         queue_bytes = atomic64_read(&worker->queued_bytes) +
                       atomic64_read(&worker->tx_queued_bytes);
         queue_packets = atomic64_read(&worker->queued_packets) +
                         atomic64_read(&worker->tx_queued_packets);
-        direction_assigned = tx ?
-            atomic64_read(&worker->tx_assigned_flows) :
-            atomic64_read(&worker->assigned_flows);
         assigned = atomic64_read(&worker->assigned_flows) +
                    atomic64_read(&worker->tx_assigned_flows);
-        if (diag)
-            diag->eligible_cpus++;
 
-        if (direction_assigned == 0 &&
-            mwan_l2_admission_better(idle, queue_bytes, queue_packets,
-                                     assigned, best, best_idle,
-                                     best_queue_bytes, best_queue_packets,
-                                     best_assigned)) {
-            best = idx;
-            best_idle = idle;
+        if (mwan_l2_admission_better(
+                admissions, idle, queue_bytes, queue_packets, assigned,
+                chosen, chosen_admissions, chosen_idle, best_queue_bytes,
+                best_queue_packets, best_assigned)) {
+            chosen = idx;
+            chosen_admissions = admissions;
+            chosen_idle = idle;
             best_queue_bytes = queue_bytes;
             best_queue_packets = queue_packets;
             best_assigned = assigned;
         }
-        if (mwan_l2_admission_better(idle, queue_bytes, queue_packets,
-                                     assigned, shared, shared_idle,
-                                     shared_queue_bytes,
-                                     shared_queue_packets,
-                                     shared_assigned)) {
-            shared = idx;
-            shared_idle = idle;
-            shared_queue_bytes = queue_bytes;
-            shared_queue_packets = queue_packets;
-            shared_assigned = assigned;
-        }
     }
 
-    chosen = best >= 0 ? best : shared;
     if (chosen < 0) {
         if (new_flow)
             atomic64_inc(&mwan_l2_rejected_no_headroom);
@@ -549,8 +583,9 @@ static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
             atomic64_inc(&cfg->l2_workers[chosen].assigned_flows);
     }
     if (new_flow) {
+        atomic_inc(&cfg->l2_workers[chosen].admissions_in_sample);
         atomic64_inc(&mwan_l2_new_flow_admitted);
-        if (best >= 0)
+        if (have_empty)
             atomic64_inc(&mwan_l2_spread_first_admitted);
         else
             atomic64_inc(&mwan_l2_shared_core_admitted);
@@ -560,8 +595,10 @@ static int mwan_l2_select_worker(const struct mwan_config *cfg, u32 flow_id,
         const struct mwan_l2_worker *worker = &cfg->l2_workers[chosen];
 
         diag->ran = true;
-        diag->spread_first = best >= 0;
+        diag->spread_first = have_empty;
         diag->chosen_idle_bp = mwan_l2_worker_idle(worker);
+        diag->chosen_admissions =
+            (unsigned int)atomic_read(&worker->admissions_in_sample);
         diag->chosen_queue_bytes =
             atomic64_read(&worker->queued_bytes) +
             atomic64_read(&worker->tx_queued_bytes);
@@ -818,4 +855,3 @@ void mwan_l2_multicore_cleanup(void)
         mwan_l2_tx_wq = NULL;
     }
 }
-

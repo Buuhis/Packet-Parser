@@ -139,6 +139,10 @@ struct mwan_l2_worker {
     atomic_t idle_raw_bp;
     atomic_t idle_ewma_bp;
     atomic_t cpu_blocked;
+    /* New-flow reservations made since the latest CPU accounting sample.
+     * This closes the window where a burst of admissions sees the same stale
+     * idle snapshot and herds onto one CPU. */
+    atomic_t admissions_in_sample;
 };
 
 struct mwan_reorder_ring {

@@ -258,12 +258,13 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
 
         if (select_diag.ran) {
             if (flow_id == 0)
-                pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u idle_bp=%u flows=%llu spread=%u select_q=%llu/%llu owner=%d/%d q=%u\n",
+                pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u idle_bp=%u admissions=%u flows=%llu spread=%u select_q=%llu/%llu owner=%d/%d q=%u\n",
                         generation, diag_cookie, flow_id, flow_seq,
                         packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
                         ingress_cpu, owner_reason,
                         select_diag.eligible_cpus,
                         select_diag.chosen_idle_bp,
+                        select_diag.chosen_admissions,
                         select_diag.chosen_assigned_flows,
                         select_diag.spread_first,
                         select_diag.chosen_queue_packets,
@@ -271,12 +272,13 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
                         owner, worker->cpu,
                         queued_after);
             else
-                pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u idle_bp=%u flows=%llu spread=%u select_q=%llu/%llu owner=%d/%d q=%u\n",
+                pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u idle_bp=%u admissions=%u flows=%llu spread=%u select_q=%llu/%llu owner=%d/%d q=%u\n",
                         generation, diag_cookie, flow_id, flow_seq,
                         packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
                         ingress_cpu, owner_reason,
                         select_diag.eligible_cpus,
                         select_diag.chosen_idle_bp,
+                        select_diag.chosen_admissions,
                         select_diag.chosen_assigned_flows,
                         select_diag.spread_first,
                         select_diag.chosen_queue_packets,
@@ -610,7 +612,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
-    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_encrypt_fail tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp irq_raw_bp irq_ewma_bp idle_raw_bp idle_ewma_bp blocked\n");
+    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_encrypt_fail tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp irq_raw_bp irq_ewma_bp idle_raw_bp idle_ewma_bp blocked admissions_sample\n");
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -651,7 +653,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->tx_work_runs),
                    atomic64_read(&w->tx_schedule_failures),
                    atomic_read(&w->tx_busy));
-        seq_printf(m, "%llu %d %d %d %d %d %d %d %d %d\n",
+        seq_printf(m, "%llu %d %d %d %d %d %d %d %d %d %d\n",
                    mwan_l2_worker_score(w),
                    atomic_read(&w->system_raw_bp),
                    atomic_read(&w->system_ewma_bp),
@@ -661,7 +663,8 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic_read(&w->irq_ewma_bp),
                    atomic_read(&w->idle_raw_bp),
                    atomic_read(&w->idle_ewma_bp),
-                   atomic_read(&w->cpu_blocked));
+                   atomic_read(&w->cpu_blocked),
+                   atomic_read(&w->admissions_in_sample));
     }
     rcu_read_unlock();
     return 0;

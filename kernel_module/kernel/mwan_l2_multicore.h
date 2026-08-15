@@ -46,6 +46,7 @@ struct mwan_l2_select_diag {
     u64 chosen_queue_packets;
     u64 chosen_queue_bytes;
     u64 chosen_assigned_flows;
+    unsigned int chosen_admissions;
     bool spread_first;
     bool ran;
 };
