@@ -5,8 +5,6 @@
 #include <linux/netdevice.h>
 #include <linux/if_arp.h>
 #include <linux/random.h>
-#include <net/neighbour.h>
-#include <net/arp.h>
 #include <linux/err.h>
 #include <net/rtnetlink.h>
 
@@ -33,10 +31,6 @@ static void mwan_config_release_devices(struct mwan_config *cfg)
         }
     }
 
-    if (cfg->local_dev) {
-        dev_put(cfg->local_dev);
-        cfg->local_dev = NULL;
-    }
 }
 
 /* Destroy only a config that has been published. The caller must first wait
@@ -165,17 +159,6 @@ int mwan_state_update(struct mwan_config *new_cfg)
         atomic_set(&new_cfg->tx_flows[i].pending_crypto, 0);
     }
 
-    /* Phase 0: Resolve Local Network Interface */
-    if (new_cfg->local_ifindex > 0) {
-        new_cfg->local_dev = dev_get_by_index(&init_net, new_cfg->local_ifindex);
-        if (!new_cfg->local_dev) {
-            pr_err("mwan_kmod: Local ifindex %u does not exist\n",
-                   new_cfg->local_ifindex);
-            err = -ENODEV;
-            goto err_release_devices;
-        }
-    }
-
     /* Phase 1: Pre-calculate and cache expensive data before publishing */
     new_cfg->total_weight = 0;
     for (i = 0; i < new_cfg->num_tunnels; i++) {
@@ -254,29 +237,6 @@ int mwan_state_update(struct mwan_config *new_cfg)
                         tun->dev->name, tun->ifindex, encap_str);
             }
             
-            /* Attempt to resolve MAC if it's an ethernet device */
-            if (tun->is_ethernet && tun->gateway) {
-                struct neighbour *n;
-                n = neigh_lookup(&arp_tbl, &tun->gateway, tun->dev);
-                if (!n) {
-                    /* Chủ động tạo ô trống nếu Linux lỡ quên */
-                    n = neigh_create(&arp_tbl, &tun->gateway, tun->dev);
-                }
-                
-                if (n && !IS_ERR(n)) {
-                    if (n->nud_state & NUD_VALID) {
-                        read_lock_bh(&n->lock);
-                        memcpy(tun->gateway_mac, n->ha, 6);
-                        read_unlock_bh(&n->lock);
-                        tun->mac_resolved = true;
-                    } else {
-                        /* POKE Kernel: Bắn Ping Mồi ARP ngay lập tức để lấy MAC về cho Hot-path */
-                        neigh_event_send(n, NULL);
-                        tun->mac_resolved = false;
-                    }
-                    neigh_release(n);
-                }
-            }
         }
     }
 
@@ -299,8 +259,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
                 new_cfg->num_tunnels, new_cfg->total_weight);
         for (i = 0; i < new_cfg->num_tunnels; i++) {
             struct mwan_tunnel *t = &new_cfg->tunnels[i];
-            pr_info("  [Tunnel %d] name: %s, ifindex: %u, weight: %u, mac_resolved: %d, dev_ptr: %px\n",
-                    i, t->dev ? t->dev->name : "NULL", t->ifindex, t->weight, t->mac_resolved, t->dev);
+            pr_info("  [Tunnel %d] name: %s, ifindex: %u, weight: %u, dev_ptr: %px\n",
+                    i, t->dev ? t->dev->name : "NULL", t->ifindex,
+                    t->weight, t->dev);
         }
     }
     /* Phase 1.75: Initialize Crypto Engine if encryption is enabled */

@@ -35,12 +35,9 @@ enum mwan_encap_type {
 struct mwan_tunnel {
     u32 ifindex;
     u32 weight;
-    __be32 gateway;
 
     /* Caching fields for performance */
     struct net_device *dev;
-    unsigned char gateway_mac[6];
-    bool mac_resolved;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
 };
@@ -140,12 +137,6 @@ struct mwan_config {
     u8  tunnel_idx_lut[MWAN_LUT_SIZE];
     
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
-
-    /* Local network for Inbound Steering */
-    __be32 local_ip;
-    __be32 local_mask;
-    u32 local_ifindex;
-    struct net_device *local_dev;
 
     /* Encryption (AES-GCM) */
     bool encrypt_on;

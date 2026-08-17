@@ -3,8 +3,6 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
-#include <net/neighbour.h>
-#include <net/arp.h>
 
 unsigned int mwan_handle_encap_none(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
@@ -15,10 +13,6 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb, struct mwan_tunnel *tun
     }
 
     if (tun->is_ethernet) {
-        if (unlikely(!mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac))) {
-            return NF_DROP;
-        }
-
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
             if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
                 return NF_ACCEPT; 
@@ -34,7 +28,7 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb, struct mwan_tunnel *tun
             else
                 eth_zero_addr(eth->h_source);
             
-            ether_addr_copy(eth->h_dest, tun->gateway_mac);
+            ether_addr_copy(eth->h_dest, target_dev->broadcast);
             eth->h_proto = htons(ETH_P_IP);
         }
     } else {

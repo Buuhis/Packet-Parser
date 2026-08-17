@@ -4,25 +4,26 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <net/if.h>
 
-#define MAX_WANS           8
 #define MAX_SDWAN_TUNS     8
 #define MAX_ENCRYPT_KEY_LEN  32  /* AES-256 = 32 bytes */
 #define MAX_ENCRYPT_SALT_LEN  4  /* 4 bytes static salt */
+#define MAX_TUNNEL_IP_LEN   51
+#define MAX_MONITOR_IP_LEN  46
 
 typedef struct {
-    char name[16];
-    char ifname[16];
-    char gateway[32];
+    char tunnel_ifname[IFNAMSIZ];
+    char physical_ifname[IFNAMSIZ];
+    char tunnel_ip[MAX_TUNNEL_IP_LEN];
+    int  segment_id;
     int  weight;
-    unsigned char dst_mac[6];
-} wan_cfg_t;
-
-typedef struct {
-    char ifname[16];
-    char gateway[32];
-    int  port;
-    int  weight;
+    char latency_ip[MAX_MONITOR_IP_LEN];
+    int  latency;
+    bool latency_enabled;
+    char loss_ip[MAX_MONITOR_IP_LEN];
+    int  loss_percentage;
+    bool loss_enabled;
 } sdwan_tun_cfg_t;
 
 typedef struct {
@@ -37,15 +38,14 @@ typedef struct {
 typedef struct {
     int  node_id;
 
-    char local_if[16];
-    unsigned int local_ip;   /* Network byte order */
-    unsigned int local_mask; /* Network byte order */
-
-    size_t wan_count;
-    wan_cfg_t wans[MAX_WANS];
-
     size_t sdwan_tun_count;
     sdwan_tun_cfg_t sdwan_tuns[MAX_SDWAN_TUNS];
+
+    bool weight_enabled;
+    bool latency_enabled;
+    bool loss_enabled;
+    int latency_duration;
+    int loss_duration;
 
     encrypt_cfg_t encrypt;
 
@@ -58,4 +58,3 @@ typedef struct {
 void app_context_dump(const app_context_t *ctx);
 
 #endif
-

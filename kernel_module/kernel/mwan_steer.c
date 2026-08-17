@@ -10,59 +10,12 @@
 #include <linux/netdevice.h>
 #include <linux/jhash.h>
 #include <linux/if_ether.h>
-#include <linux/etherdevice.h>
-
 #include <net/net_namespace.h>
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/ip.h>
-#include <net/neighbour.h>
-#include <net/arp.h>
-#include <linux/inetdevice.h>
 
 extern struct net init_net;
-
-bool mwan_resolve_gateway_mac(struct mwan_tunnel *tun, struct net_device *dev, u8 *mac_out)
-{
-    struct neighbour *n;
-    bool resolved = false;
-    struct in_device *in_dev;
-
-    /* Enforce rp_filter = 0 dynamically */
-    rcu_read_lock();
-    in_dev = __in_dev_get_rcu(dev);
-    if (in_dev && in_dev->cnf.data[IPV4_DEVCONF_RP_FILTER - 1] != 0) {
-        in_dev->cnf.data[IPV4_DEVCONF_RP_FILTER - 1] = 0;
-    }
-    rcu_read_unlock();
-
-    /* Look up gateway MAC locklessly in kernel's neighbour table */
-    n = __ipv4_neigh_lookup_noref(dev, tun->gateway);
-    if (n) {
-        if (n->nud_state & NUD_VALID) {
-            read_lock_bh(&n->lock);
-            ether_addr_copy(mac_out, n->ha);
-            read_unlock_bh(&n->lock);
-            resolved = true;
-        } else {
-            neigh_event_send(n, NULL);
-        }
-    } else {
-        n = neigh_create(&arp_tbl, &tun->gateway, dev);
-        if (n && !IS_ERR(n)) {
-            neigh_event_send(n, NULL);
-            neigh_release(n);
-        }
-    }
-
-    /* Fallback: If neighbour state is pending/invalid but we already have a cached non-zero MAC, use it! */
-    if (!resolved && !is_zero_ether_addr(tun->gateway_mac)) {
-        ether_addr_copy(mac_out, tun->gateway_mac);
-        resolved = true;
-    }
-
-    return resolved;
-}
 
 static struct mwan_tunnel *find_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 {
@@ -165,10 +118,6 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
         
-        // pr_info_ratelimited("mwan_kmod: steer packet to %pI4 - hash: 0x%x, lut_idx: %d, tunnel: %s, mac_resolved: %d, dev_ptr: %px\n",
-        //                     &iph->daddr, hash, hash & (MWAN_LUT_SIZE - 1), 
-        //                     tun->dev ? tun->dev->name : "NULL", tun->mac_resolved, tun->dev);
-
         unsigned int ret = NF_ACCEPT;
         
         switch (tun->encap_type) {

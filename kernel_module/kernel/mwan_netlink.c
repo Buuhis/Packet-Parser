@@ -10,9 +10,6 @@
 static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NODE_ID]   = { .type = NLA_U32 },
     [MWAN_ATTR_TUNNELS]   = { .type = NLA_NESTED },
-    [MWAN_ATTR_LOCAL_IP]   = { .type = NLA_U32 },
-    [MWAN_ATTR_LOCAL_MASK] = { .type = NLA_U32 },
-    [MWAN_ATTR_LOCAL_IFINDEX] = { .type = NLA_U32 },
     [MWAN_ATTR_ENCRYPT_ON]   = { .type = NLA_U8 },
     [MWAN_ATTR_ENCRYPT_TYPE] = { .type = NLA_U8 },
     [MWAN_ATTR_ENCRYPT_KEY]  = { .type = NLA_BINARY, .len = MWAN_MAX_KEY_LEN },
@@ -23,7 +20,6 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
     [MWAN_TUN_IFINDEX] = { .type = NLA_U32 },
     [MWAN_TUN_WEIGHT]  = { .type = NLA_U32 },
-    [MWAN_TUN_GATEWAY] = { .type = NLA_U32 },
 };
 
 /* Callback to handle SET_CONFIG message */
@@ -45,13 +41,6 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
 
     new_cfg->node_id   = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
     new_cfg->num_tunnels = 0;
-
-    if (info->attrs[MWAN_ATTR_LOCAL_IP])
-        new_cfg->local_ip = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_IP]);
-    if (info->attrs[MWAN_ATTR_LOCAL_MASK])
-        new_cfg->local_mask = (__force __be32)nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_MASK]);
-    if (info->attrs[MWAN_ATTR_LOCAL_IFINDEX])
-        new_cfg->local_ifindex = nla_get_u32(info->attrs[MWAN_ATTR_LOCAL_IFINDEX]);
 
     nla_tunnels = info->attrs[MWAN_ATTR_TUNNELS];
     if (nla_tunnels) {
@@ -77,10 +66,6 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 nla_get_u32(tb[MWAN_TUN_IFINDEX]);
             new_cfg->tunnels[new_cfg->num_tunnels].weight =
                 nla_get_u32(tb[MWAN_TUN_WEIGHT]);
-
-            if (tb[MWAN_TUN_GATEWAY])
-                new_cfg->tunnels[new_cfg->num_tunnels].gateway =
-                    (__force __be32)nla_get_u32(tb[MWAN_TUN_GATEWAY]);
 
             new_cfg->num_tunnels++;
         }

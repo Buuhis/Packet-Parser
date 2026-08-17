@@ -85,6 +85,7 @@ typedef struct {
     uint8_t key_ids[KEY_SLOT_COUNT];
     bool key_slots_valid[KEY_SLOT_COUNT];
 
+    char local_ip[64];
     char peer_ip[64];
     char local_fingerprint[16];
     char peer_fingerprint[16];
@@ -170,8 +171,9 @@ typedef enum {
 
 bool sig_pqc_has_identity(const char *fingerprint);
 void sig_pqc_bind_profile(int profile_id, int role_mode,
-                          const char *peer_ip, const char *local_fg,
-                          const char *peer_fg, const char *wan_ifname,
+                          const char *local_ip, const char *peer_ip,
+                          const char *local_fg, const char *peer_fg,
+                          const char *wan_ifname,
                           const char *local_priv, const char *local_pub,
                           const char *peer_pub);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);

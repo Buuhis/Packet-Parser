@@ -7,9 +7,7 @@
 #include <linux/tcp.h>
 #include <linux/scatterlist.h>
 #include <crypto/aead.h>
-#include <net/neighbour.h>
 #include <net/tcp.h>
-#include <net/arp.h>
 #include <net/dst.h>
 #include <linux/version.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
@@ -236,10 +234,6 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
 
     /* Handle L2 injection */
     if (tun->is_ethernet) {
-        if (unlikely(!mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac))) {
-            return NF_DROP;
-        }
-
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
             if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) return NF_ACCEPT;
         }
@@ -250,7 +244,7 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
             struct ethhdr *eth = eth_hdr(skb);
             if (target_dev->dev_addr) ether_addr_copy(eth->h_source, target_dev->dev_addr);
             else eth_zero_addr(eth->h_source);
-            ether_addr_copy(eth->h_dest, tun->gateway_mac);
+            ether_addr_copy(eth->h_dest, target_dev->broadcast);
             eth->h_proto = htons(ETH_P_IP);
         }
     } else {

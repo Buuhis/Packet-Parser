@@ -401,10 +401,11 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
     __be32 flow_id_be;
     __be64 seq_be, nonce_be;
     int ip_pkt_len, err;
-    bool resolved;
 
     if (unlikely(!target_dev || !worker->tx_tfm || !req))
         return -ENODEV;
+    if (unlikely(!tun->is_ethernet))
+        return -EAFNOSUPPORT;
     ip_pkt_len = skb->len;
     if (ip_pkt_len <= 0)
         return -EINVAL;
@@ -414,14 +415,6 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
             return -ENOMEM;
     }
     skb_reset_network_header(skb);
-
-    // Fast-path MAC resolution: only resolve if MAC is not cached yet or invalid
-    if (tun->is_ethernet && unlikely(!tun->mac_resolved)) {
-        resolved = mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac);
-        if (unlikely(!resolved))
-            return -EHOSTUNREACH;
-        tun->mac_resolved = true;
-    }
 
     /* Only run skb_checksum_help if checksum is partial (locally generated packet).
      * For forwarded packets, original TCP/UDP checksum is already complete. */
@@ -456,10 +449,11 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
     else
         eth_zero_addr(eth->h_source);
     
-    if (tun->is_ethernet)
-        ether_addr_copy(eth->h_dest, tun->gateway_mac);
-    else
-        eth_zero_addr(eth->h_dest);
+    /* Data tunnels are point-to-point.  Use the Ethernet broadcast address
+     * for the inner frame so L2-PQC does not depend on an overlay gateway IP
+     * or ARP entry.  The provisioned tunnel still selects the single remote
+     * endpoint for its outer transport. */
+    ether_addr_copy(eth->h_dest, target_dev->broadcast);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
     // Write authenticated L2-PQC header (flow ID, reorder sequence, unique nonce)

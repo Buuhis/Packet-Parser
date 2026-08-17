@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 1
+#define MWAN_GENL_VERSION 2
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
@@ -54,9 +54,6 @@ enum mwan_genl_attrs {
     MWAN_ATTR_UNSPEC = 0,
     MWAN_ATTR_NODE_ID,    /* u32 */
     MWAN_ATTR_TUNNELS,    /* Nested array of tunnels */
-    MWAN_ATTR_LOCAL_IP,   /* u32 (network byte order) */
-    MWAN_ATTR_LOCAL_MASK, /* u32 (network byte order) */
-    MWAN_ATTR_LOCAL_IFINDEX, /* u32 */
     MWAN_ATTR_ENCRYPT_ON,    /* u8: 0=off, 1=on */
     MWAN_ATTR_ENCRYPT_TYPE,  /* u8: enum mwan_crypt_type */
     MWAN_ATTR_ENCRYPT_KEY,   /* NLA_BINARY: raw key bytes (16 or 32) */
@@ -71,7 +68,6 @@ enum mwan_tun_attrs {
     MWAN_TUN_UNSPEC = 0,
     MWAN_TUN_IFINDEX,     /* u32 */
     MWAN_TUN_WEIGHT,      /* u32 */
-    MWAN_TUN_GATEWAY,     /* u32 (network byte order) */
     __MWAN_TUN_MAX,
 };
 #define MWAN_TUN_MAX (__MWAN_TUN_MAX - 1)

@@ -201,50 +201,6 @@ static int count_queues(const char *ifname, const char *prefix)
     return count;
 }
 
-/* Detect the underlying physical NIC of a virtual (e.g. VXLAN) interface.
- * Scans /sys/class/net/<virt_ifname>/ for symlinks starting with lower_ (e.g. lower_enp4s0).
- * Falls back to ifindex vs iflink comparison if no lower_ symlink is found. */
-static int get_lower_ifname(const char *virt_ifname, char *lower_name, size_t len)
-{
-    char dirpath[256];
-    snprintf(dirpath, sizeof(dirpath), "/sys/class/net/%s", virt_ifname);
-    DIR *d = opendir(dirpath);
-    if (d) {
-        struct dirent *ent;
-        while ((ent = readdir(d)) != NULL) {
-            if (strncmp(ent->d_name, "lower_", 6) == 0) {
-                const char *phys_name = ent->d_name + 6;
-                if (strlen(phys_name) > 0 && strlen(phys_name) < len) {
-                    snprintf(lower_name, len, "%s", phys_name);
-                    closedir(d);
-                    return 0;
-                }
-            }
-        }
-        closedir(d);
-    }
-
-    /* Fallback: Compares ifindex vs iflink */
-    char path[256], buf[32];
-    int own_idx, link_idx;
-
-    snprintf(path, sizeof(path), "/sys/class/net/%s/ifindex", virt_ifname);
-    if (read_sysfs(path, buf, sizeof(buf)) < 0) return -1;
-    own_idx = atoi(buf);
-
-    snprintf(path, sizeof(path), "/sys/class/net/%s/iflink", virt_ifname);
-    if (read_sysfs(path, buf, sizeof(buf)) < 0) return -1;
-    link_idx = atoi(buf);
-
-    if (own_idx == link_idx || link_idx == 0) return -1;
-
-    char temp[IF_NAMESIZE];
-    if (if_indextoname((unsigned)link_idx, temp) == NULL) return -1;
-
-    snprintf(lower_name, len, "%s", temp);
-    return 0;
-}
-
 static bool is_irqbalance_active(void)
 {
     int ret = system("systemctl is-active --quiet irqbalance 2>/dev/null");
@@ -561,33 +517,28 @@ int cpu_tune_apply(const app_context_t *ctx)
     write_sysfs("/proc/sys/net/core/netdev_budget", "600");
     log_info("  [+] Global: rfs=32768, backlog=10000, budget=600");
 
-    /* 2. Local interface — physical NIC (e.g. enp6s0) */
-    log_info("  [Local NIC: %s]", ctx->cfg.local_if);
-    tune_physical_nic(ctx->cfg.local_if, worker_ids, num_workers);
-
-    /* 3. Tunnel interfaces + auto-detect underlying physical NICs */
+    /* 2. Tune each logical tunnel and its BE-associated physical WAN NIC. */
     char tuned_nics[MAX_SDWAN_TUNS][IF_NAMESIZE];
     int  tuned_nic_count = 0;
 
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
-        const char *tun = ctx->cfg.sdwan_tuns[i].ifname;
+        const char *tun = ctx->cfg.sdwan_tuns[i].tunnel_ifname;
+        const char *physical = ctx->cfg.sdwan_tuns[i].physical_ifname;
         log_info("  [Tunnel: %s]", tun);
         tusdwan_tun(tun, worker_ids, num_workers);
 
-        /* Auto-detect and tune the physical NIC underneath the VXLAN */
-        char lower[IF_NAMESIZE] = {0};
-        if (get_lower_ifname(tun, lower, sizeof(lower)) == 0) {
-            /* Avoid tuning the same physical NIC twice */
-            bool already = false;
-            for (int j = 0; j < tuned_nic_count; j++) {
-                if (strcmp(tuned_nics[j], lower) == 0) { already = true; break; }
+        bool already = false;
+        for (int j = 0; j < tuned_nic_count; j++) {
+            if (strcmp(tuned_nics[j], physical) == 0) {
+                already = true;
+                break;
             }
-            /* Also skip if it's the same as local_if (already tuned above) */
-            if (!already && strcmp(lower, ctx->cfg.local_if) != 0) {
-                log_info("  [Physical WAN: %s (under %s)]", lower, tun);
-                tune_physical_nic(lower, worker_ids, num_workers);
-                snprintf(tuned_nics[tuned_nic_count++], sizeof(tuned_nics[0]), "%s", lower);
-            }
+        }
+        if (!already) {
+            log_info("  [Physical WAN: %s (for %s)]", physical, tun);
+            tune_physical_nic(physical, worker_ids, num_workers);
+            snprintf(tuned_nics[tuned_nic_count++],
+                     sizeof(tuned_nics[0]), "%s", physical);
         }
     }
 

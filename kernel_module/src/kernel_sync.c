@@ -7,7 +7,6 @@
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
-#include <arpa/inet.h>
 #include "../kernel/mwan_proto.h"
 
 
@@ -46,34 +45,25 @@ int kernel_sync_push_config(const app_context_t *ctx) {
 
     nla_put_u32(msg, MWAN_ATTR_NODE_ID, ctx->cfg.node_id);
     
-    /* Sync Local Network for Inbound Steering */
-    if (ctx->cfg.local_ip > 0) {
-        unsigned int local_idx = if_nametoindex(ctx->cfg.local_if);
-        log_info("  [+] Sync Local Net: interface=%s (idx: %u)", ctx->cfg.local_if, local_idx);
-        nla_put_u32(msg, MWAN_ATTR_LOCAL_IP, ctx->cfg.local_ip);
-        nla_put_u32(msg, MWAN_ATTR_LOCAL_MASK, ctx->cfg.local_mask);
-        nla_put_u32(msg, MWAN_ATTR_LOCAL_IFINDEX, local_idx);
-    }
-
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
         const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
-        unsigned int idx = if_nametoindex(tun->ifname);
-        if (idx == 0) continue;
+        unsigned int idx = if_nametoindex(tun->tunnel_ifname);
+        if (idx == 0) {
+            log_error("Tunnel interface '%s' does not exist",
+                      tun->tunnel_ifname);
+            goto out;
+        }
 
         struct nlattr *tun_node = nla_nest_start(msg, i + 1);
         nla_put_u32(msg, MWAN_TUN_IFINDEX, idx);
         nla_put_u32(msg, MWAN_TUN_WEIGHT, tun->weight);
-        
-        struct in_addr gw_addr;
-        if (inet_aton(tun->gateway, &gw_addr)) {
-            nla_put_u32(msg, MWAN_TUN_GATEWAY, gw_addr.s_addr);
-        }
 
         nla_nest_end(msg, tun_node);
         
-        log_info("  [+] Sync Tunnel: %s (idx: %u, weight: %d, gw: %s)", 
-                 tun->ifname, idx, tun->weight, tun->gateway);
+        log_info("  [+] Sync Tunnel: %s (idx: %u, physical: %s, weight: %d)",
+                 tun->tunnel_ifname, idx, tun->physical_ifname,
+                 tun->weight);
     }
     nla_nest_end(msg, tunnels);
 
@@ -105,6 +95,7 @@ int kernel_sync_push_config(const app_context_t *ctx) {
         ret = 0;
     }
 
+out:
     nlmsg_free(msg);
     nl_socket_free(sock);
     return ret;

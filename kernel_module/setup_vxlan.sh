@@ -6,7 +6,7 @@
 PATH1_IP_A="100.64.1.2"
 PATH1_IP_B="100.64.2.2"
 VX1_DEV="enp8s0"
-VX1_NAME="ne_tunnel1"
+VX1_NAME="sdwan_tun1"
 VX1_ID=1234
 VX1_PORT=65001
 
@@ -14,7 +14,7 @@ VX1_PORT=65001
 PATH2_IP_A="100.64.11.2"
 PATH2_IP_B="100.64.22.2"
 VX2_DEV="enp9s0"
-VX2_NAME="ne_tunnel2"
+VX2_NAME="sdwan_tun2"
 VX2_ID=1235
 VX2_PORT=65002
 
@@ -111,7 +111,7 @@ start_macsec() {
     bridge fdb append to 00:00:00:00:00:00 dst "$VX1_REMOTE" dev l2tun1
     ip link set l2tun1 up
 
-    # Configure MACsec (ne_tunnel1) on top of l2tun1
+    # Configure MACsec (sdwan_tun1) on top of l2tun1
     ip link add link l2tun1 name "$VX1_NAME" type macsec port 1 encrypt on replay on window 64 cipher gcm-aes-128
     ip macsec add "$VX1_NAME" tx sa 0 pn 1 on key "$MS1_CKN" "$MS1_CAK"
     ip macsec add "$VX1_NAME" rx port 1 address "$VX1_PEER_MAC"
@@ -127,7 +127,7 @@ start_macsec() {
     bridge fdb append to 00:00:00:00:00:00 dst "$VX2_REMOTE" dev l2tun2
     ip link set l2tun2 up
 
-    # Configure MACsec (ne_tunnel2) on top of l2tun2
+    # Configure MACsec (sdwan_tun2) on top of l2tun2
     ip link add link l2tun2 name "$VX2_NAME" type macsec port 2 encrypt on replay on window 64 cipher gcm-aes-128
     ip macsec add "$VX2_NAME" tx sa 0 pn 1 on key "$MS2_CKN" "$MS2_CAK"
     ip macsec add "$VX2_NAME" rx port 2 address "$VX2_PEER_MAC"
@@ -149,8 +149,8 @@ start_macsec() {
 stop_vxlan() {
     log "Tearing down network configuration..."
     
-    [ -d "/sys/class/net/ne_tunnel1" ] && ip link del ne_tunnel1 && log "Deleted ne_tunnel1"
-    [ -d "/sys/class/net/ne_tunnel2" ] && ip link del ne_tunnel2 && log "Deleted ne_tunnel2"
+    [ -d "/sys/class/net/sdwan_tun1" ] && ip link del sdwan_tun1 && log "Deleted sdwan_tun1"
+    [ -d "/sys/class/net/sdwan_tun2" ] && ip link del sdwan_tun2 && log "Deleted sdwan_tun2"
     [ -d "/sys/class/net/l2tun1" ] && ip link del l2tun1 && log "Deleted l2tun1"
     [ -d "/sys/class/net/l2tun2" ] && ip link del l2tun2 && log "Deleted l2tun2"
 }
@@ -170,10 +170,10 @@ case "$1" in
     *)
         echo "Usage: $0 {start|stop|macsec-on|macsec-off|restart}"
         echo "----------------------------------------------------------------"
-        echo "  start      : Set up raw VXLAN tunnels (active devs: ne_tunnel1/2)"
+        echo "  start      : Set up raw VXLAN tunnels (active devs: sdwan_tun1/2)"
         echo "  stop       : Delete all VXLAN and MACsec interfaces"
-        echo "  macsec-on  : Enable MACsec (active devs: ne_tunnel1/2 stacked on l2tun1/2)"
-        echo "  macsec-off : Disable MACsec (reverts active devs to raw ne_tunnel1/2)"
+        echo "  macsec-on  : Enable MACsec (active devs: sdwan_tun1/2 stacked on l2tun1/2)"
+        echo "  macsec-off : Disable MACsec (reverts active devs to raw sdwan_tun1/2)"
         exit 1
         ;;
 esac

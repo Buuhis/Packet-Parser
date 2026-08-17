@@ -20,9 +20,9 @@
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <net/if.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
@@ -71,28 +71,30 @@ static void clear_node_id(void) {
     }
 }
 
-/* ---------- utilities ---------- */
-static int resolve_local_network(app_config_t *cfg) {
-    struct ifaddrs *ifaddr, *ifa;
-    int found = 0;
+/* Accept either a plain IPv4 address or an IPv4 CIDR string from the BE. */
+static int normalize_ipv4(const char *input, char *output, size_t output_len,
+                          uint32_t *host_order)
+{
+    char address[INET_ADDRSTRLEN];
+    const char *slash;
+    size_t len;
+    struct in_addr parsed;
 
-    if (getifaddrs(&ifaddr) == -1) return -1;
+    if (!input || !*input || !output || output_len == 0 || !host_order)
+        return -1;
+    slash = strchr(input, '/');
+    len = slash ? (size_t)(slash - input) : strlen(input);
+    if (len == 0 || len >= sizeof(address) || len >= output_len)
+        return -1;
 
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_INET)
-            continue;
+    memcpy(address, input, len);
+    address[len] = '\0';
+    if (inet_pton(AF_INET, address, &parsed) != 1)
+        return -1;
 
-        if (strcmp(ifa->ifa_name, cfg->local_if) == 0) {
-            cfg->local_ip = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
-            cfg->local_mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr;
-            cfg->local_ip &= cfg->local_mask; // Get network address
-            found = 1;
-            break;
-        }
-    }
-
-    freeifaddrs(ifaddr);
-    return found ? 0 : -1;
+    memcpy(output, address, len + 1);
+    *host_order = ntohl(parsed.s_addr);
+    return 0;
 }
 
 /* ---------- signal handler ---------- */
@@ -101,7 +103,6 @@ static void handle_signal(int sig) {
     running_server = 0;
     cpu_tune_restore();
     kernel_sync_cleanup();
-    db_client_stop_heartbeat();
     trf_pqc_cleanup();
     if (unix_server_fd >= 0) {
         close(unix_server_fd);
@@ -131,14 +132,47 @@ void pqc_bind_node(int node_id) {
     sig_pqc_init_vault();
     sig_pqc_load_key_from_vault(local_key_name);
 
-    // Resolve WAN info from the active tunnels configured in running_ctx
-    char peer_ip[64] = "0.0.0.0";
-    const char *wan_ifname = "";
-    if (running_ctx.cfg.sdwan_tun_count > 0) {
-        peer_ip[0] = '\0';
-        strncpy(peer_ip, running_ctx.cfg.sdwan_tuns[0].gateway, sizeof(peer_ip) - 1);
-        wan_ifname = running_ctx.cfg.sdwan_tuns[0].ifname;
+    // Resolve WAN / PQC Exchange Tunnel info
+    char local_ip[INET_ADDRSTRLEN] = "";
+    char peer_ip[INET_ADDRSTRLEN] = "";
+    char hs_tun_name[64] = "";
+    char hs_tun_ip[64] = "";
+    char hs_peer_tun_ip[64] = "";
+    uint32_t local_ip_num;
+    uint32_t peer_ip_num;
+    int role_mode;
+
+    if (db_client_load_pqc_exchange_tunnel(
+            node_id, hs_tun_name, sizeof(hs_tun_name), hs_tun_ip,
+            sizeof(hs_tun_ip), hs_peer_tun_ip,
+            sizeof(hs_peer_tun_ip)) != 0) {
+        log_error("[PQC-TUNNEL] Missing PQC exchange tunnel for profile %d",
+                  node_id);
+        return;
     }
+    if (strlen(hs_tun_name) >= IFNAMSIZ || if_nametoindex(hs_tun_name) == 0) {
+        log_error("[PQC-TUNNEL] Interface '%s' does not exist or exceeds IFNAMSIZ",
+                  hs_tun_name);
+        return;
+    }
+    if (normalize_ipv4(hs_tun_ip, local_ip, sizeof(local_ip),
+                       &local_ip_num) < 0 ||
+        normalize_ipv4(hs_peer_tun_ip, peer_ip, sizeof(peer_ip),
+                       &peer_ip_num) < 0) {
+        log_error("[PQC-TUNNEL] Invalid local/peer IP: '%s' / '%s'",
+                  hs_tun_ip, hs_peer_tun_ip);
+        return;
+    }
+    if (local_ip_num == peer_ip_num) {
+        log_error("[PQC-TUNNEL] Local and peer tunnel IP are identical: %s",
+                  local_ip);
+        return;
+    }
+    role_mode = local_ip_num > peer_ip_num ? PQC_ROLE_INITIATOR :
+                                             PQC_ROLE_RESPONDER;
+    log_info("[PQC-TUNNEL] tunnel=%s local=%s peer=%s role=%s",
+             hs_tun_name, local_ip, peer_ip,
+             role_mode == PQC_ROLE_INITIATOR ? "INITIATOR" : "RESPONDER");
 
     // Read peer public key 100% directly from HashiCorp Vault (remote_public)
     char peer_fg_buf[16] = "";
@@ -168,13 +202,15 @@ void pqc_bind_node(int node_id) {
     }
 
     if (valid) {
-        // We use PQC_ROLE_DYNAMIC (2) to negotiate the handshake role automatically
-        sig_pqc_bind_profile(node_id, 2, peer_ip, local_fg, peer_fg_buf, wan_ifname, found_priv, found_pub, deobf_pub);
+        sig_pqc_bind_profile(node_id, role_mode, local_ip, peer_ip,
+                             local_fg, peer_fg_buf, hs_tun_name,
+                             found_priv, found_pub, deobf_pub);
         
         // Start/kickoff the handshake by spinning up the background worker thread for this policy
-        sig_pqc_handshake_start(node_id, wan_ifname, peer_ip);
+        sig_pqc_handshake_start(node_id, hs_tun_name, peer_ip);
         
-        log_info("[PQC] Handshake worker initiated for Node %d on WAN %s to Peer IP %s", node_id, wan_ifname, peer_ip);
+        log_info("[PQC] Handshake worker initiated for profile %d on %s (%s -> %s)",
+                 node_id, hs_tun_name, local_ip, peer_ip);
     } else {
         log_error("[PQC] PQC Handshake will NOT start for Node %d due to errors.", node_id);
     }
@@ -208,11 +244,11 @@ static void usage(const char *prog) {
     printf("                 SD-WAN            \n");
     printf("=========================================================\n");
     printf("Client Mode (Control running daemon):\n");
-    printf("  %s -id <node_id>                       Send config request to the daemon\n", prog);
+    printf("  %s -id <profile_id>                    Send config request to the daemon\n", prog);
     printf("  %s -gi <node_id>                       Generate PQC identity keys for node\n", prog);
-    printf("  %s -r <node_id>                        Retry PQC handshake for node\n", prog);
-    printf("  %s -a/--add <profile_id> <if_name>     Add a tunnel dynamically\n", prog);
-    printf("  %s -d/--delete <profile_id> <if_name>  Delete a tunnel dynamically\n", prog);
+    printf("  %s -r <profile_id>                     Retry PQC handshake for profile\n", prog);
+    printf("  %s -a/--add <profile_id> <tunnel_name> Add a tunnel dynamically\n", prog);
+    printf("  %s -d/--delete <profile_id> <tunnel_name> Delete a tunnel dynamically\n", prog);
     printf("  %s -e/--edit <profile_id> <table.field> Edit a config field\n", prog);
     printf("  %s -reset                              Clear the node_id startup configuration\n", prog);
     printf("  %s --help | -h                         Show this help message and exit\n", prog);
@@ -319,29 +355,20 @@ int main(int argc, char **argv) {
         log_info(">>> Found startup config! Auto-loading properties for Node ID: %d", saved_node_id);
         app_config_t new_cfg;
         if (db_client_load_config(saved_node_id, &new_cfg) == 0) {
-            if (resolve_local_network(&new_cfg) == 0) {
-                struct in_addr addr = { .s_addr = new_cfg.local_ip };
-                log_info("[+] Auto-discovered Local Network: %s", inet_ntoa(addr));
-            } else {
-                log_warn("[-] Could not resolve local network for interface %s", new_cfg.local_if);
-            }
             app_context_dump(&(app_context_t){new_cfg});
             running_ctx.cfg = new_cfg;
             if (kernel_sync_push_config(&running_ctx) != 0) {
                 log_error("Failed to push auto-loaded config to kernel");
-                db_client_report_error(saved_node_id, "Startup config Netlink error");
             } else {
                 cpu_tune_apply(&running_ctx);
                 save_node_id(saved_node_id);
                 log_info("Startup config successfully restored.");
-                db_client_start_heartbeat(saved_node_id);
                 if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
                     pqc_bind_node(saved_node_id);
                 }
             }
         } else {
             log_error("Failed to load startup config from DB.");
-            db_client_report_error(saved_node_id, "Failed to load config from DB");
         }
     } else {
         log_info("No startup config found. Waiting for provisioning (-id) via socket...");
@@ -364,7 +391,6 @@ int main(int argc, char **argv) {
     }
     
     log_info("Server shutting down...");
-    db_client_stop_heartbeat();
     cpu_tune_restore();
     kernel_sync_cleanup();
     db_client_disconnect();

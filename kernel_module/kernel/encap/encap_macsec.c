@@ -4,9 +4,7 @@
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
-#include <net/neighbour.h>
 #include <net/tcp.h>
-#include <net/arp.h>
 #include <net/dst.h>
 
 /* Helper to update TCP checksum after MSS modification */
@@ -111,7 +109,6 @@ static void mwan_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct net_device *target_dev = tun->dev;
-    bool resolved;
 
     if (unlikely(!target_dev)) {
         pr_info_ratelimited("mwan_kmod: macsec encap failed - target_dev is NULL\n");
@@ -152,16 +149,8 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
 
     /* 2. Optional: Check MTU and send ICMP Frag Needed if too large (TODO later for UDP) */
     
-    /* 3. Handle MAC Resolution and Injection (Same as encap_none) */
+    /* 3. Inject the inner frame through the provisioned P2P tunnel. */
     if (tun->is_ethernet) {
-        resolved = mwan_resolve_gateway_mac(tun, target_dev, tun->gateway_mac);
-        pr_info_ratelimited("mwan_kmod: macsec gateway resolution: %s (IP: %pI4, MAC: %pM)\n",
-                            resolved ? "RESOLVED" : "PENDING", &tun->gateway, tun->gateway_mac);
-        
-        if (unlikely(!resolved)) {
-            return NF_DROP;
-        }
-
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
             if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
                 pr_info_ratelimited("mwan_kmod: macsec skb_cow_head failed\n");
@@ -178,7 +167,7 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
             else
                 eth_zero_addr(eth->h_source);
             
-            ether_addr_copy(eth->h_dest, tun->gateway_mac);
+            ether_addr_copy(eth->h_dest, target_dev->broadcast);
             eth->h_proto = htons(ETH_P_IP);
         }
     } else {

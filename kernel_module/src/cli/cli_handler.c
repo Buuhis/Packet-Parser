@@ -13,9 +13,6 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <ifaddrs.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 /* ------------------------------------------------------------------ */
 /*  Forward declarations for functions defined in main.c              */
@@ -163,26 +160,8 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 
     app_config_t new_cfg;
     if (db_client_load_config(req_id, &new_cfg) != 0) {
-        db_client_report_error(req_id, "Failed to load config from DB");
         reply_json(client_fd, 404, "Failed to load config from DB");
         return;
-    }
-
-    /* Resolve local network IP from interface name */
-    struct ifaddrs *ifaddr, *ifa;
-    if (getifaddrs(&ifaddr) == 0) {
-        for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET) continue;
-            if (strcmp(ifa->ifa_name, new_cfg.local_if) == 0) {
-                new_cfg.local_ip   = ((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr;
-                new_cfg.local_mask = ((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr;
-                new_cfg.local_ip  &= new_cfg.local_mask;
-                struct in_addr a = { .s_addr = new_cfg.local_ip };
-                log_info("[+] Auto-discovered Local Network: %s", inet_ntoa(a));
-                break;
-            }
-        }
-        freeifaddrs(ifaddr);
     }
 
     app_context_dump(&(app_context_t){new_cfg});
@@ -190,14 +169,12 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 
     if (kernel_sync_push_config(ctx) != 0) {
         log_error("Failed to push config to kernel");
-        db_client_report_error(req_id, "Netlink push error");
         reply_json(client_fd, 500, "Netlink push error");
         return;
     }
 
     cpu_tune_apply(ctx);
     save_node_id(req_id);
-    db_client_start_heartbeat(req_id);
 
     if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
         pqc_bind_node(req_id);
@@ -207,82 +184,77 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 }
 
 /* ---------- handle: add <profile_id> <if_name> -------------------- */
-static void handle_add_tunnel(int client_fd, int profile_id, const char *if_name, app_context_t *ctx)
+static void handle_add_tunnel(int client_fd, int profile_id,
+                              const char *tunnel_name, app_context_t *ctx)
 {
-    log_info(">>> [ADD] Profile %d: adding tunnel '%s'", profile_id, if_name);
+    sdwan_tun_cfg_t new_tun;
+
+    log_info(">>> [ADD] Profile %d: adding tunnel '%s'", profile_id,
+             tunnel_name);
 
     if (ctx->cfg.sdwan_tun_count >= MAX_SDWAN_TUNS) {
         reply_json(client_fd, 400, "Maximum tunnel count reached");
         return;
     }
 
-    /* Query this specific tunnel from DB */
-    pthread_mutex_lock(&g_db_mutex);
-    if (!g_db_conn) {
-        pthread_mutex_unlock(&g_db_mutex);
-        reply_json(client_fd, 500, "Database not connected");
-        return;
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        if (strcmp(ctx->cfg.sdwan_tuns[i].tunnel_ifname,
+                   tunnel_name) == 0) {
+            reply_json(client_fd, 400, "Tunnel is already active");
+            return;
+        }
     }
 
-    char id_str[16], ifname_buf[16];
-    snprintf(id_str, sizeof(id_str), "%d", profile_id);
-    snprintf(ifname_buf, sizeof(ifname_buf), "%s", if_name);
-    const char *params[2] = { id_str, ifname_buf };
-
-    PGresult *res = PQexecParams(g_db_conn,
-        "SELECT ifname, gateway, weight, port FROM public.sdwan_tuns "
-        "WHERE node_id = $1 AND ifname = $2",
-        2, NULL, params, NULL, NULL, 0);
-
-    if (PQresultStatus(res) != PGRES_TUPLES_OK || PQntuples(res) == 0) {
-        log_error("[ADD] Tunnel '%s' not found in DB for profile %d", if_name, profile_id);
-        if (res) PQclear(res);
-        pthread_mutex_unlock(&g_db_mutex);
+    if (db_client_load_tunnel(profile_id, tunnel_name,
+                              ctx->cfg.weight_enabled, &new_tun) != 0) {
+        log_error("[ADD] Tunnel '%s' not found in DB for profile %d",
+                  tunnel_name, profile_id);
         reply_json(client_fd, 404, "Tunnel not found in database");
         return;
     }
 
-    /* Populate the new tunnel entry */
     size_t idx = ctx->cfg.sdwan_tun_count;
-    memset(&ctx->cfg.sdwan_tuns[idx], 0, sizeof(sdwan_tun_cfg_t));
-    strncpy(ctx->cfg.sdwan_tuns[idx].ifname,  PQgetvalue(res, 0, 0), sizeof(ctx->cfg.sdwan_tuns[idx].ifname) - 1);
-    strncpy(ctx->cfg.sdwan_tuns[idx].gateway, PQgetvalue(res, 0, 1), sizeof(ctx->cfg.sdwan_tuns[idx].gateway) - 1);
-    ctx->cfg.sdwan_tuns[idx].weight = atoi(PQgetvalue(res, 0, 2));
-    ctx->cfg.sdwan_tuns[idx].port   = atoi(PQgetvalue(res, 0, 3));
+    ctx->cfg.sdwan_tuns[idx] = new_tun;
     ctx->cfg.sdwan_tun_count++;
-
-    PQclear(res);
-    pthread_mutex_unlock(&g_db_mutex);
 
     /* Sync to kernel */
     if (kernel_sync_push_config(ctx) == 0) {
-        log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)", if_name, ctx->cfg.sdwan_tun_count);
+        log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)",
+                 tunnel_name, ctx->cfg.sdwan_tun_count);
         reply_json(client_fd, 200, "Tunnel added successfully");
     } else {
-        log_error("[ADD] Netlink push failed after adding tunnel '%s'", if_name);
+        ctx->cfg.sdwan_tun_count--;
+        memset(&ctx->cfg.sdwan_tuns[idx], 0, sizeof(ctx->cfg.sdwan_tuns[idx]));
+        log_error("[ADD] Netlink push failed after adding tunnel '%s'",
+                  tunnel_name);
         reply_json(client_fd, 500, "Netlink push error");
     }
 }
 
 /* ---------- handle: del <profile_id> <if_name> -------------------- */
-static void handle_del_tunnel(int client_fd, int profile_id, const char *if_name, app_context_t *ctx)
+static void handle_del_tunnel(int client_fd, int profile_id,
+                              const char *tunnel_name, app_context_t *ctx)
 {
-    log_info(">>> [DEL] Profile %d: removing tunnel '%s'", profile_id, if_name);
+    sdwan_tun_cfg_t removed;
+
+    log_info(">>> [DEL] Profile %d: removing tunnel '%s'", profile_id,
+             tunnel_name);
 
     int found = -1;
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
-        if (strcmp(ctx->cfg.sdwan_tuns[i].ifname, if_name) == 0) {
+        if (strcmp(ctx->cfg.sdwan_tuns[i].tunnel_ifname, tunnel_name) == 0) {
             found = (int)i;
             break;
         }
     }
 
     if (found < 0) {
-        log_warn("[DEL] Tunnel '%s' not found in running config", if_name);
+        log_warn("[DEL] Tunnel '%s' not found in running config", tunnel_name);
         reply_json(client_fd, 404, "Tunnel not found in running config");
         return;
     }
 
+    removed = ctx->cfg.sdwan_tuns[found];
     /* Shift remaining elements down */
     for (size_t i = (size_t)found; i < ctx->cfg.sdwan_tun_count - 1; i++) {
         ctx->cfg.sdwan_tuns[i] = ctx->cfg.sdwan_tuns[i + 1];
@@ -292,10 +264,16 @@ static void handle_del_tunnel(int client_fd, int profile_id, const char *if_name
 
     /* Sync to kernel */
     if (kernel_sync_push_config(ctx) == 0) {
-        log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)", if_name, ctx->cfg.sdwan_tun_count);
+        log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)",
+                 tunnel_name, ctx->cfg.sdwan_tun_count);
         reply_json(client_fd, 200, "Tunnel deleted successfully");
     } else {
-        log_error("[DEL] Netlink push failed after removing tunnel '%s'", if_name);
+        for (size_t i = ctx->cfg.sdwan_tun_count; i > (size_t)found; i--)
+            ctx->cfg.sdwan_tuns[i] = ctx->cfg.sdwan_tuns[i - 1];
+        ctx->cfg.sdwan_tuns[found] = removed;
+        ctx->cfg.sdwan_tun_count++;
+        log_error("[DEL] Netlink push failed after removing tunnel '%s'",
+                  tunnel_name);
         reply_json(client_fd, 500, "Netlink push error");
     }
 }
@@ -305,9 +283,10 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 {
     log_info(">>> [EDIT] Profile %d: fields changed: '%s'", profile_id, fields_str);
 
-    bool refresh_nodes = false;
+    bool refresh_profiles = false;
     bool refresh_tunnels = false;
-    bool refresh_pqc = false;
+    bool refresh_pqc_keys = false;
+    bool refresh_pqc_tunnels = false;
     bool unknown_prefix = false;
     char unknown_name[128] = {0};
 
@@ -322,12 +301,14 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     int token_count = 0;
     while (token != NULL) {
         token_count++;
-        if (strncmp(token, "nodes.", 6) == 0) {
-            refresh_nodes = true;
-        } else if (strncmp(token, "sdwan_tuns.", 11) == 0) {
+        if (strncmp(token, "sdwan_profiles.", 15) == 0) {
+            refresh_profiles = true;
+        } else if (strncmp(token, "sdwan_tunnels.", 14) == 0) {
             refresh_tunnels = true;
-        } else if (strncmp(token, "pqc_identities.", 15) == 0) {
-            refresh_pqc = true;
+        } else if (strncmp(token, "pqc_keys.", 9) == 0) {
+            refresh_pqc_keys = true;
+        } else if (strncmp(token, "pqc_exchange_tunnels.", 21) == 0) {
+            refresh_pqc_tunnels = true;
         } else {
             unknown_prefix = true;
             strncpy(unknown_name, token, sizeof(unknown_name) - 1);
@@ -345,65 +326,34 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     if (unknown_prefix) {
         log_warn("[EDIT] Unknown table prefix in '%s'", unknown_name);
         char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use nodes.<field>, sdwan_tuns.<field> or pqc_identities.<field>", unknown_name);
+        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use sdwan_profiles.<field>, sdwan_tunnels.<field>, pqc_keys.<field> or pqc_exchange_tunnels.<field>", unknown_name);
         reply_json(client_fd, 400, err_msg);
         return;
     }
 
     bool sync_needed = false;
 
-    // 1. Refresh nodes if needed
-    if (refresh_nodes) {
+    /* Profile weight_enable changes affect every tunnel's effective weight,
+     * so profile and tunnel refreshes both reload one coherent snapshot. */
+    if (refresh_profiles || refresh_tunnels) {
         app_config_t refreshed;
         if (db_client_load_config(profile_id, &refreshed) != 0) {
-            reply_json(client_fd, 500, "Failed to reload nodes config from DB");
-            return;
-        }
-        ctx->cfg.encrypt = refreshed.encrypt;
-        log_info("[EDIT] Encryption config refreshed from DB for profile %d", profile_id);
-        sync_needed = true;
-    }
-
-    // 2. Refresh tunnels if needed
-    if (refresh_tunnels) {
-        pthread_mutex_lock(&g_db_mutex);
-        if (!g_db_conn) {
-            pthread_mutex_unlock(&g_db_mutex);
-            reply_json(client_fd, 500, "Database not connected");
+            reply_json(client_fd, 500, "Failed to reload profile config from DB");
             return;
         }
 
-        char id_str[16];
-        snprintf(id_str, sizeof(id_str), "%d", profile_id);
-        const char *params[1] = { id_str };
-
-        PGresult *res = PQexecParams(g_db_conn,
-            "SELECT ifname, gateway, weight, port FROM public.sdwan_tuns "
-            "WHERE node_id = $1 ORDER BY id",
-            1, NULL, params, NULL, NULL, 0);
-
-        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-            log_error("[EDIT] Failed to re-query sdwan_tuns: %s", PQerrorMessage(g_db_conn));
-            PQclear(res);
-            pthread_mutex_unlock(&g_db_mutex);
-            reply_json(client_fd, 500, "Failed to reload tunnel config from DB");
-            return;
+        /* Keep an already-derived PQC session key until the requested
+         * handshake refresh below replaces it. */
+        if (ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+            ctx->cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
+            refreshed.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+            memcpy(refreshed.encrypt.key, ctx->cfg.encrypt.key,
+                   PQC_TRAFFIC_KEY_SZ);
+            refreshed.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
         }
-
-        int num = PQntuples(res);
-        ctx->cfg.sdwan_tun_count = (num < MAX_SDWAN_TUNS) ? (size_t)num : MAX_SDWAN_TUNS;
-
-        for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
-            memset(&ctx->cfg.sdwan_tuns[i], 0, sizeof(sdwan_tun_cfg_t));
-            strncpy(ctx->cfg.sdwan_tuns[i].ifname,  PQgetvalue(res, (int)i, 0), sizeof(ctx->cfg.sdwan_tuns[i].ifname) - 1);
-            strncpy(ctx->cfg.sdwan_tuns[i].gateway, PQgetvalue(res, (int)i, 1), sizeof(ctx->cfg.sdwan_tuns[i].gateway) - 1);
-            ctx->cfg.sdwan_tuns[i].weight = atoi(PQgetvalue(res, (int)i, 2));
-            ctx->cfg.sdwan_tuns[i].port   = atoi(PQgetvalue(res, (int)i, 3));
-        }
-
-        PQclear(res);
-        pthread_mutex_unlock(&g_db_mutex);
-        log_info("[EDIT] Tunnel config refreshed from DB for profile %d", profile_id);
+        ctx->cfg = refreshed;
+        log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
+                 profile_id);
         sync_needed = true;
     }
 
@@ -416,10 +366,10 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         log_info("[EDIT] Config changes successfully synced to kernel");
     }
 
-    // 4. Trigger PQC handshake if PQC encryption is active and PQC params or nodes config refreshed
+    // 4. Trigger PQC handshake if PQC encryption is active and PQC params or profiles refreshed
     bool trigger_pqc_handshake = false;
     if (ctx->cfg.encrypt.enabled && ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-        if (refresh_pqc || refresh_nodes) {
+        if (refresh_pqc_keys || refresh_pqc_tunnels || refresh_profiles) {
             trigger_pqc_handshake = true;
         }
     }

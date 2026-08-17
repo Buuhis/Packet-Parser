@@ -323,6 +323,9 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     char peer_ip[64];
     strncpy(peer_ip, b->peer_ip, sizeof(peer_ip) - 1);
     peer_ip[sizeof(peer_ip) - 1] = '\0';
+    char local_ip[64];
+    strncpy(local_ip, b->local_ip, sizeof(local_ip) - 1);
+    local_ip[sizeof(local_ip) - 1] = '\0';
     pthread_mutex_unlock(&g_key_mutex);
 
     if (!my_priv || !my_pub || !peer_pub) {
@@ -353,6 +356,39 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         b->thread_started = false;
         pthread_mutex_unlock(&g_key_mutex);
         return NULL;
+    }
+
+    if (wan_ifname[0] == '\0' ||
+        setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, wan_ifname,
+                   strlen(wan_ifname) + 1) < 0) {
+        fprintf(stderr, "[PQC-WORKER] Cannot bind socket to tunnel %s: %s\n",
+                wan_ifname[0] ? wan_ifname : "<empty>", strerror(errno));
+        close(sockfd);
+        free(my_priv); free(my_pub); free(peer_pub);
+        pthread_mutex_lock(&g_key_mutex);
+        b->thread_started = false;
+        pthread_mutex_unlock(&g_key_mutex);
+        return NULL;
+    }
+
+    {
+        struct sockaddr_in localaddr;
+
+        memset(&localaddr, 0, sizeof(localaddr));
+        localaddr.sin_family = AF_INET;
+        localaddr.sin_port = 0;
+        if (inet_pton(AF_INET, local_ip, &localaddr.sin_addr) != 1 ||
+            bind(sockfd, (const struct sockaddr *)&localaddr,
+                 sizeof(localaddr)) < 0) {
+            fprintf(stderr, "[PQC-WORKER] Cannot bind %s on %s: %s\n",
+                    local_ip, wan_ifname, strerror(errno));
+            close(sockfd);
+            free(my_priv); free(my_pub); free(peer_pub);
+            pthread_mutex_lock(&g_key_mutex);
+            b->thread_started = false;
+            pthread_mutex_unlock(&g_key_mutex);
+            return NULL;
+        }
     }
 
     struct sockaddr_in peeraddr;
@@ -840,8 +876,9 @@ bool sig_pqc_has_identity(const char *fingerprint) {
 }
 
 void sig_pqc_bind_profile(int profile_id, int role_mode,
-                          const char *peer_ip, const char *local_fg,
-                          const char *peer_fg, const char *wan_ifname,
+                          const char *local_ip, const char *peer_ip,
+                          const char *local_fg, const char *peer_fg,
+                          const char *wan_ifname,
                           const char *local_priv, const char *local_pub,
                           const char *peer_pub) {
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
@@ -901,6 +938,7 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
             if ((b->local_pub == NULL) != (local_pub == NULL)) changed = true;
             if ((b->peer_pub == NULL) != (deobf_peer == NULL)) changed = true;
 
+            if (strcmp(b->local_ip, local_ip ? local_ip : "") != 0) changed = true;
             if (strcmp(b->peer_ip, peer_ip ? peer_ip : "") != 0) changed = true;
             if (strcmp(b->wan_ifname, wan_ifname ? wan_ifname : "") != 0) changed = true;
             if (b->role_mode != role_mode) changed = true;
@@ -954,6 +992,8 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
         } else {
             b->is_initiator = false; // Will be resolved dynamically
         }
+        strncpy(b->local_ip, local_ip ? local_ip : "", sizeof(b->local_ip) - 1);
+        b->local_ip[sizeof(b->local_ip) - 1] = '\0';
         strncpy(b->peer_ip, peer_ip ? peer_ip : "", sizeof(b->peer_ip) - 1);
         b->peer_ip[sizeof(b->peer_ip) - 1] = '\0';
         char clean_local_fg[16] = "";
@@ -980,8 +1020,9 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
 
         const char *role_str = (role_mode == PQC_ROLE_INITIATOR) ? "FORCE_INITIATOR" :
                                (role_mode == PQC_ROLE_RESPONDER) ? "FORCE_RESPONDER" : "DYNAMIC";
-        fprintf(stderr, "[PQC-BIND] Profile %d bound in RAM (Local FG: %s, Peer FG: %s, Role Mode: %s, WAN: %s, Peer IP: %s).\n", 
-                profile_id, b->local_fingerprint, b->peer_fingerprint, role_str, b->wan_ifname, b->peer_ip);
+        fprintf(stderr, "[PQC-BIND] Profile %d bound in RAM (Local FG: %s, Peer FG: %s, Role Mode: %s, WAN: %s, Local IP: %s, Peer IP: %s).\n",
+                profile_id, b->local_fingerprint, b->peer_fingerprint,
+                role_str, b->wan_ifname, b->local_ip, b->peer_ip);
 
         int idx = b - g_policy_bindings;
         if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {

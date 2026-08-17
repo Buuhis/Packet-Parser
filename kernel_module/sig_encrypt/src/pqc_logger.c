@@ -8,8 +8,8 @@
 #include <pthread.h>
 #include <stdbool.h>
 
-#define LOG_DIR "/var/log/NE"
-#define LOG_FILE "/var/log/NE/authen_pqc.log"
+#define LOG_DIR "/var/log/SEP/PQC"
+#define LOG_FILE "/var/log/SEP/PQC/sd_wan_pqc.log"
 #define MAX_LOG_LINES 5000
 #define MAX_LINE_LEN 512
 
@@ -101,7 +101,7 @@ void sig_pqc_write_log(int profile_id, const char *key_id, const char *level, co
     fp = fopen(LOG_FILE, "w");
     if (fp) {
         // Write newest entry
-        fprintf(fp, "%s [%s] [Profile: %d] [Key_id: %s] Status: %s | MSG: %s\n", 
+        fprintf(fp, "%s [%s] [Profile: %d] [%s] Status: %s | MSG: %s\n", 
                 time_str, level, profile_id, key_id ? key_id : "N/A", status, msg);
         
         // Write kept old entries (limit to MAX_LOG_LINES - 1 to account for the new one)
