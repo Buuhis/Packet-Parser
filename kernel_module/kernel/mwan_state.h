@@ -152,6 +152,7 @@ struct mwan_config {
     struct mwan_l2_tx_flow tx_flows[MWAN_FLOW_TABLE_SIZE];
 
     struct timer_list reorder_timer;
+    bool reorder_stopping;
     int num_workers;
     int worker_start_cpu;
     struct mwan_l2_worker *l2_workers;

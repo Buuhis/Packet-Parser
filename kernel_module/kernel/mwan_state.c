@@ -1,5 +1,6 @@
 #include "mwan_state.h"
 #include <linux/timer.h>
+#include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
@@ -20,6 +21,18 @@ static DEFINE_MUTEX(cfg_lock);
 static atomic64_t l2_tx_seq[MWAN_FLOW_TABLE_SIZE];
 static atomic64_t l2_packet_nonce;
 
+static void mwan_reorder_timer_shutdown(struct mwan_config *cfg)
+{
+    WRITE_ONCE(cfg->reorder_stopping, true);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+    timer_shutdown_sync(&cfg->reorder_timer);
+#else
+    /* Before timer_shutdown_sync() existed, del_timer_sync() was safe only
+     * when the caller independently prevented every possible timer rearm. */
+    del_timer_sync(&cfg->reorder_timer);
+#endif
+}
+
 static void mwan_config_release_devices(struct mwan_config *cfg)
 {
     int i;
@@ -34,7 +47,8 @@ static void mwan_config_release_devices(struct mwan_config *cfg)
 }
 
 /* Destroy only a config that has been published. The caller must first wait
- * for all RCU readers; timer_shutdown_sync() then prevents timer rearming. */
+ * for all RCU readers.  reorder_stopping prevents every rearm site before
+ * del_timer_sync() removes/waits for the timer on kernels including 5.19. */
 static void mwan_config_destroy(struct mwan_config *cfg)
 {
     int i;
@@ -42,10 +56,12 @@ static void mwan_config_destroy(struct mwan_config *cfg)
     if (!cfg)
         return;
 
-    /* No RCU reader can enqueue into this config now.  Stop its crypto work
-     * before freeing reorder state or the AEAD transforms it references. */
+    /* No RCU reader can enqueue into this config now.  Publish the stop flag
+     * before draining workers so neither a worker nor the timer callback can
+     * rearm the reorder timer during teardown. */
+    WRITE_ONCE(cfg->reorder_stopping, true);
     mwan_l2_workers_cleanup(cfg);
-    timer_shutdown_sync(&cfg->reorder_timer);
+    mwan_reorder_timer_shutdown(cfg);
 
     for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
         struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[i];
@@ -144,8 +160,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
         }
     }
 
-    /* Initialize this for every publishable config. Destruction can therefore
-     * always use timer_shutdown_sync(), even when encryption is disabled. */
+    /* Initialize this for every publishable config, even when encryption is
+     * disabled, so every error/destruction path can stop it safely. */
+    WRITE_ONCE(new_cfg->reorder_stopping, false);
     timer_setup(&new_cfg->reorder_timer, mwan_reorder_timeout, 0);
     for (i = 0; i < MWAN_FLOW_TABLE_SIZE; i++) {
         atomic64_set(&new_cfg->flow_reorder[i].expected_seq, 1);
@@ -323,11 +340,12 @@ int mwan_state_update(struct mwan_config *new_cfg)
     return 0;
 
 err_free_tfm:
+    WRITE_ONCE(new_cfg->reorder_stopping, true);
     mwan_l2_workers_cleanup(new_cfg);
     if (tfm)
         crypto_free_aead(tfm);
 err_release_devices:
-    timer_shutdown_sync(&new_cfg->reorder_timer);
+    mwan_reorder_timer_shutdown(new_cfg);
     mwan_config_release_devices(new_cfg);
     return err;
 }

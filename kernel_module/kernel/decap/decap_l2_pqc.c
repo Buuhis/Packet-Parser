@@ -921,6 +921,9 @@ void mwan_reorder_timeout(struct timer_list *t)
     bool restart = false;
     int f;
 
+    if (unlikely(READ_ONCE(cfg->reorder_stopping)))
+        return;
+
     for (f = 0; f < MWAN_FLOW_TABLE_SIZE; f++) {
         struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[f];
         int i;
@@ -962,7 +965,7 @@ void mwan_reorder_timeout(struct timer_list *t)
         spin_unlock_bh(&flow->drain_lock);
     }
 
-    if (restart)
+    if (restart && !READ_ONCE(cfg->reorder_stopping))
         mod_timer(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
 }
 
@@ -1011,7 +1014,8 @@ static void mwan_l2_deliver_decrypted(struct mwan_config *cfg,
         netif_rx(pending);
     }
     spin_unlock_bh(&flow->drain_lock);
-    timer_reduce(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+    if (!READ_ONCE(cfg->reorder_stopping))
+        timer_reduce(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
 }
 
 static void mwan_l2_worker_fn(struct work_struct *work)
