@@ -875,7 +875,7 @@ bool sig_pqc_has_identity(const char *fingerprint) {
     return false;
 }
 
-void sig_pqc_bind_profile(int profile_id, int role_mode,
+void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
                           const char *local_ip, const char *peer_ip,
                           const char *local_fg, const char *peer_fg,
                           const char *wan_ifname,
@@ -941,6 +941,7 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
             if (strcmp(b->local_ip, local_ip ? local_ip : "") != 0) changed = true;
             if (strcmp(b->peer_ip, peer_ip ? peer_ip : "") != 0) changed = true;
             if (strcmp(b->wan_ifname, wan_ifname ? wan_ifname : "") != 0) changed = true;
+            if (strcmp(b->key_id, key_id ? key_id : "") != 0) changed = true;
             if (b->role_mode != role_mode) changed = true;
 
             if (changed) {
@@ -1007,7 +1008,7 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
         b->peer_fingerprint[sizeof(b->peer_fingerprint) - 1] = '\0';
         strncpy(b->wan_ifname, wan_ifname ? wan_ifname : "", sizeof(b->wan_ifname) - 1);
         b->wan_ifname[sizeof(b->wan_ifname) - 1] = '\0';
-        b->key_id[0] = '\0';
+        snprintf(b->key_id, sizeof(b->key_id), "%s", key_id ? key_id : "");
         b->is_tunnel = true;
 
         if (b->local_priv) free(b->local_priv);
@@ -1020,8 +1021,8 @@ void sig_pqc_bind_profile(int profile_id, int role_mode,
 
         const char *role_str = (role_mode == PQC_ROLE_INITIATOR) ? "FORCE_INITIATOR" :
                                (role_mode == PQC_ROLE_RESPONDER) ? "FORCE_RESPONDER" : "DYNAMIC";
-        fprintf(stderr, "[PQC-BIND] Profile %d bound in RAM (Local FG: %s, Peer FG: %s, Role Mode: %s, WAN: %s, Local IP: %s, Peer IP: %s).\n",
-                profile_id, b->local_fingerprint, b->peer_fingerprint,
+        fprintf(stderr, "[PQC-BIND] Profile %d bound in RAM (Key ID: %s, Local FG: %s, Peer FG: %s, Role Mode: %s, WAN: %s, Local IP: %s, Peer IP: %s).\n",
+                profile_id, b->key_id, b->local_fingerprint, b->peer_fingerprint,
                 role_str, b->wan_ifname, b->local_ip, b->peer_ip);
 
         int idx = b - g_policy_bindings;

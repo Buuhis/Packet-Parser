@@ -340,7 +340,10 @@ int db_client_load_tunnel(int profile_id, const char *tunnel_name,
     return ret;
 }
 
-int db_client_load_pqc_identity(int profile_id, char *local_fg_out, char *peer_pub_out) {
+int db_client_load_pqc_identity(int profile_id,
+                                char *key_id_out, size_t key_id_len,
+                                char *local_fg_out, size_t local_fg_len,
+                                char *peer_pub_out, size_t peer_pub_len) {
     pthread_mutex_lock(&g_db_mutex);
     if (!g_db_conn) {
         pthread_mutex_unlock(&g_db_mutex);
@@ -372,10 +375,16 @@ int db_client_load_pqc_identity(int profile_id, char *local_fg_out, char *peer_p
         return -2; /* Not found */
     }
 
-    strncpy(local_fg_out, PQgetvalue(res, 0, 1), 31);
-    local_fg_out[31] = '\0';
-    strncpy(peer_pub_out, PQgetvalue(res, 0, 2), 255);
-    peer_pub_out[255] = '\0';
+    if (copy_pg_field(res, 0, 0, key_id_out, key_id_len, true,
+                      "pqc_keys.key_id") < 0 ||
+        copy_pg_field(res, 0, 1, local_fg_out, local_fg_len, true,
+                      "pqc_keys.local") < 0 ||
+        copy_pg_field(res, 0, 2, peer_pub_out, peer_pub_len, true,
+                      "pqc_keys.remote") < 0) {
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
 
     PQclear(res);
     pthread_mutex_unlock(&g_db_mutex);

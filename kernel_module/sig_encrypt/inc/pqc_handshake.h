@@ -170,7 +170,7 @@ typedef enum {
 } pqc_role_mode_t;
 
 bool sig_pqc_has_identity(const char *fingerprint);
-void sig_pqc_bind_profile(int profile_id, int role_mode,
+void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
                           const char *local_ip, const char *peer_ip,
                           const char *local_fg, const char *peer_fg,
                           const char *wan_ifname,

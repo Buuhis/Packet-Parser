@@ -112,11 +112,16 @@ static void handle_signal(int sig) {
 }
 
 void pqc_bind_node(int node_id) {
+    char key_id[256] = {0};
     char local_fg_db[32] = {0};
     char peer_pub_name[256] = {0};
 
     // Load PQC identity config from DB
-    if (db_client_load_pqc_identity(node_id, local_fg_db, peer_pub_name) != 0) {
+    if (db_client_load_pqc_identity(node_id,
+                                    key_id, sizeof(key_id),
+                                    local_fg_db, sizeof(local_fg_db),
+                                    peer_pub_name,
+                                    sizeof(peer_pub_name)) != 0) {
         log_warn("[PQC] No PQC configuration or database identity found for Node ID: %d", node_id);
         return;
     }
@@ -202,7 +207,7 @@ void pqc_bind_node(int node_id) {
     }
 
     if (valid) {
-        sig_pqc_bind_profile(node_id, role_mode, local_ip, peer_ip,
+        sig_pqc_bind_profile(node_id, key_id, role_mode, local_ip, peer_ip,
                              local_fg, peer_fg_buf, hs_tun_name,
                              found_priv, found_pub, deobf_pub);
         
