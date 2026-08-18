@@ -158,6 +158,14 @@ int mwan_state_update(struct mwan_config *new_cfg)
                    new_cfg->encrypt_key_len);
             return -EINVAL;
         }
+        if ((new_cfg->encrypt_type == MWAN_CRYPT_AES_GCM_128 &&
+             new_cfg->encrypt_key_len != 16) ||
+            (new_cfg->encrypt_type != MWAN_CRYPT_AES_GCM_128 &&
+             new_cfg->encrypt_key_len != 32)) {
+            pr_err("mwan_kmod: Encryption type %u does not match key length %u\n",
+                   new_cfg->encrypt_type, new_cfg->encrypt_key_len);
+            return -EINVAL;
+        }
     }
 
     /* Initialize this for every publishable config, even when encryption is

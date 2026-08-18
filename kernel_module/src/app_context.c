@@ -20,10 +20,13 @@ void app_context_dump(const app_context_t *ctx)
              ctx->cfg.latency_duration,
              ctx->cfg.loss_enabled ? "ON" : "OFF",
              ctx->cfg.loss_duration);
-    log_info("Encryption: %s (layer=%u, type=%s, key_len=%zu bytes)",
-             ctx->cfg.encrypt.enabled ? "ON" : "OFF",
-             ctx->cfg.encrypt.layer,
-             ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" :
-             (ctx->cfg.encrypt.type == 1 ? "AES-GCM-256" : "PQC-GCM"),
-             ctx->cfg.encrypt.key_len);
+    if (!ctx->cfg.encrypt.enabled) {
+        log_info("Encryption action: BYPASS (encryption OFF)");
+    } else {
+        log_info("Encryption action: L%u, method=%s, key_len=%zu bytes",
+                 ctx->cfg.encrypt.layer,
+                 ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" :
+                 (ctx->cfg.encrypt.type == 1 ? "AES-GCM-256" : "PQC-GCM"),
+                 ctx->cfg.encrypt.key_len);
+    }
 }

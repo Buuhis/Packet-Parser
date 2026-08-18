@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 PGconn *g_db_conn = NULL;
 pthread_mutex_t g_db_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -30,6 +31,51 @@ static bool pg_bool(PGresult *res, int row, int col)
 {
     return !PQgetisnull(res, row, col) &&
            strcmp(PQgetvalue(res, row, col), "t") == 0;
+}
+
+static int parse_encryption_policy(const char *action, const char *method,
+                                   encrypt_cfg_t *encrypt)
+{
+    if (!action || action[0] == '\0') {
+        log_error("sdwan_profiles.action is NULL or empty");
+        return -1;
+    }
+
+    if (strcasecmp(action, "bypass") == 0) {
+        encrypt->enabled = false;
+        log_info("Profile action BYPASS: encryption method is ignored");
+        return 0;
+    }
+
+    encrypt->enabled = true;
+    if (strcasecmp(action, "L2") == 0 || strcmp(action, "2") == 0) {
+        encrypt->layer = 2;
+    } else if (strcasecmp(action, "L3") == 0 || strcmp(action, "3") == 0) {
+        encrypt->layer = 3;
+    } else {
+        log_error("Unsupported sdwan_profiles.action '%s' (expected bypass, L2 or L3)",
+                  action);
+        return -1;
+    }
+
+    if (!method || method[0] == '\0') {
+        log_error("sdwan_profiles.method is required for action %s", action);
+        return -1;
+    }
+
+    if (strcasecmp(method, "aes-gcm-128") == 0) {
+        encrypt->type = 0;  /* MWAN_CRYPT_AES_GCM_128 */
+    } else if (strcasecmp(method, "aes-gcm-256") == 0) {
+        encrypt->type = 1;  /* MWAN_CRYPT_AES_GCM_256 */
+    } else if (strcasecmp(method, "pqc-gcm") == 0) {
+        encrypt->type = 2;  /* MWAN_CRYPT_PQC_GCM */
+    } else {
+        log_error("Unsupported sdwan_profiles.method '%s' for action %s",
+                  method, action);
+        return -1;
+    }
+
+    return 0;
 }
 
 static int copy_pg_field(PGresult *res, int row, int col, char *dst,
@@ -177,26 +223,31 @@ int db_client_load_config(int profile_id, app_config_t *cfg)
     cfg->loss_duration = PQgetisnull(res, 0, 7) ? 0 :
                          atoi(PQgetvalue(res, 0, 7));
     
-    cfg->encrypt.enabled = (method && strcmp(method, "None") != 0);
-    
-    if (cfg->encrypt.enabled) {
-        /* Layer mode: '2' -> L2 (PQC), '3' -> L3 (Overlay) */
-        cfg->encrypt.layer = (action && strcmp(action, "2") == 0) ? 2 : 3;
+    if (parse_encryption_policy(action, method, &cfg->encrypt) < 0) {
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
+    }
 
-        /* Map string method to enum */
-        if (method && strcmp(method, "aes-gcm-256") == 0) {
-            cfg->encrypt.type = 1;  /* MWAN_CRYPT_AES_GCM_256 */
-        } else if (method && strcmp(method, "pqc-gcm") == 0) {
-            cfg->encrypt.type = 2;  /* MWAN_CRYPT_PQC_GCM */
-        } else {
-            cfg->encrypt.type = 0;  /* MWAN_CRYPT_AES_GCM_128 */
-        }
+    if (cfg->encrypt.enabled) {
         
         /* Convert static hex key if present */
         if (enc_key_hex && strlen(enc_key_hex) > 0) {
             int klen = hex_to_bytes(enc_key_hex, cfg->encrypt.key, MAX_ENCRYPT_KEY_LEN);
             if (klen > 0) {
                 cfg->encrypt.key_len = (size_t)klen;
+            }
+        }
+
+        {
+            size_t expected_key_len = cfg->encrypt.type == 0 ? 16 : 32;
+
+            if (cfg->encrypt.key_len != expected_key_len) {
+                log_error("Method %s requires a %zu-byte key, got %zu bytes",
+                          method, expected_key_len, cfg->encrypt.key_len);
+                PQclear(res);
+                pthread_mutex_unlock(&g_db_mutex);
+                return -1;
             }
         }
     }

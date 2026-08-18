@@ -76,13 +76,19 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
         new_cfg->encrypt_on = (nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_ON]) != 0);
         
         if (new_cfg->encrypt_on) {
-            if (info->attrs[MWAN_ATTR_ENCRYPT_LAYER])
-                new_cfg->encrypt_layer = nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_LAYER]);
-            else
-                new_cfg->encrypt_layer = 3; // Default L3
+            if (!info->attrs[MWAN_ATTR_ENCRYPT_LAYER] ||
+                !info->attrs[MWAN_ATTR_ENCRYPT_TYPE] ||
+                !info->attrs[MWAN_ATTR_ENCRYPT_KEY] ||
+                !info->attrs[MWAN_ATTR_ENCRYPT_SALT]) {
+                pr_err("mwan_kmod: Incomplete encryption configuration\n");
+                ret = -EINVAL;
+                goto err_free_config;
+            }
 
-            if (info->attrs[MWAN_ATTR_ENCRYPT_TYPE])
-                new_cfg->encrypt_type = nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_TYPE]);
+            new_cfg->encrypt_layer =
+                nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_LAYER]);
+            new_cfg->encrypt_type =
+                nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_TYPE]);
             
             if (info->attrs[MWAN_ATTR_ENCRYPT_KEY]) {
                 int klen = nla_len(info->attrs[MWAN_ATTR_ENCRYPT_KEY]);
@@ -99,12 +105,6 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 memcpy(new_cfg->encrypt_salt, nla_data(info->attrs[MWAN_ATTR_ENCRYPT_SALT]), MWAN_SALT_LEN);
             }
 
-            if (!info->attrs[MWAN_ATTR_ENCRYPT_KEY] ||
-                !info->attrs[MWAN_ATTR_ENCRYPT_SALT]) {
-                ret = -EINVAL;
-                goto err_free_config;
-            }
-            
             pr_info("mwan_kmod: Encryption ON (layer: %u, type: %u, key_len: %u)\n",
                     new_cfg->encrypt_layer, new_cfg->encrypt_type, new_cfg->encrypt_key_len);
         }
