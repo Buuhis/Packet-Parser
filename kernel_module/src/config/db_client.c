@@ -397,7 +397,7 @@ int db_client_load_pqc_exchange_tunnel(int profile_id, char *tunnel_name, size_t
     PGresult *res = PQexecParams(g_db_conn,
         "SELECT e.tunnel_name, e.tunnel_ip, e.peer_tunnel_ip "
         "FROM public.sdwan_tunnel_ref r "
-        "JOIN public.pqc_exchange_tunnels e ON r.tunnel_id = e.tunnel_name "
+        "JOIN public.pqc_exchange_tunnels e ON r.tunnel_id::uuid = e.id "
         "WHERE r.profile_id = $1",
         1, NULL, paramValues, NULL, NULL, 0);
 

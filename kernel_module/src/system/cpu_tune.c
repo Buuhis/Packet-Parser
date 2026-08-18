@@ -473,6 +473,14 @@ static void tune_physical_nic(const char *ifname,
 static void tusdwan_tun(const char *ifname,
                         const int *worker_ids, int num_workers)
 {
+    char rp_filter_path[256];
+
+    /* Multi-WAN return traffic is legitimately asymmetric. The old gateway
+     * resolver disabled strict reverse-path filtering on each data tunnel;
+     * retain that behavior outside the packet hot path. */
+    snprintf(rp_filter_path, sizeof(rp_filter_path),
+             "/proc/sys/net/ipv4/conf/%s/rp_filter", ifname);
+    write_sysfs(rp_filter_path, "0");
     setup_xps(ifname, worker_ids, num_workers);
     setup_rps(ifname, worker_ids, num_workers);
     setup_mq_qdisc(ifname);

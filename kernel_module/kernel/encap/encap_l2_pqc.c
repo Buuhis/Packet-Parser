@@ -1,4 +1,5 @@
 #include "../mwan_steer.h"
+#include "../mwan_mac_discovery.h"
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -400,12 +401,15 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
     u64 packet_nonce;
     __be32 flow_id_be;
     __be64 seq_be, nonce_be;
+    u8 peer_mac[ETH_ALEN];
     int ip_pkt_len, err;
 
     if (unlikely(!target_dev || !worker->tx_tfm || !req))
         return -ENODEV;
     if (unlikely(!tun->is_ethernet))
         return -EAFNOSUPPORT;
+    if (unlikely(!mwan_mac_get_peer(tun, peer_mac)))
+        return -EHOSTUNREACH;
     ip_pkt_len = skb->len;
     if (ip_pkt_len <= 0)
         return -EINVAL;
@@ -449,11 +453,7 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
     else
         eth_zero_addr(eth->h_source);
     
-    /* Data tunnels are point-to-point.  Use the Ethernet broadcast address
-     * for the inner frame so L2-PQC does not depend on an overlay gateway IP
-     * or ARP entry.  The provisioned tunnel still selects the single remote
-     * endpoint for its outer transport. */
-    ether_addr_copy(eth->h_dest, target_dev->broadcast);
+    ether_addr_copy(eth->h_dest, peer_mac);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
     // Write authenticated L2-PQC header (flow ID, reorder sequence, unique nonce)

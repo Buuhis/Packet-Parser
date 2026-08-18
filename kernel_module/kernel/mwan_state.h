@@ -10,6 +10,7 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
+#include <linux/if_ether.h>
 #include "mwan_proto.h"
 
 #define MWAN_REORDER_TIMEOUT msecs_to_jiffies(30)
@@ -38,6 +39,9 @@ struct mwan_tunnel {
 
     /* Caching fields for performance */
     struct net_device *dev;
+    spinlock_t gateway_mac_lock;
+    u8 gateway_mac[ETH_ALEN];
+    bool mac_resolved;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
 };

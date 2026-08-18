@@ -1,6 +1,7 @@
 #include "mwan_steer.h"
 #include "mwan_state.h"
 #include "mwan_proto.h"
+#include "mwan_mac_discovery.h"
 
 #include <linux/module.h>
 #include <linux/netfilter.h>
@@ -251,11 +252,19 @@ int mwan_steer_init(void) {
                                 ARRAY_SIZE(mwan_nf_ops));
         return err;
     }
+    err = mwan_mac_discovery_init();
+    if (err) {
+        mwan_decap_l2_pqc_cleanup();
+        nf_unregister_net_hooks(&init_net, mwan_nf_ops,
+                                ARRAY_SIZE(mwan_nf_ops));
+        return err;
+    }
     return 0;
 }
 
 void mwan_steer_cleanup(void) {
     pr_info("mwan_kmod: Unregistering steering hooks\n");
+    mwan_mac_discovery_cleanup();
     nf_unregister_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
     mwan_decap_l2_pqc_cleanup();
 }

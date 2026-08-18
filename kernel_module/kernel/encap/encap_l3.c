@@ -1,4 +1,5 @@
 #include "../mwan_steer.h"
+#include "../mwan_mac_discovery.h"
 #include "../mwan_proto.h"
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
@@ -113,6 +114,7 @@ unsigned int mwan_handle_encap_l3(struct sk_buff *skb, struct mwan_tunnel *tun)
 static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct net_device *target_dev = tun->dev;
+    u8 peer_mac[ETH_ALEN];
     struct mwan_config *cfg;
     struct iphdr *iph;
     struct crypto_aead *tfm;
@@ -234,6 +236,9 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
 
     /* Handle L2 injection */
     if (tun->is_ethernet) {
+        if (unlikely(!mwan_mac_get_peer(tun, peer_mac)))
+            return NF_DROP;
+
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
             if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) return NF_ACCEPT;
         }
@@ -244,7 +249,7 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
             struct ethhdr *eth = eth_hdr(skb);
             if (target_dev->dev_addr) ether_addr_copy(eth->h_source, target_dev->dev_addr);
             else eth_zero_addr(eth->h_source);
-            ether_addr_copy(eth->h_dest, target_dev->broadcast);
+            ether_addr_copy(eth->h_dest, peer_mac);
             eth->h_proto = htons(ETH_P_IP);
         }
     } else {

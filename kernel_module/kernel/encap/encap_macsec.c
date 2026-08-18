@@ -1,4 +1,5 @@
 #include "../mwan_steer.h"
+#include "../mwan_mac_discovery.h"
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -109,6 +110,7 @@ static void mwan_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct net_device *target_dev = tun->dev;
+    u8 peer_mac[ETH_ALEN];
 
     if (unlikely(!target_dev)) {
         pr_info_ratelimited("mwan_kmod: macsec encap failed - target_dev is NULL\n");
@@ -151,6 +153,12 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
     
     /* 3. Inject the inner frame through the provisioned P2P tunnel. */
     if (tun->is_ethernet) {
+        if (unlikely(!mwan_mac_get_peer(tun, peer_mac))) {
+            pr_info_ratelimited("mwan_kmod: macsec peer MAC is unresolved on %s\n",
+                                target_dev->name);
+            return NF_DROP;
+        }
+
         if (unlikely(skb_headroom(skb) < ETH_HLEN || skb_header_cloned(skb))) {
             if (skb_cow_head(skb, LL_RESERVED_SPACE(target_dev))) {
                 pr_info_ratelimited("mwan_kmod: macsec skb_cow_head failed\n");
@@ -167,7 +175,7 @@ unsigned int mwan_handle_encap_macsec(struct sk_buff *skb, struct mwan_tunnel *t
             else
                 eth_zero_addr(eth->h_source);
             
-            ether_addr_copy(eth->h_dest, target_dev->broadcast);
+            ether_addr_copy(eth->h_dest, peer_mac);
             eth->h_proto = htons(ETH_P_IP);
         }
     } else {

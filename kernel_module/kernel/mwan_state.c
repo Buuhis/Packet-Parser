@@ -1,9 +1,11 @@
 #include "mwan_state.h"
+#include "mwan_mac_discovery.h"
 #include <linux/timer.h>
 #include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/etherdevice.h>
 #include <linux/if_arp.h>
 #include <linux/random.h>
 #include <linux/err.h>
@@ -44,6 +46,38 @@ static void mwan_config_release_devices(struct mwan_config *cfg)
         }
     }
 
+}
+
+static void mwan_config_preserve_peer_macs(struct mwan_config *new_cfg,
+                                           struct mwan_config *old_cfg)
+{
+    u32 i;
+    u32 j;
+
+    if (!new_cfg || !old_cfg)
+        return;
+
+    for (i = 0; i < new_cfg->num_tunnels; i++) {
+        struct mwan_tunnel *new_tun = &new_cfg->tunnels[i];
+
+        for (j = 0; j < old_cfg->num_tunnels; j++) {
+            struct mwan_tunnel *old_tun = &old_cfg->tunnels[j];
+
+            if (new_tun->ifindex != old_tun->ifindex)
+                continue;
+            spin_lock_bh(&old_tun->gateway_mac_lock);
+            if (old_tun->mac_resolved &&
+                is_valid_ether_addr(old_tun->gateway_mac)) {
+                spin_lock_bh(&new_tun->gateway_mac_lock);
+                ether_addr_copy(new_tun->gateway_mac,
+                                old_tun->gateway_mac);
+                new_tun->mac_resolved = true;
+                spin_unlock_bh(&new_tun->gateway_mac_lock);
+            }
+            spin_unlock_bh(&old_tun->gateway_mac_lock);
+            break;
+        }
+    }
 }
 
 /* Destroy only a config that has been published. The caller must first wait
@@ -188,6 +222,10 @@ int mwan_state_update(struct mwan_config *new_cfg)
     new_cfg->total_weight = 0;
     for (i = 0; i < new_cfg->num_tunnels; i++) {
         struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+
+        spin_lock_init(&tun->gateway_mac_lock);
+        eth_zero_addr(tun->gateway_mac);
+        tun->mac_resolved = false;
         if (U32_MAX - new_cfg->total_weight < tun->weight) {
             pr_err("mwan_kmod: Tunnel weight sum overflow\n");
             err = -EOVERFLOW;
@@ -340,10 +378,17 @@ int mwan_state_update(struct mwan_config *new_cfg)
      * unload, and no blocking operation runs from softirq context. */
     mutex_lock(&cfg_lock);
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
+    /* Netlink updates (for example PQC key rotation) replace the whole
+     * config. Preserve the independently learned MAC for an unchanged data
+     * tunnel so traffic does not fall back to discovery on every update. */
+    mwan_config_preserve_peer_macs(new_cfg, old);
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
     synchronize_rcu();
     mwan_config_destroy(old);
     mutex_unlock(&cfg_lock);
+
+    /* Resolve one independent peer MAC for every published bonding tunnel. */
+    mwan_mac_discovery_kick();
 
     return 0;
 
