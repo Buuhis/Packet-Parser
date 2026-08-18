@@ -222,7 +222,10 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
     log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
     
     // Check if this matches the currently running Node configuration
-    if (running_ctx.cfg.node_id == profile_id && running_ctx.cfg.encrypt.enabled) {
+    if (key_bytes &&
+        running_ctx.cfg.node_id == profile_id &&
+        running_ctx.cfg.encrypt.enabled &&
+        running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
         // Copy the dynamic key to the active configuration
         memcpy(running_ctx.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
         running_ctx.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;

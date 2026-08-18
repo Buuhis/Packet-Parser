@@ -23,10 +23,14 @@ void app_context_dump(const app_context_t *ctx)
     if (!ctx->cfg.encrypt.enabled) {
         log_info("Encryption action: BYPASS (encryption OFF)");
     } else {
-        log_info("Encryption action: L%u, method=%s, key_len=%zu bytes",
+        const char *key_state =
+            ctx->cfg.encrypt.type == 2 && ctx->cfg.encrypt.key_len == 0 ?
+            ", key=PENDING_HANDSHAKE" : "";
+
+        log_info("Encryption action: L%u, method=%s, key_len=%zu bytes%s",
                  ctx->cfg.encrypt.layer,
                  ctx->cfg.encrypt.type == 0 ? "AES-GCM-128" :
                  (ctx->cfg.encrypt.type == 1 ? "AES-GCM-256" : "PQC-GCM"),
-                 ctx->cfg.encrypt.key_len);
+                 ctx->cfg.encrypt.key_len, key_state);
     }
 }

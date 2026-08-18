@@ -17,6 +17,17 @@ int kernel_sync_push_config(const app_context_t *ctx) {
 
     if (!ctx) return -1;
 
+    /* A PQC profile is loaded before its authenticated handshake completes.
+     * Do not send the DB key (or a zero-length key) to the kernel.  The
+     * sig_pqc_on_key_ready() callback will push this config after installing
+     * the derived 32-byte traffic key in the userspace context. */
+    if (ctx->cfg.encrypt.enabled &&
+        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+        ctx->cfg.encrypt.key_len != 32) {
+        log_info("PQC-GCM kernel sync deferred until authenticated session key is ready");
+        return 0;
+    }
+
     log_info("Pushing configuration to mwan_kmod via Generic Netlink...");
 
     sock = nl_socket_alloc();

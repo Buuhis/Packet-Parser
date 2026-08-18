@@ -229,8 +229,10 @@ int db_client_load_config(int profile_id, app_config_t *cfg)
         return -1;
     }
 
-    if (cfg->encrypt.enabled) {
-        
+    /* Static AES methods take their traffic key from sdwan_profiles.
+     * PQC-GCM deliberately leaves key_len at zero here: userspace derives
+     * its ephemeral traffic key during the authenticated PQC handshake. */
+    if (cfg->encrypt.enabled && cfg->encrypt.type != 2) {
         /* Convert static hex key if present */
         if (enc_key_hex && strlen(enc_key_hex) > 0) {
             int klen = hex_to_bytes(enc_key_hex, cfg->encrypt.key, MAX_ENCRYPT_KEY_LEN);
@@ -250,6 +252,8 @@ int db_client_load_config(int profile_id, app_config_t *cfg)
                 return -1;
             }
         }
+    } else if (cfg->encrypt.enabled) {
+        log_info("PQC-GCM selected: waiting for an authenticated userspace session key");
     }
     PQclear(res);
     
