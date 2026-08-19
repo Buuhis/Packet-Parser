@@ -31,6 +31,7 @@
 #endif
 
 #define PQC_RX_QUEUE_SIZE  16
+#define PQC_HS_CACHE_SLOTS 4
 #define MAX_IDENTITY_REGISTRY 100
 #define MAX_POLICY_BINDINGS 128
 #define MAX_L2_DISPATCHERS 16
@@ -59,6 +60,18 @@ typedef struct {
     uint8_t src_mac[6];
 } pqc_rx_pkt_info_t;
 
+/* L3 responder state for idempotent HELLO handling.  L2 keeps its existing
+ * handshake flow and does not use this cache. */
+typedef struct {
+    uint8_t *response;
+    uint32_t session_id;
+    int response_len;
+    uint8_t hello_hash[32];
+    uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
+    bool valid;
+    bool key_promoted;
+} pqc_hs_cache_entry_t;
+
 typedef struct {
     // 8-Byte Aligned Members
     uint64_t last_rotation_time;
@@ -71,6 +84,8 @@ typedef struct {
     char *local_pub;
     char *peer_pub;
 
+    pqc_hs_cache_entry_t hs_cache[PQC_HS_CACHE_SLOTS];
+
     pthread_t thread_id;
     uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
     pthread_mutex_t rx_mutex;
@@ -82,6 +97,7 @@ typedef struct {
     int role_mode;
     int rx_head;
     int rx_tail;
+    int hs_cache_next;
     int rx_len[PQC_RX_QUEUE_SIZE];
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
 
