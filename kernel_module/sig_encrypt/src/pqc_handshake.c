@@ -22,6 +22,10 @@
 #define KEY_ROTATION_INTERVAL_MS 3000000
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 
+/* TEST ONLY: allow the two peers to use different local profile IDs.
+ * Set this back to 0 after the profile-mismatch test. */
+#define PQC_TEST_ALLOW_PROFILE_MISMATCH 1
+
 extern void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes);
 
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
@@ -42,6 +46,39 @@ static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 static bool g_dispatcher_running = false;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
+
+static bool pqc_hs_profile_matches(uint32_t wire_profile_id,
+                                   int local_profile_id) {
+#if PQC_TEST_ALLOW_PROFILE_MISMATCH
+    (void)wire_profile_id;
+    (void)local_profile_id;
+    return true;
+#else
+    return wire_profile_id == (uint32_t)local_profile_id;
+#endif
+}
+
+/* g_key_mutex must be held. Exact profile matches always win. In test mode,
+ * mismatched IDs may fall back only when exactly one active PQC binding exists;
+ * multiple bindings would make routing the packet ambiguous. */
+static int pqc_hs_find_rx_binding_locked(uint32_t wire_profile_id) {
+    int fallback = -1;
+
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].profile_id == (int)wire_profile_id)
+            return i;
+    }
+
+#if PQC_TEST_ALLOW_PROFILE_MISMATCH
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (!g_policy_bindings_active[i]) continue;
+        if (fallback >= 0) return -1;
+        fallback = i;
+    }
+#endif
+
+    return fallback;
+}
 
 static int pqc_generate_session_id(uint32_t *session_id) {
     uint32_t value = 0;
@@ -284,7 +321,8 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
 
     if (pqc_hs_validate_message(rx_buf, rx_len, &msg) != 0 ||
         msg->magic != PQC_HS_MAGIC || msg->msg_type != PQC_HS_MSG_HELLO ||
-        msg->profile_id != (uint32_t)b->profile_id || msg->session_id == 0) {
+        !pqc_hs_profile_matches(msg->profile_id, b->profile_id) ||
+        msg->session_id == 0) {
         fprintf(stderr, "[PQC-HS-L3] Rejected malformed/mismatched HELLO for Profile %d.\n",
                 b->profile_id);
         return -1;
@@ -462,7 +500,7 @@ static void initiate_key_rotation(policy_key_binding_t *b, int sockfd, struct so
                     resp->magic == PQC_HS_MAGIC &&
                     resp->msg_type == PQC_HS_MSG_RESP &&
                     resp->session_id == msg_id &&
-                    resp->profile_id == (uint32_t)profile_id) {
+                    pqc_hs_profile_matches(resp->profile_id, profile_id)) {
                     pthread_mutex_lock(&g_key_mutex);
                     size_t raw_pub_sz = 0;
                     uint8_t raw_pub[8192];
@@ -516,10 +554,34 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
 
     uint32_t profile_id = msg->profile_id;
     pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].profile_id == (int)profile_id) {
-            policy_key_binding_t *b = &g_policy_bindings[i];
-            if (msg->msg_type == PQC_HS_MSG_POKE) {
+    int binding_idx = pqc_hs_find_rx_binding_locked(profile_id);
+    if (binding_idx >= 0) {
+        policy_key_binding_t *b = &g_policy_bindings[binding_idx];
+#if PQC_TEST_ALLOW_PROFILE_MISMATCH
+        if (b->profile_id != (int)profile_id) {
+            fprintf(stderr,
+                    "[PQC-HS-TEST] Accepting wire profile %u on local profile %d.\n",
+                    profile_id, b->profile_id);
+        }
+#endif
+        if (msg->msg_type == PQC_HS_MSG_POKE) {
+            b->handshake_give_up = false;
+            b->handshake_start_time = 0;
+            b->rotation_give_up = false;
+            b->rotation_start_time = 0;
+            b->key_ready = false;
+            pthread_mutex_lock(&b->rx_mutex);
+            for (int q = 0; q < PQC_RX_QUEUE_SIZE; q++) {
+                if (b->rx_queue[q]) { free(b->rx_queue[q]); b->rx_queue[q] = NULL; }
+                b->rx_len[q] = 0;
+            }
+            b->rx_head = 0; b->rx_tail = 0;
+            pthread_mutex_unlock(&b->rx_mutex);
+            fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry and flushing rx queue for Profile %d.\n", profile_id);
+            pthread_mutex_unlock(&g_key_mutex);
+            return;
+        } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
+            if (b->handshake_give_up) {
                 b->handshake_give_up = false;
                 b->handshake_start_time = 0;
                 b->rotation_give_up = false;
@@ -532,30 +594,12 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 }
                 b->rx_head = 0; b->rx_tail = 0;
                 pthread_mutex_unlock(&b->rx_mutex);
-                fprintf(stderr, "[PQC-HS] Received POKE message. Resetting handshake retry and flushing rx queue for Profile %d.\n", profile_id);
-                pthread_mutex_unlock(&g_key_mutex);
-                return;
-            } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
-                if (b->handshake_give_up) {
-                    b->handshake_give_up = false;
-                    b->handshake_start_time = 0;
-                    b->rotation_give_up = false;
-                    b->rotation_start_time = 0;
-                    b->key_ready = false;
-                    pthread_mutex_lock(&b->rx_mutex);
-                    for (int q = 0; q < PQC_RX_QUEUE_SIZE; q++) {
-                        if (b->rx_queue[q]) { free(b->rx_queue[q]); b->rx_queue[q] = NULL; }
-                        b->rx_len[q] = 0;
-                    }
-                    b->rx_head = 0; b->rx_tail = 0;
-                    pthread_mutex_unlock(&b->rx_mutex);
-                    fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder and flushing rx queue for Profile %d.\n", profile_id);
-                }
+                fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder and flushing rx queue for Profile %d.\n", profile_id);
             }
-            pqc_feed_packet_to_binding_queue(b, payload, len);
-            pthread_mutex_unlock(&g_key_mutex);
-            return;
         }
+        pqc_feed_packet_to_binding_queue(b, payload, len);
+        pthread_mutex_unlock(&g_key_mutex);
+        return;
     }
     pthread_mutex_unlock(&g_key_mutex);
 }
@@ -845,7 +889,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 resp->magic == PQC_HS_MAGIC &&
                                 resp->msg_type == PQC_HS_MSG_RESP &&
                                 resp->session_id == session_id &&
-                                resp->profile_id == (uint32_t)profile_id) {
+                                pqc_hs_profile_matches(resp->profile_id,
+                                                       profile_id)) {
                                 pthread_mutex_lock(&g_key_mutex);
                                 size_t raw_pub_sz = 0;
                                 uint8_t raw_pub[8192];
@@ -973,7 +1018,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                                       &my_priv, &peer_pub);
                     } else if (msg && msg->magic == PQC_HS_MAGIC &&
                                msg->msg_type == PQC_HS_MSG_KEEPALIVE &&
-                               msg->profile_id == (uint32_t)profile_id) {
+                               pqc_hs_profile_matches(msg->profile_id,
+                                                      profile_id)) {
                         fprintf(stderr, "[PQC-HS-L3] Responder received KEEPALIVE for Profile %d. Verifying signature...\n", profile_id);
                         pthread_mutex_lock(&g_key_mutex);
                         if (b->peer_pub && strlen(b->peer_pub) > 0) {
