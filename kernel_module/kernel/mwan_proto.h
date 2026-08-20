@@ -29,15 +29,22 @@ enum mwan_crypt_type {
 struct mwan_crypto_hdr {
     __be16 magic;      /* 0x4D57 ("MW") */
     __u8 proto;        /* Original IP L4 protocol */
-    __u8 reserved;     /* Reserved for padding/alignment */
+    __u8 key_id;       /* PQC traffic-key generation (0 = legacy current) */
     __be64 seq;        /* Sequence number (dynamic part of IV) */
 } __attribute__((packed));
 
 /* RFC4106 accepts 20 bytes here: the first 12 are authenticated fields and
- * the final 8 carry the explicit IV that is combined with the key salt. */
+ * the final 8 carry the explicit IV that is combined with the key salt.
+ *
+ * flow_token layout:
+ *   bits 63..56: key generation ID
+ *   bits 55..0 : random connection cookie
+ *
+ * A connection cookie, rather than a truncated hash-table bucket, keeps the
+ * reorder state of unrelated short-lived TCP/UDP flows independent. */
 struct mwan_l2_pqc_hdr {
-    __be32 flow_id;       /* 4-byte 4-tuple hash */
-    __be64 flow_seq;      /* 8-byte per-flow reorder sequence */
+    __be64 flow_token;    /* 8-bit key ID + 56-bit connection cookie */
+    __be32 flow_seq;      /* 32-bit sequence local to this connection */
     __be64 packet_nonce;  /* 8-byte globally unique RFC4106 explicit IV */
 } __attribute__((packed));
 
@@ -59,6 +66,9 @@ enum mwan_genl_attrs {
     MWAN_ATTR_ENCRYPT_KEY,   /* NLA_BINARY: raw key bytes (16 or 32) */
     MWAN_ATTR_ENCRYPT_SALT,  /* NLA_BINARY: 4 bytes salt */
     MWAN_ATTR_ENCRYPT_LAYER, /* u8: 2=L2 (MACsec), 3=L3 (Overlay) */
+    MWAN_ATTR_KEY_ID,        /* u8: current PQC traffic-key generation */
+    MWAN_ATTR_PREV_KEY,      /* NLA_BINARY: previous 32-byte PQC key */
+    MWAN_ATTR_PREV_KEY_ID,   /* u8: previous PQC traffic-key generation */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

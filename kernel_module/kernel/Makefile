@@ -1,6 +1,6 @@
 obj-m += mwan_kmod.o
 
-mwan_kmod-objs := mwan_main.o mwan_state.o mwan_netlink.o mwan_steer.o \
+mwan_kmod-objs := mwan_main.o mwan_state.o mwan_l2_flow.o mwan_netlink.o mwan_steer.o \
                  mwan_mac_discovery.o \
                  encap/encap_none.o \
                  encap/encap_macsec.o \

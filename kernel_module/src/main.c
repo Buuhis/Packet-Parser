@@ -225,6 +225,13 @@ void pqc_bind_node(int node_id) {
 
 void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
     log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
+    log_info("[CFG-TRACE pqc-callback] ENTER callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u active_key_len=%zu key_ptr=%s",
+             profile_id, running_ctx.cfg.node_id,
+             running_ctx.cfg.encrypt.enabled,
+             running_ctx.cfg.encrypt.layer,
+             running_ctx.cfg.encrypt.type,
+             running_ctx.cfg.encrypt.key_len,
+             key_bytes ? "valid" : "null");
     
     // Check if this matches the currently running Node configuration
     if (key_bytes &&
@@ -234,6 +241,11 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
         // Copy the dynamic key to the active configuration
         memcpy(running_ctx.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
         running_ctx.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
+        log_info("[CFG-TRACE pqc-callback] KEY_INSTALLED callback_node=%d active_node=%d active_layer=%u active_type=%u key_len=%zu",
+                 profile_id, running_ctx.cfg.node_id,
+                 running_ctx.cfg.encrypt.layer,
+                 running_ctx.cfg.encrypt.type,
+                 running_ctx.cfg.encrypt.key_len);
         
         // Push configuration to kernel datapath via Netlink
         if (kernel_sync_push_config(&running_ctx) == 0) {
@@ -242,6 +254,11 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
         }
     } else {
+        log_warn("[CFG-TRACE pqc-callback] STALE_OR_INACTIVE callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u",
+                 profile_id, running_ctx.cfg.node_id,
+                 running_ctx.cfg.encrypt.enabled,
+                 running_ctx.cfg.encrypt.layer,
+                 running_ctx.cfg.encrypt.type);
         log_warn("[PQC] Handshake key ready for Node %d but no active tunnel/encryption is configured for it.", profile_id);
     }
 }
@@ -358,7 +375,8 @@ int main(int argc, char **argv) {
     log_info("Control Plane Ready! Socket: %s", socket_path);
 
     /* Auto-load from startup config if exists */
-    int saved_node_id = load_node_id();
+    // int saved_node_id = load_node_id();
+    int saved_node_id = -1;
     if (saved_node_id > 0) {
         log_info(">>> Found startup config! Auto-loading properties for Node ID: %d", saved_node_id);
         app_config_t new_cfg;

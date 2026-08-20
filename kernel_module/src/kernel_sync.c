@@ -8,14 +8,30 @@
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 #include "../kernel/mwan_proto.h"
+#include "../sig_encrypt/inc/pqc_handshake.h"
 
 
 int kernel_sync_push_config(const app_context_t *ctx) {
     struct nl_sock *sock;
     struct nl_msg *msg;
+    static unsigned long push_generation;
+    unsigned long push_id;
+    unsigned int nl_seq = 0;
     int family_id, ret = -1;
+    int send_ret;
+    int ack_ret;
+    uint8_t pqc_keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ] = {{0}};
+    uint8_t pqc_key_ids[KEY_SLOT_COUNT] = {0};
+    bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
+    bool have_pqc_slots = false;
 
     if (!ctx) return -1;
+
+    push_id = __atomic_add_fetch(&push_generation, 1, __ATOMIC_RELAXED);
+    log_info("[CFG-TRACE push=%lu] PREPARE node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
+             push_id, ctx->cfg.node_id, ctx->cfg.encrypt.enabled,
+             ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
+             ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
 
     /* A PQC profile is loaded before its authenticated handshake completes.
      * Do not send the DB key (or a zero-length key) to the kernel.  The
@@ -24,8 +40,20 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     if (ctx->cfg.encrypt.enabled &&
         ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
         ctx->cfg.encrypt.key_len != 32) {
-        log_info("PQC-GCM kernel sync deferred until authenticated session key is ready");
+        log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu (no Netlink message sent)",
+                 push_id, ctx->cfg.encrypt.key_len);
         return 0;
+    }
+
+    if (ctx->cfg.encrypt.enabled &&
+        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+        sig_pqc_snapshot_keys(ctx->cfg.node_id, pqc_keys, pqc_key_ids,
+                              pqc_slots_valid) == 0 &&
+        pqc_slots_valid[KEY_SLOT_CURRENT] &&
+        pqc_key_ids[KEY_SLOT_CURRENT] != 0 &&
+        memcmp(pqc_keys[KEY_SLOT_CURRENT], ctx->cfg.encrypt.key,
+               PQC_TRAFFIC_KEY_SZ) == 0) {
+        have_pqc_slots = true;
     }
 
     log_info("Pushing configuration to mwan_kmod via Generic Netlink...");
@@ -85,6 +113,21 @@ int kernel_sync_push_config(const app_context_t *ctx) {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  ctx->cfg.encrypt.type);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   ctx->cfg.encrypt.key_len, ctx->cfg.encrypt.key);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     ctx->cfg.encrypt.salt);
+        if (have_pqc_slots) {
+            nla_put_u8(msg, MWAN_ATTR_KEY_ID,
+                       pqc_key_ids[KEY_SLOT_CURRENT]);
+            if (pqc_slots_valid[KEY_SLOT_PREV] &&
+                pqc_key_ids[KEY_SLOT_PREV] != 0 &&
+                pqc_key_ids[KEY_SLOT_PREV] !=
+                    pqc_key_ids[KEY_SLOT_CURRENT]) {
+                nla_put(msg, MWAN_ATTR_PREV_KEY, PQC_TRAFFIC_KEY_SZ,
+                        pqc_keys[KEY_SLOT_PREV]);
+                nla_put_u8(msg, MWAN_ATTR_PREV_KEY_ID,
+                           pqc_key_ids[KEY_SLOT_PREV]);
+            }
+        } else {
+            nla_put_u8(msg, MWAN_ATTR_KEY_ID, 1);
+        }
         
         const char *type_str = "AES-GCM-128";
         if (ctx->cfg.encrypt.type == 1) type_str = "AES-GCM-256";
@@ -99,12 +142,28 @@ int kernel_sync_push_config(const app_context_t *ctx) {
         log_info("  [+] Sync Encryption: OFF");
     }
 
-    if (nl_send_auto(sock, msg) < 0) {
-        log_error("Failed to send Netlink message");
-    } else {
-        log_info("Configuration pushed successfully to Kernel.");
-        ret = 0;
+    send_ret = nl_send_auto(sock, msg);
+    nl_seq = nlmsg_hdr(msg)->nlmsg_seq;
+    if (send_ret < 0) {
+        log_error("[CFG-TRACE push=%lu nlseq=%u] SEND_FAILED err=%d (%s)",
+                  push_id, nl_seq, send_ret, nl_geterror(send_ret));
+        goto out;
     }
+
+    log_info("[CFG-TRACE push=%lu nlseq=%u] SENT bytes=%d waiting_for_kernel_ack=1",
+             push_id, nl_seq, send_ret);
+    ack_ret = nl_wait_for_ack(sock);
+    if (ack_ret < 0) {
+        log_error("[CFG-TRACE push=%lu nlseq=%u] KERNEL_REJECTED err=%d (%s)",
+                  push_id, nl_seq, ack_ret, nl_geterror(ack_ret));
+        goto out;
+    }
+
+    log_info("[CFG-TRACE push=%lu nlseq=%u] KERNEL_ACK_OK node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
+             push_id, nl_seq, ctx->cfg.node_id, ctx->cfg.encrypt.enabled,
+             ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
+             ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
+    ret = 0;
 
 out:
     nlmsg_free(msg);

@@ -11,6 +11,7 @@
 #include <linux/math64.h>
 #include <linux/netdevice.h>
 #include <linux/seq_file.h>
+#include <linux/tcp.h>
 #include <linux/workqueue.h>
 #include <crypto/aead.h>
 #include <net/ip.h>
@@ -19,21 +20,20 @@
  * a crypto worker queue.  Clear it before returning the skb to the network
  * stack. */
 struct mwan_l2_rx_cb {
-    u64 dispatch_flow_seq;
+    uintptr_t flow_ptr;
+    u64 dispatch_flow_token;
     u64 dispatch_nonce;
     u64 diag_cookie;
-    u32 flow_idx;
+    u32 dispatch_flow_seq;
     u32 accounted_bytes;
-    u32 dispatch_flow_id;
     u32 diag_check;
-    u32 diag_magic;
     u16 dispatch_headlen;
     u8 dispatch_flags;
-    u8 reserved;
+    u8 diag_magic;
 };
 
 #define MWAN_L2_RX_CB_NONLINEAR BIT(0)
-#define MWAN_L2_RX_CB_MAGIC     0x4c324443U
+#define MWAN_L2_RX_CB_MAGIC     0x4cU
 
 #define MWAN_L2_RX_CB(skb) ((struct mwan_l2_rx_cb *)((skb)->cb))
 
@@ -58,8 +58,8 @@ struct mwan_l2_select_diag {
 static DEFINE_SPINLOCK(mwan_l2_rx_diag_lock);
 static u32 mwan_l2_rx_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
 static unsigned int mwan_l2_rx_diag_count;
-static u32 mwan_l2_rx_diag_bucket_flow[MWAN_FLOW_TABLE_SIZE];
-static bool mwan_l2_rx_diag_bucket_valid[MWAN_FLOW_TABLE_SIZE];
+static u32 mwan_l2_rx_diag_bucket_flow[MWAN_FLOW_HASH_SIZE];
+static bool mwan_l2_rx_diag_bucket_valid[MWAN_FLOW_HASH_SIZE];
 
 static DEFINE_SPINLOCK(mwan_l2_work_diag_lock);
 static u32 mwan_l2_work_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
@@ -87,9 +87,10 @@ static void mwan_l2_worker_fn(struct work_struct *work);
 
 static u32 mwan_l2_rx_cb_check(const struct mwan_l2_rx_cb *cb)
 {
-    return cb->flow_idx ^ cb->accounted_bytes ^ cb->dispatch_flow_id ^
-           lower_32_bits(cb->dispatch_flow_seq) ^
-           upper_32_bits(cb->dispatch_flow_seq) ^
+    return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
+           lower_32_bits(cb->dispatch_flow_token) ^
+           upper_32_bits(cb->dispatch_flow_token) ^
+           cb->accounted_bytes ^ cb->dispatch_flow_seq ^
            lower_32_bits(cb->dispatch_nonce) ^
            upper_32_bits(cb->dispatch_nonce) ^
            lower_32_bits(cb->diag_cookie) ^
@@ -298,7 +299,8 @@ static void mwan_l2_softirq_sample_fn(struct work_struct *work)
 
 static int mwan_l2_alloc_worker_aead(struct crypto_aead **tfm_out,
                                      struct aead_request **req_out,
-                                     const struct mwan_config *cfg)
+                                     const u8 *key, u8 key_len,
+                                     const u8 salt[MWAN_SALT_LEN])
 {
     struct crypto_aead *tfm;
     struct aead_request *req;
@@ -316,11 +318,10 @@ static int mwan_l2_alloc_worker_aead(struct crypto_aead **tfm_out,
         goto err_free_tfm;
     }
 
-    memcpy(key_and_salt, cfg->encrypt_key, cfg->encrypt_key_len);
-    memcpy(key_and_salt + cfg->encrypt_key_len, cfg->encrypt_salt,
-           MWAN_SALT_LEN);
+    memcpy(key_and_salt, key, key_len);
+    memcpy(key_and_salt + key_len, salt, MWAN_SALT_LEN);
     err = crypto_aead_setkey(tfm, key_and_salt,
-                             cfg->encrypt_key_len + MWAN_SALT_LEN);
+                             key_len + MWAN_SALT_LEN);
     memzero_explicit(key_and_salt, sizeof(key_and_salt));
     if (err)
         goto err_free_tfm;
@@ -352,16 +353,42 @@ static int mwan_l2_worker_set_keys(struct mwan_l2_worker *worker,
 {
     int err;
 
-    err = mwan_l2_alloc_worker_aead(&worker->tfm, &worker->req, cfg);
+    err = mwan_l2_alloc_worker_aead(&worker->tfm, &worker->req,
+                                    cfg->encrypt_key,
+                                    cfg->encrypt_key_len,
+                                    cfg->encrypt_salt);
     if (err)
         return err;
 
-    err = mwan_l2_alloc_worker_aead(&worker->tx_tfm, &worker->tx_req, cfg);
+    err = mwan_l2_alloc_worker_aead(&worker->tx_tfm, &worker->tx_req,
+                                    cfg->encrypt_key,
+                                    cfg->encrypt_key_len,
+                                    cfg->encrypt_salt);
     if (err) {
         aead_request_free(worker->req);
         worker->req = NULL;
         crypto_free_aead(worker->tfm);
         worker->tfm = NULL;
+    }
+    if (err)
+        return err;
+
+    if (cfg->prev_key_valid) {
+        err = mwan_l2_alloc_worker_aead(&worker->prev_tfm,
+                                        &worker->prev_req,
+                                        cfg->prev_key,
+                                        cfg->prev_key_len,
+                                        cfg->encrypt_salt);
+        if (err) {
+            aead_request_free(worker->tx_req);
+            worker->tx_req = NULL;
+            crypto_free_aead(worker->tx_tfm);
+            worker->tx_tfm = NULL;
+            aead_request_free(worker->req);
+            worker->req = NULL;
+            crypto_free_aead(worker->tfm);
+            worker->tfm = NULL;
+        }
     }
     return err;
 }
@@ -455,20 +482,31 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
         struct sk_buff *skb;
 
         while ((skb = skb_dequeue(&worker->rx_queue)) != NULL) {
-            u32 flow_idx = MWAN_L2_RX_CB(skb)->flow_idx;
+            struct mwan_l2_rx_flow *flow =
+                (struct mwan_l2_rx_flow *)MWAN_L2_RX_CB(skb)->flow_ptr;
 
             atomic64_dec(&worker->queued_packets);
             atomic64_sub(MWAN_L2_RX_CB(skb)->accounted_bytes,
                          &worker->queued_bytes);
             atomic64_inc(&worker->dropped_packets);
-            if (flow_idx < MWAN_FLOW_TABLE_SIZE)
-                atomic_dec(&cfg->flow_reorder[flow_idx].pending_crypto);
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_rx_flow_put(flow);
+            }
             kfree_skb(skb);
         }
         while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
+            struct mwan_l2_tx_flow *flow =
+                (struct mwan_l2_tx_flow *)MWAN_L2_TX_CB(skb)->flow_ptr;
+
             atomic64_dec(&worker->tx_queued_packets);
-            atomic64_sub(skb->truesize, &worker->tx_queued_bytes);
+            atomic64_sub(MWAN_L2_TX_CB(skb)->accounted_bytes,
+                         &worker->tx_queued_bytes);
             atomic64_inc(&worker->tx_dropped_packets);
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_tx_flow_put(flow);
+            }
             kfree_skb(skb);
         }
 
@@ -479,6 +517,14 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
         if (worker->tfm) {
             crypto_free_aead(worker->tfm);
             worker->tfm = NULL;
+        }
+        if (worker->prev_req) {
+            aead_request_free(worker->prev_req);
+            worker->prev_req = NULL;
+        }
+        if (worker->prev_tfm) {
+            crypto_free_aead(worker->prev_tfm);
+            worker->prev_tfm = NULL;
         }
         if (worker->tx_req) {
             aead_request_free(worker->tx_req);
@@ -638,6 +684,12 @@ int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
     return mwan_l2_select_worker(cfg, flow_id, current_owner, true, NULL);
 }
 
+int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
+                             int current_owner)
+{
+    return mwan_l2_select_worker(cfg, flow_id, current_owner, false, NULL);
+}
+
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker)
 {
     if (unlikely(!mwan_l2_tx_wq))
@@ -646,91 +698,39 @@ bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker)
 }
 
 static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
-                               u32 flow_id, u64 flow_seq, u64 packet_nonce,
+                               struct mwan_l2_rx_flow *flow, u64 flow_token,
+                               u32 flow_seq, u64 packet_nonce,
                                u32 rx_headlen, bool rx_nonlinear,
                                int ingress_cpu)
 {
-    struct mwan_per_flow_reorder *flow;
     struct mwan_l2_worker *worker;
     unsigned int accounted_bytes = skb->truesize;
-    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    int owner;
-    int new_owner;
+    u32 diag_id = lower_32_bits(flow_token);
+    int owner = flow->owner_worker;
     int was_scheduled;
     bool new_diag_flow;
-    bool bucket_collision = false;
-    u32 bucket_previous_flow = 0;
     u32 generation = mwan_l2_diag_generation_get();
     u64 diag_cookie = 0;
     unsigned int queued_after;
-    const char *owner_reason = "sticky";
-    struct mwan_l2_select_diag select_diag = { 0 };
 
     if (READ_ONCE(mwan_l2_diag_enabled))
         diag_cookie = (u64)atomic64_inc_return(&mwan_l2_diag_cookie);
 
-    new_diag_flow = mwan_l2_diag_first_flow(flow_id, mwan_l2_rx_diag_flows,
+    new_diag_flow = mwan_l2_diag_first_flow(diag_id, mwan_l2_rx_diag_flows,
                                             &mwan_l2_rx_diag_count,
                                             &mwan_l2_rx_diag_lock);
-    if (READ_ONCE(mwan_l2_diag_enabled) && unlikely(flow_id == 0)) {
+    if (READ_ONCE(mwan_l2_diag_enabled) && unlikely(diag_id == 0)) {
         atomic64_inc(&mwan_l2_rx_diag_zero);
-        pr_info_ratelimited("mwan_kmod: L2D RX_ZERO_IN g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u in=%d\n",
-                            generation, diag_cookie, flow_id, flow_seq,
+        pr_info_ratelimited("mwan_kmod: L2D RX_ZERO_IN g=%u c=%llu token=%016llx/%u/%016llx head=%u nl=%u in=%d\n",
+                            generation, diag_cookie, flow_token, flow_seq,
                             packet_nonce, rx_headlen, rx_nonlinear,
                             ingress_cpu);
     }
-    if (new_diag_flow) {
+    if (new_diag_flow)
         atomic64_inc(&mwan_l2_rx_diag_flows_count);
-        spin_lock_bh(&mwan_l2_rx_diag_lock);
-        if (mwan_l2_rx_diag_bucket_valid[flow_idx] &&
-            mwan_l2_rx_diag_bucket_flow[flow_idx] != flow_id) {
-            bucket_collision = true;
-            bucket_previous_flow = mwan_l2_rx_diag_bucket_flow[flow_idx];
-            atomic64_inc(&mwan_l2_rx_diag_collisions);
-        } else if (!mwan_l2_rx_diag_bucket_valid[flow_idx]) {
-            mwan_l2_rx_diag_bucket_valid[flow_idx] = true;
-            mwan_l2_rx_diag_bucket_flow[flow_idx] = flow_id;
-        }
-        spin_unlock_bh(&mwan_l2_rx_diag_lock);
-    }
-
-    flow = &cfg->flow_reorder[flow_idx];
-    spin_lock_bh(&flow->owner_lock);
-    owner = atomic_read(&flow->owner_worker);
-
-    if (owner < 0 || owner >= cfg->num_workers) {
-        if (unlikely(atomic_read(&flow->pending_crypto) != 0)) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        owner_reason = "new";
-        new_owner = mwan_l2_select_worker(cfg, flow_id, owner, false,
-                                          &select_diag);
-    } else if (!cpu_online(cfg->l2_workers[owner].cpu)) {
-        /* Never move an active flow while packets may still be executing on
-         * the old CPU.  Dropping during the rare hot-unplug transition is
-         * safer than decrypting the same flow concurrently on two CPUs. */
-        if (atomic_read(&flow->pending_crypto) != 0) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        owner_reason = "offline";
-        new_owner = mwan_l2_select_worker(cfg, flow_id, owner, false,
-                                          &select_diag);
-    } else {
-        /* Load never migrates an owned flow. A hot owner remains sticky and
-         * is merely excluded from admission decisions for other new flows. */
-        new_owner = owner;
-    }
-
-    if (new_owner < 0) {
-        spin_unlock_bh(&flow->owner_lock);
+    if (owner < 0 || owner >= cfg->num_workers ||
+        !cpu_online(cfg->l2_workers[owner].cpu))
         return -ENODEV;
-    }
-    if (new_owner != owner) {
-        atomic_set(&flow->owner_worker, new_owner);
-        owner = new_owner;
-    }
 
     worker = &cfg->l2_workers[owner];
     spin_lock(&worker->rx_queue.lock);
@@ -739,14 +739,13 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
             MWAN_L2_QUEUE_MAX_BYTES) {
         spin_unlock(&worker->rx_queue.lock);
         atomic64_inc(&worker->dropped_packets);
-        spin_unlock_bh(&flow->owner_lock);
         return -ENOSPC;
     }
 
     BUILD_BUG_ON(sizeof(struct mwan_l2_rx_cb) > sizeof(skb->cb));
-    MWAN_L2_RX_CB(skb)->flow_idx = flow_idx;
+    MWAN_L2_RX_CB(skb)->flow_ptr = (uintptr_t)flow;
+    MWAN_L2_RX_CB(skb)->dispatch_flow_token = flow_token;
     MWAN_L2_RX_CB(skb)->accounted_bytes = accounted_bytes;
-    MWAN_L2_RX_CB(skb)->dispatch_flow_id = flow_id;
     MWAN_L2_RX_CB(skb)->dispatch_flow_seq = flow_seq;
     MWAN_L2_RX_CB(skb)->dispatch_nonce = packet_nonce;
     MWAN_L2_RX_CB(skb)->diag_cookie = diag_cookie;
@@ -754,7 +753,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
         min_t(u32, rx_headlen, U16_MAX);
     MWAN_L2_RX_CB(skb)->dispatch_flags =
         rx_nonlinear ? MWAN_L2_RX_CB_NONLINEAR : 0;
-    MWAN_L2_RX_CB(skb)->reserved = 0;
     MWAN_L2_RX_CB(skb)->diag_magic = MWAN_L2_RX_CB_MAGIC;
     MWAN_L2_RX_CB(skb)->diag_check =
         mwan_l2_rx_cb_check(MWAN_L2_RX_CB(skb));
@@ -764,7 +762,6 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     atomic64_add(accounted_bytes, &worker->queued_bytes);
     atomic64_inc(&worker->enqueued_packets);
     atomic_inc(&flow->pending_crypto);
-    flow->last_seen = jiffies;
     /* Change 0 -> 1 while holding the same queue lock used by the worker's
      * empty-queue handoff.  This makes queue ownership and scheduled state a
      * single transition instead of two independently visible operations. */
@@ -774,49 +771,14 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     mwan_atomic64_update_max(&worker->max_queued_bytes,
                              atomic64_read(&worker->queued_bytes));
     spin_unlock(&worker->rx_queue.lock);
-    spin_unlock_bh(&flow->owner_lock);
 
     if (new_diag_flow) {
         if (worker->cpu >= 0 && worker->cpu < NR_CPUS)
             atomic64_inc(&mwan_l2_rx_diag_cpu_flows[worker->cpu]);
-
-        if (bucket_collision)
-            pr_info("mwan_kmod: L2D COLL g=%u b=%u new=%08x prev=%08x owner=%d/%d\n",
-                    generation, flow_idx, flow_id, bucket_previous_flow,
-                    owner, worker->cpu);
-
-        if (select_diag.ran) {
-            if (flow_id == 0)
-                pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u soft_bp=%u flows=%llu fallback=%u owner=%d/%d q=%u\n",
-                        generation, diag_cookie, flow_id, flow_seq,
-                        packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
-                        ingress_cpu, owner_reason,
-                        select_diag.eligible_cpus,
-                        select_diag.chosen_softirq_bp,
-                        select_diag.chosen_assigned_flows,
-                        select_diag.all_hot_fallback, owner, worker->cpu,
-                        queued_after);
-            else
-                pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s eligible=%u soft_bp=%u flows=%llu fallback=%u owner=%d/%d q=%u\n",
-                        generation, diag_cookie, flow_id, flow_seq,
-                        packet_nonce, rx_headlen, rx_nonlinear, flow_idx,
-                        ingress_cpu, owner_reason,
-                        select_diag.eligible_cpus,
-                        select_diag.chosen_softirq_bp,
-                        select_diag.chosen_assigned_flows,
-                        select_diag.all_hot_fallback, owner, worker->cpu,
-                        queued_after);
-        } else if (flow_id == 0) {
-            pr_info("mwan_kmod: L2D RX_ZERO g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s owner=%d/%d q=%u\n",
-                    generation, diag_cookie, flow_id, flow_seq, packet_nonce,
-                    rx_headlen, rx_nonlinear, flow_idx, ingress_cpu,
-                    owner_reason, owner, worker->cpu, queued_after);
-        } else {
-            pr_info("mwan_kmod: L2D RX g=%u c=%llu hdr=%08x/%llu/%016llx head=%u nl=%u b=%u in=%d reason=%s owner=%d/%d q=%u\n",
-                    generation, diag_cookie, flow_id, flow_seq, packet_nonce,
-                    rx_headlen, rx_nonlinear, flow_idx, ingress_cpu,
-                    owner_reason, owner, worker->cpu, queued_after);
-        }
+        pr_info("mwan_kmod: L2D RX g=%u c=%llu token=%016llx/%u/%016llx head=%u nl=%u in=%d owner=%d/%d q=%u\n",
+                generation, diag_cookie, flow_token, flow_seq, packet_nonce,
+                rx_headlen, rx_nonlinear, ingress_cpu, owner, worker->cpu,
+                queued_after);
     }
 
     if (was_scheduled == 0 &&
@@ -827,17 +789,18 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
 
 static int l2_pqc_decrypt_skb(struct sk_buff *skb,
                               struct mwan_l2_worker *worker,
-                              u32 *out_flow_id, u64 *out_flow_seq,
+                              u64 *out_flow_token, u32 *out_flow_seq,
                               u64 *out_packet_nonce)
 {
     u8 iv_buf[MWAN_RFC4106_IV_LEN];
     u64 packet_nonce;
-    u64 flow_seq;
-    u32 flow_id;
-    __be32 flow_id_be;
-    __be64 flow_seq_be;
-    __be64 nonce_be;
-    struct aead_request *req = worker->req;
+    u64 flow_token;
+    u32 flow_seq;
+    __be64 flow_token_be, nonce_be;
+    __be32 flow_seq_be;
+    struct aead_request *req;
+    struct crypto_aead *tfm;
+    const struct mwan_config *cfg = worker->cfg;
     struct mwan_l2_pqc_hdr *l2_hdr;
     int ciphertext_len;
     int err;
@@ -848,21 +811,32 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb,
         return -ENOMEM;
     if (skb->len < MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN)
         return -EINVAL;
-    if (unlikely(!worker->tfm || !req))
-        return -ENODEV;
-
     l2_hdr = (struct mwan_l2_pqc_hdr *)skb->data;
-    memcpy(&flow_id_be, &l2_hdr->flow_id, sizeof(flow_id_be));
+    memcpy(&flow_token_be, &l2_hdr->flow_token, sizeof(flow_token_be));
     memcpy(&flow_seq_be, &l2_hdr->flow_seq, sizeof(flow_seq_be));
     memcpy(&nonce_be, &l2_hdr->packet_nonce, sizeof(nonce_be));
-    flow_id = be32_to_cpu(flow_id_be);
-    flow_seq = be64_to_cpu(flow_seq_be);
+    flow_token = be64_to_cpu(flow_token_be);
+    flow_seq = be32_to_cpu(flow_seq_be);
     packet_nonce = be64_to_cpu(nonce_be);
     if (unlikely(packet_nonce == 0))
         return -EINVAL;
 
-    if (out_flow_id)
-        *out_flow_id = flow_id;
+    if ((u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) == cfg->key_id) {
+        tfm = worker->tfm;
+        req = worker->req;
+    } else if (cfg->prev_key_valid &&
+               (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) ==
+                   cfg->prev_key_id) {
+        tfm = worker->prev_tfm;
+        req = worker->prev_req;
+    } else {
+        return -ENOKEY;
+    }
+    if (unlikely(!tfm || !req))
+        return -ENODEV;
+
+    if (out_flow_token)
+        *out_flow_token = flow_token;
     if (out_flow_seq)
         *out_flow_seq = flow_seq;
     if (out_packet_nonce)
@@ -914,115 +888,30 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb,
     return 0;
 }
 
-void mwan_reorder_timeout(struct timer_list *t)
+static bool mwan_l2_decrypted_tcp_closing(struct sk_buff *skb)
 {
-    struct mwan_config *cfg = container_of(t, struct mwan_config,
-                                           reorder_timer);
-    bool restart = false;
-    int f;
+    struct iphdr *iph;
+    struct tcphdr *tcph;
+    int offset;
 
-    if (unlikely(READ_ONCE(cfg->reorder_stopping)))
-        return;
-
-    for (f = 0; f < MWAN_FLOW_TABLE_SIZE; f++) {
-        struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[f];
-        int i;
-
-        spin_lock_bh(&flow->drain_lock);
-        while (1) {
-            u32 slot = (u32)(atomic64_read(&flow->expected_seq) &
-                             MWAN_FLOW_RING_MASK);
-            struct sk_buff *skb = flow->ring[slot];
-
-            if (skb) {
-                flow->ring[slot] = NULL;
-                flow->slot_time[slot] = 0;
-                atomic64_inc(&flow->expected_seq);
-                netif_rx(skb);
-            } else {
-                bool timed_out = false;
-
-                for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
-                    if (flow->ring[i] && flow->slot_time[i] &&
-                        time_after_eq(jiffies, flow->slot_time[i] +
-                                      MWAN_REORDER_TIMEOUT)) {
-                        timed_out = true;
-                        break;
-                    }
-                }
-                if (!timed_out)
-                    break;
-                atomic64_inc(&flow->expected_seq);
-            }
-        }
-
-        for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
-            if (flow->ring[i]) {
-                restart = true;
-                break;
-            }
-        }
-        spin_unlock_bh(&flow->drain_lock);
-    }
-
-    if (restart && !READ_ONCE(cfg->reorder_stopping))
-        mod_timer(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
-}
-
-static void mwan_l2_deliver_decrypted(struct mwan_config *cfg,
-                                      struct sk_buff *skb, u32 flow_id,
-                                      u64 flow_seq)
-{
-    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    struct mwan_per_flow_reorder *flow = &cfg->flow_reorder[flow_idx];
-    u32 slot;
-
-    spin_lock_bh(&flow->drain_lock);
-    {
-        u64 expected = atomic64_read(&flow->expected_seq);
-
-        if (unlikely(expected == 1 || flow_seq > expected + 128)) {
-            atomic64_set(&flow->expected_seq, flow_seq);
-            expected = flow_seq;
-        }
-        if (unlikely(flow_seq < expected)) {
-            spin_unlock_bh(&flow->drain_lock);
-            kfree_skb(skb);
-            return;
-        }
-    }
-
-    slot = flow_seq & MWAN_FLOW_RING_MASK;
-    if (unlikely(flow->ring[slot] != NULL)) {
-        kfree_skb(flow->ring[slot]);
-        flow->ring[slot] = NULL;
-        flow->slot_time[slot] = 0;
-    }
-    flow->ring[slot] = skb;
-    flow->slot_time[slot] = jiffies;
-
-    while (1) {
-        u64 expected = atomic64_read(&flow->expected_seq);
-        u32 expected_slot = expected & MWAN_FLOW_RING_MASK;
-        struct sk_buff *pending = flow->ring[expected_slot];
-
-        if (!pending)
-            break;
-        flow->ring[expected_slot] = NULL;
-        flow->slot_time[expected_slot] = 0;
-        atomic64_inc(&flow->expected_seq);
-        netif_rx(pending);
-    }
-    spin_unlock_bh(&flow->drain_lock);
-    if (!READ_ONCE(cfg->reorder_stopping))
-        timer_reduce(&cfg->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+    if (!pskb_may_pull(skb, sizeof(*iph)))
+        return false;
+    iph = ip_hdr(skb);
+    if (!iph || iph->version != 4 || iph->ihl < 5 ||
+        iph->protocol != IPPROTO_TCP)
+        return false;
+    offset = iph->ihl * 4;
+    if (!pskb_may_pull(skb, offset + sizeof(*tcph)))
+        return false;
+    iph = ip_hdr(skb);
+    tcph = (struct tcphdr *)((u8 *)iph + offset);
+    return tcph->fin || tcph->rst;
 }
 
 static void mwan_l2_worker_fn(struct work_struct *work)
 {
     struct mwan_l2_worker *worker = container_of(work, struct mwan_l2_worker,
                                                  work);
-    struct mwan_config *cfg = worker->cfg;
     struct sk_buff *skb;
     unsigned int batch = 0;
 
@@ -1030,10 +919,12 @@ static void mwan_l2_worker_fn(struct work_struct *work)
     atomic_set(&worker->busy, 1);
     for (;;) {
         while ((skb = skb_dequeue(&worker->rx_queue)) != NULL) {
-            u32 flow_idx = MWAN_L2_RX_CB(skb)->flow_idx;
+            struct mwan_l2_rx_flow *flow =
+                (struct mwan_l2_rx_flow *)MWAN_L2_RX_CB(skb)->flow_ptr;
             u32 accounted_bytes = MWAN_L2_RX_CB(skb)->accounted_bytes;
-            u32 dispatch_flow_id = MWAN_L2_RX_CB(skb)->dispatch_flow_id;
-            u64 dispatch_flow_seq = MWAN_L2_RX_CB(skb)->dispatch_flow_seq;
+            u64 dispatch_flow_token =
+                MWAN_L2_RX_CB(skb)->dispatch_flow_token;
+            u32 dispatch_flow_seq = MWAN_L2_RX_CB(skb)->dispatch_flow_seq;
             u64 dispatch_nonce = MWAN_L2_RX_CB(skb)->dispatch_nonce;
             u64 diag_cookie = MWAN_L2_RX_CB(skb)->diag_cookie;
             u32 dispatch_headlen = MWAN_L2_RX_CB(skb)->dispatch_headlen;
@@ -1044,21 +935,21 @@ static void mwan_l2_worker_fn(struct work_struct *work)
                          MWAN_L2_RX_CB_MAGIC &&
                          MWAN_L2_RX_CB(skb)->diag_check ==
                          mwan_l2_rx_cb_check(MWAN_L2_RX_CB(skb));
-            u32 flow_id = 0;
-            u64 flow_seq = 0;
+            u64 flow_token = 0;
+            u32 flow_seq = 0;
             u64 packet_nonce = 0;
             u64 start_ns = ktime_get_ns();
             int ret;
 
             atomic64_dec(&worker->queued_packets);
             atomic64_sub(accounted_bytes, &worker->queued_bytes);
-            ret = l2_pqc_decrypt_skb(skb, worker, &flow_id, &flow_seq,
+            ret = l2_pqc_decrypt_skb(skb, worker, &flow_token, &flow_seq,
                                      &packet_nonce);
             mwan_l2_update_ewma(worker, ktime_get_ns() - start_ns);
             atomic64_inc(&worker->processed_packets);
 
             if (READ_ONCE(mwan_l2_diag_enabled)) {
-                bool fid_ok = dispatch_flow_id == flow_id;
+                bool fid_ok = dispatch_flow_token == flow_token;
                 bool seq_ok = dispatch_flow_seq == flow_seq;
                 bool nonce_ok = dispatch_nonce == packet_nonce;
                 bool first_work;
@@ -1079,15 +970,17 @@ static void mwan_l2_worker_fn(struct work_struct *work)
                 }
 
                 first_work = mwan_l2_diag_first_flow(
-                    dispatch_flow_id, mwan_l2_work_diag_flows,
+                    lower_32_bits(dispatch_flow_token),
+                    mwan_l2_work_diag_flows,
                     &mwan_l2_work_diag_count, &mwan_l2_work_diag_lock);
                 if (unlikely(ret || !cb_ok || !fid_ok || !seq_ok ||
                              !nonce_ok))
-                    pr_info_ratelimited("mwan_kmod: L2D WORK_BAD g=%u c=%llu cb_ok=%u cb=%08x/%llu/%016llx hdr=%08x/%llu/%016llx rx_head=%u rx_nl=%u cpu=%d/%u fid_ok=%u seq_ok=%u nonce_ok=%u decrypt_status=%s auth=%s err=%d\n",
+                    pr_info_ratelimited("mwan_kmod: L2D WORK_BAD g=%u c=%llu cb_ok=%u cb=%016llx/%u/%016llx hdr=%016llx/%u/%016llx rx_head=%u rx_nl=%u cpu=%d/%u token_ok=%u seq_ok=%u nonce_ok=%u decrypt_status=%s auth=%s err=%d\n",
                                         generation, diag_cookie,
                                         cb_ok,
-                                        dispatch_flow_id, dispatch_flow_seq,
-                                        dispatch_nonce, flow_id, flow_seq,
+                                        dispatch_flow_token,
+                                        dispatch_flow_seq,
+                                        dispatch_nonce, flow_token, flow_seq,
                                         packet_nonce, dispatch_headlen,
                                         dispatch_nonlinear,
                                         worker->cpu, raw_smp_processor_id(),
@@ -1096,8 +989,8 @@ static void mwan_l2_worker_fn(struct work_struct *work)
                                         ret == -EBADMSG ? "fail" :
                                         (ret ? "na" : "ok"), ret);
                 else if (first_work)
-                    pr_info("mwan_kmod: L2D WORK g=%u c=%llu hdr=%08x/%llu/%016llx cpu=%d/%u fid_ok=1 seq_ok=1 auth=ok\n",
-                            generation, diag_cookie, flow_id, flow_seq,
+                    pr_info("mwan_kmod: L2D WORK g=%u c=%llu hdr=%016llx/%u/%016llx cpu=%d/%u token_ok=1 seq_ok=1 auth=ok\n",
+                            generation, diag_cookie, flow_token, flow_seq,
                             packet_nonce, worker->cpu,
                             raw_smp_processor_id());
             }
@@ -1107,11 +1000,15 @@ static void mwan_l2_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->decrypt_failures);
                 kfree_skb(skb);
             } else {
-                mwan_l2_deliver_decrypted(cfg, skb, flow_id, flow_seq);
+                mwan_l2_rx_flow_touch(flow,
+                    mwan_l2_decrypted_tcp_closing(skb));
+                mwan_l2_rx_flow_deliver(flow, skb, flow_seq);
             }
 
-            if (flow_idx < MWAN_FLOW_TABLE_SIZE)
-                atomic_dec(&cfg->flow_reorder[flow_idx].pending_crypto);
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_rx_flow_put(flow);
+            }
             if (++batch == 64) {
                 batch = 0;
                 cond_resched();
@@ -1202,6 +1099,7 @@ static const struct file_operations mwan_l2_stats_fops = {
 
 static int mwan_l2_diag_show(struct seq_file *m, void *unused)
 {
+    struct mwan_config *cfg;
     int cpu;
 
     (void)unused;
@@ -1224,6 +1122,25 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     seq_printf(m, "decrypt_fail=%lld auth_fail=%lld\n",
                atomic64_read(&mwan_l2_rx_diag_decrypt_fail),
                atomic64_read(&mwan_l2_rx_diag_auth_fail));
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg) {
+        seq_printf(m, "flow_table key_id=%u prev_key_id=%u prev_valid=%u tx_active=%d rx_active=%d tx_created=%lld tx_expired=%lld rx_created=%lld rx_expired=%lld full=%lld\n",
+                   cfg->key_id, cfg->prev_key_id, cfg->prev_key_valid,
+                   atomic_read(&cfg->flows.tx_count),
+                   atomic_read(&cfg->flows.rx_count),
+                   atomic64_read(&cfg->flows.tx_created),
+                   atomic64_read(&cfg->flows.tx_expired),
+                   atomic64_read(&cfg->flows.rx_created),
+                   atomic64_read(&cfg->flows.rx_expired),
+                   atomic64_read(&cfg->flows.table_full));
+        seq_printf(m, "reorder late=%lld duplicate=%lld too_far=%lld skipped_on_timeout=%lld\n",
+                   atomic64_read(&cfg->flows.reorder_late),
+                   atomic64_read(&cfg->flows.reorder_duplicate),
+                   atomic64_read(&cfg->flows.reorder_too_far),
+                   atomic64_read(&cfg->flows.reorder_timeouts));
+    }
+    rcu_read_unlock();
     seq_printf(m, "softirq_high=%u softirq_low=%u sample_ms=%u admitted=%lld all_hot_fallback=%lld\n",
                clamp_t(unsigned int,
                        READ_ONCE(mwan_l2_softirq_high_pct), 1U, 100U),
@@ -1267,11 +1184,11 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     struct mwan_l2_pqc_hdr l2_hdr_buf;
     const struct mwan_l2_pqc_hdr *l2_hdr;
     struct mwan_config *cfg;
-    __be32 flow_id_be;
-    __be64 flow_seq_be;
-    __be64 nonce_be;
-    u32 flow_id;
-    u64 flow_seq;
+    struct mwan_l2_rx_flow *flow;
+    __be64 flow_token_be, nonce_be;
+    __be32 flow_seq_be;
+    u64 flow_token;
+    u32 flow_seq;
     u64 packet_nonce;
     u32 rx_headlen;
     bool rx_nonlinear;
@@ -1298,11 +1215,11 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         kfree_skb(skb);
         return NET_RX_DROP;
     }
-    memcpy(&flow_id_be, &l2_hdr->flow_id, sizeof(flow_id_be));
+    memcpy(&flow_token_be, &l2_hdr->flow_token, sizeof(flow_token_be));
     memcpy(&flow_seq_be, &l2_hdr->flow_seq, sizeof(flow_seq_be));
     memcpy(&nonce_be, &l2_hdr->packet_nonce, sizeof(nonce_be));
-    flow_id = be32_to_cpu(flow_id_be);
-    flow_seq = be64_to_cpu(flow_seq_be);
+    flow_token = be64_to_cpu(flow_token_be);
+    flow_seq = be32_to_cpu(flow_seq_be);
     packet_nonce = be64_to_cpu(nonce_be);
     rx_headlen = skb_headlen(skb);
     rx_nonlinear = skb_is_nonlinear(skb);
@@ -1315,11 +1232,26 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         kfree_skb(skb);
         return NET_RX_DROP;
     }
+    if ((u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) != cfg->key_id &&
+        (!cfg->prev_key_valid ||
+         (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) != cfg->prev_key_id)) {
+        rcu_read_unlock();
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
 
-    ret = mwan_l2_enqueue_skb(cfg, skb, flow_id, flow_seq, packet_nonce,
+    flow = mwan_l2_rx_flow_get(cfg, flow_token, flow_seq);
+    if (!flow) {
+        rcu_read_unlock();
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+    ret = mwan_l2_enqueue_skb(cfg, skb, flow, flow_token, flow_seq,
+                              packet_nonce,
                               rx_headlen, rx_nonlinear, ingress_cpu);
     rcu_read_unlock();
     if (unlikely(ret < 0)) {
+        mwan_l2_rx_flow_put(flow);
         kfree_skb(skb);
         return NET_RX_DROP;
     }

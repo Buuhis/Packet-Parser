@@ -1,0 +1,8 @@
+# this is build directory, ignore it
+*
+!.gitignore
+!mwan_l2_multicore.c
+!mwan_l2_multicore.h
+!mwan_l2_flow.c
+!mwan_mac_discovery.c
+!mwan_mac_discovery.h

@@ -11,19 +11,25 @@
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
 #include <linux/if_ether.h>
+#include <linux/refcount.h>
+#include <linux/list.h>
 #include "mwan_proto.h"
 
-#define MWAN_REORDER_TIMEOUT msecs_to_jiffies(30)
-#define MWAN_REORDER_RING_SIZE 1024
-#define MWAN_REORDER_RING_MASK (MWAN_REORDER_RING_SIZE - 1)
+#define MWAN_REORDER_TIMEOUT       msecs_to_jiffies(30)
 #define MAX_MWAN_TUNNELS 100
 #define MWAN_LUT_SIZE    256
-#define MWAN_FLOW_TABLE_SIZE 256
+#define MWAN_FLOW_HASH_SIZE 1024
 #define MWAN_FLOW_RING_SIZE  256
 #define MWAN_FLOW_RING_MASK  (MWAN_FLOW_RING_SIZE - 1)
+#define MWAN_FLOW_MAX_ACTIVE 4096
+#define MWAN_FLOW_IDLE_TIMEOUT msecs_to_jiffies(60000)
+#define MWAN_FLOW_CLOSING_TIMEOUT msecs_to_jiffies(2000)
+#define MWAN_FLOW_GC_INTERVAL msecs_to_jiffies(5000)
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
+#define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
+#define MWAN_FLOW_KEY_ID_SHIFT 56
 
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
@@ -46,24 +52,79 @@ struct mwan_tunnel {
     enum mwan_encap_type encap_type;
 };
 
-struct mwan_per_flow_reorder {
-    struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
-    atomic64_t expected_seq;
-    spinlock_t drain_lock;
-    spinlock_t owner_lock;
-    atomic_t owner_worker;
+struct mwan_l2_flow_key {
+    __be32 saddr;
+    __be32 daddr;
+    __be16 sport;
+    __be16 dport;
+    u32 fallback_hash;
+    u8 protocol;
+    u8 reserved[3];
+};
+
+struct mwan_l2_tx_flow {
+    struct hlist_node node;
+    struct mwan_l2_flow_key key;
+    refcount_t refs;
+    u64 flow_token;
+    atomic_t next_seq;
     atomic_t pending_crypto;
+    int owner_worker;
     unsigned long last_seen;
+    bool closing;
+};
+
+struct mwan_l2_rx_flow {
+    struct hlist_node node;
+    refcount_t refs;
+    u64 flow_token;
+    u32 expected_seq;
+    atomic_t pending_crypto;
+    int owner_worker;
+    unsigned long last_seen;
+    bool closing;
+    bool stopping;
+    struct mwan_l2_flow_manager *manager;
+    spinlock_t reorder_lock;
+    struct timer_list reorder_timer;
+    struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
-/* TX ownership is independent from RX ownership. Once a flow bucket has an
- * owner, load changes never migrate it; a hot CPU is only excluded when a
- * different, previously unseen bucket is admitted. */
-struct mwan_l2_tx_flow {
-    spinlock_t owner_lock;
-    atomic_t owner_worker;
-    atomic_t pending_crypto;
+struct mwan_l2_tx_cb {
+    uintptr_t flow_ptr;
+    u64 flow_token;
+    u32 flow_seq;
+    u32 accounted_bytes;
+    u16 tunnel_idx;
+    u16 magic;
+};
+
+#define MWAN_L2_TX_CB_MAGIC 0x4d54U
+#define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
+
+struct mwan_l2_flow_bucket {
+    struct hlist_head head;
+    spinlock_t lock;
+};
+
+struct mwan_l2_flow_manager {
+    struct mwan_l2_flow_bucket tx[MWAN_FLOW_HASH_SIZE];
+    struct mwan_l2_flow_bucket rx[MWAN_FLOW_HASH_SIZE];
+    atomic_t tx_count;
+    atomic_t rx_count;
+    atomic64_t tx_created;
+    atomic64_t tx_expired;
+    atomic64_t rx_created;
+    atomic64_t rx_expired;
+    atomic64_t table_full;
+    atomic64_t reorder_late;
+    atomic64_t reorder_duplicate;
+    atomic64_t reorder_too_far;
+    atomic64_t reorder_timeouts;
+    struct delayed_work gc_work;
+    struct mwan_config *cfg;
+    bool stopping;
 };
 
 /* Ordered RX/TX crypto queues per CPU. A flow bucket is owned by exactly one
@@ -75,6 +136,8 @@ struct mwan_l2_worker {
     struct work_struct work;
     struct crypto_aead *tfm;
     struct aead_request *req;
+    struct crypto_aead *prev_tfm;
+    struct aead_request *prev_req;
     int cpu;
 
     atomic64_t queued_packets;
@@ -124,14 +187,6 @@ struct mwan_l2_worker {
     atomic_t softirq_blocked;
 };
 
-struct mwan_reorder_ring {
-    struct sk_buff *ring[MWAN_REORDER_RING_SIZE];
-    atomic64_t expected_seq;
-    spinlock_t drain_lock;
-    struct timer_list timer;
-    unsigned long slot_time[MWAN_REORDER_RING_SIZE];
-};
-
 struct mwan_config {
     u32 node_id;
     u32 num_tunnels;
@@ -150,13 +205,14 @@ struct mwan_config {
     u8   encrypt_key_len;                 /* 16 (128-bit) or 32 (256-bit) */
     u8   encrypt_salt[MWAN_SALT_LEN];
     struct crypto_aead *tfm;              /* Crypto transform context */
-    atomic64_t encrypt_seq;               /* Auto-increment sequence for IV */
+    struct crypto_aead *prev_tfm;         /* Previous PQC key during grace */
     
-    struct mwan_per_flow_reorder flow_reorder[MWAN_FLOW_TABLE_SIZE];
-    struct mwan_l2_tx_flow tx_flows[MWAN_FLOW_TABLE_SIZE];
-
-    struct timer_list reorder_timer;
-    bool reorder_stopping;
+    struct mwan_l2_flow_manager flows;
+    u8 key_id;
+    u8 prev_key_id;
+    u8 prev_key[MWAN_MAX_KEY_LEN];
+    u8 prev_key_len;
+    bool prev_key_valid;
     int num_workers;
     int worker_start_cpu;
     struct mwan_l2_worker *l2_workers;
@@ -175,12 +231,12 @@ extern unsigned int mwan_l2_softirq_sample_ms;
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
-void mwan_reorder_timeout(struct timer_list *t);
-u64 mwan_l2_next_tx_seq(u32 flow_idx);
-u64 mwan_l2_next_packet_nonce(void);
+u64 mwan_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
 int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
+                             int current_owner);
+int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
                              int current_owner);
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
@@ -189,5 +245,21 @@ void mwan_l2_tx_diag_reset(void);
 u32 mwan_l2_diag_generation_get(void);
 u64 mwan_l2_tx_diag_flows_get(void);
 u64 mwan_l2_tx_diag_zero_get(void);
+
+int mwan_l2_flow_manager_init(struct mwan_config *cfg);
+void mwan_l2_flow_manager_start(struct mwan_config *cfg);
+void mwan_l2_flow_manager_stop(struct mwan_config *cfg);
+struct mwan_l2_tx_flow *
+mwan_l2_tx_flow_get(struct mwan_config *cfg,
+                    const struct mwan_l2_flow_key *key, u32 flow_hash);
+void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
+void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
+u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);
+struct mwan_l2_rx_flow *
+mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq);
+void mwan_l2_rx_flow_put(struct mwan_l2_rx_flow *flow);
+void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing);
+void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
+                             struct sk_buff *skb, u32 flow_seq);
 
 #endif /* MWAN_STATE_H */

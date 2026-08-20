@@ -144,6 +144,25 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
 /*  DAEMON-SIDE HANDLERS                                              */
 /* ================================================================== */
 
+static unsigned long provision_generation;
+
+static const char *provision_mode_name(const app_config_t *cfg)
+{
+    if (!cfg->encrypt.enabled)
+        return "BYPASS";
+    if (cfg->encrypt.layer == 2 && cfg->encrypt.type == MWAN_CRYPT_PQC_GCM)
+        return "L2/PQC-GCM";
+    if (cfg->encrypt.layer == 3 && cfg->encrypt.type == MWAN_CRYPT_PQC_GCM)
+        return "L3/PQC-GCM";
+    if (cfg->encrypt.layer == 2)
+        return cfg->encrypt.type == MWAN_CRYPT_AES_GCM_128 ?
+               "L2/AES-GCM-128" : "L2/AES-GCM-256";
+    if (cfg->encrypt.layer == 3)
+        return cfg->encrypt.type == MWAN_CRYPT_AES_GCM_128 ?
+               "L3/AES-GCM-128" : "L3/AES-GCM-256";
+    return "INVALID";
+}
+
 
 /* ---------- handle: -r <node_id> ---------------------------------- */
 static void handle_retry(int client_fd, int req_id)
@@ -156,30 +175,56 @@ static void handle_retry(int client_fd, int req_id)
 /* ---------- handle: <node_id> (initial provisioning) -------------- */
 static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 {
-    log_info(">>> Received configure request for Node ID: %d", req_id);
+    unsigned long generation = ++provision_generation;
+
+    log_info("[CFG-TRACE user=%lu] BEGIN -id node=%d active_node=%d active_mode=%s active_key_len=%zu active_tunnels=%zu",
+             generation, req_id, ctx->cfg.node_id,
+             provision_mode_name(&ctx->cfg), ctx->cfg.encrypt.key_len,
+             ctx->cfg.sdwan_tun_count);
 
     app_config_t new_cfg;
     if (db_client_load_config(req_id, &new_cfg) != 0) {
+        log_error("[CFG-TRACE user=%lu] DB_LOAD_FAILED node=%d",
+                  generation, req_id);
         reply_json(client_fd, 404, "Failed to load config from DB");
         return;
     }
 
+    log_info("[CFG-TRACE user=%lu] DB_LOADED node=%d mode=%s enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
+             generation, new_cfg.node_id, provision_mode_name(&new_cfg),
+             new_cfg.encrypt.enabled, new_cfg.encrypt.layer,
+             new_cfg.encrypt.type, new_cfg.encrypt.key_len,
+             new_cfg.sdwan_tun_count);
+
     app_context_dump(&(app_context_t){new_cfg});
     ctx->cfg = new_cfg;
 
+    log_info("[CFG-TRACE user=%lu] CTX_REPLACED node=%d mode=%s key_len=%zu",
+             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg),
+             ctx->cfg.encrypt.key_len);
+
     if (kernel_sync_push_config(ctx) != 0) {
-        log_error("Failed to push config to kernel");
+        log_error("[CFG-TRACE user=%lu] KERNEL_SYNC_FAILED node=%d mode=%s",
+                  generation, ctx->cfg.node_id,
+                  provision_mode_name(&ctx->cfg));
         reply_json(client_fd, 500, "Netlink push error");
         return;
     }
+
+    log_info("[CFG-TRACE user=%lu] KERNEL_SYNC_RETURNED_SUCCESS node=%d mode=%s",
+             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
 
     cpu_tune_apply(ctx);
     save_node_id(req_id);
 
     if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        log_info("[CFG-TRACE user=%lu] PQC_HANDSHAKE_START node=%d",
+                 generation, req_id);
         pqc_bind_node(req_id);
     }
 
+    log_info("[CFG-TRACE user=%lu] END response=200 node=%d mode=%s",
+             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
     reply_json(client_fd, 200, "Success");
 }
 

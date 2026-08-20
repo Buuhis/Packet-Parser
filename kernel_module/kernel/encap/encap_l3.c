@@ -148,7 +148,9 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
      * to distribute traffic across multiple CPU cores. */
     skb_get_hash(skb);
 
-    seq = (u64)atomic64_inc_return(&cfg->encrypt_seq);
+    seq = mwan_next_packet_nonce();
+    if (unlikely(seq == 0))
+        return NF_DROP;
     memcpy(iv, cfg->encrypt_salt, MWAN_SALT_LEN);
     *(__be64 *)(iv + MWAN_SALT_LEN) = cpu_to_be64(seq);
 
@@ -187,7 +189,7 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
         chdr = (struct mwan_crypto_hdr *)payload_start;
         chdr->magic = htons(MWAN_CRYPTO_MAGIC);
         chdr->proto = iph->protocol;
-        chdr->reserved = 0;
+        chdr->key_id = cfg->key_id;
         chdr->seq = cpu_to_be64(seq);
     }
 

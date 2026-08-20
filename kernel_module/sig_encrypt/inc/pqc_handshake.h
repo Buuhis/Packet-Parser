@@ -206,6 +206,8 @@ void sig_pqc_record_sent(int profile_id);
 void sig_pqc_record_recv(int profile_id);
 
 int sig_pqc_get_keys(int profile_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]);
+int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
+                          uint8_t key_ids[3], bool key_slots_valid[3]);
 void sig_pqc_promote_responder_key(int profile_id);
 void sig_pqc_discard_prev_key(int profile_id);
 void sig_pqc_trigger_retry(int profile_id);

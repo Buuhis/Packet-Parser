@@ -15,6 +15,9 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_ENCRYPT_KEY]  = { .type = NLA_BINARY, .len = MWAN_MAX_KEY_LEN },
     [MWAN_ATTR_ENCRYPT_SALT] = NLA_POLICY_EXACT_LEN(MWAN_SALT_LEN),
     [MWAN_ATTR_ENCRYPT_LAYER] = { .type = NLA_U8 },
+    [MWAN_ATTR_KEY_ID] = { .type = NLA_U8 },
+    [MWAN_ATTR_PREV_KEY] = NLA_POLICY_EXACT_LEN(MWAN_MAX_KEY_LEN),
+    [MWAN_ATTR_PREV_KEY_ID] = { .type = NLA_U8 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -31,7 +34,12 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     u32 node_id, num_tunnels;
     int rem, err, ret;
 
+    pr_info("mwan_kmod: CFG-TRACE nlseq=%u portid=%u ENTER SET_CONFIG\n",
+            info->snd_seq, info->snd_portid);
+
     if (!info->attrs[MWAN_ATTR_NODE_ID]) {
+        pr_err("mwan_kmod: CFG-TRACE nlseq=%u REJECT missing_node_id ret=%d\n",
+               info->snd_seq, -EINVAL);
         return -EINVAL;
     }
 
@@ -105,6 +113,35 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 memcpy(new_cfg->encrypt_salt, nla_data(info->attrs[MWAN_ATTR_ENCRYPT_SALT]), MWAN_SALT_LEN);
             }
 
+            new_cfg->key_id = 1;
+            if (info->attrs[MWAN_ATTR_KEY_ID]) {
+                new_cfg->key_id = nla_get_u8(info->attrs[MWAN_ATTR_KEY_ID]);
+                if (new_cfg->key_id == 0) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+            }
+            if (info->attrs[MWAN_ATTR_PREV_KEY] ||
+                info->attrs[MWAN_ATTR_PREV_KEY_ID]) {
+                if (!info->attrs[MWAN_ATTR_PREV_KEY] ||
+                    !info->attrs[MWAN_ATTR_PREV_KEY_ID]) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+                new_cfg->prev_key_id =
+                    nla_get_u8(info->attrs[MWAN_ATTR_PREV_KEY_ID]);
+                if (new_cfg->prev_key_id == 0 ||
+                    new_cfg->prev_key_id == new_cfg->key_id) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+                memcpy(new_cfg->prev_key,
+                       nla_data(info->attrs[MWAN_ATTR_PREV_KEY]),
+                       MWAN_MAX_KEY_LEN);
+                new_cfg->prev_key_len = MWAN_MAX_KEY_LEN;
+                new_cfg->prev_key_valid = true;
+            }
+
             pr_info("mwan_kmod: Encryption ON (layer: %u, type: %u, key_len: %u)\n",
                     new_cfg->encrypt_layer, new_cfg->encrypt_type, new_cfg->encrypt_key_len);
         }
@@ -112,12 +149,22 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
 
     node_id = new_cfg->node_id;
     num_tunnels = new_cfg->num_tunnels;
+    pr_info("mwan_kmod: CFG-TRACE nlseq=%u PARSED node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u\n",
+            info->snd_seq, node_id, num_tunnels, new_cfg->encrypt_on,
+            new_cfg->encrypt_layer, new_cfg->encrypt_type,
+            new_cfg->encrypt_key_len);
     ret = mwan_state_update(new_cfg);
     if (ret < 0) {
+        pr_err("mwan_kmod: CFG-TRACE nlseq=%u REJECT node=%u ret=%d\n",
+               info->snd_seq, node_id, ret);
         goto err_free_config;
     }
 
-    pr_info("mwan_kmod: Netlink config updated (Node: %u, Tunnels: %u)\n", 
+    pr_info("mwan_kmod: CFG-TRACE nlseq=%u ACCEPT node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u\n",
+            info->snd_seq, node_id, num_tunnels, new_cfg->encrypt_on,
+            new_cfg->encrypt_layer, new_cfg->encrypt_type,
+            new_cfg->encrypt_key_len);
+    pr_info("mwan_kmod: Netlink config updated (Node: %u, Tunnels: %u)\n",
             node_id, num_tunnels);
             
     return 0;

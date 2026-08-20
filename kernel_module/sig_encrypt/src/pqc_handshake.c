@@ -221,8 +221,6 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
             role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT],
             derived_master[0], derived_master[1], derived_master[2], derived_master[3]);
 
-    // Call success callback to synchronize the key to the kernel datapath
-    sig_pqc_on_key_ready(b->profile_id, derived_master);
 }
 
 static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
@@ -285,6 +283,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
     }
 
     if (promote_now) {
+        sig_pqc_on_key_ready(b->profile_id, master_key);
         forwarder_pre_diversify_pqc_keys(b->profile_id);
     }
 
@@ -517,6 +516,7 @@ static void initiate_key_rotation(policy_key_binding_t *b, int sockfd, struct so
                         handle_handshake_success(b, derived_master, "Initiator");
                         pthread_mutex_unlock(&g_key_mutex);
 
+                        sig_pqc_on_key_ready(profile_id, derived_master);
                         forwarder_pre_diversify_pqc_keys(profile_id);
                         return;
                     }
@@ -906,6 +906,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         handle_handshake_success(b, derived_master, "Initiator");
                                         pthread_mutex_unlock(&g_key_mutex);
 
+                                        sig_pqc_on_key_ready(profile_id,
+                                                             derived_master);
                                         fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Profile %d!\n", profile_id);
                                         forwarder_pre_diversify_pqc_keys(profile_id);
                                         break;
@@ -1469,6 +1471,28 @@ int sig_pqc_get_keys(int profile_id, uint8_t keys[3][32], uint8_t key_ids[3], bo
     g_datapath_key_version[idx] = g_policy_key_version[idx];
     pthread_mutex_unlock(&g_key_mutex);
     return 0; // 0 indicates keys were updated
+}
+
+int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
+                          uint8_t key_ids[3], bool key_slots_valid[3]) {
+    int idx = -1;
+
+    pthread_mutex_lock(&g_key_mutex);
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        if (g_policy_bindings[i].profile_id == profile_id) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx >= 0) {
+        memcpy(keys, g_policy_bindings[idx].keys,
+               KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
+        memcpy(key_ids, g_policy_bindings[idx].key_ids, KEY_SLOT_COUNT);
+        memcpy(key_slots_valid, g_policy_bindings[idx].key_slots_valid,
+               KEY_SLOT_COUNT * sizeof(bool));
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return idx >= 0 ? 0 : -1;
 }
 
 void sig_pqc_promote_responder_key(int profile_id) {

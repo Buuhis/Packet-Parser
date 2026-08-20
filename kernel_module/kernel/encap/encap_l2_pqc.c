@@ -316,19 +316,6 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
     }
 }
 
-/* skb->cb is private to the module from NF_STOLEN until the TX worker clears
- * it. Only metadata moves between CPUs; the packet payload is never copied. */
-struct mwan_l2_tx_cb {
-    u64 flow_seq;
-    u32 flow_id;
-    u32 accounted_bytes;
-    u16 tunnel_idx;
-    u16 magic;
-};
-
-#define MWAN_L2_TX_CB_MAGIC 0x4d54U
-#define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
-
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun);
 
@@ -392,15 +379,15 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb, struct mwan_tunnel *t
 
 static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
                                     struct mwan_l2_worker *worker,
-                                    struct mwan_tunnel *tun, u32 flow_id,
-                                    u64 seq)
+                                    struct mwan_tunnel *tun, u64 flow_token,
+                                    u32 seq)
 {
     struct net_device *target_dev = tun->dev;
     struct aead_request *req = worker->tx_req;
     u8 iv[MWAN_RFC4106_IV_LEN];
     u64 packet_nonce;
-    __be32 flow_id_be;
-    __be64 seq_be, nonce_be;
+    __be64 flow_token_be, nonce_be;
+    __be32 seq_be;
     u8 peer_mac[ETH_ALEN];
     int ip_pkt_len, err;
 
@@ -427,7 +414,7 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
             return -EINVAL;
     }
 
-    packet_nonce = mwan_l2_next_packet_nonce();
+    packet_nonce = mwan_next_packet_nonce();
     if (unlikely(packet_nonce == 0))
         return -EOVERFLOW;
     nonce_be = cpu_to_be64(packet_nonce);
@@ -456,11 +443,11 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
     ether_addr_copy(eth->h_dest, peer_mac);
     eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    // Write authenticated L2-PQC header (flow ID, reorder sequence, unique nonce)
+    // Write authenticated L2-PQC header (connection cookie, sequence, nonce)
     struct mwan_l2_pqc_hdr *l2_hdr = (struct mwan_l2_pqc_hdr *)(skb->data + ETH_HLEN);
-    flow_id_be = cpu_to_be32(flow_id);
-    seq_be = cpu_to_be64(seq);
-    memcpy(&l2_hdr->flow_id, &flow_id_be, sizeof(flow_id_be));
+    flow_token_be = cpu_to_be64(flow_token);
+    seq_be = cpu_to_be32(seq);
+    memcpy(&l2_hdr->flow_token, &flow_token_be, sizeof(flow_token_be));
     memcpy(&l2_hdr->flow_seq, &seq_be, sizeof(seq_be));
     memcpy(&l2_hdr->packet_nonce, &nonce_be, sizeof(nonce_be));
 
@@ -508,50 +495,22 @@ static int mwan_l2_encrypt_and_xmit(struct sk_buff *skb,
 }
 
 static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
-                              struct mwan_tunnel *tun, u32 flow_id, u64 seq,
+                              struct mwan_tunnel *tun,
+                              struct mwan_l2_tx_flow *flow, u32 seq,
                               int *owner_cpu)
 {
-    struct mwan_l2_tx_flow *flow;
     struct mwan_l2_worker *worker;
     unsigned int accounted_bytes = skb->truesize;
     long tunnel_idx = tun - cfg->tunnels;
-    u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    int owner;
-    int new_owner;
+    int owner = flow->owner_worker;
     int was_scheduled;
 
     if (unlikely(tunnel_idx < 0 || tunnel_idx >= cfg->num_tunnels))
         return -EINVAL;
 
-    flow = &cfg->tx_flows[flow_idx];
-    spin_lock_bh(&flow->owner_lock);
-    owner = atomic_read(&flow->owner_worker);
-    if (owner < 0 || owner >= cfg->num_workers) {
-        if (unlikely(atomic_read(&flow->pending_crypto) != 0)) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
-    } else if (!cpu_online(cfg->l2_workers[owner].cpu)) {
-        if (atomic_read(&flow->pending_crypto) != 0) {
-            spin_unlock_bh(&flow->owner_lock);
-            return -EBUSY;
-        }
-        new_owner = mwan_l2_select_tx_worker(cfg, flow_id, owner);
-    } else {
-        /* Never migrate a live TX flow because of load. A worker at or above
-         * the high watermark is excluded only from future admissions. */
-        new_owner = owner;
-    }
-
-    if (new_owner < 0) {
-        spin_unlock_bh(&flow->owner_lock);
+    if (owner < 0 || owner >= cfg->num_workers ||
+        !cpu_online(cfg->l2_workers[owner].cpu))
         return -ENODEV;
-    }
-    if (new_owner != owner) {
-        atomic_set(&flow->owner_worker, new_owner);
-        owner = new_owner;
-    }
 
     worker = &cfg->l2_workers[owner];
     if (owner_cpu)
@@ -562,14 +521,14 @@ static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
             MWAN_L2_QUEUE_MAX_BYTES) {
         spin_unlock(&worker->tx_queue.lock);
         atomic64_inc(&worker->tx_dropped_packets);
-        spin_unlock_bh(&flow->owner_lock);
         return -ENOSPC;
     }
 
     BUILD_BUG_ON(sizeof(struct mwan_l2_tx_cb) > sizeof(skb->cb));
     memset(skb->cb, 0, sizeof(skb->cb));
+    MWAN_L2_TX_CB(skb)->flow_ptr = (uintptr_t)flow;
+    MWAN_L2_TX_CB(skb)->flow_token = flow->flow_token;
     MWAN_L2_TX_CB(skb)->flow_seq = seq;
-    MWAN_L2_TX_CB(skb)->flow_id = flow_id;
     MWAN_L2_TX_CB(skb)->accounted_bytes = accounted_bytes;
     MWAN_L2_TX_CB(skb)->tunnel_idx = (u16)tunnel_idx;
     MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
@@ -584,22 +543,41 @@ static int mwan_l2_tx_enqueue(struct mwan_config *cfg, struct sk_buff *skb,
     mwan_l2_tx_update_max(&worker->tx_max_queued_bytes,
                           atomic64_read(&worker->tx_queued_bytes));
     spin_unlock(&worker->tx_queue.lock);
-    spin_unlock_bh(&flow->owner_lock);
 
     if (was_scheduled == 0 && unlikely(!mwan_l2_schedule_tx_worker(worker)))
         atomic64_inc(&worker->tx_schedule_failures);
     return 0;
 }
 
+static bool mwan_l2_tcp_flow_closing(struct sk_buff *skb)
+{
+    struct iphdr *iph;
+    struct tcphdr *tcph;
+    int offset;
+
+    iph = ip_hdr(skb);
+    if (!iph || iph->version != 4 || iph->ihl < 5 ||
+        iph->protocol != IPPROTO_TCP)
+        return false;
+    offset = iph->ihl * 4;
+    if (!pskb_may_pull(skb, offset + sizeof(*tcph)))
+        return false;
+    iph = ip_hdr(skb);
+    tcph = (struct tcphdr *)((u8 *)iph + offset);
+    return tcph->fin || tcph->rst;
+}
+
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
 {
     struct mwan_l2_tx_diag flow_diag;
+    struct mwan_l2_flow_key flow_key;
+    struct mwan_l2_tx_flow *flow;
     struct mwan_config *cfg;
     struct net_device *target_dev = tun->dev;
     u32 flow_id;
     u32 flow_idx;
-    u64 seq;
+    u32 seq;
     int owner_cpu = -1;
     int err;
 
@@ -616,12 +594,27 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_tunnel *tun)
     /* The SYN must be adjusted while the inner packet is still plaintext. */
     mwan_l2_clamp_mss(skb, target_dev);
     flow_id = mwan_calc_flow_id(skb, &flow_diag);
-    flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-    seq = mwan_l2_next_tx_seq(flow_idx);
-    err = mwan_l2_tx_enqueue(cfg, skb, tun, flow_id, seq, &owner_cpu);
+    memset(&flow_key, 0, sizeof(flow_key));
+    flow_key.saddr = flow_diag.saddr;
+    flow_key.daddr = flow_diag.daddr;
+    flow_key.sport = flow_diag.sport;
+    flow_key.dport = flow_diag.dport;
+    flow_key.fallback_hash = flow_id;
+    flow_key.protocol = flow_diag.protocol;
+    flow = mwan_l2_tx_flow_get(cfg, &flow_key, flow_id);
+    if (unlikely(!flow)) {
+        rcu_read_unlock();
+        return NF_DROP;
+    }
+    mwan_l2_tx_flow_touch(flow, mwan_l2_tcp_flow_closing(skb));
+    flow_idx = flow_id & (MWAN_FLOW_HASH_SIZE - 1);
+    seq = mwan_l2_tx_flow_next_seq(flow);
+    err = mwan_l2_tx_enqueue(cfg, skb, tun, flow, seq, &owner_cpu);
     if (!err)
         mwan_l2_tx_diag_log(&flow_diag, tun, flow_id, flow_idx, seq,
                             owner_cpu);
+    else
+        mwan_l2_tx_flow_put(flow);
     rcu_read_unlock();
 
     return err ? NF_DROP : NF_STOLEN;
@@ -640,9 +633,10 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
     for (;;) {
         while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
             u32 accounted_bytes = MWAN_L2_TX_CB(skb)->accounted_bytes;
-            u32 flow_id = MWAN_L2_TX_CB(skb)->flow_id;
-            u32 flow_idx = flow_id & (MWAN_FLOW_TABLE_SIZE - 1);
-            u64 flow_seq = MWAN_L2_TX_CB(skb)->flow_seq;
+            struct mwan_l2_tx_flow *flow =
+                (struct mwan_l2_tx_flow *)MWAN_L2_TX_CB(skb)->flow_ptr;
+            u64 flow_token = MWAN_L2_TX_CB(skb)->flow_token;
+            u32 flow_seq = MWAN_L2_TX_CB(skb)->flow_seq;
             u16 tunnel_idx = MWAN_L2_TX_CB(skb)->tunnel_idx;
             bool cb_ok = MWAN_L2_TX_CB(skb)->magic == MWAN_L2_TX_CB_MAGIC;
             u64 start_ns = ktime_get_ns();
@@ -656,7 +650,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 err = -EINVAL;
             else
                 err = mwan_l2_encrypt_and_xmit(
-                    skb, worker, &cfg->tunnels[tunnel_idx], flow_id,
+                    skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
                     flow_seq);
 
             mwan_l2_tx_update_ewma(worker, ktime_get_ns() - start_ns);
@@ -666,7 +660,10 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
             }
-            atomic_dec(&cfg->tx_flows[flow_idx].pending_crypto);
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_tx_flow_put(flow);
+            }
 
             if (++batch == 64) {
                 batch = 0;

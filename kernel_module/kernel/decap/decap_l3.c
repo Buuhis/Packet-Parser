@@ -29,6 +29,7 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
     int ciphertext_len;
     u8 iv_buf[MWAN_GCM_IV_LEN];
     struct aead_request *req;
+    struct crypto_aead *tfm;
     struct scatterlist sg[2];
     int err;
 
@@ -62,6 +63,19 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
     if (ntohs(chdr->magic) != MWAN_CRYPTO_MAGIC)
         return MWAN_DECAP_CONTINUE;
 
+    /* Generation 0 is accepted as current for rolling compatibility with
+     * packets emitted before key IDs were carried in the reserved byte. */
+    if (chdr->key_id == 0 || chdr->key_id == cfg->key_id) {
+        tfm = cfg->tfm;
+    } else if (cfg->prev_key_valid &&
+               chdr->key_id == cfg->prev_key_id) {
+        tfm = cfg->prev_tfm;
+    } else {
+        return NF_DROP;
+    }
+    if (!tfm)
+        return NF_DROP;
+
     /* Build IV: salt (4B) + sequence (8B) */
     memcpy(iv_buf, cfg->encrypt_salt, MWAN_SALT_LEN);
     memcpy(iv_buf + MWAN_SALT_LEN, &chdr->seq, 8);
@@ -78,7 +92,7 @@ int mwan_handle_decap_l3(struct sk_buff *skb, struct mwan_config *cfg)
     /* Setup AEAD request for decryption
      * AAD = MWAN Crypto Header (10B) — immutable, contains sequence
      * Ciphertext + Tag follow immediately in memory */
-    req = aead_request_alloc(cfg->tfm, GFP_ATOMIC);
+    req = aead_request_alloc(tfm, GFP_ATOMIC);
     if (!req)
         return NF_ACCEPT;
 
