@@ -13,6 +13,7 @@
 #include <linux/if_ether.h>
 #include <linux/refcount.h>
 #include <linux/list.h>
+#include <linux/seqlock.h>
 #include "mwan_proto.h"
 
 #define MWAN_REORDER_TIMEOUT       msecs_to_jiffies(30)
@@ -41,13 +42,21 @@ enum mwan_encap_type {
 
 struct mwan_tunnel {
     u32 ifindex;
+    u32 configured_ifindex;
     u32 weight;
+    __be32 local_tunnel_ip;
 
     /* Caching fields for performance */
     struct net_device *dev;
     spinlock_t gateway_mac_lock;
     u8 gateway_mac[ETH_ALEN];
     bool mac_resolved;
+    __be32 peer_tunnel_ip;
+    bool peer_ip_resolved;
+    u64 discovery_nonce;
+    u32 peer_generation;
+    bool is_up;
+    u32 state_sequence;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
 };
@@ -194,6 +203,13 @@ struct mwan_config {
     
     /* Lookup table for O(1) weight-proportional tunnel selection */
     u8  tunnel_idx_lut[MWAN_LUT_SIZE];
+
+    /* Rebuilt whenever a published BFD state changes. Readers use the
+     * seqcount because the config itself remains RCU-published. */
+    seqcount_t active_lut_seq;
+    u32 active_total_weight;
+    u32 active_tunnel_count;
+    u8 active_tunnel_idx_lut[MWAN_LUT_SIZE];
     
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
 
@@ -231,6 +247,7 @@ extern unsigned int mwan_l2_softirq_sample_ms;
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
+int mwan_state_set_tunnel_state(u32 ifindex, bool is_up, u32 sequence);
 u64 mwan_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
