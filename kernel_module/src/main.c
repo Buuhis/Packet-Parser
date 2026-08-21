@@ -60,7 +60,7 @@ static int load_node_id(void) {
     return id;
 }
 
-static void clear_node_id(void) {
+void clear_node_id(void) {
     if (unlink(NODE_INFO_FILE) == 0) {
          printf("[+] Device has been unprovisioned. Startup config removed.\n");
     } else {
