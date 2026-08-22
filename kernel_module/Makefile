@@ -10,6 +10,7 @@ SRC := \
     src/main.c \
     src/kernel_sync.c \
     src/app_context.c \
+    src/runtime_config.c \
     sig_encrypt/src/traffic_crypto.c \
     sig_encrypt/src/pqc_handshake.c \
     sig_encrypt/src/pqc_logger.c \

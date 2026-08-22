@@ -26,7 +26,8 @@
  * Set this back to 0 after the profile-mismatch test. */
 #define PQC_TEST_ALLOW_PROFILE_MISMATCH 1
 
-extern void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes);
+extern void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
+                                 uint64_t config_generation);
 
 __attribute__((weak)) void forwarder_pre_diversify_pqc_keys(int profile_id) {
     (void)profile_id;
@@ -65,7 +66,8 @@ static int pqc_hs_find_rx_binding_locked(uint32_t wire_profile_id) {
     int fallback = -1;
 
     for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].profile_id == (int)wire_profile_id)
+        if (g_policy_bindings_active[i] &&
+            g_policy_bindings[i].profile_id == (int)wire_profile_id)
             return i;
     }
 
@@ -232,6 +234,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
     int response_len = 0;
     bool already_promoted = false;
     bool promote_now = false;
+    uint64_t callback_generation = 0;
     ssize_t sent;
 
     pthread_mutex_lock(&g_key_mutex);
@@ -277,13 +280,15 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
             handle_handshake_success(b, master_key, "Responder");
             memset(b->hs_cache[cache_slot].master_key, 0,
                    sizeof(b->hs_cache[cache_slot].master_key));
+            callback_generation = b->config_generation;
             promote_now = true;
         }
         pthread_mutex_unlock(&g_key_mutex);
     }
 
     if (promote_now) {
-        sig_pqc_on_key_ready(b->profile_id, master_key);
+        sig_pqc_on_key_ready(b->profile_id, master_key,
+                             callback_generation);
         forwarder_pre_diversify_pqc_keys(b->profile_id);
     }
 
@@ -512,11 +517,15 @@ static void initiate_key_rotation(policy_key_binding_t *b, int sockfd, struct so
                         uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                         derive_traffic_key(ss, 32, derived_master);
 
+                        uint64_t callback_generation;
+
                         pthread_mutex_lock(&g_key_mutex);
                         handle_handshake_success(b, derived_master, "Initiator");
+                        callback_generation = b->config_generation;
                         pthread_mutex_unlock(&g_key_mutex);
 
-                        sig_pqc_on_key_ready(profile_id, derived_master);
+                        sig_pqc_on_key_ready(profile_id, derived_master,
+                                             callback_generation);
                         forwarder_pre_diversify_pqc_keys(profile_id);
                         return;
                     }
@@ -902,12 +911,16 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                                         derive_traffic_key(ss, 32, derived_master);
 
+                                        uint64_t callback_generation;
+
                                         pthread_mutex_lock(&g_key_mutex);
                                         handle_handshake_success(b, derived_master, "Initiator");
+                                        callback_generation = b->config_generation;
                                         pthread_mutex_unlock(&g_key_mutex);
 
                                         sig_pqc_on_key_ready(profile_id,
-                                                             derived_master);
+                                                             derived_master,
+                                                             callback_generation);
                                         fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Profile %d!\n", profile_id);
                                         forwarder_pre_diversify_pqc_keys(profile_id);
                                         break;
@@ -1180,7 +1193,8 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
                           const char *local_fg, const char *peer_fg,
                           const char *wan_ifname,
                           const char *local_priv, const char *local_pub,
-                          const char *peer_pub) {
+                          const char *peer_pub,
+                          uint64_t config_generation) {
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
 
     pthread_mutex_lock(&g_key_mutex);
@@ -1286,6 +1300,7 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         }
         b->policy_id = profile_id;
         b->profile_id = profile_id;
+        b->config_generation = config_generation;
         b->role_mode = role_mode;
         // Default assignment for is_initiator based on static roles
         if (role_mode == PQC_ROLE_INITIATOR) {

@@ -1,6 +1,7 @@
 #include "cli/cli_handler.h"
 #include "config/db_client.h"
 #include "kernel_sync.h"
+#include "runtime_config.h"
 #include "system/cpu_tune.h"
 #include "utils/logger.h"
 #include "pqc_handshake.h"
@@ -17,7 +18,7 @@
 /* ------------------------------------------------------------------ */
 /*  Forward declarations for functions defined in main.c              */
 /* ------------------------------------------------------------------ */
-extern void pqc_bind_node(int node_id);
+extern void pqc_bind_node(int node_id, uint64_t config_generation);
 extern void save_node_id(int node_id);
 extern void clear_node_id(void);
 
@@ -179,6 +180,19 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
 
 static unsigned long provision_generation;
 
+static enum kernel_sync_result apply_candidate(app_context_t *ctx,
+                                               const app_context_t *candidate)
+{
+    enum kernel_sync_result result;
+
+    runtime_config_lock();
+    result = kernel_sync_push_config(candidate);
+    if (result != KERNEL_SYNC_ERROR)
+        *ctx = *candidate;
+    runtime_config_unlock();
+    return result;
+}
+
 static const char *provision_mode_name(const app_config_t *cfg)
 {
     if (!cfg->encrypt.enabled)
@@ -209,12 +223,20 @@ static void handle_retry(int client_fd, int req_id)
 static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 {
     unsigned long generation = ++provision_generation;
+    app_context_t active_snapshot;
     app_context_t candidate;
+    enum kernel_sync_result sync_result;
+    uint64_t previous_config_generation;
+    uint64_t config_generation;
 
+    runtime_config_lock();
+    active_snapshot = *ctx;
+    runtime_config_unlock();
     log_info("[CFG-TRACE user=%lu] BEGIN -id node=%d active_node=%d active_mode=%s active_key_len=%zu active_tunnels=%zu",
-             generation, req_id, ctx->cfg.node_id,
-             provision_mode_name(&ctx->cfg), ctx->cfg.encrypt.key_len,
-             ctx->cfg.sdwan_tun_count);
+             generation, req_id, active_snapshot.cfg.node_id,
+             provision_mode_name(&active_snapshot.cfg),
+             active_snapshot.cfg.encrypt.key_len,
+             active_snapshot.cfg.sdwan_tun_count);
 
     app_config_t new_cfg;
     if (db_client_load_config(req_id, &new_cfg) != 0) {
@@ -233,15 +255,18 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     candidate.cfg = new_cfg;
     app_context_dump(&candidate);
 
-    if (kernel_sync_push_config(&candidate) != 0) {
+    config_generation = runtime_config_begin_reload(
+        &previous_config_generation);
+    sync_result = apply_candidate(ctx, &candidate);
+    if (sync_result == KERNEL_SYNC_ERROR) {
+        runtime_config_cancel_reload(config_generation,
+                                     previous_config_generation);
         log_error("[CFG-TRACE user=%lu] KERNEL_SYNC_FAILED node=%d mode=%s",
                   generation, candidate.cfg.node_id,
                   provision_mode_name(&candidate.cfg));
         reply_json(client_fd, 500, "Netlink push error");
         return;
     }
-
-    ctx->cfg = candidate.cfg;
 
     log_info("[CFG-TRACE user=%lu] CTX_REPLACED node=%d mode=%s key_len=%zu",
              generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg),
@@ -253,10 +278,13 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     cpu_tune_apply(ctx);
     save_node_id(req_id);
 
+    sig_pqc_prepare_reload();
+    sig_pqc_finalize_reload();
+
     if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
         log_info("[CFG-TRACE user=%lu] PQC_HANDSHAKE_START node=%d",
                  generation, req_id);
-        pqc_bind_node(req_id);
+        pqc_bind_node(req_id, config_generation);
     }
 
     log_info("[CFG-TRACE user=%lu] END response=200 node=%d mode=%s",
@@ -269,7 +297,10 @@ static void handle_add_tunnels(int client_fd, int profile_id,
                                const char tunnel_names[][IFNAMSIZ],
                                size_t tunnel_count, app_context_t *ctx)
 {
-    app_context_t candidate = *ctx;
+    app_context_t candidate;
+
+    runtime_config_lock();
+    candidate = *ctx;
 
     for (size_t n = 0; n < tunnel_count; n++) {
         const char *tunnel_name = tunnel_names[n];
@@ -279,6 +310,7 @@ static void handle_add_tunnels(int client_fd, int profile_id,
                  tunnel_name);
 
         if (candidate.cfg.sdwan_tun_count >= MAX_SDWAN_TUNS) {
+            runtime_config_unlock();
             reply_json(client_fd, 400, "Maximum tunnel count reached");
             return;
         }
@@ -286,6 +318,7 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
             if (strcmp(candidate.cfg.sdwan_tuns[i].tunnel_ifname,
                        tunnel_name) == 0) {
+                runtime_config_unlock();
                 reply_json(client_fd, 400, "Tunnel is already active");
                 return;
             }
@@ -294,6 +327,7 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         if (db_client_load_tunnel(profile_id, tunnel_name,
                                   candidate.cfg.weight_enabled,
                                   &new_tun) != 0) {
+            runtime_config_unlock();
             log_error("[ADD] Tunnel '%s' not found in DB for profile %d",
                       tunnel_name, profile_id);
             reply_json(client_fd, 404, "Tunnel not found in database");
@@ -304,14 +338,16 @@ static void handle_add_tunnels(int client_fd, int profile_id,
     }
 
     /* Sync to kernel */
-    if (kernel_sync_push_config(&candidate) == 0) {
+    if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
         *ctx = candidate;
+        runtime_config_unlock();
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)",
-                     tunnel_names[n], ctx->cfg.sdwan_tun_count);
+                     tunnel_names[n], candidate.cfg.sdwan_tun_count);
         }
         reply_json(client_fd, 200, "Tunnel added successfully");
     } else {
+        runtime_config_unlock();
         log_error("[ADD] Netlink push failed after adding tunnel '%s'",
                   tunnel_names[0]);
         reply_json(client_fd, 500, "Netlink push error");
@@ -323,7 +359,10 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                                const char tunnel_names[][IFNAMSIZ],
                                size_t tunnel_count, app_context_t *ctx)
 {
-    app_context_t candidate = *ctx;
+    app_context_t candidate;
+
+    runtime_config_lock();
+    candidate = *ctx;
 
     for (size_t n = 0; n < tunnel_count; n++) {
         const char *tunnel_name = tunnel_names[n];
@@ -341,6 +380,7 @@ static void handle_del_tunnels(int client_fd, int profile_id,
         }
 
         if (found < 0) {
+            runtime_config_unlock();
             log_warn("[DEL] Tunnel '%s' not found in running config",
                      tunnel_name);
             reply_json(client_fd, 404, "Tunnel not found in running config");
@@ -358,14 +398,16 @@ static void handle_del_tunnels(int client_fd, int profile_id,
     }
 
     /* Sync to kernel */
-    if (kernel_sync_push_config(&candidate) == 0) {
+    if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
         *ctx = candidate;
+        runtime_config_unlock();
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)",
-                     tunnel_names[n], ctx->cfg.sdwan_tun_count);
+                     tunnel_names[n], candidate.cfg.sdwan_tun_count);
         }
         reply_json(client_fd, 200, "Tunnel deleted successfully");
     } else {
+        runtime_config_unlock();
         log_error("[DEL] Netlink push failed after removing tunnel '%s'",
                   tunnel_names[0]);
         reply_json(client_fd, 500, "Netlink push error");
@@ -377,9 +419,15 @@ static void handle_del_profile(int client_fd, int profile_id,
                                app_context_t *ctx)
 {
     app_context_t candidate = {0};
+    uint64_t previous_config_generation;
+    uint64_t config_generation;
 
     (void)profile_id;
-    if (kernel_sync_push_config(&candidate) != 0) {
+    config_generation = runtime_config_begin_reload(
+        &previous_config_generation);
+    if (apply_candidate(ctx, &candidate) == KERNEL_SYNC_ERROR) {
+        runtime_config_cancel_reload(config_generation,
+                                     previous_config_generation);
         reply_json(client_fd, 500, "Netlink push error");
         return;
     }
@@ -387,7 +435,6 @@ static void handle_del_profile(int client_fd, int profile_id,
     sig_pqc_prepare_reload();
     sig_pqc_finalize_reload();
     cpu_tune_restore();
-    memset(ctx, 0, sizeof(*ctx));
     clear_node_id();
     reply_json(client_fd, 200, "Success");
 }
@@ -395,7 +442,9 @@ static void handle_del_profile(int client_fd, int profile_id,
 /* ---------- handle: edit <profile_id> <fields...> ----------------- */
 static void handle_edit_config_multi(int client_fd, int profile_id, const char *fields_str, app_context_t *ctx)
 {
-    app_context_t candidate = *ctx;
+    app_context_t candidate;
+    uint64_t previous_config_generation = 0;
+    uint64_t config_generation = 0;
 
     log_info(">>> [EDIT] Profile %d: fields changed: '%s'", profile_id, fields_str);
 
@@ -448,12 +497,26 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     bool sync_needed = false;
+    bool reload_pqc_lifecycle = refresh_profiles || refresh_pqc_keys ||
+                                refresh_pqc_tunnels;
+    bool trigger_pqc_handshake = false;
+
+    if (reload_pqc_lifecycle)
+        config_generation = runtime_config_begin_reload(
+            &previous_config_generation);
+
+    runtime_config_lock();
+    candidate = *ctx;
 
     /* Profile weight_enable changes affect every tunnel's effective weight,
      * so profile and tunnel refreshes both reload one coherent snapshot. */
     if (refresh_profiles || refresh_tunnels) {
         app_config_t refreshed;
         if (db_client_load_config(profile_id, &refreshed) != 0) {
+            runtime_config_unlock();
+            if (reload_pqc_lifecycle)
+                runtime_config_cancel_reload(config_generation,
+                                             previous_config_generation);
             reply_json(client_fd, 500, "Failed to reload profile config from DB");
             return;
         }
@@ -473,7 +536,11 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 
     // 3. Sync config to kernel if needed
     if (sync_needed) {
-        if (kernel_sync_push_config(&candidate) != 0) {
+        if (kernel_sync_push_config(&candidate) == KERNEL_SYNC_ERROR) {
+            runtime_config_unlock();
+            if (reload_pqc_lifecycle)
+                runtime_config_cancel_reload(config_generation,
+                                             previous_config_generation);
             reply_json(client_fd, 500, "Netlink push error");
             return;
         }
@@ -484,17 +551,22 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     // 4. Trigger PQC handshake if PQC encryption is active and PQC params or profiles refreshed
-    bool trigger_pqc_handshake = false;
     if (ctx->cfg.encrypt.enabled && ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
         if (refresh_pqc_keys || refresh_pqc_tunnels || refresh_profiles) {
             trigger_pqc_handshake = true;
         }
     }
+    runtime_config_unlock();
+
+    if (reload_pqc_lifecycle) {
+        sig_pqc_prepare_reload();
+        sig_pqc_finalize_reload();
+    }
 
     if (trigger_pqc_handshake) {
         log_info("[EDIT] PQC credentials/config updated — triggering key re-handshake for profile %d", profile_id);
         sig_pqc_init_vault();
-        pqc_bind_node(profile_id);
+        pqc_bind_node(profile_id, config_generation);
     }
 
     reply_json(client_fd, 200, "Config updated and synced successfully");

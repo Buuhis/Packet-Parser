@@ -11,13 +11,14 @@
 #include "../sig_encrypt/inc/pqc_handshake.h"
 
 
-int kernel_sync_push_config(const app_context_t *ctx) {
+enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     struct nl_sock *sock;
     struct nl_msg *msg;
     static unsigned long push_generation;
     unsigned long push_id;
     unsigned int nl_seq = 0;
-    int family_id, ret = -1;
+    int family_id;
+    enum kernel_sync_result ret = KERNEL_SYNC_ERROR;
     int send_ret;
     int ack_ret;
     uint8_t pqc_keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ] = {{0}};
@@ -25,7 +26,7 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
     bool have_pqc_slots = false;
 
-    if (!ctx) return -1;
+    if (!ctx) return KERNEL_SYNC_ERROR;
 
     push_id = __atomic_add_fetch(&push_generation, 1, __ATOMIC_RELAXED);
     log_info("[CFG-TRACE push=%lu] PREPARE node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
@@ -42,7 +43,7 @@ int kernel_sync_push_config(const app_context_t *ctx) {
         ctx->cfg.encrypt.key_len != 32) {
         log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu (no Netlink message sent)",
                  push_id, ctx->cfg.encrypt.key_len);
-        return 0;
+        return KERNEL_SYNC_DEFERRED;
     }
 
     if (ctx->cfg.encrypt.enabled &&
@@ -59,25 +60,25 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     log_info("Pushing configuration to mwan_kmod via Generic Netlink...");
 
     sock = nl_socket_alloc();
-    if (!sock) return -1;
+    if (!sock) return KERNEL_SYNC_ERROR;
     
     if (genl_connect(sock) < 0) {
         log_error("Failed to connect to Generic Netlink");
         nl_socket_free(sock);
-        return -1;
+        return KERNEL_SYNC_ERROR;
     }
 
     family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
     if (family_id < 0) {
         log_error("Kernel Module (mwan_kmod) not loaded or family not found");
         nl_socket_free(sock);
-        return -1;
+        return KERNEL_SYNC_ERROR;
     }
 
     msg = nlmsg_alloc();
     if (!msg) {
         nl_socket_free(sock);
-        return -1;
+        return KERNEL_SYNC_ERROR;
     }
 
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MWAN_CMD_SET_CONFIG, MWAN_GENL_VERSION);
@@ -163,7 +164,7 @@ int kernel_sync_push_config(const app_context_t *ctx) {
              push_id, nl_seq, ctx->cfg.node_id, ctx->cfg.encrypt.enabled,
              ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
              ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
-    ret = 0;
+    ret = KERNEL_SYNC_APPLIED;
 
 out:
     nlmsg_free(msg);

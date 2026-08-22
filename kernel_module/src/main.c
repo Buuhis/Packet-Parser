@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "app_context.h"
 #include "kernel_sync.h"
+#include "runtime_config.h"
 #include "system/cpu_tune.h"
 #include "config/db_client.h"
 #include "config/vault_db_client.h"
@@ -111,7 +112,7 @@ static void handle_signal(int sig) {
     }
 }
 
-void pqc_bind_node(int node_id) {
+void pqc_bind_node(int node_id, uint64_t config_generation) {
     char key_id[256] = {0};
     char local_fg_db[32] = {0};
     char peer_pub_name[256] = {0};
@@ -209,7 +210,8 @@ void pqc_bind_node(int node_id) {
     if (valid) {
         sig_pqc_bind_profile(node_id, key_id, role_mode, local_ip, peer_ip,
                              local_fg, peer_fg_buf, hs_tun_name,
-                             found_priv, found_pub, deobf_pub);
+                             found_priv, found_pub, deobf_pub,
+                             config_generation);
         
         // Start/kickoff the handshake by spinning up the background worker thread for this policy
         sig_pqc_handshake_start(node_id, hs_tun_name, peer_ip);
@@ -223,8 +225,13 @@ void pqc_bind_node(int node_id) {
     if (deobf_pub) free(deobf_pub);
 }
 
-void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
+void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
+                          uint64_t config_generation) {
+    app_context_t candidate;
+    enum kernel_sync_result sync_result;
+
     log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
+    runtime_config_lock();
     log_info("[CFG-TRACE pqc-callback] ENTER callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u active_key_len=%zu key_ptr=%s",
              profile_id, running_ctx.cfg.node_id,
              running_ctx.cfg.encrypt.enabled,
@@ -235,20 +242,23 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
     
     // Check if this matches the currently running Node configuration
     if (key_bytes &&
+        runtime_config_generation_is_current_locked(config_generation) &&
         running_ctx.cfg.node_id == profile_id &&
         running_ctx.cfg.encrypt.enabled &&
         running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-        // Copy the dynamic key to the active configuration
-        memcpy(running_ctx.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
-        running_ctx.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
+        candidate = running_ctx;
+        memcpy(candidate.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
+        candidate.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
         log_info("[CFG-TRACE pqc-callback] KEY_INSTALLED callback_node=%d active_node=%d active_layer=%u active_type=%u key_len=%zu",
-                 profile_id, running_ctx.cfg.node_id,
-                 running_ctx.cfg.encrypt.layer,
-                 running_ctx.cfg.encrypt.type,
-                 running_ctx.cfg.encrypt.key_len);
+                 profile_id, candidate.cfg.node_id,
+                 candidate.cfg.encrypt.layer,
+                 candidate.cfg.encrypt.type,
+                 candidate.cfg.encrypt.key_len);
         
         // Push configuration to kernel datapath via Netlink
-        if (kernel_sync_push_config(&running_ctx) == 0) {
+        sync_result = kernel_sync_push_config(&candidate);
+        if (sync_result == KERNEL_SYNC_APPLIED) {
+            running_ctx = candidate;
             log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
         } else {
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
@@ -261,6 +271,7 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes) {
                  running_ctx.cfg.encrypt.type);
         log_warn("[PQC] Handshake key ready for Node %d but no active tunnel/encryption is configured for it.", profile_id);
     }
+    runtime_config_unlock();
 }
 
 /* ---------- usage ---------- */
@@ -381,16 +392,28 @@ int main(int argc, char **argv) {
         log_info(">>> Found startup config! Auto-loading properties for Node ID: %d", saved_node_id);
         app_config_t new_cfg;
         if (db_client_load_config(saved_node_id, &new_cfg) == 0) {
+            uint64_t previous_generation;
+            uint64_t config_generation = runtime_config_begin_reload(
+                &previous_generation);
+            enum kernel_sync_result sync_result;
+
             app_context_dump(&(app_context_t){new_cfg});
-            running_ctx.cfg = new_cfg;
-            if (kernel_sync_push_config(&running_ctx) != 0) {
+            runtime_config_lock();
+            sync_result = kernel_sync_push_config(
+                &(app_context_t){.cfg = new_cfg});
+            if (sync_result == KERNEL_SYNC_ERROR) {
+                runtime_config_unlock();
+                runtime_config_cancel_reload(config_generation,
+                                             previous_generation);
                 log_error("Failed to push auto-loaded config to kernel");
             } else {
+                running_ctx.cfg = new_cfg;
+                runtime_config_unlock();
                 cpu_tune_apply(&running_ctx);
                 save_node_id(saved_node_id);
                 log_info("Startup config successfully restored.");
                 if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-                    pqc_bind_node(saved_node_id);
+                    pqc_bind_node(saved_node_id, config_generation);
                 }
             }
         } else {
