@@ -232,8 +232,9 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
 
     log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
     runtime_config_lock();
-    log_info("[CFG-TRACE pqc-callback] ENTER callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u active_key_len=%zu key_ptr=%s",
-             profile_id, running_ctx.cfg.node_id,
+    log_info("[CFG-TRACE pqc-callback] ENTER config_generation=%llu callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u active_key_len=%zu key_ptr=%s",
+             (unsigned long long)config_generation, profile_id,
+             running_ctx.cfg.node_id,
              running_ctx.cfg.encrypt.enabled,
              running_ctx.cfg.encrypt.layer,
              running_ctx.cfg.encrypt.type,
@@ -264,8 +265,9 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
         }
     } else {
-        log_warn("[CFG-TRACE pqc-callback] STALE_OR_INACTIVE callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u",
-                 profile_id, running_ctx.cfg.node_id,
+        log_warn("[CFG-TRACE pqc-callback] STALE_OR_INACTIVE config_generation=%llu callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u",
+                 (unsigned long long)config_generation, profile_id,
+                 running_ctx.cfg.node_id,
                  running_ctx.cfg.encrypt.enabled,
                  running_ctx.cfg.encrypt.layer,
                  running_ctx.cfg.encrypt.type);

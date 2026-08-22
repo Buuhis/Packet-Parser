@@ -101,9 +101,9 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
 
         nla_nest_end(msg, tun_node);
         
-        log_info("  [+] Sync Tunnel: %s (idx: %u, physical: %s, weight: %d)",
-                 tun->tunnel_ifname, idx, tun->physical_ifname,
-                 tun->weight);
+        log_info("[CFG-TRACE push=%lu] TUNNEL slot=%zu name=%s ifindex=%u physical=%s weight=%d",
+                 push_id, i, tun->tunnel_ifname, idx,
+                 tun->physical_ifname, tun->weight);
     }
     nla_nest_end(msg, tunnels);
 

@@ -198,8 +198,8 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
             rcu_read_unlock();
             return NF_ACCEPT;
         }
-        pr_info_ratelimited("mwan_kmod: PRE_ROUTING hit from tunnel %s, proto %d, saddr %pI4, daddr %pI4\n",
-                            skb->dev->name, iph->protocol, &iph->saddr, &iph->daddr);
+        // pr_info_ratelimited("mwan_kmod: PRE_ROUTING hit from tunnel %s, proto %d, saddr %pI4, daddr %pI4\n",
+        //                     skb->dev->name, iph->protocol, &iph->saddr, &iph->daddr);
         
         /* 2. Decrypt if encryption is enabled */
         if (cfg->encrypt_on && cfg->tfm) {

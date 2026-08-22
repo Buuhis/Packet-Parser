@@ -210,6 +210,33 @@ static const char *provision_mode_name(const app_config_t *cfg)
     return "INVALID";
 }
 
+static void log_provision_snapshot(unsigned long request_id,
+                                   const char *stage,
+                                   const app_config_t *cfg)
+{
+    if (!cfg)
+        return;
+
+    log_info("[CFG-AUDIT req=%lu stage=%s] PROFILE node=%d mode=%s enabled=%d layer=%u type=%u key_len=%zu weight=%d latency=%d/%d loss=%d/%d tunnels=%zu",
+             request_id, stage, cfg->node_id, provision_mode_name(cfg),
+             cfg->encrypt.enabled, cfg->encrypt.layer, cfg->encrypt.type,
+             cfg->encrypt.key_len, cfg->weight_enabled,
+             cfg->latency_enabled, cfg->latency_duration,
+             cfg->loss_enabled, cfg->loss_duration,
+             cfg->sdwan_tun_count);
+
+    for (size_t i = 0; i < cfg->sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *tun = &cfg->sdwan_tuns[i];
+
+        log_info("[CFG-AUDIT req=%lu stage=%s] TUNNEL slot=%zu name=%s physical=%s ip=%s segment=%d weight=%d latency=%s/%d/%d loss=%s/%d/%d",
+                 request_id, stage, i, tun->tunnel_ifname,
+                 tun->physical_ifname, tun->tunnel_ip, tun->segment_id,
+                 tun->weight, tun->latency_ip, tun->latency,
+                 tun->latency_enabled, tun->loss_ip,
+                 tun->loss_percentage, tun->loss_enabled);
+    }
+}
+
 
 /* ---------- handle: -r <node_id> ---------------------------------- */
 static void handle_retry(int client_fd, int req_id)
@@ -237,6 +264,7 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
              provision_mode_name(&active_snapshot.cfg),
              active_snapshot.cfg.encrypt.key_len,
              active_snapshot.cfg.sdwan_tun_count);
+    log_provision_snapshot(generation, "BEFORE", &active_snapshot.cfg);
 
     app_config_t new_cfg;
     if (db_client_load_config(req_id, &new_cfg) != 0) {
@@ -251,12 +279,16 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
              new_cfg.encrypt.enabled, new_cfg.encrypt.layer,
              new_cfg.encrypt.type, new_cfg.encrypt.key_len,
              new_cfg.sdwan_tun_count);
+    log_provision_snapshot(generation, "DB", &new_cfg);
 
     candidate.cfg = new_cfg;
     app_context_dump(&candidate);
 
     config_generation = runtime_config_begin_reload(
         &previous_config_generation);
+    log_info("[CFG-AUDIT req=%lu] CONFIG_GENERATION=%llu previous=%llu",
+             generation, (unsigned long long)config_generation,
+             (unsigned long long)previous_config_generation);
     sync_result = apply_candidate(ctx, &candidate);
     if (sync_result == KERNEL_SYNC_ERROR) {
         runtime_config_cancel_reload(config_generation,
@@ -274,6 +306,11 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 
     log_info("[CFG-TRACE user=%lu] KERNEL_SYNC_RETURNED_SUCCESS node=%d mode=%s",
              generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
+    log_info("[CFG-AUDIT req=%lu] SYNC_RESULT=%s node=%d mode=%s",
+             generation,
+             sync_result == KERNEL_SYNC_APPLIED ? "APPLIED" : "DEFERRED",
+             ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
+    log_provision_snapshot(generation, "USERSPACE_ACTIVE", &ctx->cfg);
 
     cpu_tune_apply(ctx);
     save_node_id(req_id);
@@ -643,6 +680,8 @@ void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *ru
             return;
         }
 
+        log_info("[CLI-AUDIT] RECEIVED command=-id profile=%ld",
+                 parsed_id);
         handle_provision(client_fd, (int)parsed_id, running_ctx);
         return;
     }

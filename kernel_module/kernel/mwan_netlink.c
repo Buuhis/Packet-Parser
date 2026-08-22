@@ -75,6 +75,11 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
             new_cfg->tunnels[new_cfg->num_tunnels].weight =
                 nla_get_u32(tb[MWAN_TUN_WEIGHT]);
 
+            pr_info("mwan_kmod: CFG-TRACE nlseq=%u TUNNEL slot=%u ifindex=%u weight=%u\n",
+                    info->snd_seq, new_cfg->num_tunnels,
+                    new_cfg->tunnels[new_cfg->num_tunnels].ifindex,
+                    new_cfg->tunnels[new_cfg->num_tunnels].weight);
+
             new_cfg->num_tunnels++;
         }
     }
@@ -149,10 +154,11 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
 
     node_id = new_cfg->node_id;
     num_tunnels = new_cfg->num_tunnels;
-    pr_info("mwan_kmod: CFG-TRACE nlseq=%u PARSED node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u\n",
+    pr_info("mwan_kmod: CFG-TRACE nlseq=%u PARSED node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u key_id=%u prev_key=%u\n",
             info->snd_seq, node_id, num_tunnels, new_cfg->encrypt_on,
             new_cfg->encrypt_layer, new_cfg->encrypt_type,
-            new_cfg->encrypt_key_len);
+            new_cfg->encrypt_key_len, new_cfg->key_id,
+            new_cfg->prev_key_valid);
     ret = mwan_state_update(new_cfg);
     if (ret < 0) {
         pr_err("mwan_kmod: CFG-TRACE nlseq=%u REJECT node=%u ret=%d\n",
@@ -160,10 +166,11 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
         goto err_free_config;
     }
 
-    pr_info("mwan_kmod: CFG-TRACE nlseq=%u ACCEPT node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u\n",
+    pr_info("mwan_kmod: CFG-TRACE nlseq=%u ACCEPT_ACTIVE node=%u tunnels=%u enabled=%u layer=%u type=%u key_len=%u key_id=%u prev_key=%u\n",
             info->snd_seq, node_id, num_tunnels, new_cfg->encrypt_on,
             new_cfg->encrypt_layer, new_cfg->encrypt_type,
-            new_cfg->encrypt_key_len);
+            new_cfg->encrypt_key_len, new_cfg->key_id,
+            new_cfg->prev_key_valid);
     pr_info("mwan_kmod: Netlink config updated (Node: %u, Tunnels: %u)\n",
             node_id, num_tunnels);
             
