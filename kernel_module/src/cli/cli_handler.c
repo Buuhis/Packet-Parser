@@ -78,7 +78,7 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
             int node_id = atoi(argv[++i]);
             if (node_id <= 0) { fprintf(stderr, "Error: Invalid ID\n"); return 1; }
             char msg[32];
-            snprintf(msg, sizeof(msg), "%d", node_id);
+            snprintf(msg, sizeof(msg), "-id %d", node_id);
             return client_send_and_print(socket_path, msg);
         }
 
@@ -630,6 +630,23 @@ static int parse_tunnel_command(const char *args, int *profile_id,
 void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *running_ctx)
 {
 
+    /* -id <profile_id>: always perform a full DB reload, even when a
+     * configuration is already active. */
+    if (strncmp(buf, "-id ", 4) == 0) {
+        char *endptr;
+        long parsed_id = strtol(buf + 4, &endptr, 10);
+
+        while (*endptr == ' ' || *endptr == '\t')
+            endptr++;
+        if (parsed_id <= 0 || *endptr != '\0') {
+            reply_json(client_fd, 400, "Unknown command");
+            return;
+        }
+
+        handle_provision(client_fd, (int)parsed_id, running_ctx);
+        return;
+    }
+
     /* -r <id> */
     if (strncmp(buf, "-r ", 3) == 0) {
         handle_retry(client_fd, atoi(buf + 3));
@@ -683,7 +700,7 @@ void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *ru
         return;
     }
 
-    /* Default: numeric node_id = provisioning */
+    /* Backward compatibility with older clients that sent only node_id. */
     int req_id = atoi(buf);
     if (req_id > 0) {
         handle_provision(client_fd, req_id, running_ctx);
