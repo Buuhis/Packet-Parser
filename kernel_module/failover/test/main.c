@@ -111,7 +111,7 @@ static void usage(const char *program)
     printf("  --flap-penalty N       Penalty for a raw UP->DOWN; default 1000\n");
     printf("  --suppress N           Penalty that suppresses recovery; default 2000\n");
     printf("  --reuse N              Penalty below which recovery resumes; default 750\n");
-    printf("  --duration-s N         Test duration; 0 means until Ctrl-C; default 0\n");
+    printf("  --duration-s N         Test duration; 0 means until Ctrl-C; default 30\n");
     printf("\n");
     printf("Local two-peer smoke test (two terminals):\n");
     printf("  %s --bind 127.0.0.1 --peer 127.0.0.2 --duration-s 15\n", program);
@@ -140,7 +140,7 @@ int main(int argc, char **argv)
     struct test_options options = {
         .tx_ms = 300,
         .rx_ms = 300,
-        .duration_s = 0,
+        .duration_s = 30,
         .detect_mult = 3,
         .stability = {
             .up_hold_ms = 3000,

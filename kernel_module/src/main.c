@@ -10,7 +10,6 @@
 #include "pqc_logger.h"
 #include "pqc_vault.h"
 #include "traffic_crypto.h"
-#include "failover.h"
 #include "../kernel/mwan_proto.h"
 
 #include <stdio.h>
@@ -403,7 +402,6 @@ int main(int argc, char **argv) {
 
     /* ======================== MAIN LOOP ======================== */
     while(running_server) {
-        failover_service_reconcile(&running_ctx);
         int client_fd = accept(unix_server_fd, NULL, NULL);
         if (client_fd < 0) continue;
         char buf[256] = {0};

@@ -52,8 +52,6 @@ struct mwan_l2_pqc_hdr {
 enum mwan_genl_cmds {
     MWAN_CMD_UNSPEC = 0,
     MWAN_CMD_SET_CONFIG,  /* sdwan send to mwan_kmod */
-    MWAN_CMD_GET_TUNNEL_PEERS,
-    MWAN_CMD_SET_TUNNEL_STATE,
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -71,9 +69,6 @@ enum mwan_genl_attrs {
     MWAN_ATTR_KEY_ID,        /* u8: current PQC traffic-key generation */
     MWAN_ATTR_PREV_KEY,      /* NLA_BINARY: previous 32-byte PQC key */
     MWAN_ATTR_PREV_KEY_ID,   /* u8: previous PQC traffic-key generation */
-    MWAN_ATTR_TUNNEL_IFINDEX, /* u32: target of a state update */
-    MWAN_ATTR_TUNNEL_UP,      /* u8: published BFD state */
-    MWAN_ATTR_STATE_SEQUENCE, /* u32: reject stale state updates */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)
@@ -83,14 +78,6 @@ enum mwan_tun_attrs {
     MWAN_TUN_UNSPEC = 0,
     MWAN_TUN_IFINDEX,     /* u32 */
     MWAN_TUN_WEIGHT,      /* u32 */
-    MWAN_TUN_PEER_IPV4,   /* u32: network byte order */
-    MWAN_TUN_PEER_MAC,    /* binary: ETH_ALEN bytes */
-    MWAN_TUN_PEER_GENERATION, /* u32 */
-    MWAN_TUN_UP,          /* u8: current published state */
-    MWAN_TUN_STATE_SEQUENCE, /* u32 */
-    MWAN_TUN_CONFIG_IFINDEX, /* u32: ifindex received from userspace */
-    MWAN_TUN_LOCAL_IPV4,     /* u32: network byte order */
-    MWAN_TUN_IFNAME,         /* NUL-terminated interface name */
     __MWAN_TUN_MAX,
 };
 #define MWAN_TUN_MAX (__MWAN_TUN_MAX - 1)

@@ -4,16 +4,14 @@
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
 #include <linux/jiffies.h>
-#include <linux/inetdevice.h>
 #include <linux/netdevice.h>
-#include <linux/random.h>
 #include <linux/rcupdate.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
 
 #define MWAN_MAC_DISCOVERY_ETHERTYPE 0x88B6
 #define MWAN_MAC_DISCOVERY_MAGIC     0x4d574d44U /* "MWMD" */
-#define MWAN_MAC_DISCOVERY_VERSION   2
+#define MWAN_MAC_DISCOVERY_VERSION   1
 #define MWAN_MAC_DISCOVERY_REQUEST   1
 #define MWAN_MAC_DISCOVERY_RESPONSE  2
 #define MWAN_MAC_RETRY_MS            1000
@@ -25,8 +23,6 @@ struct mwan_mac_discovery_hdr {
     u8 type;
     __be16 reserved;
     __be32 node_id;
-    __be32 tunnel_ip;
-    __be64 nonce;
 } __packed;
 
 static void mwan_mac_discovery_workfn(struct work_struct *work);
@@ -53,9 +49,8 @@ static bool mwan_mac_is_resolved(struct mwan_tunnel *tun)
     bool resolved;
 
     spin_lock_bh(&tun->gateway_mac_lock);
-    resolved = tun->mac_resolved && tun->peer_ip_resolved &&
-               is_valid_ether_addr(tun->gateway_mac) &&
-               tun->peer_tunnel_ip != 0;
+    resolved = tun->mac_resolved &&
+               is_valid_ether_addr(tun->gateway_mac);
     spin_unlock_bh(&tun->gateway_mac_lock);
     return resolved;
 }
@@ -79,67 +74,36 @@ bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[ETH_ALEN])
     return resolved;
 }
 
-static __be32 mwan_mac_local_ip(const struct mwan_tunnel *tun)
-{
-    if (!tun || !tun->dev)
-        return 0;
-    if (tun->local_tunnel_ip)
-        return tun->local_tunnel_ip;
-    return inet_select_addr(tun->dev, 0, RT_SCOPE_LINK);
-}
-
-static void mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
-                                __be32 peer_ip, u64 nonce)
+static void mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac)
 {
     bool changed;
-    __be32 local_ip;
 
-    if (!tun || !is_valid_ether_addr(mac) || !peer_ip)
-        return;
-    local_ip = mwan_mac_local_ip(tun);
-    if (!local_ip || peer_ip == local_ip || peer_ip == htonl(INADDR_BROADCAST))
+    if (!tun || !is_valid_ether_addr(mac))
         return;
 
     spin_lock_bh(&tun->gateway_mac_lock);
-    if (!nonce || nonce != tun->discovery_nonce) {
-        spin_unlock_bh(&tun->gateway_mac_lock);
-        return;
-    }
-    changed = !tun->mac_resolved || !tun->peer_ip_resolved ||
-              !ether_addr_equal(tun->gateway_mac, mac) ||
-              tun->peer_tunnel_ip != peer_ip;
+    changed = !tun->mac_resolved ||
+              !ether_addr_equal(tun->gateway_mac, mac);
     ether_addr_copy(tun->gateway_mac, mac);
     tun->mac_resolved = true;
-    tun->peer_tunnel_ip = peer_ip;
-    tun->peer_ip_resolved = true;
-    if (changed && ++tun->peer_generation == 0)
-        tun->peer_generation = 1;
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     if (changed)
-        pr_info("mwan_kmod: learned peer tuple mac=%pM ip=%pI4 on data tunnel %s\n",
-                mac, &peer_ip, tun->dev ? tun->dev->name : "unknown");
+        pr_info("mwan_kmod: learned peer MAC %pM on data tunnel %s\n",
+                mac, tun->dev ? tun->dev->name : "unknown");
 }
 
-static int mwan_mac_send(struct mwan_tunnel *tun, const u8 *dest,
-                         u8 type, u32 node_id, u64 nonce, gfp_t gfp)
+static int mwan_mac_send(struct net_device *dev, const u8 *dest,
+                         u8 type, u32 node_id, gfp_t gfp)
 {
     struct mwan_mac_discovery_hdr *hdr;
     struct sk_buff *skb;
     struct ethhdr *eth;
     unsigned int headroom;
     int ret;
-    struct net_device *dev;
-    __be32 local_ip;
 
-    if (!tun)
-        return -EINVAL;
-    dev = tun->dev;
     if (!dev || dev->type != ARPHRD_ETHER || !netif_running(dev))
         return -ENETDOWN;
-    local_ip = mwan_mac_local_ip(tun);
-    if (!local_ip)
-        return -EADDRNOTAVAIL;
 
     headroom = LL_RESERVED_SPACE(dev);
     skb = alloc_skb(headroom + ETH_HLEN + sizeof(*hdr), gfp);
@@ -152,8 +116,6 @@ static int mwan_mac_send(struct mwan_tunnel *tun, const u8 *dest,
     hdr->version = MWAN_MAC_DISCOVERY_VERSION;
     hdr->type = type;
     hdr->node_id = cpu_to_be32(node_id);
-    hdr->tunnel_ip = local_ip;
-    hdr->nonce = cpu_to_be64(nonce);
 
     eth = skb_push(skb, ETH_HLEN);
     skb_reset_mac_header(skb);
@@ -207,23 +169,13 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
     }
 
-    if (be32_to_cpu(hdr->node_id) == cfg->node_id ||
-        ether_addr_equal(eth->h_source, tun->dev->dev_addr)) {
-        rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
-    }
-
-    /* A request is answered but never trusted as discovery completion. Both
-     * sites issue their own nonce-bearing request, so learning is symmetric
-     * and a stale/unsolicited response cannot replace the tuple. */
-    if (hdr->type == MWAN_MAC_DISCOVERY_RESPONSE)
-        mwan_mac_learn_peer(tun, eth->h_source, hdr->tunnel_ip,
-                            be64_to_cpu(hdr->nonce));
-    else
-        mwan_mac_send(tun, eth->h_source,
+    /* The point-to-point peer is identified by the interface on which the
+     * control frame arrived. Each bonding data tunnel therefore learns and
+     * retains its own peer MAC independently. */
+    mwan_mac_learn_peer(tun, eth->h_source);
+    if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST)
+        mwan_mac_send(tun->dev, eth->h_source,
                       MWAN_MAC_DISCOVERY_RESPONSE, cfg->node_id,
-                      be64_to_cpu(hdr->nonce),
                       GFP_ATOMIC);
     rcu_read_unlock();
 
@@ -251,20 +203,13 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
     if (cfg) {
         for (i = 0; i < cfg->num_tunnels; i++) {
             struct mwan_tunnel *tun = &cfg->tunnels[i];
-            u64 nonce;
 
             if (!tun->is_ethernet || !tun->dev)
                 continue;
             if (!mwan_mac_is_resolved(tun))
                 unresolved = true;
-            nonce = get_random_u64();
-            if (!nonce)
-                nonce = 1;
-            spin_lock_bh(&tun->gateway_mac_lock);
-            tun->discovery_nonce = nonce;
-            spin_unlock_bh(&tun->gateway_mac_lock);
-            mwan_mac_send(tun, tun->dev->broadcast,
-                          MWAN_MAC_DISCOVERY_REQUEST, cfg->node_id, nonce,
+            mwan_mac_send(tun->dev, tun->dev->broadcast,
+                          MWAN_MAC_DISCOVERY_REQUEST, cfg->node_id,
                           GFP_ATOMIC);
         }
     }

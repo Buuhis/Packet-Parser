@@ -92,8 +92,6 @@ struct bfd_counters {
     uint64_t published_state_transitions;
 };
 
-/* listen_ip selects a single-address standalone manager. NULL binds
- * INADDR_ANY; sessions are then demultiplexed by IP_PKTINFO for production. */
 struct bfd_manager *bfd_manager_create(const struct in_addr *listen_ip);
 void bfd_manager_destroy(struct bfd_manager *manager);
 

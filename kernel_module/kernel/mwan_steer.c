@@ -55,41 +55,6 @@ static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *ip
     return false;
 }
 
-static inline bool is_bfd_control_packet(struct sk_buff *skb,
-                                         struct iphdr *iph)
-{
-    struct udphdr *udph;
-    int ip_hlen;
-
-    if (!iph || iph->protocol != IPPROTO_UDP)
-        return false;
-    ip_hlen = iph->ihl * 4;
-    if (!pskb_may_pull(skb, ip_hlen + sizeof(*udph)))
-        return false;
-    iph = ip_hdr(skb);
-    udph = (struct udphdr *)(skb_network_header(skb) + ip_hlen);
-    return udph->dest == htons(3784);
-}
-
-static unsigned int mwan_dispatch_encap(struct sk_buff *skb,
-                                        struct mwan_tunnel *tun)
-{
-    switch (tun->encap_type) {
-    case MWAN_ENCAP_NONE:
-        return mwan_handle_encap_none(skb, tun);
-    case MWAN_ENCAP_MACSEC:
-        return mwan_handle_encap_macsec(skb, tun);
-    case MWAN_ENCAP_L3_CUSTOM:
-        return mwan_handle_encap_l3(skb, tun);
-    case MWAN_ENCAP_L3_PQC:
-        return mwan_handle_encap_l3_pqc(skb, tun);
-    case MWAN_ENCAP_L2_PQC:
-        return mwan_handle_encap_l2_pqc(skb, tun);
-    default:
-        return mwan_handle_encap_none(skb, tun);
-    }
-}
-
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -118,18 +83,6 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     if (!state->out || !is_mwan_tunnel(cfg, state->out->ifindex)) {
         rcu_read_unlock();
         return NF_ACCEPT;
-    }
-
-    /* BFD belongs to the exact session/interface that created it. It must
-     * remain able to probe a tunnel whose published data state is DOWN and
-     * must never be load-balanced onto another tunnel. */
-    if (is_bfd_control_packet(skb, iph)) {
-        struct mwan_tunnel *tun = find_mwan_tunnel(cfg,
-                                                   state->out->ifindex);
-        unsigned int ret = tun ? mwan_dispatch_encap(skb, tun) : NF_DROP;
-
-        rcu_read_unlock();
-        return ret;
     }
 
     /* Bypass PQC handshake traffic (UDP port 7090) */
@@ -162,28 +115,32 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     }
     
     /* 3. Steer: Choose a tunnel based on the weight-proportional LUT (O(1)) */
-    if (cfg->num_tunnels > 0) {
-        unsigned int sequence;
-        u32 active_count;
-        u8 tun_idx;
-
-        do {
-            sequence = read_seqcount_begin(&cfg->active_lut_seq);
-            active_count = cfg->active_tunnel_count;
-            tun_idx = cfg->active_tunnel_idx_lut[
-                hash & (MWAN_LUT_SIZE - 1)];
-        } while (read_seqcount_retry(&cfg->active_lut_seq, sequence));
-
-        if (!active_count) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
-        if (unlikely(tun_idx >= cfg->num_tunnels)) {
-            rcu_read_unlock();
-            return NF_DROP;
-        }
+    if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
+        u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
-        unsigned int ret = mwan_dispatch_encap(skb, tun);
+        
+        unsigned int ret = NF_ACCEPT;
+        
+        switch (tun->encap_type) {
+            case MWAN_ENCAP_NONE:
+                ret = mwan_handle_encap_none(skb, tun);
+                break;
+            case MWAN_ENCAP_MACSEC:
+                ret = mwan_handle_encap_macsec(skb, tun);
+                break;
+            case MWAN_ENCAP_L3_CUSTOM:
+                ret = mwan_handle_encap_l3(skb, tun);
+                break;
+            case MWAN_ENCAP_L3_PQC:
+                ret = mwan_handle_encap_l3_pqc(skb, tun);
+                break;
+            case MWAN_ENCAP_L2_PQC:
+                ret = mwan_handle_encap_l2_pqc(skb, tun);
+                break;
+            default:
+                ret = mwan_handle_encap_none(skb, tun);
+                break;
+        }
         
         rcu_read_unlock();
         return ret;
@@ -191,7 +148,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
 
 
     rcu_read_unlock();
-    return NF_DROP;
+    return NF_ACCEPT; 
 }
 
 /* The core Inbound processing logic */

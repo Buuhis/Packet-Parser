@@ -5,8 +5,6 @@
 #include <net/genetlink.h>
 #include <linux/module.h>
 #include <linux/slab.h>
-#include <linux/etherdevice.h>
-#include <linux/inetdevice.h>
 
 /* Netlink Policy for parsing payload */
 static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
@@ -20,25 +18,12 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_KEY_ID] = { .type = NLA_U8 },
     [MWAN_ATTR_PREV_KEY] = NLA_POLICY_EXACT_LEN(MWAN_MAX_KEY_LEN),
     [MWAN_ATTR_PREV_KEY_ID] = { .type = NLA_U8 },
-    [MWAN_ATTR_TUNNEL_IFINDEX] = { .type = NLA_U32 },
-    [MWAN_ATTR_TUNNEL_UP] = { .type = NLA_U8 },
-    [MWAN_ATTR_STATE_SEQUENCE] = { .type = NLA_U32 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
     [MWAN_TUN_IFINDEX] = { .type = NLA_U32 },
     [MWAN_TUN_WEIGHT]  = { .type = NLA_U32 },
-    [MWAN_TUN_PEER_IPV4] = { .type = NLA_U32 },
-    [MWAN_TUN_PEER_MAC] = NLA_POLICY_EXACT_LEN(ETH_ALEN),
-    [MWAN_TUN_PEER_GENERATION] = { .type = NLA_U32 },
-    [MWAN_TUN_UP] = { .type = NLA_U8 },
-    [MWAN_TUN_STATE_SEQUENCE] = { .type = NLA_U32 },
-    [MWAN_TUN_CONFIG_IFINDEX] = { .type = NLA_U32 },
-    [MWAN_TUN_LOCAL_IPV4] = { .type = NLA_U32 },
-    [MWAN_TUN_IFNAME] = { .type = NLA_NUL_STRING, .len = IFNAMSIZ - 1 },
 };
-
-static struct genl_family mwan_genl_family;
 
 /* Callback to handle SET_CONFIG message */
 static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
@@ -89,9 +74,6 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 nla_get_u32(tb[MWAN_TUN_IFINDEX]);
             new_cfg->tunnels[new_cfg->num_tunnels].weight =
                 nla_get_u32(tb[MWAN_TUN_WEIGHT]);
-            if (tb[MWAN_TUN_LOCAL_IPV4])
-                new_cfg->tunnels[new_cfg->num_tunnels].local_tunnel_ip =
-                    (__force __be32)nla_get_u32(tb[MWAN_TUN_LOCAL_IPV4]);
 
             new_cfg->num_tunnels++;
         }
@@ -192,114 +174,6 @@ err_free_config:
     return ret;
 }
 
-static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
-                                      struct genl_info *info)
-{
-    struct sk_buff *reply;
-    struct mwan_config *cfg;
-    struct nlattr *list;
-    void *header;
-    u32 i;
-    int ret = -EMSGSIZE;
-
-    (void)skb;
-    reply = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
-    if (!reply)
-        return -ENOMEM;
-    header = genlmsg_put_reply(reply, info, &mwan_genl_family, 0,
-                               MWAN_CMD_GET_TUNNEL_PEERS);
-    if (!header)
-        goto err_free;
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
-    if (nla_put_u32(reply, MWAN_ATTR_NODE_ID, cfg ? cfg->node_id : 0)) {
-        rcu_read_unlock();
-        goto err_cancel;
-    }
-    list = nla_nest_start_noflag(reply, MWAN_ATTR_TUNNELS);
-    if (!list) {
-        rcu_read_unlock();
-        goto err_cancel;
-    }
-    if (cfg) {
-        for (i = 0; i < cfg->num_tunnels; i++) {
-            struct mwan_tunnel *tun = &cfg->tunnels[i];
-            struct nlattr *entry;
-            u8 mac[ETH_ALEN];
-            __be32 peer_ip;
-            u32 generation;
-            bool resolved;
-            __be32 local_ip;
-
-            spin_lock_bh(&tun->gateway_mac_lock);
-            resolved = tun->mac_resolved && tun->peer_ip_resolved &&
-                       is_valid_ether_addr(tun->gateway_mac) &&
-                       tun->peer_tunnel_ip != 0;
-            ether_addr_copy(mac, tun->gateway_mac);
-            peer_ip = tun->peer_tunnel_ip;
-            generation = tun->peer_generation;
-            spin_unlock_bh(&tun->gateway_mac_lock);
-            local_ip = tun->local_tunnel_ip;
-            if (!local_ip && tun->dev)
-                local_ip = inet_select_addr(tun->dev, 0, RT_SCOPE_LINK);
-            if (!local_ip || !tun->dev)
-                continue;
-
-            entry = nla_nest_start_noflag(reply, i + 1);
-            if (!entry ||
-                nla_put_u32(reply, MWAN_TUN_IFINDEX, tun->ifindex) ||
-                nla_put_u8(reply, MWAN_TUN_UP, tun->is_up ? 1 : 0) ||
-                nla_put_u32(reply, MWAN_TUN_STATE_SEQUENCE,
-                            tun->state_sequence) ||
-                nla_put_u32(reply, MWAN_TUN_CONFIG_IFINDEX,
-                            tun->configured_ifindex) ||
-                nla_put_u32(reply, MWAN_TUN_LOCAL_IPV4,
-                            (__force u32)local_ip) ||
-                nla_put_string(reply, MWAN_TUN_IFNAME, tun->dev->name)) {
-                if (entry)
-                    nla_nest_cancel(reply, entry);
-                rcu_read_unlock();
-                goto err_cancel;
-            }
-            if (resolved &&
-                (nla_put_u32(reply, MWAN_TUN_PEER_IPV4,
-                             (__force u32)peer_ip) ||
-                 nla_put(reply, MWAN_TUN_PEER_MAC, ETH_ALEN, mac) ||
-                 nla_put_u32(reply, MWAN_TUN_PEER_GENERATION,
-                             generation))) {
-                nla_nest_cancel(reply, entry);
-                rcu_read_unlock();
-                goto err_cancel;
-            }
-            nla_nest_end(reply, entry);
-        }
-    }
-    rcu_read_unlock();
-    nla_nest_end(reply, list);
-    genlmsg_end(reply, header);
-    return genlmsg_reply(reply, info);
-
-err_cancel:
-    genlmsg_cancel(reply, header);
-err_free:
-    nlmsg_free(reply);
-    return ret;
-}
-
-static int mwan_genl_set_tunnel_state(struct sk_buff *skb,
-                                      struct genl_info *info)
-{
-    (void)skb;
-    if (!info->attrs[MWAN_ATTR_TUNNEL_IFINDEX] ||
-        !info->attrs[MWAN_ATTR_TUNNEL_UP] ||
-        !info->attrs[MWAN_ATTR_STATE_SEQUENCE])
-        return -EINVAL;
-    return mwan_state_set_tunnel_state(
-        nla_get_u32(info->attrs[MWAN_ATTR_TUNNEL_IFINDEX]),
-        nla_get_u8(info->attrs[MWAN_ATTR_TUNNEL_UP]) != 0,
-        nla_get_u32(info->attrs[MWAN_ATTR_STATE_SEQUENCE]));
-}
-
 /* Operation Definition */
 static const struct genl_ops mwan_genl_ops[] = {
     {
@@ -308,18 +182,6 @@ static const struct genl_ops mwan_genl_ops[] = {
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_set_config,
         .dumpit = NULL,
-    },
-    {
-        .cmd    = MWAN_CMD_GET_TUNNEL_PEERS,
-        .flags  = 0,
-        .policy = mwan_genl_policy,
-        .doit   = mwan_genl_get_tunnel_peers,
-    },
-    {
-        .cmd    = MWAN_CMD_SET_TUNNEL_STATE,
-        .flags  = GENL_ADMIN_PERM,
-        .policy = mwan_genl_policy,
-        .doit   = mwan_genl_set_tunnel_state,
     },
 };
 

@@ -4,29 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <net/if.h>
-#include <arpa/inet.h>
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 #include "../kernel/mwan_proto.h"
 #include "../sig_encrypt/inc/pqc_handshake.h"
-
-static int tunnel_ipv4(const char *text, struct in_addr *address)
-{
-    char buffer[INET_ADDRSTRLEN];
-    const char *slash;
-    size_t length;
-
-    if (!text || !address)
-        return -1;
-    slash = strchr(text, '/');
-    length = slash ? (size_t)(slash - text) : strlen(text);
-    if (!length || length >= sizeof(buffer))
-        return -1;
-    memcpy(buffer, text, length);
-    buffer[length] = '\0';
-    return inet_pton(AF_INET, buffer, address) == 1 ? 0 : -1;
-}
 
 
 int kernel_sync_push_config(const app_context_t *ctx) {
@@ -106,22 +88,15 @@ int kernel_sync_push_config(const app_context_t *ctx) {
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
         const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
         unsigned int idx = if_nametoindex(tun->tunnel_ifname);
-        struct in_addr local_tunnel_ip;
         if (idx == 0) {
             log_error("Tunnel interface '%s' does not exist",
                       tun->tunnel_ifname);
-            goto out;
-        }
-        if (tunnel_ipv4(tun->tunnel_ip, &local_tunnel_ip) < 0) {
-            log_error("Tunnel interface '%s' has invalid tunnel_ip '%s'",
-                      tun->tunnel_ifname, tun->tunnel_ip);
             goto out;
         }
 
         struct nlattr *tun_node = nla_nest_start(msg, i + 1);
         nla_put_u32(msg, MWAN_TUN_IFINDEX, idx);
         nla_put_u32(msg, MWAN_TUN_WEIGHT, tun->weight);
-        nla_put_u32(msg, MWAN_TUN_LOCAL_IPV4, local_tunnel_ip.s_addr);
 
         nla_nest_end(msg, tun_node);
         
