@@ -16,6 +16,7 @@
 #include <net/route.h>
 #include <net/ip.h>
 #include <net/netfilter/nf_conntrack.h>
+#include <net/netfilter/nf_conntrack_core.h>
 
 extern struct net init_net;
 
@@ -186,12 +187,28 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
         u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
-        
+        int confirm_ret;
         unsigned int ret = NF_ACCEPT;
+
+        /* Every asynchronous encap handler below takes ownership of skb and
+         * normally returns NF_STOLEN.  Confirm a NEW conntrack entry first,
+         * otherwise a later conntrack-confirm hook will never see this skb
+         * and the reply can be classified as INVALID by nftables.  This is a
+         * no-op for untracked packets and already-confirmed connections. */
+        confirm_ret = nf_conntrack_confirm(skb);
+        if (unlikely(confirm_ret != NF_ACCEPT)) {
+            mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,
+                             "CONNTRACK_CONFIRM_REJECT",
+                             tun->dev ? tun->dev->name : NULL);
+            pr_warn_ratelimited("mwan_kmod: conntrack confirm rejected TX packet ret=%d\n",
+                                confirm_ret);
+            rcu_read_unlock();
+            return (unsigned int)confirm_ret;
+        }
 
         mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,
                          "DISPATCH", tun->dev ? tun->dev->name : NULL);
-        
+
         switch (tun->encap_type) {
             case MWAN_ENCAP_NONE:
                 ret = mwan_handle_encap_none(skb, cfg, tun_idx);
