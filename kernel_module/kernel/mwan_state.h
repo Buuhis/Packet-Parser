@@ -273,6 +273,7 @@ struct mwan_config {
 /* Global pointer to the current active configuration */
 extern struct mwan_config __rcu *g_mwan_cfg;
 extern bool mwan_l2_diag_enabled;
+extern bool mwan_fw_diag_enabled;
 extern unsigned int mwan_l2_diag_limit;
 extern unsigned int mwan_l2_softirq_high_pct;
 extern unsigned int mwan_l2_softirq_low_pct;

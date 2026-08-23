@@ -5,6 +5,7 @@
 #include "mwan_state.h"
 
 bool mwan_l2_diag_enabled;
+bool mwan_fw_diag_enabled;
 unsigned int mwan_l2_diag_limit = 64;
 unsigned int mwan_l2_softirq_high_pct = 91;
 unsigned int mwan_l2_softirq_low_pct = 70;
@@ -16,6 +17,9 @@ static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
                  "Log the first L2-PQC TX/RX/worker observation per flow");
+module_param_named(fw_diag, mwan_fw_diag_enabled, bool, 0644);
+MODULE_PARM_DESC(fw_diag,
+                 "Log MWAN TX/RX/FORWARD path and conntrack observations");
 module_param_named(l2_diag_limit, mwan_l2_diag_limit, uint, 0644);
 MODULE_PARM_DESC(l2_diag_limit,
                  "Maximum number of distinct L2-PQC flows logged per stage");

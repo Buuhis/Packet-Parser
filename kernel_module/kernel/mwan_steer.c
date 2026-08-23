@@ -15,6 +15,7 @@
 #include <net/dst.h>
 #include <net/route.h>
 #include <net/ip.h>
+#include <net/netfilter/nf_conntrack.h>
 
 extern struct net init_net;
 
@@ -31,6 +32,66 @@ static struct mwan_tunnel *find_mwan_tunnel(struct mwan_config *cfg, u32 ifindex
 static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 {
     return find_mwan_tunnel(cfg, ifindex) != NULL;
+}
+
+static const char *mwan_ct_info_name(struct nf_conn *ct,
+                                     enum ip_conntrack_info ctinfo)
+{
+    if (!ct)
+        return "NONE";
+
+    switch (ctinfo) {
+    case IP_CT_ESTABLISHED:
+        return "ESTABLISHED";
+    case IP_CT_RELATED:
+        return "RELATED";
+    case IP_CT_NEW:
+        return "NEW";
+    case IP_CT_ESTABLISHED_REPLY:
+        return "ESTABLISHED_REPLY";
+    case IP_CT_RELATED_REPLY:
+        return "RELATED_REPLY";
+    case IP_CT_UNTRACKED:
+        return "UNTRACKED";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+/* Read-only diagnostic: this must never change skb, conntrack or verdict. */
+static void mwan_fw_diag_log(const char *stage, struct sk_buff *skb,
+                             const struct nf_hook_state *state,
+                             int encap_type, const char *action,
+                             const char *selected_dev)
+{
+    enum ip_conntrack_info ctinfo = IP_CT_UNTRACKED;
+    struct iphdr iph_buf;
+    const struct iphdr *iph;
+    struct nf_conn *ct;
+
+    if (!READ_ONCE(mwan_fw_diag_enabled) || !skb)
+        return;
+
+    iph = skb_header_pointer(skb, skb_network_offset(skb),
+                             sizeof(iph_buf), &iph_buf);
+    if (!iph || iph->version != 4)
+        return;
+
+    ct = nf_ct_get(skb, &ctinfo);
+    pr_info_ratelimited("mwan_kmod: FWDIAG stage=%s in=%s out=%s iif=%d "
+                        "src=%pI4 dst=%pI4 proto=%u len=%u "
+                        "ct=%s/%d tracked=%u confirmed=%u encap=%d "
+                        "action=%s selected=%s\n",
+                        stage,
+                        state && state->in ? state->in->name : "-",
+                        state && state->out ? state->out->name : "-",
+                        skb->skb_iif, &iph->saddr, &iph->daddr,
+                        iph->protocol, skb->len,
+                        mwan_ct_info_name(ct, ctinfo),
+                        ct ? (int)ctinfo : -1, !!ct,
+                        ct ? !!nf_ct_is_confirmed(ct) : 0,
+                        encap_type, action ? action : "-",
+                        selected_dev ? selected_dev : "-");
 }
 
 /* Helper function to check if packet is PQC handshake traffic (UDP port 7090) */
@@ -88,6 +149,11 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
 
     /* 1. Filter: Check if Outbound Interface is managed by MWAN */
     if (!state->out || !is_mwan_tunnel(cfg, state->out->ifindex)) {
+        /* A packet received from a managed tunnel and routed to LAN must be
+         * left untouched.  This log proves that POST_ROUTING did so. */
+        if (is_mwan_tunnel(cfg, skb->skb_iif))
+            mwan_fw_diag_log("TX_POST_PASS", skb, state, -1,
+                             "ACCEPT_UNMANAGED_OUT", NULL);
         rcu_read_unlock();
         return NF_ACCEPT;
     }
@@ -98,6 +164,8 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
          * normal IPv4 stack.  In particular, do not steal the skb and call
          * dev_queue_xmit() here: doing that bypasses the remaining output
          * path, including its normal MTU/fragmentation handling. */
+        mwan_fw_diag_log("TX_POST", skb, state, -1,
+                         "ACCEPT_PQC_HANDSHAKE", state->out->name);
         rcu_read_unlock();
         return NF_ACCEPT;
     }
@@ -120,6 +188,9 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
         
         unsigned int ret = NF_ACCEPT;
+
+        mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,
+                         "DISPATCH", tun->dev ? tun->dev->name : NULL);
         
         switch (tun->encap_type) {
             case MWAN_ENCAP_NONE:
@@ -185,6 +256,10 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     /* 1. Check if packet is coming from one of our WAN tunnels */
     struct mwan_tunnel *tun = find_mwan_tunnel(cfg, skb->dev->ifindex);
     if (tun) {
+        mwan_fw_diag_log("RX_PRE", skb, state, tun->encap_type,
+                         tun->encap_type == MWAN_ENCAP_L2_PQC ?
+                         "L2_PLAINTEXT_REINJECT" : "ENTER_TUNNEL",
+                         tun->dev ? tun->dev->name : NULL);
         /* If this tunnel is configured for L2 PQC encapsulation,
          * we bypass L3 decryption completely because the packet
          * was already decrypted at the L2 layer handler. */
@@ -223,6 +298,28 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     return NF_ACCEPT;
 }
 
+/* Runs after IPv4 conntrack (-200), immediately before a normal nftables
+ * filter-priority (0) FORWARD chain.  It is diagnostic-only and always
+ * returns NF_ACCEPT, so nftables remains solely responsible for filtering. */
+static unsigned int mwan_hook_forward_diag(void *priv, struct sk_buff *skb,
+                                           const struct nf_hook_state *state)
+{
+    struct mwan_config *cfg;
+
+    if (!READ_ONCE(mwan_fw_diag_enabled) || !skb)
+        return NF_ACCEPT;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg && ((state->in && is_mwan_tunnel(cfg, state->in->ifindex)) ||
+                (state->out && is_mwan_tunnel(cfg, state->out->ifindex))))
+        mwan_fw_diag_log("FWD_PRE_NFT", skb, state, -1,
+                         "OBSERVE_ONLY", NULL);
+    rcu_read_unlock();
+
+    return NF_ACCEPT;
+}
+
 /* Netfilter Hook Definitions */
 static struct nf_hook_ops mwan_nf_ops[] = {
     {
@@ -236,6 +333,12 @@ static struct nf_hook_ops mwan_nf_ops[] = {
         .pf       = NFPROTO_IPV4,
         .hooknum  = NF_INET_PRE_ROUTING,
         .priority = NF_IP_PRI_FIRST, 
+    },
+    {
+        .hook     = mwan_hook_forward_diag,
+        .pf       = NFPROTO_IPV4,
+        .hooknum  = NF_INET_FORWARD,
+        .priority = NF_IP_PRI_FILTER - 1,
     },
 };
 
