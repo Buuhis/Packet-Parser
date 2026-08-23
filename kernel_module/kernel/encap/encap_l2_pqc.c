@@ -11,6 +11,7 @@
 #include <linux/cpu.h>
 #include <linux/ktime.h>
 #include <net/neighbour.h>
+#include <net/ip.h>
 #include <net/tcp.h>
 #include <net/arp.h>
 #include <net/dst.h>
@@ -226,7 +227,8 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 
     iph = ip_hdr(skb);
     if (!iph || iph->version != 4 || iph->ihl < 5 ||
-        iph->protocol != IPPROTO_TCP)
+        iph->protocol != IPPROTO_TCP ||
+        (iph->frag_off & htons(IP_OFFSET)))
         return;
 
     ip_hlen = iph->ihl * 4;
@@ -285,6 +287,25 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
                                 u16 tunnel_idx);
+
+struct mwan_l2_fragment_context {
+    struct mwan_config *cfg;
+    u16 tunnel_idx;
+};
+
+static int mwan_l2_fragment_output(struct sk_buff *fragment, void *context)
+{
+    struct mwan_l2_fragment_context *fragment_context = context;
+    unsigned int verdict;
+
+    verdict = mwan_handle_encap_l2_pqc_single(
+        fragment, fragment_context->cfg, fragment_context->tunnel_idx);
+    if (verdict == NF_STOLEN)
+        return 0;
+
+    kfree_skb(fragment);
+    return -EIO;
+}
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
                                       struct mwan_config *cfg,
@@ -446,7 +467,8 @@ static bool mwan_l2_tcp_flow_closing(struct sk_buff *skb)
 
     iph = ip_hdr(skb);
     if (!iph || iph->version != 4 || iph->ihl < 5 ||
-        iph->protocol != IPPROTO_TCP)
+        iph->protocol != IPPROTO_TCP ||
+        (iph->frag_off & htons(IP_OFFSET)))
         return false;
     offset = iph->ihl * 4;
     if (!pskb_may_pull(skb, offset + sizeof(*tcph)))
@@ -482,8 +504,27 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
     mtu_result = mwan_mtu_classify_ipv4_skb(
         skb, target_dev, MWAN_MTU_PROFILE_L2_PQC, &decision);
     if (mtu_result == MWAN_MTU_OVERSIZE) {
-        mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_L2_PQC, &decision);
-        return NF_DROP;
+        struct mwan_l2_fragment_context fragment_context = {
+            .cfg = cfg,
+            .tunnel_idx = tunnel_idx,
+        };
+        bool consumed = false;
+
+        if (decision.ipv4_df && !skb->ignore_df) {
+            mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_L2_PQC,
+                                      &decision);
+            return NF_DROP;
+        }
+
+        err = mwan_mtu_fragment_ipv4(
+            skb, target_dev, &decision, mwan_l2_fragment_output,
+            &fragment_context, &consumed);
+        if (!consumed) {
+            pr_warn_ratelimited("mwan_kmod: L2-PQC MTU fragment setup failed ret=%d\n",
+                                err);
+            return NF_DROP;
+        }
+        return NF_STOLEN;
     }
     if (mtu_result != MWAN_MTU_FITS)
         return NF_DROP;

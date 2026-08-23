@@ -8,6 +8,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/version.h>
+#include <net/ip.h>
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
 #include <net/gso.h>
 #endif
@@ -129,11 +130,35 @@ static bool mwan_none_tcp_closing(struct sk_buff *skb)
         return false;
     iph = skb_header_pointer(skb, offset, sizeof(iph_buf), &iph_buf);
     if (!iph || iph->version != 4 || iph->ihl < 5 ||
-        iph->protocol != IPPROTO_TCP)
+        iph->protocol != IPPROTO_TCP ||
+        (iph->frag_off & htons(IP_OFFSET)))
         return false;
     tcp = skb_header_pointer(skb, offset + iph->ihl * 4,
                              sizeof(tcp_buf), &tcp_buf);
     return tcp && (tcp->fin || tcp->rst);
+}
+
+static unsigned int
+mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
+                              u16 tunnel_idx);
+
+struct mwan_none_fragment_context {
+    struct mwan_config *cfg;
+    u16 tunnel_idx;
+};
+
+static int mwan_none_fragment_output(struct sk_buff *fragment, void *context)
+{
+    struct mwan_none_fragment_context *fragment_context = context;
+    unsigned int verdict;
+
+    verdict = mwan_handle_encap_none_single(
+        fragment, fragment_context->cfg, fragment_context->tunnel_idx);
+    if (verdict == NF_STOLEN)
+        return 0;
+
+    kfree_skb(fragment);
+    return -EIO;
 }
 
 static unsigned int
@@ -155,8 +180,27 @@ mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
     mtu_result = mwan_mtu_classify_ipv4_skb(
         skb, tun->dev, MWAN_MTU_PROFILE_BYPASS, &decision);
     if (mtu_result == MWAN_MTU_OVERSIZE) {
-        mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_BYPASS, &decision);
-        return NF_DROP;
+        struct mwan_none_fragment_context fragment_context = {
+            .cfg = cfg,
+            .tunnel_idx = tunnel_idx,
+        };
+        bool consumed = false;
+
+        if (decision.ipv4_df && !skb->ignore_df) {
+            mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_BYPASS,
+                                      &decision);
+            return NF_DROP;
+        }
+
+        err = mwan_mtu_fragment_ipv4(
+            skb, tun->dev, &decision, mwan_none_fragment_output,
+            &fragment_context, &consumed);
+        if (!consumed) {
+            pr_warn_ratelimited("mwan_kmod: bypass MTU fragment setup failed ret=%d\n",
+                                err);
+            return NF_DROP;
+        }
+        return NF_STOLEN;
     }
     if (mtu_result != MWAN_MTU_FITS)
         return NF_DROP;

@@ -7,6 +7,11 @@
 struct net_device;
 struct sk_buff;
 
+/* The callback owns every fragment passed to it, for both success and
+ * failure.  Return zero when that fragment was accepted by the datapath. */
+typedef int (*mwan_mtu_fragment_output_t)(struct sk_buff *fragment,
+                                          void *context);
+
 /*
  * target_dev->mtu is the L3 payload MTU advertised by the selected netdev.
  * In particular, a correctly configured VXLAN device has already deducted
@@ -86,6 +91,18 @@ u32 mwan_mtu_ipv4_l4_payload_limit(const struct net_device *target_dev,
 bool mwan_mtu_send_frag_needed(struct sk_buff *skb,
 			       enum mwan_mtu_profile profile,
 			       const struct mwan_mtu_decision *decision);
+
+/*
+ * Use the IPv4 kernel fragmenter with decision->limits.max_inner_len, then
+ * hand each resulting IPv4 fragment to output().  On entry skb is owned by
+ * the caller.  Once *consumed becomes true, this function has consumed skb
+ * regardless of its return value.
+ */
+int mwan_mtu_fragment_ipv4(struct sk_buff *skb,
+			   struct net_device *target_dev,
+			   const struct mwan_mtu_decision *decision,
+			   mwan_mtu_fragment_output_t output,
+			   void *context, bool *consumed);
 
 void mwan_mtu_stats_get(enum mwan_mtu_profile profile,
 			struct mwan_mtu_stats_snapshot *snapshot);

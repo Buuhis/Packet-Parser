@@ -8,9 +8,12 @@
 #include <linux/ip.h>
 #include <linux/netdevice.h>
 #include <linux/overflow.h>
+#include <linux/percpu.h>
+#include <linux/preempt.h>
 #include <linux/skbuff.h>
 #include <linux/string.h>
 #include <net/icmp.h>
+#include <net/ip.h>
 
 struct mwan_mtu_atomic_stats {
 	atomic64_t fits;
@@ -21,6 +24,35 @@ struct mwan_mtu_atomic_stats {
 };
 
 static struct mwan_mtu_atomic_stats mwan_mtu_stats[MWAN_MTU_PROFILE_MAX];
+
+struct mwan_mtu_fragment_dispatch {
+	mwan_mtu_fragment_output_t output;
+	void *context;
+	u32 fragments;
+};
+
+/* ip_do_fragment() has a fixed output callback signature.  The fragmenter
+ * is synchronous, so a per-CPU stack context safely carries the selected
+ * config/tunnel into that callback while preemption is disabled.  Saving
+ * and restoring the previous pointer also makes nested fragmentation safe. */
+static DEFINE_PER_CPU(struct mwan_mtu_fragment_dispatch *,
+		      mwan_mtu_active_fragment);
+
+static int mwan_mtu_fragment_output(struct net *net, struct sock *sk,
+				    struct sk_buff *fragment)
+{
+	struct mwan_mtu_fragment_dispatch *dispatch;
+
+	(void)net;
+	(void)sk;
+	dispatch = this_cpu_read(mwan_mtu_active_fragment);
+	if (unlikely(!dispatch || !dispatch->output)) {
+		kfree_skb(fragment);
+		return -EINVAL;
+	}
+	dispatch->fragments++;
+	return dispatch->output(fragment, dispatch->context);
+}
 
 static bool mwan_mtu_profile_valid(enum mwan_mtu_profile profile)
 {
@@ -210,6 +242,66 @@ bool mwan_mtu_send_frag_needed(struct sk_buff *skb,
 	 * guaranteed to have reached the original sender. */
 	atomic64_inc(&mwan_mtu_stats[profile].frag_needed_attempted);
 	return true;
+}
+
+int mwan_mtu_fragment_ipv4(struct sk_buff *skb,
+			   struct net_device *target_dev,
+			   const struct mwan_mtu_decision *decision,
+			   mwan_mtu_fragment_output_t output,
+			   void *context, bool *consumed)
+{
+	struct mwan_mtu_fragment_dispatch dispatch = {
+		.output = output,
+		.context = context,
+	};
+	struct mwan_mtu_fragment_dispatch *previous;
+	u32 max_inner_len;
+	u32 original_len;
+	int ret;
+
+	if (consumed)
+		*consumed = false;
+	if (!skb || !target_dev || !decision || !output ||
+	    decision->result != MWAN_MTU_OVERSIZE || !skb_dst(skb))
+		return -EINVAL;
+
+	max_inner_len = decision->limits.max_inner_len;
+	/* Never widen a stricter PMTU/fragment limit already attached by an
+	 * earlier tunnel or bridge layer. */
+	if (IPCB(skb)->frag_max_size &&
+	    IPCB(skb)->frag_max_size < max_inner_len)
+		max_inner_len = IPCB(skb)->frag_max_size;
+	if (max_inner_len <= decision->ipv4_header_len ||
+	    max_inner_len > U16_MAX)
+		return -ERANGE;
+	/* Respect DF unless a previous tunnel layer explicitly allowed the skb
+	 * to be fragmented.  The caller retains ownership on this path. */
+	if (decision->ipv4_df && !skb->ignore_df)
+		return -EMSGSIZE;
+
+	original_len = decision->inner_len;
+	skb->dev = target_dev;
+	IPCB(skb)->frag_max_size = (u16)max_inner_len;
+
+	preempt_disable();
+	previous = this_cpu_read(mwan_mtu_active_fragment);
+	this_cpu_write(mwan_mtu_active_fragment, &dispatch);
+	if (consumed)
+		*consumed = true;
+	ret = ip_do_fragment(dev_net(target_dev), skb->sk, skb,
+			     mwan_mtu_fragment_output);
+	this_cpu_write(mwan_mtu_active_fragment, previous);
+	preempt_enable();
+
+	if (unlikely(ret))
+		pr_warn_ratelimited("mwan_kmod: MTU fragment failed dev=%s inner=%u limit=%u fragments=%u ret=%d\n",
+				    target_dev->name, original_len,
+				    max_inner_len, dispatch.fragments, ret);
+	else
+		pr_info_ratelimited("mwan_kmod: MTU fragmented dev=%s inner=%u limit=%u fragments=%u\n",
+				    target_dev->name, original_len,
+				    max_inner_len, dispatch.fragments);
+	return ret;
 }
 
 void mwan_mtu_stats_get(enum mwan_mtu_profile profile,
