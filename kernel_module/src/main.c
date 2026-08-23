@@ -112,7 +112,7 @@ static void handle_signal(int sig) {
     }
 }
 
-void pqc_bind_node(int node_id, uint64_t config_generation) {
+int pqc_bind_node(int node_id, uint64_t config_generation) {
     char key_id[256] = {0};
     char local_fg_db[32] = {0};
     char peer_pub_name[256] = {0};
@@ -124,19 +124,22 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
                                     peer_pub_name,
                                     sizeof(peer_pub_name)) != 0) {
         log_warn("[PQC] No PQC configuration or database identity found for Node ID: %d", node_id);
-        return;
+        return -ENOENT;
     }
 
     char local_fg[16] = {0};
-    strncpy(local_fg, local_fg_db, 8);
-    local_fg[8] = '\0';
+    memcpy(local_fg, local_fg_db, strnlen(local_fg_db, 8));
 
     char local_key_name[64];
     snprintf(local_key_name, sizeof(local_key_name), "%s.key", local_fg);
 
     // Initialize Vault and load local identity keypair from Vault into RAM registry
     sig_pqc_init_vault();
-    sig_pqc_load_key_from_vault(local_key_name);
+    if (sig_pqc_load_key_from_vault(local_key_name) != 0) {
+        log_error("[PQC-VAULT] Failed to refresh local identity key [%s] from Vault",
+                  local_key_name);
+        return -EKEYREJECTED;
+    }
 
     // Resolve WAN / PQC Exchange Tunnel info
     char local_ip[INET_ADDRSTRLEN] = "";
@@ -154,12 +157,16 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
             sizeof(hs_peer_tun_ip)) != 0) {
         log_error("[PQC-TUNNEL] Missing PQC exchange tunnel for profile %d",
                   node_id);
-        return;
+        return -ENOENT;
     }
-    if (strlen(hs_tun_name) >= IFNAMSIZ || if_nametoindex(hs_tun_name) == 0) {
-        log_error("[PQC-TUNNEL] Interface '%s' does not exist or exceeds IFNAMSIZ",
+    if (hs_tun_name[0] == '\0' || strlen(hs_tun_name) >= IFNAMSIZ) {
+        log_error("[PQC-TUNNEL] Interface name '%s' is empty or exceeds IFNAMSIZ",
                   hs_tun_name);
-        return;
+        return -EINVAL;
+    }
+    if (if_nametoindex(hs_tun_name) == 0) {
+        log_warn("[PQC-TUNNEL] Interface '%s' is not ready yet; retaining the binding so -r can recover it later",
+                 hs_tun_name);
     }
     if (normalize_ipv4(hs_tun_ip, local_ip, sizeof(local_ip),
                        &local_ip_num) < 0 ||
@@ -167,12 +174,12 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
                        &peer_ip_num) < 0) {
         log_error("[PQC-TUNNEL] Invalid local/peer IP: '%s' / '%s'",
                   hs_tun_ip, hs_peer_tun_ip);
-        return;
+        return -EINVAL;
     }
     if (local_ip_num == peer_ip_num) {
         log_error("[PQC-TUNNEL] Local and peer tunnel IP are identical: %s",
                   local_ip);
-        return;
+        return -EINVAL;
     }
     role_mode = local_ip_num > peer_ip_num ? PQC_ROLE_INITIATOR :
                                              PQC_ROLE_RESPONDER;
@@ -190,8 +197,14 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
         sig_pqc_vault_read_key(VAULT_PATH_REMOTE_PUBLIC, peer_pub_name, vault_peer_pub_buf, sizeof(vault_peer_pub_buf)) == 0) {
         log_info("[PQC-VAULT] SUCCESS: Loaded peer public key [%s] 100%% directly from HashiCorp Vault.", peer_pub_name);
         deobf_pub = strdup(vault_peer_pub_buf);
-        strncpy(peer_fg_buf, peer_pub_name, 8);
-        peer_fg_buf[8] = '\0';
+        if (!deobf_pub) {
+            log_error("[PQC-VAULT] Out of memory while retaining peer public key [%s]",
+                      peer_pub_name);
+            valid = false;
+        } else {
+            memcpy(peer_fg_buf, peer_pub_name,
+                   strnlen(peer_pub_name, 8));
+        }
     } else {
         log_error("[PQC-VAULT] ERROR: Node %d peer_pub key [%s] NOT found in HashiCorp Vault (remote_public)!", node_id, peer_pub_name);
         valid = false;
@@ -208,13 +221,25 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
     }
 
     if (valid) {
-        sig_pqc_bind_profile(node_id, key_id, role_mode, local_ip, peer_ip,
-                             local_fg, peer_fg_buf, hs_tun_name,
-                             found_priv, found_pub, deobf_pub,
-                             config_generation);
+        int bind_rc = sig_pqc_bind_profile(
+            node_id, key_id, role_mode, local_ip, peer_ip,
+            local_fg, peer_fg_buf, hs_tun_name,
+            found_priv, found_pub, deobf_pub, config_generation);
+        if (bind_rc != 0) {
+            log_error("[PQC] Failed to retain binding for profile %d: %s",
+                      node_id, strerror(-bind_rc));
+            if (deobf_pub) free(deobf_pub);
+            return bind_rc;
+        }
         
         // Start/kickoff the handshake by spinning up the background worker thread for this policy
-        sig_pqc_handshake_start(node_id, hs_tun_name, peer_ip);
+        int start_rc = sig_pqc_handshake_start(node_id, hs_tun_name, peer_ip);
+        if (start_rc != 0) {
+            log_warn("[PQC] Handshake runtime for profile %d is deferred: %s. The binding remains available for -r.",
+                     node_id, strerror(-start_rc));
+            if (deobf_pub) free(deobf_pub);
+            return start_rc;
+        }
         
         log_info("[PQC] Handshake worker initiated for profile %d on %s (%s -> %s)",
                  node_id, hs_tun_name, local_ip, peer_ip);
@@ -223,6 +248,7 @@ void pqc_bind_node(int node_id, uint64_t config_generation) {
     }
 
     if (deobf_pub) free(deobf_pub);
+    return valid ? 0 : -EINVAL;
 }
 
 void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,

@@ -69,6 +69,10 @@ struct mwan_l2_tx_flow {
     u64 flow_token;
     atomic_t next_seq;
     atomic_t pending_crypto;
+    /* Serializes admission + sequence allocation + queue insertion for one
+     * flow.  A sequence number is consumed only after the packet is certain
+     * to enter its sticky owner's FIFO. */
+    spinlock_t submit_lock;
     int owner_worker;
     unsigned long last_seen;
     bool closing;
@@ -91,13 +95,47 @@ struct mwan_l2_rx_flow {
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
+/* skb->cb metadata while an encrypted RX frame waits for its sticky worker. */
+struct mwan_l2_rx_cb {
+    uintptr_t flow_ptr;
+    u64 dispatch_flow_token;
+    u64 dispatch_nonce;
+    u64 diag_cookie;
+    u32 dispatch_flow_seq;
+    u32 accounted_bytes;
+    u32 diag_check;
+    u16 dispatch_headlen;
+    u8 dispatch_flags;
+    u8 diag_magic;
+};
+
+#define MWAN_L2_RX_CB_NONLINEAR BIT(0)
+#define MWAN_L2_RX_CB_MAGIC     0x4cU
+#define MWAN_L2_RX_CB(skb) ((struct mwan_l2_rx_cb *)((skb)->cb))
+
+static inline u32 mwan_l2_rx_cb_checksum(const struct mwan_l2_rx_cb *cb)
+{
+    return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
+           lower_32_bits(cb->dispatch_flow_token) ^
+           upper_32_bits(cb->dispatch_flow_token) ^
+           cb->accounted_bytes ^ cb->dispatch_flow_seq ^
+           lower_32_bits(cb->dispatch_nonce) ^
+           upper_32_bits(cb->dispatch_nonce) ^
+           lower_32_bits(cb->diag_cookie) ^
+           upper_32_bits(cb->diag_cookie) ^ cb->dispatch_headlen ^
+           cb->dispatch_flags ^ 0x6d77616eU;
+}
+
 struct mwan_l2_tx_cb {
     uintptr_t flow_ptr;
     u64 flow_token;
     u32 flow_seq;
     u32 accounted_bytes;
+    u32 check;
     u16 tunnel_idx;
     u16 magic;
+    u8 encap_type;
+    u8 reserved[3];
 };
 
 #define MWAN_L2_TX_CB_MAGIC 0x4d54U
@@ -168,7 +206,7 @@ struct mwan_l2_worker {
     atomic64_t tx_enqueued_packets;
     atomic64_t tx_processed_packets;
     atomic64_t tx_dropped_packets;
-    atomic64_t tx_encrypt_failures;
+    atomic64_t tx_xmit_failures;
     atomic64_t tx_assigned_flows;
     atomic64_t tx_processing_ewma_ns;
     atomic64_t tx_work_runs;
@@ -176,15 +214,28 @@ struct mwan_l2_worker {
     atomic_t tx_scheduled;
     atomic_t tx_busy;
 
-    /* Per-CPU softirq admission signal, sampled from kernel CPU accounting.
-     * Values are basis points (10000 == 100%). Only the sampler updates the
-     * previous counters/cooldown; RX and TX admission read the snapshot. */
-    u64 softirq_prev_total;
-    u64 softirq_prev_time;
-    unsigned int softirq_cool_samples;
+    /* Per-CPU admission signals from kernel CPU accounting.  Values are
+     * basis points (10000 == 100%).  The sampler is the only writer; RX/TX
+     * admission and shedding consume atomic snapshots. */
+    u64 cpu_prev_total;
+    u64 cpu_prev_system;
+    u64 cpu_prev_softirq;
+    u64 cpu_prev_idle;
+    unsigned int cpu_cool_samples;
+    atomic_t system_raw_bp;
+    atomic_t system_ewma_bp;
     atomic_t softirq_raw_bp;
     atomic_t softirq_ewma_bp;
-    atomic_t softirq_blocked;
+    atomic_t idle_raw_bp;
+    atomic_t idle_ewma_bp;
+    atomic_t busy_raw_bp;
+    atomic_t busy_ewma_bp;
+    atomic_t admission_blocked;
+    atomic_t emergency_shed;
+    atomic64_t tx_ecn_marked;
+    atomic64_t rx_ecn_marked;
+    atomic64_t tx_overload_dropped;
+    atomic64_t tx_control_preserved;
 };
 
 struct mwan_config {
@@ -226,6 +277,9 @@ extern unsigned int mwan_l2_diag_limit;
 extern unsigned int mwan_l2_softirq_high_pct;
 extern unsigned int mwan_l2_softirq_low_pct;
 extern unsigned int mwan_l2_softirq_sample_ms;
+extern unsigned int mwan_l2_idle_unblock_pct;
+extern unsigned int mwan_l2_emergency_pct;
+extern unsigned int mwan_l2_max_shed_pct;
 
 /* API Functions */
 void mwan_state_init(void);
@@ -235,11 +289,21 @@ u64 mwan_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
 int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
-                             int current_owner);
+                             int current_owner,
+                             bool allow_blocked_fallback);
 int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
-                             int current_owner);
+                             int current_owner,
+                             bool allow_blocked_fallback);
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
+void mwan_l2_rx_worker_fn(struct work_struct *work);
+void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker);
+int mwan_multicore_init(void);
+void mwan_multicore_cleanup(void);
+u64 mwan_multicore_worker_score(const struct mwan_l2_worker *worker);
+u64 mwan_multicore_admitted_get(void);
+u64 mwan_multicore_no_eligible_get(void);
+void mwan_multicore_diag_reset(void);
 void mwan_l2_diag_reset_all(void);
 void mwan_l2_tx_diag_reset(void);
 u32 mwan_l2_diag_generation_get(void);
@@ -251,14 +315,20 @@ void mwan_l2_flow_manager_start(struct mwan_config *cfg);
 void mwan_l2_flow_manager_stop(struct mwan_config *cfg);
 struct mwan_l2_tx_flow *
 mwan_l2_tx_flow_get(struct mwan_config *cfg,
-                    const struct mwan_l2_flow_key *key, u32 flow_hash);
+                    const struct mwan_l2_flow_key *key, u32 flow_hash,
+                    bool control_packet);
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);
+bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
+                                   const struct mwan_l2_flow_key *key,
+                                   int owner_worker);
 struct mwan_l2_rx_flow *
 mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq);
 void mwan_l2_rx_flow_put(struct mwan_l2_rx_flow *flow);
 void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing);
+bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
+                                   int owner_worker);
 void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                              struct sk_buff *skb, u32 flow_seq);
 

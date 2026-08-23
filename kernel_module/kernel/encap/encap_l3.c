@@ -131,7 +131,7 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
 
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->encrypt_on || !cfg->tfm)
-        return mwan_handle_encap_none(skb, tun);
+        return mwan_handle_encap_none_direct(skb, tun);
 
     /* MTU Protection: Clamp TCP MSS before encryption */
     mwan_clamp_mss(skb, target_dev);
@@ -140,7 +140,7 @@ static unsigned int mwan_handle_encap_l3_single(struct sk_buff *skb, struct mwan
     iph = ip_hdr(skb);
     iph_len = iph->ihl * 4;
     payload_len = ntohs(iph->tot_len) - iph_len;
-    if (payload_len <= 0) return mwan_handle_encap_none(skb, tun);
+    if (payload_len <= 0) return mwan_handle_encap_none_direct(skb, tun);
 
     /* Entropy Fix: Calculate the flow hash of the plaintext packet BEFORE encryption.
      * This hash is essential for the tunnel driver (e.g. VXLAN) to generate 

@@ -9,6 +9,9 @@ unsigned int mwan_l2_diag_limit = 64;
 unsigned int mwan_l2_softirq_high_pct = 91;
 unsigned int mwan_l2_softirq_low_pct = 70;
 unsigned int mwan_l2_softirq_sample_ms = 50;
+unsigned int mwan_l2_idle_unblock_pct = 20;
+unsigned int mwan_l2_emergency_pct = 97;
+unsigned int mwan_l2_max_shed_pct = 50;
 static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
@@ -18,14 +21,23 @@ MODULE_PARM_DESC(l2_diag_limit,
                  "Maximum number of distinct L2-PQC flows logged per stage");
 module_param_named(l2_softirq_high, mwan_l2_softirq_high_pct, uint, 0644);
 MODULE_PARM_DESC(l2_softirq_high,
-                 "Softirq percent that blocks new-flow admission to a CPU");
+                 "Compatibility name: busy/sys/soft percent blocking new flows");
 module_param_named(l2_softirq_low, mwan_l2_softirq_low_pct, uint, 0644);
 MODULE_PARM_DESC(l2_softirq_low,
-                 "Softirq percent that begins unblocking a CPU");
+                 "Maximum system/softirq percent allowed while unblocking a CPU");
 module_param_named(l2_softirq_sample_ms, mwan_l2_softirq_sample_ms, uint,
                    0644);
 MODULE_PARM_DESC(l2_softirq_sample_ms,
-                 "Per-CPU softirq accounting sample interval in milliseconds");
+                 "Per-CPU accounting sample interval in milliseconds");
+module_param_named(l2_idle_unblock, mwan_l2_idle_unblock_pct, uint, 0644);
+MODULE_PARM_DESC(l2_idle_unblock,
+                 "Raw and EWMA idle percent required to unblock a CPU");
+module_param_named(l2_emergency, mwan_l2_emergency_pct, uint, 0644);
+MODULE_PARM_DESC(l2_emergency,
+                 "Busy/sys/soft percent that enables packet-level shedding");
+module_param_named(l2_max_shed, mwan_l2_max_shed_pct, uint, 0644);
+MODULE_PARM_DESC(l2_max_shed,
+                 "Maximum percentage of eligible data packets shed per CPU");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)

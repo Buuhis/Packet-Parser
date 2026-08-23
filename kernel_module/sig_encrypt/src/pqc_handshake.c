@@ -17,10 +17,13 @@
 #include <sys/ioctl.h>
 #include <sys/random.h>
 #include <net/if.h>
+#include <stdatomic.h>
+#include <time.h>
 
 #define PQC_RX_PKT_MAX     10000
 #define KEY_ROTATION_INTERVAL_MS 3000000
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
+#define PQC_WORKER_STOP_TIMEOUT_MS 3000
 
 /* TEST ONLY: allow the two peers to use different local profile IDs.
  * Set this back to 0 after the profile-mismatch test. */
@@ -44,9 +47,34 @@ static volatile int g_policy_key_version[MAX_POLICY_BINDINGS] = {0};
 static volatile int g_datapath_key_version[MAX_POLICY_BINDINGS] = {0};
 static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 
-static bool g_dispatcher_running = false;
+static atomic_bool g_dispatcher_running = ATOMIC_VAR_INIT(false);
+static pqc_runtime_state_t g_dispatcher_state = PQC_RUNTIME_STOPPED;
+static int g_dispatcher_last_error;
+static pthread_cond_t g_dispatcher_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t g_worker_state_cond = PTHREAD_COND_INITIALIZER;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
+static void *pqc_udp_dispatcher_thread(void *arg);
+
+static bool pqc_dispatcher_is_running(void) {
+    return atomic_load_explicit(&g_dispatcher_running,
+                                memory_order_acquire);
+}
+
+static const char *pqc_runtime_state_name(pqc_runtime_state_t state) {
+    switch (state) {
+    case PQC_RUNTIME_STOPPED:
+        return "STOPPED";
+    case PQC_RUNTIME_STARTING:
+        return "STARTING";
+    case PQC_RUNTIME_RUNNING:
+        return "RUNNING";
+    case PQC_RUNTIME_FAILED:
+        return "FAILED";
+    default:
+        return "UNKNOWN";
+    }
+}
 
 static bool pqc_hs_profile_matches(uint32_t wire_profile_id,
                                    int local_profile_id) {
@@ -169,6 +197,22 @@ static void pqc_hs_clear_cache_locked(policy_key_binding_t *b) {
         memset(&b->hs_cache[i], 0, sizeof(b->hs_cache[i]));
     }
     b->hs_cache_next = 0;
+}
+
+static void pqc_flush_rx_queue(policy_key_binding_t *b) {
+    if (!b) return;
+
+    pthread_mutex_lock(&b->rx_mutex);
+    for (int i = 0; i < PQC_RX_QUEUE_SIZE; i++) {
+        free(b->rx_queue[i]);
+        b->rx_queue[i] = NULL;
+        b->rx_len[i] = 0;
+        memset(&b->rx_info[i], 0, sizeof(b->rx_info[i]));
+    }
+    b->rx_head = 0;
+    b->rx_tail = 0;
+    pthread_cond_broadcast(&b->rx_cond);
+    pthread_mutex_unlock(&b->rx_mutex);
 }
 
 // Helper to calculate SHA256 hash
@@ -482,18 +526,29 @@ static void initiate_key_rotation(policy_key_binding_t *b, int sockfd, struct so
     uint64_t rotation_started = get_time_ms_hs();
     int retry_cnt = 0;
 
-    while (g_dispatcher_running && !b->thread_exit_sig &&
+    while (pqc_dispatcher_is_running() && !b->thread_exit_sig &&
            get_time_ms_hs() - rotation_started < PQC_HS_GIVEUP_TIMEOUT_MS) {
         ssize_t sent = sendto(sockfd, buffer, payload_tot_sz, 0,
                               (const struct sockaddr *)peeraddr,
                               sizeof(struct sockaddr_in));
+        int send_error = sent < 0 ? errno : 0;
         fprintf(stderr,
-                "[PQC-HS-L3] Rotation HELLO Profile %d, session %u, try %d%s.\n",
+                "[PQC-HS-L3] Rotation HELLO Profile %d, session %u, try %d%s%s%s.\n",
                 profile_id, msg_id, ++retry_cnt,
-                sent == payload_tot_sz ? " sent" : " send failed");
+                sent == payload_tot_sz ? " sent" : " send failed",
+                sent == payload_tot_sz ? "" : ": ",
+                sent == payload_tot_sz ? "" :
+                (sent < 0 ? strerror(send_error) : "short UDP send"));
+
+        if (sent != payload_tot_sz) {
+            if (send_error == EMSGSIZE)
+                break;
+            usleep(200000);
+            continue;
+        }
 
         uint64_t start_rx = get_time_ms_hs();
-        while (g_dispatcher_running && !b->thread_exit_sig &&
+        while (pqc_dispatcher_is_running() && !b->thread_exit_sig &&
                get_time_ms_hs() - start_rx < 3000) {
             uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
             pqc_rx_pkt_info_t info;
@@ -556,9 +611,12 @@ static void pqc_feed_packet_to_binding_queue(policy_key_binding_t *b, const uint
 }
 
 void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_mac) {
+    const struct pqc_hs_msg *validated_msg = NULL;
+
     (void)src_mac;
-    if (len < (int)sizeof(struct pqc_hs_msg)) return;
-    struct pqc_hs_msg *msg = (struct pqc_hs_msg *)payload;
+    if (pqc_hs_validate_message(payload, len, &validated_msg) != 0)
+        return;
+    const struct pqc_hs_msg *msg = validated_msg;
     if (msg->magic != PQC_HS_MAGIC) return;
 
     uint32_t profile_id = msg->profile_id;
@@ -642,11 +700,125 @@ static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz,
     return len;
 }
 
+static void pqc_dispatcher_publish_failure(int error_code) {
+    pthread_mutex_lock(&g_key_mutex);
+    atomic_store_explicit(&g_dispatcher_running, false,
+                          memory_order_release);
+    g_dispatcher_state = PQC_RUNTIME_FAILED;
+    g_dispatcher_last_error = error_code ? error_code : EIO;
+    pthread_cond_broadcast(&g_dispatcher_cond);
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+static int pqc_dispatcher_ensure_running(void) {
+    struct timespec deadline;
+    pthread_t udp_tid;
+    int rc;
+
+    pthread_mutex_lock(&g_key_mutex);
+    if (g_dispatcher_state == PQC_RUNTIME_RUNNING &&
+        pqc_dispatcher_is_running()) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return 0;
+    }
+
+    if (g_dispatcher_state != PQC_RUNTIME_STARTING) {
+        g_dispatcher_state = PQC_RUNTIME_STARTING;
+        g_dispatcher_last_error = 0;
+        atomic_store_explicit(&g_dispatcher_running, false,
+                              memory_order_release);
+        rc = pthread_create(&udp_tid, NULL, pqc_udp_dispatcher_thread, NULL);
+        if (rc != 0) {
+            g_dispatcher_state = PQC_RUNTIME_FAILED;
+            g_dispatcher_last_error = rc;
+            pthread_cond_broadcast(&g_dispatcher_cond);
+            pthread_mutex_unlock(&g_key_mutex);
+            fprintf(stderr,
+                    "[PQC-HS] ERROR starting UDP dispatcher thread: %s\n",
+                    strerror(rc));
+            return -rc;
+        }
+        pthread_detach(udp_tid);
+    }
+
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    while (g_dispatcher_state == PQC_RUNTIME_STARTING) {
+        rc = pthread_cond_timedwait(&g_dispatcher_cond, &g_key_mutex,
+                                    &deadline);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_key_mutex);
+            fprintf(stderr,
+                    "[PQC-HS] UDP dispatcher did not become ready within 2 seconds.\n");
+            return -ETIMEDOUT;
+        }
+    }
+
+    if (g_dispatcher_state != PQC_RUNTIME_RUNNING ||
+        !pqc_dispatcher_is_running()) {
+        rc = g_dispatcher_last_error ? g_dispatcher_last_error : EIO;
+        pthread_mutex_unlock(&g_key_mutex);
+        return -rc;
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return 0;
+}
+
+static int pqc_interface_ipv4_ready(const char *ifname,
+                                    const char *local_ip) {
+    struct ifreq ifr;
+    struct sockaddr_in *addr;
+    struct in_addr expected;
+    int sockfd;
+    int saved_errno;
+
+    if (!ifname || !ifname[0] || strlen(ifname) >= IFNAMSIZ ||
+        !local_ip || inet_pton(AF_INET, local_ip, &expected) != 1)
+        return -EINVAL;
+    if (if_nametoindex(ifname) == 0)
+        return -ENODEV;
+
+    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd < 0)
+        return -errno;
+
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+    if (ioctl(sockfd, SIOCGIFFLAGS, &ifr) < 0) {
+        saved_errno = errno;
+        close(sockfd);
+        return -saved_errno;
+    }
+    if (!(ifr.ifr_flags & IFF_UP)) {
+        close(sockfd);
+        return -ENETDOWN;
+    }
+
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, sizeof(ifr.ifr_name), "%s", ifname);
+    if (ioctl(sockfd, SIOCGIFADDR, &ifr) < 0) {
+        saved_errno = errno;
+        close(sockfd);
+        return saved_errno == EADDRNOTAVAIL ? -EADDRNOTAVAIL :
+                                              -saved_errno;
+    }
+    close(sockfd);
+
+    addr = (struct sockaddr_in *)&ifr.ifr_addr;
+    if (addr->sin_family != AF_INET ||
+        addr->sin_addr.s_addr != expected.s_addr)
+        return -EADDRNOTAVAIL;
+    return 0;
+}
+
 static void* pqc_udp_dispatcher_thread(void* arg) {
     (void)arg;
+    int runtime_error = 0;
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
+        int saved_errno = errno;
         perror("[PQC-DISPATCHER] Socket creation failed");
+        pqc_dispatcher_publish_failure(saved_errno);
         return NULL;
     }
 
@@ -660,10 +832,20 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     servaddr.sin_port = htons(PQC_HS_PORT);
 
     if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
+        int saved_errno = errno;
         perror("[PQC-DISPATCHER] Bind failed (Port 7090)");
         close(sockfd);
+        pqc_dispatcher_publish_failure(saved_errno);
         return NULL;
     }
+
+    pthread_mutex_lock(&g_key_mutex);
+    atomic_store_explicit(&g_dispatcher_running, true,
+                          memory_order_release);
+    g_dispatcher_state = PQC_RUNTIME_RUNNING;
+    g_dispatcher_last_error = 0;
+    pthread_cond_broadcast(&g_dispatcher_cond);
+    pthread_mutex_unlock(&g_key_mutex);
 
     uint8_t buffer[PQC_HS_MSG_MAX_SZ];
     struct sockaddr_in clientaddr;
@@ -671,17 +853,76 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
 
     fprintf(stderr, "[PQC-DISPATCHER] UDP Listener running on port %d\n", PQC_HS_PORT);
 
-    while (g_dispatcher_running) {
+    while (pqc_dispatcher_is_running()) {
         int n = recvfrom(sockfd, buffer, sizeof(buffer), MSG_DONTWAIT, (struct sockaddr *)&clientaddr, &addr_len);
         if (n > 0) {
             sig_pqc_feed_rx_packet(buffer, n, NULL);
-        } else {
-            usleep(10000);
+            continue;
         }
+        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+            errno != EINTR) {
+            runtime_error = errno;
+            fprintf(stderr, "[PQC-DISPATCHER] recvfrom failed: %s\n",
+                    strerror(runtime_error));
+            break;
+        }
+        usleep(10000);
     }
 
     close(sockfd);
+    pthread_mutex_lock(&g_key_mutex);
+    atomic_store_explicit(&g_dispatcher_running, false,
+                          memory_order_release);
+    if (g_dispatcher_state == PQC_RUNTIME_RUNNING) {
+        g_dispatcher_state = PQC_RUNTIME_FAILED;
+        g_dispatcher_last_error = runtime_error ? runtime_error : ECONNRESET;
+    }
+    pthread_cond_broadcast(&g_dispatcher_cond);
+    pthread_mutex_unlock(&g_key_mutex);
     return NULL;
+}
+
+static void pqc_worker_publish_state(policy_key_binding_t *b,
+                                     pqc_runtime_state_t state,
+                                     int error_code,
+                                     bool started) {
+    pthread_mutex_lock(&g_key_mutex);
+    b->worker_state = state;
+    b->worker_last_error = error_code;
+    b->thread_started = started;
+    pthread_cond_broadcast(&g_worker_state_cond);
+    pthread_mutex_unlock(&g_key_mutex);
+}
+
+/* g_key_mutex must be held. */
+static int pqc_stop_worker_locked(policy_key_binding_t *b, int timeout_ms) {
+    struct timespec deadline;
+
+    if (!b->thread_started) {
+        b->thread_exit_sig = false;
+        return 0;
+    }
+
+    b->thread_exit_sig = true;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    while (b->thread_started) {
+        int rc = pthread_cond_timedwait(&g_worker_state_cond, &g_key_mutex,
+                                        &deadline);
+        if (rc == ETIMEDOUT && b->thread_started)
+            return -ETIMEDOUT;
+        if (rc != 0 && rc != EINTR)
+            return -rc;
+    }
+
+    b->thread_exit_sig = false;
+    return 0;
 }
 
 static void* pqc_policy_handshake_worker_run(void *arg) {
@@ -711,9 +952,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         if (my_priv) free(my_priv);
         if (my_pub) free(my_pub);
         if (peer_pub) free(peer_pub);
-        pthread_mutex_lock(&g_key_mutex);
-        b->thread_started = false;
-        pthread_mutex_unlock(&g_key_mutex);
+        pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, EINVAL, false);
         return NULL;
     }
 
@@ -728,24 +967,23 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
+        int saved_errno = errno;
         perror("[PQC-WORKER] UDP Socket creation failed");
         free(my_priv); free(my_pub); free(peer_pub);
-        pthread_mutex_lock(&g_key_mutex);
-        b->thread_started = false;
-        pthread_mutex_unlock(&g_key_mutex);
+        pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, saved_errno, false);
         return NULL;
     }
 
     if (wan_ifname[0] == '\0' ||
         setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, wan_ifname,
                    strlen(wan_ifname) + 1) < 0) {
+        int saved_errno = errno ? errno : EINVAL;
         fprintf(stderr, "[PQC-WORKER] Cannot bind socket to tunnel %s: %s\n",
-                wan_ifname[0] ? wan_ifname : "<empty>", strerror(errno));
+                wan_ifname[0] ? wan_ifname : "<empty>",
+                strerror(saved_errno));
         close(sockfd);
         free(my_priv); free(my_pub); free(peer_pub);
-        pthread_mutex_lock(&g_key_mutex);
-        b->thread_started = false;
-        pthread_mutex_unlock(&g_key_mutex);
+        pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, saved_errno, false);
         return NULL;
     }
 
@@ -755,16 +993,19 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         memset(&localaddr, 0, sizeof(localaddr));
         localaddr.sin_family = AF_INET;
         localaddr.sin_port = 0;
-        if (inet_pton(AF_INET, local_ip, &localaddr.sin_addr) != 1 ||
-            bind(sockfd, (const struct sockaddr *)&localaddr,
-                 sizeof(localaddr)) < 0) {
+        int bind_error = 0;
+        if (inet_pton(AF_INET, local_ip, &localaddr.sin_addr) != 1)
+            bind_error = EINVAL;
+        else if (bind(sockfd, (const struct sockaddr *)&localaddr,
+                      sizeof(localaddr)) < 0)
+            bind_error = errno;
+        if (bind_error != 0) {
             fprintf(stderr, "[PQC-WORKER] Cannot bind %s on %s: %s\n",
-                    local_ip, wan_ifname, strerror(errno));
+                    local_ip, wan_ifname, strerror(bind_error));
             close(sockfd);
             free(my_priv); free(my_pub); free(peer_pub);
-            pthread_mutex_lock(&g_key_mutex);
-            b->thread_started = false;
-            pthread_mutex_unlock(&g_key_mutex);
+            pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, bind_error,
+                                     false);
             return NULL;
         }
     }
@@ -773,9 +1014,18 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     memset(&peeraddr, 0, sizeof(peeraddr));
     peeraddr.sin_family = AF_INET;
     peeraddr.sin_port = htons(PQC_HS_PORT);
-    inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr);
+    if (inet_pton(AF_INET, peer_ip, &peeraddr.sin_addr) != 1) {
+        fprintf(stderr, "[PQC-WORKER] Invalid peer IP '%s' for Profile %d.\n",
+                peer_ip, profile_id);
+        close(sockfd);
+        free(my_priv); free(my_pub); free(peer_pub);
+        pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, EINVAL, false);
+        return NULL;
+    }
 
-    while (g_dispatcher_running && !b->thread_exit_sig) {
+    pqc_worker_publish_state(b, PQC_RUNTIME_RUNNING, 0, true);
+
+    while (pqc_dispatcher_is_running() && !b->thread_exit_sig) {
         if (b->handshake_give_up) {
             usleep(500000);
             continue;
@@ -794,10 +1044,13 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     uint32_t local_ip_num = 0;
                     char local_ip_str[32] = "0.0.0.0";
 
-                    if (strlen(b->wan_ifname) > 0) {
+                    if (wan_ifname[0] != '\0') {
                         struct ifreq ifr;
+                        size_t ifname_len = strnlen(wan_ifname,
+                                                   IFNAMSIZ - 1);
                         memset(&ifr, 0, sizeof(ifr));
-                        strncpy(ifr.ifr_name, b->wan_ifname, IFNAMSIZ - 1);
+                        memcpy(ifr.ifr_name, wan_ifname, ifname_len);
+                        ifr.ifr_name[ifname_len] = '\0';
                         ifr.ifr_addr.sa_family = AF_INET;
                         if (ioctl(temp_sock, SIOCGIFADDR, &ifr) == 0) {
                             struct sockaddr_in *ipaddr = (struct sockaddr_in *)&ifr.ifr_addr;
@@ -869,7 +1122,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 pthread_mutex_unlock(&g_key_mutex);
 
                 int retry_cnt = 0;
-                while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                while (pqc_dispatcher_is_running() && !b->key_ready && !b->thread_exit_sig) {
                     if (b->handshake_start_time == 0) {
                         b->handshake_start_time = get_time_ms_hs();
                         retry_cnt = 0;
@@ -884,11 +1137,33 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     fprintf(stderr,
                             "[PQC-WORKER-L3] Initiator Profile %d sending HELLO session %u (try: %d)...\n",
                             profile_id, session_id, retry_cnt + 1);
-                    sendto(sockfd, buffer, sizeof(struct pqc_hs_msg) + pk_sz + sig_sz, 0,
-                           (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                    size_t hello_len = sizeof(struct pqc_hs_msg) +
+                                       (size_t)pk_sz + (size_t)sig_sz;
+                    ssize_t sent = sendto(
+                        sockfd, buffer, hello_len, 0,
+                        (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                    if (sent != (ssize_t)hello_len) {
+                        int send_error = sent < 0 ? errno : EMSGSIZE;
+
+                        fprintf(stderr,
+                                "[PQC-HS-L3] Failed to send HELLO for Profile %d, session %u: %s (len=%zu).\n",
+                                profile_id, session_id, strerror(send_error),
+                                hello_len);
+                        if (send_error == EMSGSIZE) {
+                            sig_pqc_write_log(
+                                profile_id, b->key_id, PQC_LOG_LEVEL_ERROR,
+                                PQC_LOG_STATUS_FAILED,
+                                "Handshake HELLO exceeds path/socket MTU.");
+                            b->handshake_give_up = true;
+                            break;
+                        }
+                        retry_cnt++;
+                        usleep(200000);
+                        continue;
+                    }
 
                     uint64_t start_rx = get_time_ms_hs();
-                    while (g_dispatcher_running && get_time_ms_hs() - start_rx < 3000 && !b->key_ready && !b->thread_exit_sig) {
+                    while (pqc_dispatcher_is_running() && get_time_ms_hs() - start_rx < 3000 && !b->key_ready && !b->thread_exit_sig) {
                         uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                         pqc_rx_pkt_info_t info;
                         int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
@@ -937,7 +1212,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     b->handshake_start_time = get_time_ms_hs();
                 }
                 fprintf(stderr, "[PQC-WORKER-L3] Responder (Profile %d) listening for HELLO...\n", profile_id);
-                while (g_dispatcher_running && !b->key_ready && !b->thread_exit_sig) {
+                while (pqc_dispatcher_is_running() && !b->key_ready && !b->thread_exit_sig) {
                     if (b->handshake_start_time == 0) {
                         b->handshake_start_time = get_time_ms_hs();
                     }
@@ -952,14 +1227,29 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         b->send_poke = false;
                         pthread_mutex_unlock(&g_key_mutex);
                         struct pqc_hs_msg poke_msg;
+                        memset(&poke_msg, 0, sizeof(poke_msg));
                         poke_msg.magic = PQC_HS_MAGIC;
                         poke_msg.msg_type = PQC_HS_MSG_POKE;
-                        poke_msg.session_id = 999;
                         poke_msg.profile_id = profile_id;
                         poke_msg.sig_len = 0;
                         poke_msg.data_len = 0;
+                        if (pqc_generate_session_id(&poke_msg.session_id) != 0) {
+                            fprintf(stderr,
+                                    "[PQC-HS-L3] Failed to create POKE session for Profile %d: %s.\n",
+                                    profile_id, strerror(errno));
+                            continue;
+                        }
                         fprintf(stderr, "[PQC-WORKER-L3] Responder (Profile %d) sending POKE to Initiator...\n", profile_id);
-                        sendto(sockfd, &poke_msg, sizeof(poke_msg), 0, (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                        ssize_t sent = sendto(
+                            sockfd, &poke_msg, sizeof(poke_msg), 0,
+                            (const struct sockaddr *)&peeraddr,
+                            sizeof(peeraddr));
+                        if (sent != (ssize_t)sizeof(poke_msg)) {
+                            int send_error = sent < 0 ? errno : EMSGSIZE;
+                            fprintf(stderr,
+                                    "[PQC-HS-L3] Failed to send POKE for Profile %d: %s.\n",
+                                    profile_id, strerror(send_error));
+                        }
                     } else {
                         pthread_mutex_unlock(&g_key_mutex);
                     }
@@ -1066,50 +1356,145 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     free(my_priv);
     free(my_pub);
     free(peer_pub);
-    pthread_mutex_lock(&g_key_mutex);
-    b->thread_started = false;
-    pthread_mutex_unlock(&g_key_mutex);
+    pqc_worker_publish_state(
+        b, b->thread_exit_sig ? PQC_RUNTIME_STOPPED : PQC_RUNTIME_FAILED,
+        b->thread_exit_sig ? 0 : EPIPE, false);
     return NULL;
 }
 
 int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *peer_ip) {
-    pthread_mutex_lock(&g_key_mutex);
-    if (!g_dispatcher_running) {
-        g_dispatcher_running = true;
-        pthread_t udp_tid;
-        if (pthread_create(&udp_tid, NULL, pqc_udp_dispatcher_thread, NULL) == 0) {
-            pthread_detach(udp_tid);
-        } else {
-            fprintf(stderr, "[PQC-HS] ERROR starting UDP dispatcher thread\n");
-        }
-    }
-    pthread_mutex_unlock(&g_key_mutex);
+    char configured_ifname[64] = {0};
+    char configured_local_ip[64] = {0};
+    policy_key_binding_t *binding = NULL;
+    struct timespec worker_deadline;
+    int binding_idx = -1;
+    int rc;
 
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].profile_id == profile_id) {
-            if (wan_ifname && wan_ifname[0] != '\0') {
-                strncpy(g_policy_bindings[i].wan_ifname, wan_ifname, sizeof(g_policy_bindings[i].wan_ifname) - 1);
-                g_policy_bindings[i].wan_ifname[sizeof(g_policy_bindings[i].wan_ifname) - 1] = '\0';
-            }
-            if (peer_ip && peer_ip[0] != '\0') {
-                strncpy(g_policy_bindings[i].peer_ip, peer_ip, sizeof(g_policy_bindings[i].peer_ip) - 1);
-                g_policy_bindings[i].peer_ip[sizeof(g_policy_bindings[i].peer_ip) - 1] = '\0';
-            }
-            if (!g_policy_bindings[i].thread_started) {
-                g_policy_bindings[i].thread_started = true;
-                if (pthread_create(&g_policy_bindings[i].thread_id, NULL, pqc_policy_handshake_worker_run, &g_policy_bindings[i]) == 0) {
-                    pthread_detach(g_policy_bindings[i].thread_id);
-                    fprintf(stderr, "[PQC-HS] Spawned Handshake Worker for Profile %d\n", profile_id);
-                } else {
-                    g_policy_bindings[i].thread_started = false;
-                    fprintf(stderr, "[PQC-HS] ERROR: Failed to spawn Handshake Worker for Profile %d\n", profile_id);
-                }
-            }
+        if (g_policy_bindings_active[i] &&
+            g_policy_bindings[i].profile_id == profile_id) {
+            binding = &g_policy_bindings[i];
+            binding_idx = i;
+            break;
         }
+    }
+    if (!binding || !binding->local_priv || !binding->local_pub ||
+        !binding->peer_pub) {
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] Profile %d has no active, complete PQC binding.\n",
+                profile_id);
+        return -ENOENT;
+    }
+
+    if (wan_ifname && wan_ifname[0] != '\0') {
+        snprintf(binding->wan_ifname, sizeof(binding->wan_ifname), "%s",
+                 wan_ifname);
+    }
+    if (peer_ip && peer_ip[0] != '\0') {
+        snprintf(binding->peer_ip, sizeof(binding->peer_ip), "%s", peer_ip);
+    }
+    snprintf(configured_ifname, sizeof(configured_ifname), "%s",
+             binding->wan_ifname);
+    snprintf(configured_local_ip, sizeof(configured_local_ip), "%s",
+             binding->local_ip);
+    pthread_mutex_unlock(&g_key_mutex);
+
+    rc = pqc_interface_ipv4_ready(configured_ifname, configured_local_ip);
+    if (rc != 0) {
+        pthread_mutex_lock(&g_key_mutex);
+        if (binding_idx < g_policy_bindings_count &&
+            !g_policy_bindings[binding_idx].thread_started) {
+            g_policy_bindings[binding_idx].worker_state = PQC_RUNTIME_FAILED;
+            g_policy_bindings[binding_idx].worker_last_error = -rc;
+        }
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] Profile %d is not ready: interface %s must be UP with local IP %s (%s).\n",
+                profile_id, configured_ifname[0] ? configured_ifname : "<empty>",
+                configured_local_ip[0] ? configured_local_ip : "<empty>",
+                strerror(-rc));
+        return rc;
+    }
+
+    rc = pqc_dispatcher_ensure_running();
+    if (rc != 0) {
+        pthread_mutex_lock(&g_key_mutex);
+        if (binding_idx < g_policy_bindings_count &&
+            !g_policy_bindings[binding_idx].thread_started) {
+            g_policy_bindings[binding_idx].worker_state = PQC_RUNTIME_FAILED;
+            g_policy_bindings[binding_idx].worker_last_error = -rc;
+        }
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] Profile %d cannot start because UDP dispatcher is unavailable: %s\n",
+                profile_id, strerror(-rc));
+        return rc;
+    }
+
+    pthread_mutex_lock(&g_key_mutex);
+    if (binding_idx >= g_policy_bindings_count ||
+        !g_policy_bindings_active[binding_idx] ||
+        g_policy_bindings[binding_idx].profile_id != profile_id) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ENOENT;
+    }
+    binding = &g_policy_bindings[binding_idx];
+    if (binding->thread_started) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return 0;
+    }
+
+    binding->thread_exit_sig = false;
+    binding->worker_state = PQC_RUNTIME_STARTING;
+    binding->worker_last_error = 0;
+    binding->thread_started = true;
+    rc = pthread_create(&binding->thread_id, NULL,
+                        pqc_policy_handshake_worker_run, binding);
+    if (rc != 0) {
+        binding->thread_started = false;
+        binding->worker_state = PQC_RUNTIME_FAILED;
+        binding->worker_last_error = rc;
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] ERROR: Failed to spawn Handshake Worker for Profile %d: %s\n",
+                profile_id, strerror(rc));
+        return -rc;
+    }
+    pthread_detach(binding->thread_id);
+
+    clock_gettime(CLOCK_REALTIME, &worker_deadline);
+    worker_deadline.tv_sec += 1;
+    while (binding->worker_state == PQC_RUNTIME_STARTING) {
+        int wait_rc = pthread_cond_timedwait(
+            &g_worker_state_cond, &g_key_mutex, &worker_deadline);
+        if (wait_rc == ETIMEDOUT)
+            break;
+    }
+    if (binding->worker_state == PQC_RUNTIME_FAILED) {
+        rc = binding->worker_last_error ? binding->worker_last_error : EIO;
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] Handshake Worker for Profile %d failed during startup: %s\n",
+                profile_id, strerror(rc));
+        return -rc;
+    }
+    if (binding->worker_state == PQC_RUNTIME_STOPPED) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ECANCELED;
+    }
+    if (binding->worker_state == PQC_RUNTIME_STARTING) {
+        pthread_mutex_unlock(&g_key_mutex);
+        fprintf(stderr,
+                "[PQC-HS] Handshake Worker for Profile %d did not report readiness within 1 second.\n",
+                profile_id);
+        return -ETIMEDOUT;
     }
     pthread_mutex_unlock(&g_key_mutex);
 
+    fprintf(stderr, "[PQC-HS] Spawned Handshake Worker for Profile %d\n",
+            profile_id);
     return 0;
 }
 
@@ -1188,14 +1573,24 @@ bool sig_pqc_has_identity(const char *fingerprint) {
     return false;
 }
 
-void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
-                          const char *local_ip, const char *peer_ip,
-                          const char *local_fg, const char *peer_fg,
-                          const char *wan_ifname,
-                          const char *local_priv, const char *local_pub,
-                          const char *peer_pub,
-                          uint64_t config_generation) {
+int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
+                         const char *local_ip, const char *peer_ip,
+                         const char *local_fg, const char *peer_fg,
+                         const char *wan_ifname,
+                         const char *local_priv, const char *local_pub,
+                         const char *peer_pub,
+                         uint64_t config_generation) {
+    char *new_local_priv = local_priv ? strdup(local_priv) : NULL;
+    char *new_local_pub = local_pub ? strdup(local_pub) : NULL;
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
+
+    if ((local_priv && !new_local_priv) || (local_pub && !new_local_pub) ||
+        (peer_pub && !deobf_peer)) {
+        free(new_local_priv);
+        free(new_local_pub);
+        free(deobf_peer);
+        return -ENOMEM;
+    }
 
     pthread_mutex_lock(&g_key_mutex);
     policy_key_binding_t *b = NULL;
@@ -1214,6 +1609,8 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         memset(b->decrypt_key, 0, PQC_TRAFFIC_KEY_SZ);
         b->key_ready = false;
         b->thread_started = false;
+        b->worker_state = PQC_RUNTIME_STOPPED;
+        b->worker_last_error = 0;
         b->rx_head = 0;
         b->rx_tail = 0;
         pthread_mutex_init(&b->rx_mutex, NULL);
@@ -1245,8 +1642,10 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
     if (b) {
         if (is_existing) {
             bool changed = false;
-            if (b->local_priv && local_priv && strcmp(b->local_priv, local_priv) != 0) changed = true;
-            if (b->local_pub && local_pub && strcmp(b->local_pub, local_pub) != 0) changed = true;
+            int stop_rc;
+
+            if (b->local_priv && new_local_priv && strcmp(b->local_priv, new_local_priv) != 0) changed = true;
+            if (b->local_pub && new_local_pub && strcmp(b->local_pub, new_local_pub) != 0) changed = true;
             if (b->peer_pub && deobf_peer && strcmp(b->peer_pub, deobf_peer) != 0) changed = true;
             
             if ((b->local_priv == NULL) != (local_priv == NULL)) changed = true;
@@ -1259,44 +1658,30 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
             if (strcmp(b->key_id, key_id ? key_id : "") != 0) changed = true;
             if (b->role_mode != role_mode) changed = true;
 
-            if (changed) {
-                fprintf(stderr, "[PQC-BIND-DBG] Profile %d: change detected, thread_started=%d, about to wait for worker exit...\n",
-                        profile_id, (int)b->thread_started);
-                if (b->thread_started) {
-                    uint64_t wait_start = get_time_ms_hs();
-                    b->thread_exit_sig = true;
-                    int wait_iters = 0;
-                    while (b->thread_started) {
-                        pthread_mutex_unlock(&g_key_mutex);
-                        usleep(1000);
-                        pthread_mutex_lock(&g_key_mutex);
-                        wait_iters++;
-                        if (wait_iters % 500 == 0) {
-                            fprintf(stderr, "[PQC-BIND-DBG] Profile %d: STILL waiting for worker exit... (%dms elapsed)\n",
-                                    profile_id, (int)(get_time_ms_hs() - wait_start));
-                        }
-                    }
-                    fprintf(stderr, "[PQC-BIND-DBG] Profile %d: worker exited after %dms. Proceeding.\n",
-                            profile_id, (int)(get_time_ms_hs() - wait_start));
-                    b->thread_exit_sig = false;
-                }
-                pqc_hs_clear_cache_locked(b);
-                b->key_ready = false;
-                b->handshake_give_up = false;
-                b->handshake_start_time = 0;
-                b->rotation_give_up = false;
-                b->rotation_start_time = 0;
-                b->send_poke = true;
-            } else {
-                /* If configuration is identical but bind is re-requested (e.g. via -id CLI),
-                 * we reset the handshake state to trigger a fresh 15-second retry attempt. */
-                b->key_ready = false;
-                b->handshake_give_up = false;
-                b->handshake_start_time = 0;
-                b->rotation_give_up = false;
-                b->rotation_start_time = 0;
-                b->send_poke = true;
+            fprintf(stderr,
+                    "[PQC-BIND-DBG] Profile %d: %s config, stopping old worker before clean restart.\n",
+                    profile_id, changed ? "changed" : "unchanged");
+            stop_rc = pqc_stop_worker_locked(
+                b, PQC_WORKER_STOP_TIMEOUT_MS);
+            if (stop_rc != 0) {
+                fprintf(stderr,
+                        "[PQC-BIND] Profile %d worker did not stop cleanly: %s\n",
+                        profile_id, strerror(-stop_rc));
+                pthread_mutex_unlock(&g_key_mutex);
+                free(new_local_priv);
+                free(new_local_pub);
+                free(deobf_peer);
+                return stop_rc;
             }
+
+            pqc_hs_clear_cache_locked(b);
+            pqc_flush_rx_queue(b);
+            b->key_ready = false;
+            b->handshake_give_up = false;
+            b->handshake_start_time = 0;
+            b->rotation_give_up = false;
+            b->rotation_start_time = 0;
+            b->send_poke = true;
         }
         b->policy_id = profile_id;
         b->profile_id = profile_id;
@@ -1332,9 +1717,12 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         if (b->local_pub) free(b->local_pub);
         if (b->peer_pub) free(b->peer_pub);
 
-        b->local_priv = local_priv ? strdup(local_priv) : NULL;
-        b->local_pub = local_pub ? strdup(local_pub) : NULL;
+        b->local_priv = new_local_priv;
+        b->local_pub = new_local_pub;
         b->peer_pub = deobf_peer;
+        new_local_priv = NULL;
+        new_local_pub = NULL;
+        deobf_peer = NULL;
 
         const char *role_str = (role_mode == PQC_ROLE_INITIATOR) ? "FORCE_INITIATOR" :
                                (role_mode == PQC_ROLE_RESPONDER) ? "FORCE_RESPONDER" : "DYNAMIC";
@@ -1349,6 +1737,13 @@ void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
+
+    free(new_local_priv);
+    free(new_local_pub);
+    free(deobf_peer);
+    if (!b)
+        return -ENOSPC;
+    return 0;
 }
 
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub) {
@@ -1417,13 +1812,14 @@ void sig_pqc_finalize_reload(void) {
             if (b->local_priv || b->local_pub || b->peer_pub || b->key_ready || b->thread_started) {
                 fprintf(stderr, "[PQC-RECONCILE] Profile %d PQC binding is no longer active. Deactivating and clearing keys.\n", b->profile_id);
                 if (b->thread_started) {
-                    b->thread_exit_sig = true;
-                    while (b->thread_started) {
-                        pthread_mutex_unlock(&g_key_mutex);
-                        usleep(1000);
-                        pthread_mutex_lock(&g_key_mutex);
+                    int stop_rc = pqc_stop_worker_locked(
+                        b, PQC_WORKER_STOP_TIMEOUT_MS);
+                    if (stop_rc != 0) {
+                        fprintf(stderr,
+                                "[PQC-RECONCILE] Profile %d worker stop timed out; binding retained until worker exits.\n",
+                                b->profile_id);
+                        continue;
                     }
-                    b->thread_exit_sig = false;
                 }
                 b->key_ready = false;
                 if (b->local_priv) { free(b->local_priv); b->local_priv = NULL; }
@@ -1437,6 +1833,9 @@ void sig_pqc_finalize_reload(void) {
                 }
             }
             pqc_hs_clear_cache_locked(b);
+            pqc_flush_rx_queue(b);
+            b->worker_state = PQC_RUNTIME_STOPPED;
+            b->worker_last_error = 0;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
@@ -1557,62 +1956,98 @@ void sig_pqc_discard_prev_key(int profile_id) {
 }
 
 void sig_pqc_trigger_retry(int profile_id) {
-    pthread_mutex_lock(&g_key_mutex);
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].profile_id == profile_id) {
-            policy_key_binding_t *b = &g_policy_bindings[i];
-            b->handshake_give_up = false;
-            b->handshake_start_time = 0;
-            b->rotation_give_up = false;
-            b->rotation_start_time = 0;
-            b->key_ready = false;
-            b->send_poke = true;
-            fprintf(stderr, "[PQC-HS] Manual retry triggered for Profile %d. All retry states reset.\n", profile_id);
-            break;
-        }
-    }
-    pthread_mutex_unlock(&g_key_mutex);
+    char info[256];
+    int rc = sig_pqc_trigger_retry_with_info(profile_id, info, sizeof(info));
+
+    if (rc != 0)
+        fprintf(stderr, "[PQC-HS] Manual retry failed: %s\n", info);
 }
 
 int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_max) {
-    bool found = false;
-    policy_key_binding_t target_binding;
-    memset(&target_binding, 0, sizeof(target_binding));
+    char key_id[256] = {0};
+    char wan_ifname[64] = {0};
+    char peer_ip[64] = {0};
+    bool is_initiator = false;
+    int rc;
+    int idx = -1;
+
+    if (!out_info || out_max == 0)
+        return -EINVAL;
 
     pthread_mutex_lock(&g_key_mutex);
     for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings[i].profile_id == profile_id) {
+        if (g_policy_bindings_active[i] &&
+            g_policy_bindings[i].profile_id == profile_id) {
             policy_key_binding_t *b = &g_policy_bindings[i];
+            int stop_rc;
+
+            if (!b->local_priv || !b->local_pub || !b->peer_pub) {
+                pthread_mutex_unlock(&g_key_mutex);
+                snprintf(out_info, out_max,
+                         "Profile ID %d has an incomplete PQC binding",
+                         profile_id);
+                return -EINVAL;
+            }
+
+            stop_rc = pqc_stop_worker_locked(
+                b, PQC_WORKER_STOP_TIMEOUT_MS);
+            if (stop_rc != 0) {
+                pthread_mutex_unlock(&g_key_mutex);
+                snprintf(out_info, out_max,
+                         "Profile %d worker did not stop: %s", profile_id,
+                         strerror(-stop_rc));
+                return stop_rc;
+            }
+
             b->handshake_give_up = false;
             b->handshake_start_time = 0;
             b->rotation_give_up = false;
             b->rotation_start_time = 0;
             b->key_ready = false;
             b->send_poke = true;
-            
-            target_binding = *b;
-            found = true;
+            pqc_hs_clear_cache_locked(b);
+            pqc_flush_rx_queue(b);
+
+            snprintf(key_id, sizeof(key_id), "%s", b->key_id);
+            snprintf(wan_ifname, sizeof(wan_ifname), "%s", b->wan_ifname);
+            snprintf(peer_ip, sizeof(peer_ip), "%s", b->peer_ip);
+            is_initiator = b->is_initiator;
+            idx = i;
             break;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
 
-    if (found) {
+    if (idx < 0) {
         snprintf(out_info, out_max,
-            "[MANUAL-RETRY] Profile=%d, KeyID=%s, Iface=%s, Peer=%s, Role=%s, Status=RESETTING\n",
-            profile_id,
-            (strlen(target_binding.key_id) > 0) ? target_binding.key_id : "N/A",
-            target_binding.wan_ifname,
-            target_binding.peer_ip,
-            target_binding.is_initiator ? "Initiator" : "Responder"
-        );
-        fprintf(stderr, "[PQC-HS] Manual retry triggered for Profile %d. All retry states reset.\n", profile_id);
-        return 0;
-    } else {
-        snprintf(out_info, out_max,
-            "[FAILED] Profile ID %d is not active or has no PQC binding configured in RAM.\n",
-            profile_id
-        );
-        return -1;
+                 "Profile ID %d has no active PQC binding in RAM; run -id first",
+                 profile_id);
+        return -ENOENT;
     }
+
+    rc = sig_pqc_handshake_start(profile_id, wan_ifname, peer_ip);
+    if (rc != 0) {
+        snprintf(out_info, out_max,
+                 "Profile %d retry could not start on %s: %s",
+                 profile_id, wan_ifname[0] ? wan_ifname : "<empty>",
+                 strerror(-rc));
+        fprintf(stderr,
+                "[PQC-HS] Manual retry for Profile %d failed to recover runtime: %s\n",
+                profile_id, strerror(-rc));
+        return rc;
+    }
+
+    pthread_mutex_lock(&g_key_mutex);
+    const char *state = pqc_runtime_state_name(
+        g_policy_bindings[idx].worker_state);
+    snprintf(out_info, out_max,
+             "Profile=%d KeyID=%s Iface=%s Peer=%s Role=%s Status=%s",
+             profile_id, key_id[0] ? key_id : "N/A", wan_ifname, peer_ip,
+             is_initiator ? "Initiator" : "Responder", state);
+    pthread_mutex_unlock(&g_key_mutex);
+
+    fprintf(stderr,
+            "[PQC-HS] Manual retry triggered for Profile %d. Queue/cache flushed and runtime is %s.\n",
+            profile_id, state);
+    return 0;
 }

@@ -348,10 +348,13 @@ int mwan_state_update(struct mwan_config *new_cfg)
         pr_info("mwan_kmod: AES-GCM crypto engine initialized (key_len=%u)\n",
                 new_cfg->encrypt_key_len);
 
-        err = mwan_l2_workers_init(new_cfg);
-        if (err)
-            goto err_free_tfm;
     }
+
+    /* Bypass and L2-PQC share the sticky per-flow TX dispatcher.  Other
+     * encryption modes retain their existing synchronous datapaths. */
+    err = mwan_l2_workers_init(new_cfg);
+    if (err)
+        goto err_free_tfm;
 
     /* Phase 2: publish, wait for old readers, stop the old timer and destroy
      * the old config in this process context. No RCU callback survives module

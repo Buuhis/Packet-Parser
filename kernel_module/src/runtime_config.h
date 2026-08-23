@@ -19,4 +19,7 @@ void runtime_config_unlock(void);
 /* The caller must hold runtime_config_lock(). */
 bool runtime_config_generation_is_current_locked(uint64_t generation);
 
+/* Return the active generation without changing it. */
+uint64_t runtime_config_current_generation(void);
+
 #endif

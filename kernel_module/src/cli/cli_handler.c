@@ -12,13 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
 /* ------------------------------------------------------------------ */
 /*  Forward declarations for functions defined in main.c              */
 /* ------------------------------------------------------------------ */
-extern void pqc_bind_node(int node_id, uint64_t config_generation);
+extern int pqc_bind_node(int node_id, uint64_t config_generation);
 extern void save_node_id(int node_id);
 extern void clear_node_id(void);
 
@@ -239,11 +240,45 @@ static void log_provision_snapshot(unsigned long request_id,
 
 
 /* ---------- handle: -r <node_id> ---------------------------------- */
-static void handle_retry(int client_fd, int req_id)
+static void handle_retry(int client_fd, int req_id, app_context_t *ctx)
 {
+    char retry_info[320] = {0};
+    app_context_t active;
+    uint64_t config_generation;
+    int retry_rc;
+
     log_info(">>> Received PQC handshake retry request for Node ID: %d", req_id);
-    sig_pqc_trigger_retry(req_id);
-    reply_json(client_fd, 200, "Retry triggered");
+
+    runtime_config_lock();
+    active = *ctx;
+    runtime_config_unlock();
+    if (active.cfg.node_id != req_id || !active.cfg.encrypt.enabled ||
+        active.cfg.encrypt.type != MWAN_CRYPT_PQC_GCM) {
+        snprintf(retry_info, sizeof(retry_info),
+                 "Profile ID %d has no active PQC configuration; run -id first",
+                 req_id);
+        log_warn("[PQC-HS] Retry rejected for profile %d: %s", req_id,
+                 retry_info);
+        reply_json(client_fd, 404, retry_info);
+        return;
+    }
+
+    /* A retry is a full control-plane recovery: query DB/Vault again, replace
+     * stale credentials, stop the previous attempt, and start a clean worker. */
+    config_generation = runtime_config_current_generation();
+    retry_rc = pqc_bind_node(req_id, config_generation);
+    if (retry_rc == 0) {
+        log_info("[PQC-HS] Profile %d credentials reloaded and runtime restarted",
+                 req_id);
+        reply_json(client_fd, 200, "Retry triggered");
+        return;
+    }
+
+    snprintf(retry_info, sizeof(retry_info),
+             "Profile %d retry failed: %s", req_id, strerror(-retry_rc));
+    log_warn("[PQC-HS] Retry rejected for profile %d: %s", req_id,
+             retry_info);
+    reply_json(client_fd, 503, retry_info);
 }
 
 /* ---------- handle: <node_id> (initial provisioning) -------------- */
@@ -319,9 +354,15 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     sig_pqc_finalize_reload();
 
     if (new_cfg.encrypt.enabled && new_cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        int pqc_rc;
+
         log_info("[CFG-TRACE user=%lu] PQC_HANDSHAKE_START node=%d",
                  generation, req_id);
-        pqc_bind_node(req_id, config_generation);
+        pqc_rc = pqc_bind_node(req_id, config_generation);
+        if (pqc_rc != 0) {
+            log_warn("[CFG-TRACE user=%lu] PQC_HANDSHAKE_DEFERRED node=%d error=%s",
+                     generation, req_id, strerror(-pqc_rc));
+        }
     }
 
     log_info("[CFG-TRACE user=%lu] END response=200 node=%d mode=%s",
@@ -601,9 +642,15 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     if (trigger_pqc_handshake) {
+        int pqc_rc;
+
         log_info("[EDIT] PQC credentials/config updated — triggering key re-handshake for profile %d", profile_id);
         sig_pqc_init_vault();
-        pqc_bind_node(profile_id, config_generation);
+        pqc_rc = pqc_bind_node(profile_id, config_generation);
+        if (pqc_rc != 0) {
+            log_warn("[EDIT] PQC handshake deferred for profile %d: %s",
+                     profile_id, strerror(-pqc_rc));
+        }
     }
 
     reply_json(client_fd, 200, "Config updated and synced successfully");
@@ -688,7 +735,7 @@ void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *ru
 
     /* -r <id> */
     if (strncmp(buf, "-r ", 3) == 0) {
-        handle_retry(client_fd, atoi(buf + 3));
+        handle_retry(client_fd, atoi(buf + 3), running_ctx);
         return;
     }
 

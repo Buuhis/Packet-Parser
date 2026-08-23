@@ -6,3 +6,7 @@
 !mwan_l2_flow.c
 !mwan_mac_discovery.c
 !mwan_mac_discovery.h
+!mwan_mtu.c
+!mwan_mtu.h
+!mwan_multicore.c
+!mwan_multicore.h

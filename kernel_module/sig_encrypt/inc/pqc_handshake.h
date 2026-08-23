@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -36,6 +37,13 @@
 #define MAX_POLICY_BINDINGS 128
 #define MAX_L2_DISPATCHERS 16
 
+typedef enum {
+    PQC_RUNTIME_STOPPED = 0,
+    PQC_RUNTIME_STARTING,
+    PQC_RUNTIME_RUNNING,
+    PQC_RUNTIME_FAILED
+} pqc_runtime_state_t;
+
 typedef struct {
     char fingerprint[16];
     char *priv_key;
@@ -65,11 +73,11 @@ typedef struct {
 
 typedef struct {
     // 8-Byte Aligned Members
-    uint64_t last_rotation_time;
-    uint64_t last_sent_time;
-    uint64_t last_recv_time;
-    uint64_t handshake_start_time;
-    uint64_t rotation_start_time;
+    atomic_uint_fast64_t last_rotation_time;
+    atomic_uint_fast64_t last_sent_time;
+    atomic_uint_fast64_t last_recv_time;
+    atomic_uint_fast64_t handshake_start_time;
+    atomic_uint_fast64_t rotation_start_time;
     uint64_t config_generation;
 
     char *local_priv;
@@ -92,6 +100,8 @@ typedef struct {
     int hs_cache_next;
     int rx_len[PQC_RX_QUEUE_SIZE];
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
+    pqc_runtime_state_t worker_state;
+    int worker_last_error;
 
     // 1-Byte Aligned Members
     uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];
@@ -107,14 +117,14 @@ typedef struct {
     char wan_ifname[64];
     char key_id[256];
 
-    bool key_ready;
+    atomic_bool key_ready;
     bool is_initiator;
-    bool thread_started;
-    bool handshake_give_up;
-    bool rotation_give_up;
-    bool send_poke;
+    atomic_bool thread_started;
+    atomic_bool handshake_give_up;
+    atomic_bool rotation_give_up;
+    atomic_bool send_poke;
     bool is_tunnel;
-    volatile bool thread_exit_sig;
+    atomic_bool thread_exit_sig;
 } policy_key_binding_t;
 
 typedef struct {
@@ -142,6 +152,9 @@ struct pqc_hs_msg {
  * @param peer_ip The IP address of the peer server.
  * @param identity_priv The local identity private key (used for HMAC signing).
  * @param identity_pub The peer's identity public key (used for HMAC verification).
+ * @return 0 when the runtime is already running or a worker was started;
+ *         otherwise a negative errno value describing the missing readiness
+ *         condition or startup failure.
  */
 int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *peer_ip);
 
@@ -185,12 +198,12 @@ typedef enum {
 } pqc_role_mode_t;
 
 bool sig_pqc_has_identity(const char *fingerprint);
-void sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
-                          const char *local_ip, const char *peer_ip,
-                          const char *local_fg, const char *peer_fg,
-                          const char *wan_ifname,
-                          const char *local_priv, const char *local_pub,
-                          const char *peer_pub, uint64_t config_generation);
+int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
+                         const char *local_ip, const char *peer_ip,
+                         const char *local_fg, const char *peer_fg,
+                         const char *wan_ifname,
+                         const char *local_priv, const char *local_pub,
+                         const char *peer_pub, uint64_t config_generation);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 int sig_pqc_load_key_from_vault(const char *fingerprint_key);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);

@@ -43,3 +43,13 @@ bool runtime_config_generation_is_current_locked(uint64_t generation)
 {
     return generation != 0 && generation == config_generation;
 }
+
+uint64_t runtime_config_current_generation(void)
+{
+    uint64_t generation;
+
+    pthread_mutex_lock(&config_mutex);
+    generation = config_generation;
+    pthread_mutex_unlock(&config_mutex);
+    return generation;
+}

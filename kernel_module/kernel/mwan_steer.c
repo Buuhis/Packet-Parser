@@ -36,23 +36,30 @@ static bool is_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 /* Helper function to check if packet is PQC handshake traffic (UDP port 7090) */
 static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *iph)
 {
-    if (iph && iph->protocol == IPPROTO_UDP) {
-        int ip_hlen = iph->ihl * 4;
-        struct udphdr *udph;
-        
-        // Ensure we can access the UDP header safely
-        if (!pskb_may_pull(skb, ip_hlen + sizeof(struct udphdr)))
-            return false;
-        
-        // Reload iph/udph after pskb_may_pull as skb header pointers may change
-        iph = ip_hdr(skb);
-        udph = (struct udphdr *)(skb_network_header(skb) + ip_hlen);
-        
-        if (udph->dest == htons(7090) || udph->source == htons(7090)) {
-            return true;
-        }
-    }
-    return false;
+    struct udphdr udph_buf;
+    const struct udphdr *udph;
+    int network_offset;
+    int ip_hlen;
+
+    if (!skb || !iph || iph->version != 4 || iph->ihl < 5 ||
+        iph->protocol != IPPROTO_UDP)
+        return false;
+    /* A non-initial IPv4 fragment does not carry the UDP ports.  Locally
+     * generated UDP is seen here before ip_finish_output() fragments it. */
+    if (iph->frag_off & htons(IP_OFFSET))
+        return false;
+
+    network_offset = skb_network_offset(skb);
+    ip_hlen = iph->ihl * 4;
+    if (network_offset < 0 || ntohs(iph->tot_len) <
+                              ip_hlen + sizeof(struct udphdr))
+        return false;
+    udph = skb_header_pointer(skb, network_offset + ip_hlen,
+                              sizeof(udph_buf), &udph_buf);
+    if (!udph)
+        return false;
+
+    return udph->dest == htons(7090) || udph->source == htons(7090);
 }
 
 /* The core TX steering logic */
@@ -87,19 +94,12 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
 
     /* Bypass PQC handshake traffic (UDP port 7090) */
     if (is_pqc_handshake_packet(skb, iph)) {
-        int i;
-        struct mwan_tunnel *tun = NULL;
-        for (i = 0; i < cfg->num_tunnels; i++) {
-            if (cfg->tunnels[i].ifindex == state->out->ifindex) {
-                tun = &cfg->tunnels[i];
-                break;
-            }
-        }
-        if (tun) {
-            unsigned int ret = mwan_handle_encap_none(skb, tun);
-            rcu_read_unlock();
-            return ret;
-        }
+        /* Keep control traffic on the route/interface selected by the
+         * normal IPv4 stack.  In particular, do not steal the skb and call
+         * dev_queue_xmit() here: doing that bypasses the remaining output
+         * path, including its normal MTU/fragmentation handling. */
+        rcu_read_unlock();
+        return NF_ACCEPT;
     }
 
     // pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
@@ -123,7 +123,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         
         switch (tun->encap_type) {
             case MWAN_ENCAP_NONE:
-                ret = mwan_handle_encap_none(skb, tun);
+                ret = mwan_handle_encap_none(skb, cfg, tun_idx);
                 break;
             case MWAN_ENCAP_MACSEC:
                 ret = mwan_handle_encap_macsec(skb, tun);
@@ -135,10 +135,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                 ret = mwan_handle_encap_l3_pqc(skb, tun);
                 break;
             case MWAN_ENCAP_L2_PQC:
-                ret = mwan_handle_encap_l2_pqc(skb, tun);
+                ret = mwan_handle_encap_l2_pqc(skb, cfg, tun_idx);
                 break;
             default:
-                ret = mwan_handle_encap_none(skb, tun);
+                ret = mwan_handle_encap_none(skb, cfg, tun_idx);
                 break;
         }
         

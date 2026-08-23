@@ -266,7 +266,8 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
 
 struct mwan_l2_tx_flow *
 mwan_l2_tx_flow_get(struct mwan_config *cfg,
-                    const struct mwan_l2_flow_key *key, u32 flow_hash)
+                    const struct mwan_l2_flow_key *key, u32 flow_hash,
+                    bool control_packet)
 {
     struct mwan_l2_tx_flow *flow;
     struct mwan_l2_tx_flow *candidate;
@@ -297,7 +298,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     candidate = kzalloc(sizeof(*candidate), GFP_ATOMIC);
     if (!candidate)
         return NULL;
-    owner = mwan_l2_select_tx_worker(cfg, flow_hash, -1);
+    owner = mwan_l2_select_tx_worker(cfg, flow_hash, -1, control_packet);
     if (owner < 0) {
         kfree(candidate);
         return NULL;
@@ -307,6 +308,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     refcount_set(&candidate->refs, 1); /* table reference */
     atomic_set(&candidate->next_seq, 0);
     atomic_set(&candidate->pending_crypto, 0);
+    spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
     candidate->last_seen = jiffies;
     INIT_HLIST_NODE(&candidate->node);
@@ -333,6 +335,38 @@ void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow)
 {
     if (flow && refcount_dec_and_test(&flow->refs))
         kfree(flow);
+}
+
+bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
+                                   const struct mwan_l2_flow_key *key,
+                                   int owner_worker)
+{
+    struct mwan_l2_flow_bucket *bucket;
+    struct mwan_l2_tx_flow *flow;
+    u32 index;
+    bool released = false;
+
+    if (!cfg || !key || owner_worker < 0 ||
+        owner_worker >= cfg->num_workers)
+        return false;
+    index = mwan_l2_tx_bucket(key);
+    bucket = &cfg->flows.tx[index];
+
+    spin_lock_bh(&bucket->lock);
+    hlist_for_each_entry(flow, &bucket->head, node) {
+        if (!mwan_l2_flow_key_equal(&flow->key, key) ||
+            flow->owner_worker != owner_worker)
+            continue;
+        if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
+            /* The table reference keeps flow alive while bucket->lock is
+             * held; this put releases exactly one queue-owned reference. */
+            mwan_l2_tx_flow_put(flow);
+            released = true;
+        }
+        break;
+    }
+    spin_unlock_bh(&bucket->lock);
+    return released;
 }
 
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing)
@@ -380,7 +414,14 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
     candidate = kzalloc(sizeof(*candidate), GFP_ATOMIC);
     if (!candidate)
         return NULL;
-    owner = mwan_l2_select_rx_worker(cfg, lower_32_bits(flow_token), -1);
+    /* The encrypted RX prefix does not expose the inner protocol.  If every
+     * CPU is admission-blocked, admit the first authenticated-flow candidate
+     * on the CPU with the most remaining idle time.  TX can distinguish and
+     * reserve this fallback for control packets; RX cannot do so safely before
+     * decryption, and dropping the first ciphertext would also black-hole TCP
+     * SYN/FIN/RST and pure ACK traffic. */
+    owner = mwan_l2_select_rx_worker(cfg, lower_32_bits(flow_token), -1,
+                                     true);
     if (owner < 0) {
         kfree(candidate);
         return NULL;
@@ -418,6 +459,35 @@ void mwan_l2_rx_flow_put(struct mwan_l2_rx_flow *flow)
 {
     if (flow && refcount_dec_and_test(&flow->refs))
         kfree(flow);
+}
+
+bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
+                                   int owner_worker)
+{
+    struct mwan_l2_flow_bucket *bucket;
+    struct mwan_l2_rx_flow *flow;
+    u32 index;
+    bool released = false;
+
+    if (!cfg || !flow_token || owner_worker < 0 ||
+        owner_worker >= cfg->num_workers)
+        return false;
+    index = mwan_l2_rx_bucket(flow_token);
+    bucket = &cfg->flows.rx[index];
+
+    spin_lock_bh(&bucket->lock);
+    hlist_for_each_entry(flow, &bucket->head, node) {
+        if (flow->flow_token != flow_token ||
+            flow->owner_worker != owner_worker)
+            continue;
+        if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
+            mwan_l2_rx_flow_put(flow);
+            released = true;
+        }
+        break;
+    }
+    spin_unlock_bh(&bucket->lock);
+    return released;
 }
 
 void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing)
