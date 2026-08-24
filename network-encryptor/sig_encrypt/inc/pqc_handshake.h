@@ -12,6 +12,7 @@
 #define PQC_HS_MSG_HELLO   1
 #define PQC_HS_MSG_RESP    2
 #define PQC_HS_MSG_KEEPALIVE 3
+/* L3: signed responder-to-initiator request to restart HELLO after reboot. */
 #define PQC_HS_MSG_POKE    4
 
 #define PQC_KEM_PK_SIZE    1184 // ML-KEM-768 PK size
@@ -79,6 +80,8 @@ typedef struct {
     uint64_t last_recv_time;
     uint64_t handshake_start_time;
     uint64_t rotation_start_time;
+    uint64_t local_request_id;
+    uint64_t peer_request_id;
 
     char *local_priv;
     char *local_pub;
