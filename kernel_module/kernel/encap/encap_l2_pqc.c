@@ -291,12 +291,92 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
 struct mwan_l2_fragment_context {
     struct mwan_config *cfg;
     u16 tunnel_idx;
+    /* ip_do_fragment() removes the UDP header from every non-initial
+     * fragment and marks the first one with IP_MF.  Preserve the flow
+     * identity extracted from the complete datagram so all fragments keep
+     * the original 4-tuple and owner worker. */
+    struct mwan_tx_flow_info flow_info;
+    bool preserve_flow;
 };
+
+static int
+mwan_l2_submit_fragment(struct sk_buff *fragment,
+                        struct mwan_l2_fragment_context *fragment_context)
+{
+    struct mwan_l2_tx_diag flow_diag;
+    struct mwan_mtu_decision decision;
+    struct mwan_tunnel *tun;
+    enum mwan_mtu_result mtu_result;
+    u32 flow_idx;
+    u32 seq = 0;
+    int owner_cpu = -1;
+    int err;
+
+    if (!fragment || !fragment_context || !fragment_context->cfg ||
+        fragment_context->tunnel_idx >= fragment_context->cfg->num_tunnels)
+        return -EINVAL;
+
+    tun = &fragment_context->cfg->tunnels[fragment_context->tunnel_idx];
+    if (!tun->dev)
+        return -ENODEV;
+
+    /* The kernel fragmenter was given the effective L2-PQC inner MTU.  Do
+     * not recurse through the oversize path or recalculate the flow from a
+     * fragment that no longer contains the complete UDP 4-tuple. */
+    mtu_result = mwan_mtu_classify_ipv4_skb(
+        fragment, tun->dev, MWAN_MTU_PROFILE_L2_PQC, &decision);
+    if (mtu_result != MWAN_MTU_FITS)
+        return mtu_result == MWAN_MTU_OVERSIZE ? -EMSGSIZE : -EINVAL;
+    if (!mwan_l2_normalize_ipv4_extent(fragment, &decision))
+        return -EINVAL;
+
+    err = mwan_multicore_tx_submit(
+        fragment, fragment_context->cfg, fragment_context->tunnel_idx,
+        &fragment_context->flow_info, false, &seq, &owner_cpu);
+    if (err)
+        return err;
+
+    memset(&flow_diag, 0, sizeof(flow_diag));
+    flow_diag.saddr = fragment_context->flow_info.key.saddr;
+    flow_diag.daddr = fragment_context->flow_info.key.daddr;
+    flow_diag.sport = fragment_context->flow_info.key.sport;
+    flow_diag.dport = fragment_context->flow_info.key.dport;
+    flow_diag.protocol = fragment_context->flow_info.key.protocol;
+    flow_diag.hash_before = fragment_context->flow_info.hash_before;
+    flow_diag.tuple_valid = fragment_context->flow_info.tuple_valid;
+    flow_diag.hash_was_cached =
+        fragment_context->flow_info.hash_was_cached;
+    flow_diag.hash_is_l4 = fragment_context->flow_info.hash_is_l4;
+    flow_diag.hash_is_sw = fragment_context->flow_info.hash_is_sw;
+    flow_diag.hash_source = mwan_multicore_hash_source_name(
+        fragment_context->flow_info.hash_source);
+    flow_idx = fragment_context->flow_info.flow_id &
+               (MWAN_FLOW_HASH_SIZE - 1);
+    mwan_l2_tx_diag_log(&flow_diag, tun,
+                        fragment_context->flow_info.flow_id, flow_idx, seq,
+                        owner_cpu);
+    return 0;
+}
 
 static int mwan_l2_fragment_output(struct sk_buff *fragment, void *context)
 {
     struct mwan_l2_fragment_context *fragment_context = context;
     unsigned int verdict;
+    int err;
+
+    if (unlikely(!fragment_context)) {
+        kfree_skb(fragment);
+        return -EINVAL;
+    }
+
+    if (fragment_context->preserve_flow) {
+        err = mwan_l2_submit_fragment(fragment, fragment_context);
+        if (!err)
+            return 0;
+
+        kfree_skb(fragment);
+        return err;
+    }
 
     verdict = mwan_handle_encap_l2_pqc_single(
         fragment, fragment_context->cfg, fragment_context->tunnel_idx);
@@ -514,6 +594,16 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
             mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_L2_PQC,
                                       &decision);
             return NF_DROP;
+        }
+
+        /* skb_gso_segment() has already run in the wrapper.  A normal UDP
+         * datagram reaches this branch with its complete 4-tuple still
+         * available, so capture it before ip_do_fragment() creates packets
+         * whose IP fragment flags intentionally hide the L4 ports from the
+         * generic flow dissector. */
+        if (decision.ip_protocol == IPPROTO_UDP) {
+            mwan_multicore_flow_info(skb, &fragment_context.flow_info);
+            fragment_context.preserve_flow = true;
         }
 
         err = mwan_mtu_fragment_ipv4(
