@@ -82,6 +82,9 @@ typedef struct {
     uint64_t config_generation;
     uint64_t local_request_id;
     uint64_t peer_request_id;
+    uint64_t local_keepalive_seq;
+    uint64_t peer_keepalive_epoch;
+    uint64_t peer_keepalive_seq;
 
     char *local_priv;
     char *local_pub;
@@ -126,6 +129,7 @@ typedef struct {
     atomic_bool handshake_give_up;
     atomic_bool rotation_give_up;
     atomic_bool send_poke;
+    bool keepalive_enabled;
     bool is_tunnel;
     atomic_bool thread_exit_sig;
 } policy_key_binding_t;
