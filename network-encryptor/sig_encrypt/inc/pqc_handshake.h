@@ -82,6 +82,9 @@ typedef struct {
     uint64_t rotation_start_time;
     uint64_t local_request_id;
     uint64_t peer_request_id;
+    uint64_t local_keepalive_seq;
+    uint64_t peer_keepalive_epoch;
+    uint64_t peer_keepalive_seq;
 
     char *local_priv;
     char *local_pub;
@@ -124,6 +127,7 @@ typedef struct {
     bool rotation_give_up;
     bool giveup_logged;
     bool send_poke;
+    bool keepalive_enabled;
     bool is_tunnel;
     volatile bool thread_exit_sig;
 } policy_key_binding_t;
