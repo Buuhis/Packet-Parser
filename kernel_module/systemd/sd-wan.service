@@ -12,10 +12,19 @@ EnvironmentFile=/opt/.env
 Environment=LD_LIBRARY_PATH=/usr/local/lib/sd-wan:/usr/lib/sd-wan
 
 # Daemon & Kernel Module lifecycle
-ExecStartPre=/bin/sh -c "/sbin/insmod /usr/local/lib/modules/mwan_kmod.ko 2>/dev/null || /sbin/modprobe mwan_kmod 2>/dev/null || true"
+# Keep the boot path deterministic while diagnosing module-startup failures:
+# load this exact .ko, expose the real insmod error, and refuse to start the
+# userspace daemon until both the module and its Generic Netlink family exist.
+ExecStartPre=/bin/sh -ec 'echo "[SDWAN-PRE] kernel=$(/bin/uname -r)"; test -r /usr/local/lib/modules/mwan_kmod.ko || { echo "[SDWAN-PRE] ERROR: /usr/local/lib/modules/mwan_kmod.ko is missing or unreadable" >&2; exit 1; }; echo "[SDWAN-PRE] module_vermagic=$(/usr/sbin/modinfo -F vermagic /usr/local/lib/modules/mwan_kmod.ko)"; /usr/bin/sha256sum /usr/local/lib/modules/mwan_kmod.ko /usr/local/bin/sd-wan'
+ExecStartPre=/bin/sh -ec 'if test -d /sys/module/mwan_kmod; then echo "[SDWAN-PRE] mwan_kmod is already loaded"; else echo "[SDWAN-PRE] loading /usr/local/lib/modules/mwan_kmod.ko"; /usr/sbin/insmod /usr/local/lib/modules/mwan_kmod.ko; fi'
+ExecStartPre=/bin/sh -ec 'test -d /sys/module/mwan_kmod || { echo "[SDWAN-PRE] ERROR: mwan_kmod is absent after insmod" >&2; exit 1; }; echo "[SDWAN-PRE] module_present=1"'
+ExecStartPre=/bin/sh -ec '/usr/sbin/genl ctrl list | /usr/bin/grep -qw MWAN_STEER || { echo "[SDWAN-PRE] ERROR: Generic Netlink family MWAN_STEER is absent" >&2; exit 1; }; echo "[SDWAN-PRE] netlink_family=MWAN_STEER ready=1"'
 ExecStart=/usr/local/bin/sd-wan
 ExecStopPost=-/sbin/rmmod mwan_kmod
 Restart=always
+RestartSec=3s
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
