@@ -114,6 +114,9 @@ typedef struct {
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
     pqc_runtime_state_t worker_state;
     int worker_last_error;
+    int keepalive_rx_last_error;
+    int request_rx_last_error;
+    int hello_rx_last_status;
 
     // 1-Byte Aligned Members
     uint8_t encrypt_key[PQC_TRAFFIC_KEY_SZ];

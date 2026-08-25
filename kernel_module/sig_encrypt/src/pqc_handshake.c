@@ -20,6 +20,7 @@
 #include <stdatomic.h>
 #include <time.h>
 #include <endian.h>
+#include <limits.h>
 
 #define PQC_RX_PKT_MAX     10000
 #define KEY_ROTATION_INTERVAL_MS 3000000
@@ -36,6 +37,18 @@
 #define PQC_HS_STATE_READY 1
 #define PQC_HS_STATE_FAILED 2
 #define PQC_HS_STATE_HANDSHAKING 3
+
+enum pqc_hs_hello_diag_status {
+    PQC_HS_HELLO_DIAG_OK = 0,
+    PQC_HS_HELLO_DIAG_MALFORMED,
+    PQC_HS_HELLO_DIAG_FINGERPRINT,
+    PQC_HS_HELLO_DIAG_SESSION_CONFLICT,
+    PQC_HS_HELLO_DIAG_MISSING_KEYS,
+    PQC_HS_HELLO_DIAG_BAD_SIGNATURE,
+    PQC_HS_HELLO_DIAG_ENCAPSULATE,
+    PQC_HS_HELLO_DIAG_SIGN_RESPONSE,
+    PQC_HS_HELLO_DIAG_SEND_RESPONSE,
+};
 
 typedef struct {
     uint8_t state;
@@ -118,6 +131,15 @@ static bool pqc_hs_profile_matches(uint32_t wire_profile_id,
 #else
     return wire_profile_id == (uint32_t)local_profile_id;
 #endif
+}
+
+/* These diagnostic slots are owned by one profile.  Returning true only on
+ * a transition keeps persistent packet/retry errors from flooding journald. */
+static bool pqc_hs_diag_changed(int *last_status, int new_status) {
+    if (!last_status || *last_status == new_status)
+        return false;
+    *last_status = new_status;
+    return true;
 }
 
 /* g_key_mutex must be held. Exact profile matches always win. In test mode,
@@ -671,10 +693,13 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
                   (const struct sockaddr *)peeraddr, sizeof(*peeraddr));
     free(response);
     if (sent != response_len) {
-        fprintf(stderr,
-                "[PQC-HS-L3] Failed to send RESP for Profile %d, session %u: %s\n",
-                b->profile_id, session_id,
-                sent < 0 ? strerror(errno) : "short UDP send");
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_SEND_RESPONSE)) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Failed to send RESP for Profile %d, session %u: %s\n",
+                    b->profile_id, session_id,
+                    sent < 0 ? strerror(errno) : "short UDP send");
+        }
         return -1;
     }
 
@@ -700,11 +725,14 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
         forwarder_pre_diversify_pqc_keys(b->profile_id);
     }
 
-    fprintf(stderr,
-            "[PQC-HS-L3] Responder %s RESP for Profile %d, session %u%s.\n",
-            replay ? "replayed cached" : "sent new",
-            b->profile_id, session_id,
-            already_promoted ? " (key unchanged)" : "");
+    /* A cached RESP can be retransmitted several times for the same HELLO.
+     * That is normal retry traffic, not a state change, so keep it silent. */
+    if (!replay) {
+        fprintf(stderr,
+                "[PQC-HS-L3] Responder sent new RESP for Profile %d, session %u.\n",
+                b->profile_id, session_id);
+    }
+    b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
     return 0;
 }
 
@@ -735,14 +763,20 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         msg->magic != PQC_HS_MAGIC || msg->msg_type != PQC_HS_MSG_HELLO ||
         !pqc_hs_profile_matches(msg->profile_id, b->profile_id) ||
         msg->session_id == 0) {
-        fprintf(stderr, "[PQC-HS-L3] Rejected malformed/mismatched HELLO for Profile %d.\n",
-                b->profile_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_MALFORMED)) {
+            fprintf(stderr, "[PQC-HS-L3] Rejected malformed/mismatched HELLO for Profile %d.\n",
+                    b->profile_id);
+        }
         return -1;
     }
 
     if (trf_calculate_digest(DIGEST_TYPE_SHA256, rx_buf, rx_len, hello_hash) != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-HS-L3] Failed to fingerprint HELLO for Profile %d.\n",
-                b->profile_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_FINGERPRINT)) {
+            fprintf(stderr, "[PQC-HS-L3] Failed to fingerprint HELLO for Profile %d.\n",
+                    b->profile_id);
+        }
         return -1;
     }
 
@@ -759,9 +793,12 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     pthread_mutex_unlock(&g_key_mutex);
 
     if (session_conflict) {
-        fprintf(stderr,
-                "[PQC-HS-L3] Rejected HELLO reusing session %u with different content for Profile %d.\n",
-                msg->session_id, b->profile_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_SESSION_CONFLICT)) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Rejected HELLO reusing session %u with different content for Profile %d.\n",
+                    msg->session_id, b->profile_id);
+        }
         return -1;
     }
     if (cached_slot >= 0) {
@@ -777,8 +814,11 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     if (!new_my_priv || !new_peer_pub) {
         free(new_my_priv);
         free(new_peer_pub);
-        fprintf(stderr, "[PQC-HS-L3] Missing responder authentication keys for Profile %d.\n",
-                b->profile_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_MISSING_KEYS)) {
+            fprintf(stderr, "[PQC-HS-L3] Missing responder authentication keys for Profile %d.\n",
+                    b->profile_id);
+        }
         return -1;
     }
     free(*my_priv);
@@ -788,18 +828,25 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
 
     trf_base64_decode(*peer_pub, raw_pub, &raw_pub_sz);
     if (pqc_hs_verify_message(raw_pub, raw_pub_sz, msg) != TRF_PQC_OK) {
-        fprintf(stderr,
-                "[PQC-HS-L3] HELLO signature verification failed for Profile %d, session %u.\n",
-                b->profile_id, msg->session_id);
-        sig_pqc_write_log(b->profile_id, b->key_id, PQC_LOG_LEVEL_ERROR,
-                          PQC_LOG_STATUS_FAILED,
-                          "Handshake signature verification failed. Mismatched authentication keys.");
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_BAD_SIGNATURE)) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] HELLO signature verification failed for Profile %d, session %u.\n",
+                    b->profile_id, msg->session_id);
+            sig_pqc_write_log(b->profile_id, b->key_id,
+                              PQC_LOG_LEVEL_ERROR,
+                              PQC_LOG_STATUS_FAILED,
+                              "Handshake signature verification failed. Mismatched authentication keys.");
+        }
         return -1;
     }
 
     if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-HS-L3] KEM encapsulation failed for Profile %d, session %u.\n",
-                b->profile_id, msg->session_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_ENCAPSULATE)) {
+            fprintf(stderr, "[PQC-HS-L3] KEM encapsulation failed for Profile %d, session %u.\n",
+                    b->profile_id, msg->session_id);
+        }
         return -1;
     }
 
@@ -814,8 +861,11 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     trf_base64_decode(*my_priv, raw_priv, &raw_priv_sz);
     if (pqc_hs_sign_message(raw_priv, raw_priv_sz, resp,
                             resp->payload + ct_sz, &sig_sz) != TRF_PQC_OK) {
-        fprintf(stderr, "[PQC-HS-L3] Failed to sign RESP for Profile %d, session %u.\n",
-                b->profile_id, msg->session_id);
+        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                PQC_HS_HELLO_DIAG_SIGN_RESPONSE)) {
+            fprintf(stderr, "[PQC-HS-L3] Failed to sign RESP for Profile %d, session %u.\n",
+                    b->profile_id, msg->session_id);
+        }
         return -1;
     }
     resp->sig_len = (uint16_t)sig_sz;
@@ -888,21 +938,28 @@ static void initiate_key_rotation(policy_key_binding_t *b, int sockfd, struct so
 
     int payload_tot_sz = sizeof(struct pqc_hs_msg) + pk_sz + sig_sz;
     uint64_t rotation_started = get_time_ms_hs();
-    int retry_cnt = 0;
+    int last_send_status = INT_MIN;
 
     while (pqc_dispatcher_is_running() && !b->thread_exit_sig &&
            get_time_ms_hs() - rotation_started < PQC_HS_GIVEUP_TIMEOUT_MS) {
         ssize_t sent = sendto(sockfd, buffer, payload_tot_sz, 0,
                               (const struct sockaddr *)peeraddr,
                               sizeof(struct sockaddr_in));
-        int send_error = sent < 0 ? errno : 0;
-        fprintf(stderr,
-                "[PQC-HS-L3] Rotation HELLO Profile %d, session %u, try %d%s%s%s.\n",
-                profile_id, msg_id, ++retry_cnt,
-                sent == payload_tot_sz ? " sent" : " send failed",
-                sent == payload_tot_sz ? "" : ": ",
-                sent == payload_tot_sz ? "" :
-                (sent < 0 ? strerror(send_error) : "short UDP send"));
+        int send_error = sent < 0 ? errno : EMSGSIZE;
+        int send_status = sent == payload_tot_sz ? 0 : -send_error;
+
+        if (send_status != last_send_status) {
+            if (send_status == 0) {
+                fprintf(stderr,
+                        "[PQC-HS-L3] Rotation HELLO started for Profile %d, session %u.\n",
+                        profile_id, msg_id);
+            } else {
+                fprintf(stderr,
+                        "[PQC-HS-L3] Rotation HELLO send failed for Profile %d, session %u: %s.\n",
+                        profile_id, msg_id, strerror(-send_status));
+            }
+            last_send_status = send_status;
+        }
 
         if (sent != payload_tot_sz) {
             if (send_error == EMSGSIZE)
@@ -1006,11 +1063,20 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             verify_rc = pqc_hs_verify_l3_keepalive_locked(
                 b, msg, &peer_status);
             if (verify_rc != 0) {
-                fprintf(stderr,
-                        "[PQC-HS-L3] Rejected unauthenticated/invalid KEM key keepalive for Profile %d: %s.\n",
-                        b->profile_id, strerror(-verify_rc));
+                if (pqc_hs_diag_changed(&b->keepalive_rx_last_error,
+                                        verify_rc)) {
+                    fprintf(stderr,
+                            "[PQC-HS-L3] Rejected unauthenticated/invalid KEM key keepalive for Profile %d: %s.\n",
+                            b->profile_id, strerror(-verify_rc));
+                }
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
+            }
+            if (b->keepalive_rx_last_error != 0) {
+                fprintf(stderr,
+                        "[PQC-HS-L3] Valid signed keepalive reception restored for Profile %d.\n",
+                        b->profile_id);
+                b->keepalive_rx_last_error = 0;
             }
 
             if (peer_status.epoch == b->peer_keepalive_epoch &&
@@ -1069,16 +1135,20 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                                                          &request_id);
 
             if (verify_rc != 0) {
-                fprintf(stderr,
-                        "[PQC-HS] Rejected unauthenticated/invalid handshake request for Profile %d: %s.\n",
-                        b->profile_id, strerror(-verify_rc));
+                if (pqc_hs_diag_changed(&b->request_rx_last_error,
+                                        verify_rc)) {
+                    fprintf(stderr,
+                            "[PQC-HS] Rejected unauthenticated/invalid handshake request for Profile %d: %s.\n",
+                            b->profile_id, strerror(-verify_rc));
+                }
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             }
+            b->request_rx_last_error = 0;
             if (request_id == b->peer_request_id) {
-                fprintf(stderr,
-                        "[PQC-HS] Ignored duplicate handshake request %016llx for Profile %d.\n",
-                        (unsigned long long)request_id, b->profile_id);
+                /* The responder retries the same authenticated request until
+                 * the state changes.  Duplicates are expected and must not
+                 * flood the service journal. */
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             }
@@ -1366,6 +1436,11 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     uint64_t next_request_time = 0;
     uint64_t next_keepalive_time = 0;
     uint8_t last_keepalive_state = 0;
+    int last_resolved_role = -1;
+    int last_keepalive_send_status = 0;
+    int last_hello_send_status = INT_MIN;
+    int last_request_send_status = INT_MIN;
+    int last_prepare_error = 0;
 
     fprintf(stderr, "[PQC-WORKER] Handshake Worker started for Profile %d\n", profile_id);
 
@@ -1531,10 +1606,18 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             last_keepalive_state = keepalive_state;
             next_keepalive_time =
                 loop_now + PQC_HS_KEEPALIVE_INTERVAL_MS;
-            if (keepalive_rc != 0 && keepalive_rc != -EAGAIN) {
-                fprintf(stderr,
-                        "[PQC-HS-L3] Failed to send signed KEM key keepalive for Profile %d: %s.\n",
-                        profile_id, strerror(-keepalive_rc));
+            if (keepalive_rc != -EAGAIN &&
+                keepalive_rc != last_keepalive_send_status) {
+                if (keepalive_rc == 0) {
+                    fprintf(stderr,
+                            "[PQC-HS-L3] Signed keepalive transmission recovered for Profile %d.\n",
+                            profile_id);
+                } else {
+                    fprintf(stderr,
+                            "[PQC-HS-L3] Failed to send signed KEM key keepalive for Profile %d: %s.\n",
+                            profile_id, strerror(-keepalive_rc));
+                }
+                last_keepalive_send_status = keepalive_rc;
             }
         }
 
@@ -1583,9 +1666,12 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         pthread_mutex_lock(&g_key_mutex);
                         b->is_initiator = is_initiator;
                         pthread_mutex_unlock(&g_key_mutex);
-                        fprintf(stderr, "[PQC-WORKER-L3] Profile %d: Dynamic role resolved. Local IP: %s (%u), Peer IP: %s (%u). Resolved Role: %s\n",
-                                profile_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num,
-                                is_initiator ? "INITIATOR" : "RESPONDER");
+                        if (last_resolved_role != (int)is_initiator) {
+                            fprintf(stderr, "[PQC-WORKER-L3] Profile %d: Dynamic role resolved. Local IP: %s (%u), Peer IP: %s (%u). Resolved Role: %s\n",
+                                    profile_id, local_ip_str, local_ip_num, peer_ip, peer_ip_num,
+                                    is_initiator ? "INITIATOR" : "RESPONDER");
+                            last_resolved_role = (int)is_initiator;
+                        }
                     }
                 }
             }
@@ -1598,9 +1684,12 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 uint32_t session_id;
                 if (trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz) != TRF_PQC_OK ||
                     pqc_generate_session_id(&session_id) != 0) {
-                    fprintf(stderr,
-                            "[PQC-HS-L3] Failed to create KEM/session material for Profile %d.\n",
-                            profile_id);
+                    if (last_prepare_error != 1) {
+                        fprintf(stderr,
+                                "[PQC-HS-L3] Failed to create KEM/session material for Profile %d.\n",
+                                profile_id);
+                        last_prepare_error = 1;
+                    }
                     usleep(500000);
                     continue;
                 }
@@ -1628,19 +1717,21 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 if (pqc_hs_sign_message(raw_priv, raw_priv_sz, msg,
                                         msg->payload + pk_sz, &sig_sz) != TRF_PQC_OK) {
                     pthread_mutex_unlock(&g_key_mutex);
-                    fprintf(stderr, "[PQC-HS-L3] Failed to sign HELLO for Profile %d.\n",
-                            profile_id);
+                    if (last_prepare_error != 2) {
+                        fprintf(stderr, "[PQC-HS-L3] Failed to sign HELLO for Profile %d.\n",
+                                profile_id);
+                        last_prepare_error = 2;
+                    }
                     usleep(500000);
                     continue;
                 }
                 msg->sig_len = (uint16_t)sig_sz;
                 pthread_mutex_unlock(&g_key_mutex);
+                last_prepare_error = 0;
 
-                int retry_cnt = 0;
                 while (pqc_dispatcher_is_running() && !b->key_ready && !b->thread_exit_sig) {
                     if (b->handshake_start_time == 0) {
                         b->handshake_start_time = get_time_ms_hs();
-                        retry_cnt = 0;
                     }
                     if (get_time_ms_hs() - b->handshake_start_time > PQC_HS_GIVEUP_TIMEOUT_MS) {
                         fprintf(stderr, "[PQC-HS-L3] Handshake timed out after %d seconds. Giving up on Profile %d.\n",
@@ -1649,21 +1740,29 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         b->handshake_give_up = true;
                         break;
                     }
-                    fprintf(stderr,
-                            "[PQC-WORKER-L3] Initiator Profile %d sending HELLO session %u (try: %d)...\n",
-                            profile_id, session_id, retry_cnt + 1);
                     size_t hello_len = sizeof(struct pqc_hs_msg) +
                                        (size_t)pk_sz + (size_t)sig_sz;
                     ssize_t sent = sendto(
                         sockfd, buffer, hello_len, 0,
                         (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
+                    int send_status = sent == (ssize_t)hello_len
+                        ? 0 : -(sent < 0 ? errno : EMSGSIZE);
+
+                    if (send_status != last_hello_send_status) {
+                        if (send_status == 0) {
+                            fprintf(stderr,
+                                    "[PQC-WORKER-L3] Initiator Profile %d started sending HELLO session %u.\n",
+                                    profile_id, session_id);
+                        } else {
+                            fprintf(stderr,
+                                    "[PQC-HS-L3] Failed to send HELLO for Profile %d, session %u: %s (len=%zu).\n",
+                                    profile_id, session_id,
+                                    strerror(-send_status), hello_len);
+                        }
+                        last_hello_send_status = send_status;
+                    }
                     if (sent != (ssize_t)hello_len) {
                         int send_error = sent < 0 ? errno : EMSGSIZE;
-
-                        fprintf(stderr,
-                                "[PQC-HS-L3] Failed to send HELLO for Profile %d, session %u: %s (len=%zu).\n",
-                                profile_id, session_id, strerror(send_error),
-                                hello_len);
                         if (send_error == EMSGSIZE) {
                             sig_pqc_write_log(
                                 profile_id, b->key_id, PQC_LOG_LEVEL_ERROR,
@@ -1672,7 +1771,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             b->handshake_give_up = true;
                             break;
                         }
-                        retry_cnt++;
                         usleep(200000);
                         continue;
                     }
@@ -1711,7 +1809,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                         sig_pqc_on_key_ready(profile_id,
                                                              derived_master,
                                                              callback_generation);
-                                        fprintf(stderr, "[PQC-WORKER-L3] Handshake SUCCESS for Profile %d!\n", profile_id);
                                         forwarder_pre_diversify_pqc_keys(profile_id);
                                         break;
                                     }
@@ -1720,7 +1817,6 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         }
                         usleep(10000);
                     }
-                    retry_cnt++;
                 }
             } else {
                 if (b->handshake_start_time == 0) {
@@ -1751,14 +1847,17 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                             b, sockfd, &peeraddr, my_priv);
 
                         next_request_time = now + PQC_HS_REQUEST_RETRY_MS;
-                        if (request_rc == 0) {
-                            fprintf(stderr,
-                                    "[PQC-HS-L3] Responder Profile %d sent authenticated handshake request to Initiator.\n",
-                                    profile_id);
-                        } else {
-                            fprintf(stderr,
-                                    "[PQC-HS-L3] Responder Profile %d failed to send authenticated handshake request: %s.\n",
-                                    profile_id, strerror(-request_rc));
+                        if (request_rc != last_request_send_status) {
+                            if (request_rc == 0) {
+                                fprintf(stderr,
+                                        "[PQC-HS-L3] Responder Profile %d started sending authenticated handshake requests.\n",
+                                        profile_id);
+                            } else {
+                                fprintf(stderr,
+                                        "[PQC-HS-L3] Responder Profile %d failed to send authenticated handshake request: %s.\n",
+                                        profile_id, strerror(-request_rc));
+                            }
+                            last_request_send_status = request_rc;
                         }
                     }
 
@@ -2103,6 +2202,9 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->thread_started = false;
         b->worker_state = PQC_RUNTIME_STOPPED;
         b->worker_last_error = 0;
+        b->keepalive_rx_last_error = 0;
+        b->request_rx_last_error = 0;
+        b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
         b->rx_head = 0;
         b->rx_tail = 0;
         pthread_mutex_init(&b->rx_mutex, NULL);
@@ -2187,6 +2289,9 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
             b->keepalive_monitor_start_time = 0;
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->keepalive_rx_last_error = 0;
+            b->request_rx_last_error = 0;
+            b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
         }
         b->policy_id = profile_id;
         b->profile_id = profile_id;
@@ -2362,6 +2467,9 @@ void sig_pqc_finalize_reload(void) {
             b->next_auto_retry_time = 0;
             b->worker_state = PQC_RUNTIME_STOPPED;
             b->worker_last_error = 0;
+            b->keepalive_rx_last_error = 0;
+            b->request_rx_last_error = 0;
+            b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
         }
     }
     pthread_mutex_unlock(&g_key_mutex);
@@ -2545,6 +2653,9 @@ int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_m
             b->keepalive_monitor_start_time = get_time_ms_hs();
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->keepalive_rx_last_error = 0;
+            b->request_rx_last_error = 0;
+            b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
             pqc_hs_clear_cache_locked(b);
             pqc_flush_rx_queue(b);
 
