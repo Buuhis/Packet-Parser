@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <net/if.h>
 
 struct app_config;
 struct forwarder;
@@ -19,6 +20,14 @@ typedef struct y1731_metrics {
     float    loss_rate;     // Frame loss rate (0.0 to 1.0)
     int      loss_mechanism;// 1 = LMM, 2 = SLM
 } y1731_metrics_t;
+
+/* A point-in-time view of one WAN interface monitored by CFM. */
+typedef struct cfm_link_status {
+    char ifname[IF_NAMESIZE];
+    int wan_dp;
+    cfm_link_state_t state;
+    bool quality_is_bad;
+} cfm_link_status_t;
 
 /**
  * Initialize the CFM diagnostic subsystem.
@@ -55,6 +64,18 @@ int cfm_get_link_state(int wan_dp);
  * @return 0 on success, negative error code on failure.
  */
 int cfm_get_link_quality(int wan_dp, y1731_metrics_t *metrics);
+
+/**
+ * Copy the current status of all WAN interfaces actively monitored by CFM.
+ * The returned state is the raw CFM state; quality_is_bad must also be
+ * considered because failover treats a bad-quality link as unavailable.
+ *
+ * @return Number of copied entries, or negative on invalid arguments.
+ */
+int cfm_get_monitored_link_status(cfm_link_status_t *statuses, int max_statuses);
+
+/* CLI handler for `network-encryptor -gs <interface>`. */
+int cfm_handle_get_status(const char *ifname);
 
 /**
  * Terminate the CFM diagnostic subsystem.

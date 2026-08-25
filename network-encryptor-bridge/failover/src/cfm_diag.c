@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/poll.h>
+#include <sys/un.h>
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <linux/if_packet.h>
@@ -25,6 +26,7 @@
 #define CFM_INTERVAL_MS 100
 #define CFM_TIMEOUT_MS  350
 #define CFM_STARTUP_TIMEOUT_MS 1000
+#define CFM_STATUS_SOCKET_PATH "/tmp/network-encryptor-bridge-status.sock"
 
 typedef struct cfm_link {
     pthread_mutex_t lock;       
@@ -81,6 +83,115 @@ static int g_link_count = 0;
 static pthread_t g_cfm_thread;
 static volatile bool g_cfm_running = false;
 static pthread_mutex_t g_cfm_init_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t g_status_thread;
+static volatile bool g_status_running = false;
+static int g_status_sock = -1;
+
+static const char *cfm_effective_status(const cfm_link_status_t *status)
+{
+    if (status->quality_is_bad || status->state == CFM_LINK_STATE_DOWN)
+        return "DOWN";
+    if (status->state == CFM_LINK_STATE_UP)
+        return "UP";
+    return "INIT";
+}
+
+static void cfm_status_server_reply(int client_fd, const char *ifname)
+{
+    cfm_link_status_t statuses[MAX_INTERFACES];
+    int count = cfm_get_monitored_link_status(statuses, MAX_INTERFACES);
+
+    if (!ifname || !*ifname) {
+        dprintf(client_fd, "ERROR invalid interface\n");
+        return;
+    }
+    if (count < 0) {
+        dprintf(client_fd, "ERROR status unavailable\n");
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        if (strcmp(statuses[i].ifname, ifname) == 0) {
+            dprintf(client_fd, "%s\n", cfm_effective_status(&statuses[i]));
+            return;
+        }
+    }
+    dprintf(client_fd, "NOT_MONITORED\n");
+}
+
+static void *cfm_status_server_thread(void *arg)
+{
+    (void)arg;
+    while (g_status_running) {
+        int client_fd = accept(g_status_sock, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR)
+                continue;
+            if (!g_status_running)
+                break;
+            continue;
+        }
+        char ifname[IF_NAMESIZE] = {0};
+        ssize_t len = read(client_fd, ifname, sizeof(ifname) - 1);
+        if (len > 0) {
+            ifname[len] = '\0';
+            ifname[strcspn(ifname, "\r\n")] = '\0';
+        }
+        cfm_status_server_reply(client_fd, len > 0 ? ifname : NULL);
+        close(client_fd);
+    }
+    return NULL;
+}
+
+static int cfm_status_server_start(void)
+{
+    if (g_status_running)
+        return 0;
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "[CFM-STATUS] socket failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CFM_STATUS_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    unlink(CFM_STATUS_SOCKET_PATH);
+
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 || listen(fd, 8) != 0) {
+        fprintf(stderr, "[CFM-STATUS] cannot listen on %s: %s\n",
+                CFM_STATUS_SOCKET_PATH, strerror(errno));
+        close(fd);
+        unlink(CFM_STATUS_SOCKET_PATH);
+        return -1;
+    }
+
+    g_status_sock = fd;
+    g_status_running = true;
+    if (pthread_create(&g_status_thread, NULL, cfm_status_server_thread, NULL) != 0) {
+        fprintf(stderr, "[CFM-STATUS] failed to create server thread\n");
+        g_status_running = false;
+        close(g_status_sock);
+        g_status_sock = -1;
+        unlink(CFM_STATUS_SOCKET_PATH);
+        return -1;
+    }
+    return 0;
+}
+
+static void cfm_status_server_stop(void)
+{
+    if (!g_status_running)
+        return;
+
+    g_status_running = false;
+    shutdown(g_status_sock, SHUT_RDWR);
+    pthread_join(g_status_thread, NULL);
+    close(g_status_sock);
+    g_status_sock = -1;
+    unlink(CFM_STATUS_SOCKET_PATH);
+}
 
 static uint64_t get_time_ms(void) {
     struct timespec ts;
@@ -841,6 +952,9 @@ int cfm_init(const struct app_config *cfg) {
         printf("[CFM-INIT] No WAN interfaces initialized for CFM.\n");
     }
 
+    if (cfm_status_server_start() != 0)
+        fprintf(stderr, "[CFM-STATUS] -gs is unavailable\n");
+
     pthread_mutex_unlock(&g_cfm_init_lock);
     return 0;
 }
@@ -980,7 +1094,68 @@ int cfm_get_link_quality(int wan_dp, y1731_metrics_t *metrics) {
     return -2;
 }
 
+int cfm_get_monitored_link_status(cfm_link_status_t *statuses, int max_statuses) {
+    if (!statuses || max_statuses < 0)
+        return -1;
+
+    pthread_mutex_lock(&g_cfm_init_lock);
+    int count = g_link_count;
+    if (count > max_statuses)
+        count = max_statuses;
+
+    for (int i = 0; i < count; i++) {
+        cfm_link_t *link = &g_links[i];
+        pthread_mutex_lock(&link->lock);
+        strncpy(statuses[i].ifname, link->ifname, IF_NAMESIZE - 1);
+        statuses[i].ifname[IF_NAMESIZE - 1] = '\0';
+        statuses[i].wan_dp = link->wan_dp;
+        statuses[i].state = link->state;
+        statuses[i].quality_is_bad = link->quality_is_bad;
+        pthread_mutex_unlock(&link->lock);
+    }
+    pthread_mutex_unlock(&g_cfm_init_lock);
+    return count;
+}
+
+int cfm_handle_get_status(const char *ifname)
+{
+    if (!ifname || !*ifname || strlen(ifname) >= IF_NAMESIZE) {
+        fprintf(stderr, "[CFM-STATUS] invalid interface\n");
+        return 1;
+    }
+
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        fprintf(stderr, "[CFM-STATUS] socket failed: %s\n", strerror(errno));
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CFM_STATUS_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "[CFM-STATUS] daemon is not running or status is unavailable\n");
+        close(fd);
+        return 1;
+    }
+
+    if (write(fd, ifname, strlen(ifname)) < 0 || shutdown(fd, SHUT_WR) != 0) {
+        fprintf(stderr, "[CFM-STATUS] failed to request status\n");
+        close(fd);
+        return 1;
+    }
+
+    char buf[512];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0)
+        fwrite(buf, 1, (size_t)n, stdout);
+    close(fd);
+    return n < 0 ? 1 : 0;
+}
+
 void cfm_cleanup(void) {
+    cfm_status_server_stop();
     pthread_mutex_lock(&g_cfm_init_lock);
     if (!g_cfm_running) {
         pthread_mutex_unlock(&g_cfm_init_lock);
