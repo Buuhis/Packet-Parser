@@ -28,6 +28,10 @@
 #define PQC_HS_REQUEST_RETRY_MS 1000
 #define PQC_HS_REQUEST_DATA_SZ ((uint16_t)sizeof(uint64_t))
 #define PQC_HS_KEEPALIVE_INTERVAL_MS 15000
+#define PQC_HS_KEEPALIVE_MISSED_LIMIT 3
+#define PQC_HS_KEEPALIVE_TIMEOUT_MS \
+    (PQC_HS_KEEPALIVE_INTERVAL_MS * PQC_HS_KEEPALIVE_MISSED_LIMIT)
+#define PQC_HS_AUTO_RETRY_INTERVAL_MS 15000
 #define PQC_HS_KEY_FINGERPRINT_SZ 32
 #define PQC_HS_STATE_READY 1
 #define PQC_HS_STATE_FAILED 2
@@ -543,6 +547,30 @@ static void pqc_flush_rx_queue(policy_key_binding_t *b) {
     pthread_mutex_unlock(&b->rx_mutex);
 }
 
+/* g_key_mutex must be held.  Recovery is deliberately local to one binding:
+ * no other profile loses its key, queue, retry state, or worker.  The kernel
+ * keeps its current/previous datapath key slots until a successful handshake
+ * invokes sig_pqc_on_key_ready() with a replacement key. */
+static void pqc_hs_begin_profile_recovery_locked(policy_key_binding_t *b,
+                                                  uint64_t now) {
+    if (!b)
+        return;
+
+    b->key_ready = false;
+    b->handshake_give_up = false;
+    b->handshake_start_time = 0;
+    b->rotation_give_up = false;
+    b->rotation_start_time = 0;
+    b->local_request_id = 0;
+    b->local_keepalive_seq = 0;
+    b->send_poke = !b->is_initiator;
+    b->keepalive_enabled = b->is_tunnel;
+    b->last_keepalive_rx_time = 0;
+    b->keepalive_monitor_start_time = now;
+    b->next_auto_retry_time = 0;
+    pqc_hs_clear_cache_locked(b);
+}
+
 // Helper to calculate SHA256 hash
 static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t *out_key) {
     uint8_t hash[64]; // Enough for SHA512
@@ -557,6 +585,8 @@ static uint64_t get_time_ms_hs(void) {
 }
 
 static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *derived_master, const char *role) {
+    uint64_t now = get_time_ms_hs();
+
     if (b->key_ready) {
         sig_pqc_write_log(b->profile_id, b->key_id, PQC_LOG_LEVEL_INFO, PQC_LOG_STATUS_SUCCESS, "Session key updated.");
     } else {
@@ -578,14 +608,19 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     memcpy(b->decrypt_key, derived_master, PQC_TRAFFIC_KEY_SZ);
 
     b->key_ready = true;
-    b->last_sent_time = get_time_ms_hs();
-    b->last_recv_time = get_time_ms_hs();
-    b->last_rotation_time = get_time_ms_hs();
+    b->last_sent_time = now;
+    b->last_recv_time = now;
+    b->last_rotation_time = now;
     b->handshake_start_time = 0;
     b->handshake_give_up = false;
     b->rotation_start_time = 0;
     b->rotation_give_up = false;
-    if (b->is_tunnel) b->keepalive_enabled = true;
+    if (b->is_tunnel) {
+        b->keepalive_enabled = true;
+        b->keepalive_monitor_start_time = now;
+        b->last_keepalive_rx_time = 0;
+        b->next_auto_retry_time = 0;
+    }
 
     int idx = b - g_policy_bindings;
     if (idx >= 0 && idx < MAX_POLICY_BINDINGS) {
@@ -985,6 +1020,10 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             }
             b->peer_keepalive_epoch = peer_status.epoch;
             b->peer_keepalive_seq = peer_status.sequence;
+            b->last_keepalive_rx_time = get_time_ms_hs();
+            b->keepalive_monitor_start_time =
+                b->last_keepalive_rx_time;
+            b->next_auto_retry_time = 0;
 
             local_state = pqc_hs_l3_state_locked(b);
             if (local_state == PQC_HS_STATE_HANDSHAKING ||
@@ -1015,19 +1054,8 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 return;
             }
 
-            b->handshake_give_up = false;
-            b->handshake_start_time = 0;
-            b->rotation_give_up = false;
-            b->rotation_start_time = 0;
-            b->key_ready = false;
-            if (b->is_initiator) {
-                b->send_poke = false;
-            } else {
-                b->local_request_id = 0;
-                b->local_keepalive_seq = 0;
-                b->send_poke = true;
-            }
-            pqc_hs_clear_cache_locked(b);
+            pqc_hs_begin_profile_recovery_locked(
+                b, b->last_keepalive_rx_time);
             pqc_flush_rx_queue(b);
             fprintf(stderr,
                     "[PQC-HS-L3] KEM key keepalive triggered automatic recovery for Profile %d (%s). Role=%s.\n",
@@ -1056,12 +1084,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             }
 
             b->peer_request_id = request_id;
-            b->handshake_give_up = false;
-            b->handshake_start_time = 0;
-            b->rotation_give_up = false;
-            b->rotation_start_time = 0;
-            b->key_ready = false;
-            pqc_hs_clear_cache_locked(b);
+            pqc_hs_begin_profile_recovery_locked(b, get_time_ms_hs());
             pqc_flush_rx_queue(b);
             fprintf(stderr,
                     "[PQC-HS] Accepted authenticated responder request %016llx. Restarting initiator handshake for Profile %d.\n",
@@ -1070,18 +1093,9 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             return;
         } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
             if (b->handshake_give_up) {
-                b->handshake_give_up = false;
-                b->handshake_start_time = 0;
-                b->rotation_give_up = false;
-                b->rotation_start_time = 0;
-                b->key_ready = false;
-                pthread_mutex_lock(&b->rx_mutex);
-                for (int q = 0; q < PQC_RX_QUEUE_SIZE; q++) {
-                    if (b->rx_queue[q]) { free(b->rx_queue[q]); b->rx_queue[q] = NULL; }
-                    b->rx_len[q] = 0;
-                }
-                b->rx_head = 0; b->rx_tail = 0;
-                pthread_mutex_unlock(&b->rx_mutex);
+                pqc_hs_begin_profile_recovery_locked(
+                    b, get_time_ms_hs());
+                pqc_flush_rx_queue(b);
                 fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder and flushing rx queue for Profile %d.\n", profile_id);
             }
         }
@@ -1452,13 +1466,57 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
     while (pqc_dispatcher_is_running() && !b->thread_exit_sig) {
         uint64_t loop_now = get_time_ms_hs();
         bool keepalive_enabled;
+        bool handshake_give_up;
+        bool keepalive_timeout_recovery = false;
+        bool auto_retry_started = false;
+        bool flush_rx_queue = false;
         uint8_t keepalive_state = PQC_HS_STATE_FAILED;
 
         pthread_mutex_lock(&g_key_mutex);
+        if (b->keepalive_enabled && b->key_ready) {
+            uint64_t monitor_from = b->last_keepalive_rx_time != 0
+                ? b->last_keepalive_rx_time
+                : b->keepalive_monitor_start_time;
+
+            if (monitor_from != 0 && loop_now >= monitor_from &&
+                loop_now - monitor_from >=
+                    PQC_HS_KEEPALIVE_TIMEOUT_MS) {
+                pqc_hs_begin_profile_recovery_locked(b, loop_now);
+                keepalive_timeout_recovery = true;
+                flush_rx_queue = true;
+            }
+        }
+
+        if (b->handshake_give_up) {
+            if (b->next_auto_retry_time == 0) {
+                b->next_auto_retry_time =
+                    loop_now + PQC_HS_AUTO_RETRY_INTERVAL_MS;
+            } else if (loop_now >= b->next_auto_retry_time) {
+                pqc_hs_begin_profile_recovery_locked(b, loop_now);
+                auto_retry_started = true;
+                flush_rx_queue = true;
+            }
+        }
+
         keepalive_enabled = b->keepalive_enabled;
         if (keepalive_enabled)
             keepalive_state = pqc_hs_l3_state_locked(b);
+        handshake_give_up = b->handshake_give_up;
         pthread_mutex_unlock(&g_key_mutex);
+
+        if (flush_rx_queue)
+            pqc_flush_rx_queue(b);
+        if (keepalive_timeout_recovery) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Profile %d missed %d keepalive intervals; starting independent recovery as %s.\n",
+                    profile_id, PQC_HS_KEEPALIVE_MISSED_LIMIT,
+                    is_initiator ? "Initiator" : "Responder");
+        } else if (auto_retry_started) {
+            fprintf(stderr,
+                    "[PQC-HS-L3] Profile %d automatically retrying after handshake give-up as %s.\n",
+                    profile_id,
+                    is_initiator ? "Initiator" : "Responder");
+        }
 
         if (keepalive_enabled && next_keepalive_time == 0) {
             next_keepalive_time =
@@ -1480,7 +1538,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             }
         }
 
-        if (b->handshake_give_up) {
+        if (handshake_give_up) {
             usleep(500000);
             continue;
         }
@@ -2072,6 +2130,9 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->local_keepalive_seq = 0;
         b->peer_keepalive_epoch = 0;
         b->peer_keepalive_seq = 0;
+        b->keepalive_monitor_start_time = 0;
+        b->last_keepalive_rx_time = 0;
+        b->next_auto_retry_time = 0;
         b->keepalive_enabled = false;
         for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
             memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
@@ -2123,6 +2184,9 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
             b->rotation_start_time = 0;
             b->send_poke = true;
             b->keepalive_enabled = false;
+            b->keepalive_monitor_start_time = 0;
+            b->last_keepalive_rx_time = 0;
+            b->next_auto_retry_time = 0;
         }
         b->policy_id = profile_id;
         b->profile_id = profile_id;
@@ -2159,6 +2223,12 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->wan_ifname[sizeof(b->wan_ifname) - 1] = '\0';
         snprintf(b->key_id, sizeof(b->key_id), "%s", key_id ? key_id : "");
         b->is_tunnel = true;
+        /* Advertise FAILED/HANDSHAKING as well as READY.  This lets a newly
+         * rebooted profile wake a peer which is still holding the old key. */
+        b->keepalive_enabled = true;
+        b->keepalive_monitor_start_time = get_time_ms_hs();
+        b->last_keepalive_rx_time = 0;
+        b->next_auto_retry_time = 0;
 
         if (b->local_priv) free(b->local_priv);
         if (b->local_pub) free(b->local_pub);
@@ -2287,6 +2357,9 @@ void sig_pqc_finalize_reload(void) {
             b->local_keepalive_seq = 0;
             b->peer_keepalive_epoch = 0;
             b->peer_keepalive_seq = 0;
+            b->keepalive_monitor_start_time = 0;
+            b->last_keepalive_rx_time = 0;
+            b->next_auto_retry_time = 0;
             b->worker_state = PQC_RUNTIME_STOPPED;
             b->worker_last_error = 0;
         }
@@ -2468,6 +2541,10 @@ int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_m
             b->local_request_id = new_request_id;
             b->local_keepalive_seq = 0;
             b->send_poke = !b->is_initiator;
+            b->keepalive_enabled = b->is_tunnel;
+            b->keepalive_monitor_start_time = get_time_ms_hs();
+            b->last_keepalive_rx_time = 0;
+            b->next_auto_retry_time = 0;
             pqc_hs_clear_cache_locked(b);
             pqc_flush_rx_queue(b);
 

@@ -85,6 +85,12 @@ typedef struct {
     uint64_t local_keepalive_seq;
     uint64_t peer_keepalive_epoch;
     uint64_t peer_keepalive_seq;
+    /* Per-profile liveness state.  Keepalive transmission remains on its
+     * own 15-second schedule; these timestamps only decide when this one
+     * profile has missed three consecutive peer keepalives. */
+    uint64_t keepalive_monitor_start_time;
+    uint64_t last_keepalive_rx_time;
+    uint64_t next_auto_retry_time;
 
     char *local_priv;
     char *local_pub;
