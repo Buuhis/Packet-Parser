@@ -41,6 +41,7 @@ enum mwan_encap_type {
 
 struct mwan_tunnel {
     u32 ifindex;
+    u32 configured_ifindex;
     u32 weight;
 
     /* Caching fields for performance */
@@ -48,6 +49,9 @@ struct mwan_tunnel {
     spinlock_t gateway_mac_lock;
     u8 gateway_mac[ETH_ALEN];
     bool mac_resolved;
+    __be32 peer_tunnel_ip;
+    u64 discovery_nonce;
+    bool peer_ip_resolved;
     bool is_ethernet;
     enum mwan_encap_type encap_type;
 };

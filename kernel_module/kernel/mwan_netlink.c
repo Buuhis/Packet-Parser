@@ -1,10 +1,13 @@
 #include "mwan_netlink.h"
+#include "mwan_mac_discovery.h"
 #include "mwan_proto.h"
 #include "mwan_state.h"
 
 #include <net/genetlink.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+
+static struct genl_family mwan_genl_family;
 
 /* Netlink Policy for parsing payload */
 static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
@@ -18,6 +21,9 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_KEY_ID] = { .type = NLA_U8 },
     [MWAN_ATTR_PREV_KEY] = NLA_POLICY_EXACT_LEN(MWAN_MAX_KEY_LEN),
     [MWAN_ATTR_PREV_KEY_ID] = { .type = NLA_U8 },
+    [MWAN_ATTR_QUERY_IFINDEX] = { .type = NLA_U32 },
+    [MWAN_ATTR_PEER_TUNNEL_IP] = NLA_POLICY_EXACT_LEN(sizeof(__be32)),
+    [MWAN_ATTR_PEER_RESOLVED] = { .type = NLA_U8 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -72,6 +78,8 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
 
             new_cfg->tunnels[new_cfg->num_tunnels].ifindex =
                 nla_get_u32(tb[MWAN_TUN_IFINDEX]);
+            new_cfg->tunnels[new_cfg->num_tunnels].configured_ifindex =
+                new_cfg->tunnels[new_cfg->num_tunnels].ifindex;
             new_cfg->tunnels[new_cfg->num_tunnels].weight =
                 nla_get_u32(tb[MWAN_TUN_WEIGHT]);
 
@@ -181,6 +189,73 @@ err_free_config:
     return ret;
 }
 
+/* Read-only runtime query. Discovery owns the peer tuple; userspace supplies
+ * only the data-tunnel ifindex so no database value can become authoritative
+ * for liveness/failover. */
+static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+    struct mwan_config *cfg;
+    struct mwan_tunnel *tun = NULL;
+    struct sk_buff *reply;
+    void *reply_hdr;
+    __be32 peer_tunnel_ip = 0;
+    u32 ifindex;
+    bool resolved = false;
+    u32 i;
+    int ret;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_QUERY_IFINDEX])
+        return -EINVAL;
+    ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    if (ifindex == 0)
+        return -EINVAL;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg) {
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            if (cfg->tunnels[i].ifindex == ifindex ||
+                cfg->tunnels[i].configured_ifindex == ifindex) {
+                tun = &cfg->tunnels[i];
+                resolved = mwan_mac_get_peer_tunnel_ip(
+                    tun, &peer_tunnel_ip);
+                break;
+            }
+        }
+    }
+    rcu_read_unlock();
+    if (!tun)
+        return -ENOENT;
+
+    reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+    if (!reply)
+        return -ENOMEM;
+    reply_hdr = genlmsg_put_reply(reply, info, &mwan_genl_family, 0,
+                                  MWAN_CMD_GET_TUNNEL_PEERS);
+    if (!reply_hdr) {
+        nlmsg_free(reply);
+        return -EMSGSIZE;
+    }
+
+    ret = nla_put_u32(reply, MWAN_ATTR_QUERY_IFINDEX, ifindex);
+    if (!ret)
+        ret = nla_put_u8(reply, MWAN_ATTR_PEER_RESOLVED,
+                         resolved ? 1 : 0);
+    if (!ret && resolved)
+        ret = nla_put(reply, MWAN_ATTR_PEER_TUNNEL_IP,
+                      sizeof(peer_tunnel_ip), &peer_tunnel_ip);
+    if (ret) {
+        genlmsg_cancel(reply, reply_hdr);
+        nlmsg_free(reply);
+        return ret;
+    }
+
+    genlmsg_end(reply, reply_hdr);
+    return genlmsg_reply(reply, info);
+}
+
 /* Operation Definition */
 static const struct genl_ops mwan_genl_ops[] = {
     {
@@ -188,6 +263,13 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = 0,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_set_config,
+        .dumpit = NULL,
+    },
+    {
+        .cmd    = MWAN_CMD_GET_TUNNEL_PEERS,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_get_tunnel_peers,
         .dumpit = NULL,
     },
 };

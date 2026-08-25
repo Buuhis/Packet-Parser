@@ -3,12 +3,55 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <arpa/inet.h>
 #include <net/if.h>
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 #include "../kernel/mwan_proto.h"
 #include "../sig_encrypt/inc/pqc_handshake.h"
+
+struct tunnel_peer_reply {
+    unsigned int expected_ifindex;
+    struct in_addr peer_addr;
+    bool resolved;
+    bool received;
+    bool valid;
+};
+
+static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
+{
+    struct tunnel_peer_reply *reply = arg;
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *ghdr = nlmsg_data(nlh);
+    struct nlattr *attrs[MWAN_ATTR_MAX + 1] = {0};
+
+    reply->received = true;
+    if (!ghdr || ghdr->cmd != MWAN_CMD_GET_TUNNEL_PEERS ||
+        genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
+        !attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !attrs[MWAN_ATTR_PEER_RESOLVED] ||
+        nla_get_u32(attrs[MWAN_ATTR_QUERY_IFINDEX]) !=
+            reply->expected_ifindex)
+        return NL_STOP;
+
+    reply->resolved = nla_get_u8(attrs[MWAN_ATTR_PEER_RESOLVED]) != 0;
+    if (!reply->resolved) {
+        reply->valid = true;
+        return NL_STOP;
+    }
+    if (!attrs[MWAN_ATTR_PEER_TUNNEL_IP] ||
+        nla_len(attrs[MWAN_ATTR_PEER_TUNNEL_IP]) !=
+            sizeof(reply->peer_addr.s_addr))
+        return NL_STOP;
+
+    memcpy(&reply->peer_addr.s_addr,
+           nla_data(attrs[MWAN_ATTR_PEER_TUNNEL_IP]),
+           sizeof(reply->peer_addr.s_addr));
+    reply->valid = true;
+    return NL_STOP;
+}
 
 
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
@@ -169,6 +212,74 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
 out:
     nlmsg_free(msg);
     nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
+                                size_t peer_ip_len)
+{
+    struct tunnel_peer_reply reply = {0};
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    unsigned int ifindex;
+    int family_id;
+    int ret = -EIO;
+
+    if (!ifname || !ifname[0] || !peer_ip || peer_ip_len == 0)
+        return -EINVAL;
+    peer_ip[0] = '\0';
+    ifindex = if_nametoindex(ifname);
+    if (ifindex == 0)
+        return -ENODEV;
+    reply.expected_ifindex = ifindex;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_GET_TUNNEL_PEERS, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_QUERY_IFINDEX, ifindex) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    if (nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                            kernel_sync_tunnel_peer_valid_cb,
+                            &reply) < 0 ||
+        nl_send_auto(sock, msg) < 0 || nl_recvmsgs_default(sock) < 0)
+        goto out;
+
+    if (!reply.received || !reply.valid) {
+        ret = -EPROTO;
+        goto out;
+    }
+    if (!reply.resolved) {
+        ret = -EAGAIN;
+        goto out;
+    }
+    if (!inet_ntop(AF_INET, &reply.peer_addr, peer_ip, peer_ip_len)) {
+        ret = -errno;
+        goto out;
+    }
+    ret = 0;
+
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
     return ret;
 }
 

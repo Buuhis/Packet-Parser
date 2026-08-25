@@ -36,8 +36,8 @@ static void mwan_config_release_devices(struct mwan_config *cfg)
 
 }
 
-static void mwan_config_preserve_peer_macs(struct mwan_config *new_cfg,
-                                           struct mwan_config *old_cfg)
+static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
+                                            struct mwan_config *old_cfg)
 {
     u32 i;
     u32 j;
@@ -51,7 +51,8 @@ static void mwan_config_preserve_peer_macs(struct mwan_config *new_cfg,
         for (j = 0; j < old_cfg->num_tunnels; j++) {
             struct mwan_tunnel *old_tun = &old_cfg->tunnels[j];
 
-            if (new_tun->ifindex != old_tun->ifindex)
+            if (new_tun->configured_ifindex !=
+                old_tun->configured_ifindex)
                 continue;
             spin_lock_bh(&old_tun->gateway_mac_lock);
             if (old_tun->mac_resolved &&
@@ -60,6 +61,10 @@ static void mwan_config_preserve_peer_macs(struct mwan_config *new_cfg,
                 ether_addr_copy(new_tun->gateway_mac,
                                 old_tun->gateway_mac);
                 new_tun->mac_resolved = true;
+                new_tun->peer_tunnel_ip = old_tun->peer_tunnel_ip;
+                new_tun->peer_ip_resolved =
+                    old_tun->peer_ip_resolved;
+                new_tun->discovery_nonce = old_tun->discovery_nonce;
                 spin_unlock_bh(&new_tun->gateway_mac_lock);
             }
             spin_unlock_bh(&old_tun->gateway_mac_lock);
@@ -177,9 +182,14 @@ int mwan_state_update(struct mwan_config *new_cfg)
     for (i = 0; i < new_cfg->num_tunnels; i++) {
         struct mwan_tunnel *tun = &new_cfg->tunnels[i];
 
+        if (tun->configured_ifindex == 0)
+            tun->configured_ifindex = tun->ifindex;
         spin_lock_init(&tun->gateway_mac_lock);
         eth_zero_addr(tun->gateway_mac);
         tun->mac_resolved = false;
+        tun->peer_tunnel_ip = 0;
+        tun->discovery_nonce = 0;
+        tun->peer_ip_resolved = false;
         if (U32_MAX - new_cfg->total_weight < tun->weight) {
             pr_err("mwan_kmod: Tunnel weight sum overflow\n");
             err = -EOVERFLOW;
@@ -373,9 +383,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
                 new_cfg->encrypt_layer, new_cfg->encrypt_type);
     }
     /* Netlink updates (for example PQC key rotation) replace the whole
-     * config. Preserve the independently learned MAC for an unchanged data
-     * tunnel so traffic does not fall back to discovery on every update. */
-    mwan_config_preserve_peer_macs(new_cfg, old);
+     * config. Preserve the independently learned MAC/IP tuple for an
+     * unchanged data tunnel so traffic and failover do not rediscover it. */
+    mwan_config_preserve_peer_state(new_cfg, old);
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
     synchronize_rcu();
     mwan_config_destroy(old);
@@ -386,7 +396,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     mutex_unlock(&cfg_lock);
 
     mwan_l2_flow_manager_start(new_cfg);
-    /* Resolve one independent peer MAC for every published bonding tunnel. */
+    /* Resolve one independent peer MAC/IP tuple for every bonding tunnel. */
     mwan_mac_discovery_kick();
 
     return 0;

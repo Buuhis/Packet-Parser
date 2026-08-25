@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 
@@ -90,6 +91,26 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
             if (node_id <= 0) { fprintf(stderr, "Error: Invalid ID\n"); return 1; }
             char msg[32];
             snprintf(msg, sizeof(msg), "-r %d", node_id);
+            return client_send_and_print(socket_path, msg);
+        }
+
+        /* ----- -gs / --get-status <data_tunnel_interface> ------------------ */
+        if (strcmp(argv[i], "-gs") == 0 ||
+            strcmp(argv[i], "--get-status") == 0) {
+            size_t ifname_len;
+            char msg[32];
+
+            if (i + 1 >= argc || i + 2 != argc) {
+                fprintf(stderr,
+                        "Error: Usage: -gs/--get-status <interface>\n");
+                return 1;
+            }
+            ifname_len = strnlen(argv[i + 1], IFNAMSIZ);
+            if (ifname_len == 0 || ifname_len >= IFNAMSIZ) {
+                fprintf(stderr, "Error: Invalid tunnel interface\n");
+                return 1;
+            }
+            snprintf(msg, sizeof(msg), "get-status %s", argv[i + 1]);
             return client_send_and_print(socket_path, msg);
         }
 
@@ -180,6 +201,46 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
 /* ================================================================== */
 
 static unsigned long provision_generation;
+
+/* Current phase: expose the runtime-discovered peer tunnel IP. The command
+ * name intentionally remains get-status so BFD can later extend the reply
+ * without changing the user-facing syntax. */
+static void handle_get_status(int client_fd, const char *ifname,
+                              app_context_t *ctx)
+{
+    char peer_ip[INET_ADDRSTRLEN] = {0};
+    bool active_tunnel = false;
+    int rc;
+
+    runtime_config_lock();
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        if (strcmp(ctx->cfg.sdwan_tuns[i].tunnel_ifname, ifname) == 0) {
+            active_tunnel = true;
+            break;
+        }
+    }
+    runtime_config_unlock();
+
+    if (!active_tunnel) {
+        reply_json(client_fd, 404,
+                   "Tunnel not found in running configuration");
+        return;
+    }
+
+    rc = kernel_sync_get_tunnel_peer(ifname, peer_ip, sizeof(peer_ip));
+    if (rc == 0) {
+        reply_json(client_fd, 200, peer_ip);
+    } else if (rc == -EAGAIN) {
+        reply_json(client_fd, 503, "Peer tunnel IP not resolved");
+    } else if (rc == -ENODEV) {
+        reply_json(client_fd, 503,
+                   "Kernel module or tunnel interface unavailable");
+    } else {
+        log_warn("[GET-STATUS] Failed to query peer for tunnel %s: %s",
+                 ifname, strerror(-rc));
+        reply_json(client_fd, 500, "Failed to query tunnel peer");
+    }
+}
 
 static enum kernel_sync_result apply_candidate(app_context_t *ctx,
                                                const app_context_t *candidate)
@@ -713,6 +774,21 @@ static int parse_tunnel_command(const char *args, int *profile_id,
 /* ================================================================== */
 void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *running_ctx)
 {
+
+    /* get-status <data_tunnel_interface> */
+    if (strncmp(buf, "get-status ", 11) == 0) {
+        const char *ifname = buf + 11;
+        size_t ifname_len = strnlen(ifname, IFNAMSIZ);
+
+        if (ifname_len == 0 || ifname_len >= IFNAMSIZ ||
+            ifname[ifname_len] != '\0' || strpbrk(ifname, " \t\r\n")) {
+            reply_json(client_fd, 400,
+                       "Usage: get-status <interface>");
+            return;
+        }
+        handle_get_status(client_fd, ifname, running_ctx);
+        return;
+    }
 
     /* -id <profile_id>: always perform a full DB reload, even when a
      * configuration is already active. */

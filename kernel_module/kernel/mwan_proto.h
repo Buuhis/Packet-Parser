@@ -52,6 +52,7 @@ struct mwan_l2_pqc_hdr {
 enum mwan_genl_cmds {
     MWAN_CMD_UNSPEC = 0,
     MWAN_CMD_SET_CONFIG,  /* sdwan send to mwan_kmod */
+    MWAN_CMD_GET_TUNNEL_PEERS, /* query runtime peer learned by discovery */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -69,6 +70,9 @@ enum mwan_genl_attrs {
     MWAN_ATTR_KEY_ID,        /* u8: current PQC traffic-key generation */
     MWAN_ATTR_PREV_KEY,      /* NLA_BINARY: previous 32-byte PQC key */
     MWAN_ATTR_PREV_KEY_ID,   /* u8: previous PQC traffic-key generation */
+    MWAN_ATTR_QUERY_IFINDEX, /* u32: data tunnel requested by userspace */
+    MWAN_ATTR_PEER_TUNNEL_IP,/* NLA_BINARY: network-order IPv4 address */
+    MWAN_ATTR_PEER_RESOLVED, /* u8: peer tunnel IP discovery completed */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

@@ -311,6 +311,7 @@ static void usage(const char *prog) {
     printf("  %s -id <profile_id>                    Send config request to the daemon\n", prog);
     printf("  %s -gi <node_id>                       Generate PQC identity keys for node\n", prog);
     printf("  %s -r <profile_id>                     Retry PQC handshake for profile\n", prog);
+    printf("  %s -gs/--get-status <interface>        Get the discovered peer tunnel IP\n", prog);
     printf("  %s -a/--add <profile_id> <tunnel_name> Add a tunnel dynamically\n", prog);
     printf("  %s -d/--delete <profile_id> <tunnel_name> Delete a tunnel dynamically\n", prog);
     printf("  %s -e/--edit <profile_id> <table.field> Edit a config field\n", prog);
