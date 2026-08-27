@@ -683,11 +683,14 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.rx_created),
                    atomic64_read(&cfg->flows.rx_expired),
                    atomic64_read(&cfg->flows.table_full));
-        seq_printf(m, "reorder late=%lld duplicate=%lld too_far=%lld skipped_on_timeout=%lld\n",
+        seq_printf(m, "reorder late=%lld duplicate=%lld too_far=%lld skipped_on_timeout=%lld resync=%lld resync_skipped=%lld resync_flushed=%lld\n",
                    atomic64_read(&cfg->flows.reorder_late),
                    atomic64_read(&cfg->flows.reorder_duplicate),
                    atomic64_read(&cfg->flows.reorder_too_far),
-                   atomic64_read(&cfg->flows.reorder_timeouts));
+                   atomic64_read(&cfg->flows.reorder_timeouts),
+                   atomic64_read(&cfg->flows.reorder_resync),
+                   atomic64_read(&cfg->flows.reorder_resync_skipped),
+                   atomic64_read(&cfg->flows.reorder_resync_flushed));
     }
     rcu_read_unlock();
     seq_printf(m, "cpu_high=%u recover_load=%u idle_unblock=%u emergency=%u max_shed=%u sample_ms=%u admitted=%llu no_eligible=%llu\n",

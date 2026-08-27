@@ -174,6 +174,9 @@ struct mwan_l2_flow_manager {
     atomic64_t reorder_duplicate;
     atomic64_t reorder_too_far;
     atomic64_t reorder_timeouts;
+    atomic64_t reorder_resync;
+    atomic64_t reorder_resync_skipped;
+    atomic64_t reorder_resync_flushed;
     struct delayed_work gc_work;
     struct mwan_config *cfg;
     bool stopping;

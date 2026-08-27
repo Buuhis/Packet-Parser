@@ -116,6 +116,9 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.reorder_duplicate, 0);
     atomic64_set(&cfg->flows.reorder_too_far, 0);
     atomic64_set(&cfg->flows.reorder_timeouts, 0);
+    atomic64_set(&cfg->flows.reorder_resync, 0);
+    atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
+    atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
     for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
         INIT_HLIST_HEAD(&cfg->flows.tx[i].head);
         spin_lock_init(&cfg->flows.tx[i].lock);
@@ -502,6 +505,7 @@ void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing)
 void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                              struct sk_buff *skb, u32 flow_seq)
 {
+    u32 delta;
     u32 slot;
 
     if (!flow || !skb) {
@@ -516,12 +520,31 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         kfree_skb(skb);
         return;
     }
-    if (unlikely((u32)(flow_seq - flow->expected_seq) >=
-                 MWAN_FLOW_RING_SIZE)) {
+    delta = (u32)(flow_seq - flow->expected_seq);
+    if (unlikely(delta >= MWAN_FLOW_RING_SIZE)) {
+        u32 flushed = 0;
+        int i;
+
+        /* This function is reached only after AES-GCM authentication has
+         * succeeded.  A validated packet to the right of the receive window
+         * must advance the window; dropping it while leaving expected_seq
+         * unchanged would permanently black-hole a high-rate UDP flow after
+         * a failover gap larger than MWAN_FLOW_RING_SIZE. */
         atomic64_inc(&flow->manager->reorder_too_far);
-        spin_unlock_bh(&flow->reorder_lock);
-        kfree_skb(skb);
-        return;
+        atomic64_inc(&flow->manager->reorder_resync);
+        atomic64_add(delta, &flow->manager->reorder_resync_skipped);
+        for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
+            if (!flow->ring[i])
+                continue;
+            kfree_skb(flow->ring[i]);
+            flow->ring[i] = NULL;
+            flow->slot_time[i] = 0;
+            flushed++;
+        }
+        if (flushed)
+            atomic64_add(flushed,
+                         &flow->manager->reorder_resync_flushed);
+        flow->expected_seq = flow_seq;
     }
 
     slot = flow_seq & MWAN_FLOW_RING_MASK;
