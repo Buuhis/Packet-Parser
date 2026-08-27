@@ -1,4 +1,5 @@
 #include "kernel_sync.h"
+#include "failover.h"
 #include "utils/logger.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -208,6 +209,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
              ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
              ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
     ret = KERNEL_SYNC_APPLIED;
+    (void)failover_service_reconcile(ctx);
 
 out:
     nlmsg_free(msg);

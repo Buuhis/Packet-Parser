@@ -18,7 +18,12 @@
 #define BFD_STARTUP_TX_US       1000000U
 #define BFD_MIN_INTERVAL_US     1000U
 #define BFD_MAX_EVENTS          4
+#define BFD_SOURCE_PORT_MIN     49152U
+#define BFD_SOURCE_PORT_COUNT   16384U
+#define BFD_SOURCE_BIND_TRIES   128U
 
+#define BFD_FLAG_POLL           0x20U
+#define BFD_FLAG_FINAL          0x10U
 #define BFD_FLAG_AUTH           0x04U
 #define BFD_FLAG_MULTIPOINT     0x01U
 
@@ -37,6 +42,8 @@ struct bfd_session {
     char ifname[IFNAMSIZ];
     struct in_addr local_ip;
     struct in_addr peer_ip;
+    unsigned int ifindex;
+    uint16_t source_port;
     int tx_fd;
 
     uint32_t local_discriminator;
@@ -46,6 +53,7 @@ struct bfd_session {
     uint8_t local_detect_mult;
     uint8_t remote_detect_mult;
     uint32_t desired_min_tx_us;
+    uint32_t active_desired_min_tx_us;
     uint32_t required_min_rx_us;
     uint32_t remote_desired_min_tx_us;
     uint32_t remote_required_min_rx_us;
@@ -54,6 +62,8 @@ struct bfd_session {
     uint64_t next_tx_ns;
     uint64_t detection_deadline_ns;
     uint32_t prng;
+    bool poll_active;
+    bool send_final;
 
     struct bfd_stabilizer stabilizer;
     struct bfd_callbacks callbacks;
@@ -155,6 +165,31 @@ static uint32_t manager_new_discriminator(const struct bfd_manager *manager)
         discriminator = nonzero_random_u32();
     } while (manager_has_discriminator(manager, discriminator));
     return discriminator;
+}
+
+static int bind_session_source(struct bfd_session *session)
+{
+    struct sockaddr_in local;
+    unsigned int attempt;
+
+    memset(&local, 0, sizeof(local));
+    local.sin_family = AF_INET;
+    local.sin_addr = session->local_ip;
+    for (attempt = 0; attempt < BFD_SOURCE_BIND_TRIES; attempt++) {
+        uint32_t port = BFD_SOURCE_PORT_MIN +
+                        session_random(session) % BFD_SOURCE_PORT_COUNT;
+
+        local.sin_port = htons((uint16_t)port);
+        if (bind(session->tx_fd, (const struct sockaddr *)&local,
+                 sizeof(local)) == 0) {
+            session->source_port = (uint16_t)port;
+            return 0;
+        }
+        if (errno != EADDRINUSE)
+            return -1;
+    }
+    errno = EADDRINUSE;
+    return -1;
 }
 
 const char *bfd_state_name(enum bfd_state state)
@@ -341,6 +376,18 @@ static void raw_state_transition(struct bfd_session *session,
     if (new_state == BFD_STATE_DOWN) {
         session->remote_discriminator = 0;
         session->detection_deadline_ns = 0;
+        session->active_desired_min_tx_us =
+            session->desired_min_tx_us > BFD_STARTUP_TX_US ?
+            session->desired_min_tx_us : BFD_STARTUP_TX_US;
+        session->poll_active = false;
+        session->send_final = false;
+    } else if (new_state == BFD_STATE_UP &&
+               session->active_desired_min_tx_us !=
+                   session->desired_min_tx_us) {
+        /* RFC 5880 6.8.3: decreasing Desired Min TX while Up requires a
+         * Poll Sequence.  Advertise the target now, but continue pacing at
+         * the old interval until the peer acknowledges it with Final. */
+        session->poll_active = true;
     }
 
     /* Send a state update promptly; normal pacing resumes after this packet. */
@@ -362,11 +409,19 @@ static uint32_t session_advertised_tx_us(const struct bfd_session *session)
 
 static void session_schedule_next_tx(struct bfd_session *session, uint64_t now_ns)
 {
-    uint32_t interval_us = session_advertised_tx_us(session);
-    uint32_t jitter_us = interval_us / 4U;
+    uint32_t interval_us = session->active_desired_min_tx_us;
+    uint32_t minimum_reduction_pct;
+    uint32_t reduction_pct;
 
-    if (jitter_us > 0)
-        interval_us += session_random(session) % (jitter_us + 1U);
+    if (session->remote_required_min_rx_us > interval_us)
+        interval_us = session->remote_required_min_rx_us;
+
+    /* RFC 5880 6.8.7: transmit 0--25% earlier than the negotiated
+     * interval (10--25% when Detect Mult is one), never later. */
+    minimum_reduction_pct = session->local_detect_mult == 1 ? 10U : 0U;
+    reduction_pct = minimum_reduction_pct +
+        session_random(session) % (26U - minimum_reduction_pct);
+    interval_us -= (uint32_t)(((uint64_t)interval_us * reduction_pct) / 100U);
     session->next_tx_ns = now_ns + us_to_ns(interval_us);
 }
 
@@ -379,6 +434,10 @@ static int session_send(struct bfd_session *session, uint64_t now_ns)
     memset(&packet, 0, sizeof(packet));
     packet.version_diag = (uint8_t)(1U << 5U);
     packet.state_flags = (uint8_t)((uint8_t)session->raw_state << 6U);
+    if (session->poll_active)
+        packet.state_flags |= BFD_FLAG_POLL;
+    if (session->send_final)
+        packet.state_flags |= BFD_FLAG_FINAL;
     packet.detect_mult = session->local_detect_mult;
     packet.length = BFD_CONTROL_LEN;
     packet.my_discriminator = htonl(session->local_discriminator);
@@ -394,9 +453,12 @@ static int session_send(struct bfd_session *session, uint64_t now_ns)
     sent = sendto(session->tx_fd, &packet, sizeof(packet), 0,
                   (const struct sockaddr *)&peer, sizeof(peer));
     session_schedule_next_tx(session, now_ns);
-    if (sent != (ssize_t)sizeof(packet))
+    if (sent != (ssize_t)sizeof(packet)) {
+        session->counters.send_errors++;
         return -1;
+    }
 
+    session->send_final = false;
     session->counters.tx_packets++;
     return 0;
 }
@@ -448,6 +510,14 @@ static struct bfd_session *find_session_by_peer(struct bfd_manager *manager,
     return NULL;
 }
 
+static bool session_path_matches(const struct bfd_session *session,
+                                 const struct in_addr *destination,
+                                 unsigned int ifindex)
+{
+    return destination && destination->s_addr == session->local_ip.s_addr &&
+           (session->ifindex == 0 || session->ifindex == ifindex);
+}
+
 static void update_detection_timer(struct bfd_session *session, uint64_t now_ns)
 {
     uint32_t base_us;
@@ -469,6 +539,8 @@ static void process_packet(struct bfd_manager *manager,
                            const struct bfd_control_packet *packet,
                            size_t length,
                            const struct sockaddr_in *source,
+                           const struct in_addr *destination,
+                           unsigned int ifindex,
                            int ttl,
                            uint64_t now_ns)
 {
@@ -479,8 +551,12 @@ static void process_packet(struct bfd_manager *manager,
 
     if (!packet_is_valid(packet, length)) {
         session = find_session_by_peer(manager, &source->sin_addr);
-        if (session)
-            session->counters.invalid_packets++;
+        if (session) {
+            if (session_path_matches(session, destination, ifindex))
+                session->counters.invalid_packets++;
+            else
+                session->counters.path_drops++;
+        }
         return;
     }
     your_discriminator = ntohl(packet->your_discriminator);
@@ -495,6 +571,10 @@ static void process_packet(struct bfd_manager *manager,
     }
     if (source->sin_addr.s_addr != session->peer_ip.s_addr) {
         session->counters.peer_drops++;
+        return;
+    }
+    if (!session_path_matches(session, destination, ifindex)) {
+        session->counters.path_drops++;
         return;
     }
     if (your_discriminator != 0 && your_discriminator != session->local_discriminator) {
@@ -515,6 +595,18 @@ static void process_packet(struct bfd_manager *manager,
     session->remote_desired_min_tx_us = ntohl(packet->desired_min_tx);
     session->remote_required_min_rx_us = ntohl(packet->required_min_rx);
     update_detection_timer(session, now_ns);
+
+    if ((packet->state_flags & BFD_FLAG_POLL) != 0) {
+        session->send_final = true;
+        session->next_tx_ns = now_ns;
+    }
+    if ((packet->state_flags & BFD_FLAG_FINAL) != 0 &&
+        session->poll_active) {
+        session->active_desired_min_tx_us =
+            session_advertised_tx_us(session);
+        session->poll_active = false;
+        session->next_tx_ns = now_ns;
+    }
 
     switch (session->raw_state) {
     case BFD_STATE_DOWN:
@@ -549,6 +641,8 @@ static void receive_packets(struct bfd_manager *manager, uint64_t now_ns)
         struct iovec iov;
         char control[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(int))];
         struct cmsghdr *cmsg;
+        struct in_addr destination = { .s_addr = 0 };
+        unsigned int ifindex = 0;
         int ttl = -1;
         ssize_t received;
 
@@ -573,10 +667,29 @@ static void receive_packets(struct bfd_manager *manager, uint64_t now_ns)
             continue;
 
         for (cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-            if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TTL)
+            if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TTL) {
                 memcpy(&ttl, CMSG_DATA(cmsg), sizeof(ttl));
+            } else if (cmsg->cmsg_level == IPPROTO_IP &&
+                       cmsg->cmsg_type == IP_PKTINFO &&
+                       cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                const struct in_pktinfo *pktinfo =
+                    (const struct in_pktinfo *)CMSG_DATA(cmsg);
+
+                destination = pktinfo->ipi_addr;
+                ifindex = (unsigned int)pktinfo->ipi_ifindex;
+            }
         }
-        process_packet(manager, &packet, (size_t)received, &source, ttl, now_ns);
+        if ((msg.msg_flags & MSG_CTRUNC) != 0 ||
+            destination.s_addr == 0 || ifindex == 0) {
+            struct bfd_session *session =
+                find_session_by_peer(manager, &source.sin_addr);
+
+            if (session)
+                session->counters.pktinfo_drops++;
+            continue;
+        }
+        process_packet(manager, &packet, (size_t)received, &source,
+                       &destination, ifindex, ttl, now_ns);
     }
 }
 
@@ -706,7 +819,6 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
                                              const struct bfd_callbacks *callbacks)
 {
     struct bfd_session *session;
-    struct sockaddr_in local;
     int ttl = 255;
 
     if (!manager || !config || !stability || manager->session_count >= BFD_MAX_SESSIONS ||
@@ -724,7 +836,15 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
     session->tx_fd = -1;
     session->local_ip = config->local_ip;
     session->peer_ip = config->peer_ip;
+    if (config->ifname && config->ifname[0] != '\0') {
+        session->ifindex = if_nametoindex(config->ifname);
+        if (session->ifindex == 0)
+            goto error;
+    }
     session->desired_min_tx_us = config->desired_min_tx_us;
+    session->active_desired_min_tx_us =
+        config->desired_min_tx_us > BFD_STARTUP_TX_US ?
+        config->desired_min_tx_us : BFD_STARTUP_TX_US;
     session->required_min_rx_us = config->required_min_rx_us;
     session->local_detect_mult = config->detect_mult;
     session->raw_state = BFD_STATE_DOWN;
@@ -752,10 +872,7 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
                    strlen(session->ifname) + 1U) < 0)
         goto error;
 
-    memset(&local, 0, sizeof(local));
-    local.sin_family = AF_INET;
-    local.sin_addr = session->local_ip;
-    if (bind(session->tx_fd, (const struct sockaddr *)&local, sizeof(local)) < 0)
+    if (bind_session_source(session) < 0)
         goto error;
 
     session->next_tx_ns = monotonic_ns();
@@ -767,6 +884,31 @@ error:
         close(session->tx_fd);
     free(session);
     return NULL;
+}
+
+int bfd_manager_remove_session(struct bfd_manager *manager,
+                               struct bfd_session *session)
+{
+    size_t i;
+
+    if (!manager || !session)
+        return -EINVAL;
+    for (i = 0; i < manager->session_count; i++) {
+        if (manager->sessions[i] != session)
+            continue;
+        if (session->tx_fd >= 0)
+            close(session->tx_fd);
+        free(session);
+        manager->session_count--;
+        if (i < manager->session_count) {
+            memmove(&manager->sessions[i], &manager->sessions[i + 1],
+                    (manager->session_count - i) *
+                    sizeof(manager->sessions[0]));
+        }
+        manager->sessions[manager->session_count] = NULL;
+        return 0;
+    }
+    return -ENOENT;
 }
 
 int bfd_manager_poll(struct bfd_manager *manager, int timeout_ms)
@@ -800,6 +942,16 @@ int bfd_manager_poll(struct bfd_manager *manager, int timeout_ms)
 const char *bfd_session_ifname(const struct bfd_session *session)
 {
     return session ? session->ifname : "";
+}
+
+unsigned int bfd_session_ifindex(const struct bfd_session *session)
+{
+    return session ? session->ifindex : 0;
+}
+
+uint16_t bfd_session_source_port(const struct bfd_session *session)
+{
+    return session ? session->source_port : 0;
 }
 
 const struct in_addr *bfd_session_local_ip(const struct bfd_session *session)
@@ -840,6 +992,11 @@ uint32_t bfd_session_penalty(const struct bfd_session *session)
 bool bfd_session_is_suppressed(const struct bfd_session *session)
 {
     return session && session->stabilizer.suppressed;
+}
+
+bool bfd_session_poll_active(const struct bfd_session *session)
+{
+    return session && session->poll_active;
 }
 
 const struct bfd_counters *bfd_session_counters(const struct bfd_session *session)

@@ -1,11 +1,15 @@
 #ifndef SDWAN_FAILOVER_H
 #define SDWAN_FAILOVER_H
 
-/*
- * The standalone phase deliberately exposes only BFD manager APIs from bfd.h.
- * This header reserves the integration boundary: a later main daemon will
- * consume published UP/DOWN callbacks here, not raw BFD transitions.
- */
 #include "bfd.h"
+#include "app_context.h"
+
+/* Replace the desired data-tunnel snapshot after a config reached the kernel.
+ * The worker reconciles sessions incrementally; this call never waits for BFD
+ * discovery or changes kernel path selection. */
+int failover_service_reconcile(const app_context_t *ctx);
+
+/* Stop the worker and release every BFD session. */
+void failover_service_stop(void);
 
 #endif /* SDWAN_FAILOVER_H */

@@ -87,6 +87,9 @@ struct bfd_counters {
     uint64_t ttl_drops;
     uint64_t discriminator_drops;
     uint64_t peer_drops;
+    uint64_t pktinfo_drops;
+    uint64_t path_drops;
+    uint64_t send_errors;
     uint64_t timeouts;
     uint64_t raw_state_transitions;
     uint64_t published_state_transitions;
@@ -104,6 +107,8 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
                                              const struct bfd_session_config *config,
                                              const struct bfd_stability_config *stability,
                                              const struct bfd_callbacks *callbacks);
+int bfd_manager_remove_session(struct bfd_manager *manager,
+                               struct bfd_session *session);
 
 /* Process packets and due timers. timeout_ms is an upper bound, not a promise. */
 int bfd_manager_poll(struct bfd_manager *manager, int timeout_ms);
@@ -113,6 +118,8 @@ const char *bfd_stable_state_name(enum bfd_stable_state state);
 const char *bfd_stabilizer_state_name(enum bfd_stabilizer_state state);
 
 const char *bfd_session_ifname(const struct bfd_session *session);
+unsigned int bfd_session_ifindex(const struct bfd_session *session);
+uint16_t bfd_session_source_port(const struct bfd_session *session);
 const struct in_addr *bfd_session_local_ip(const struct bfd_session *session);
 const struct in_addr *bfd_session_peer_ip(const struct bfd_session *session);
 enum bfd_state bfd_session_raw_state(const struct bfd_session *session);
@@ -121,6 +128,7 @@ enum bfd_stabilizer_state bfd_session_stabilizer_state(const struct bfd_session 
 uint32_t bfd_session_detection_time_us(const struct bfd_session *session);
 uint32_t bfd_session_penalty(const struct bfd_session *session);
 bool bfd_session_is_suppressed(const struct bfd_session *session);
+bool bfd_session_poll_active(const struct bfd_session *session);
 const struct bfd_counters *bfd_session_counters(const struct bfd_session *session);
 
 #endif /* SDWAN_FAILOVER_BFD_H */

@@ -124,6 +124,52 @@ static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *ip
     return udph->dest == htons(7090) || udph->source == htons(7090);
 }
 
+/* Single-hop BFD probes belong to the tunnel selected by their bound
+ * userspace socket.  They must not be re-hashed onto another data tunnel. */
+static inline bool is_bfd_control_packet(struct sk_buff *skb,
+                                         struct iphdr *iph)
+{
+    struct udphdr udph_buf;
+    const struct udphdr *udph;
+    int network_offset;
+    int ip_hlen;
+
+    if (!skb || !iph || iph->version != 4 || iph->ihl < 5 ||
+        iph->protocol != IPPROTO_UDP ||
+        (iph->frag_off & htons(IP_OFFSET)) != 0)
+        return false;
+    network_offset = skb_network_offset(skb);
+    ip_hlen = iph->ihl * 4;
+    if (network_offset < 0 || ntohs(iph->tot_len) <
+                              ip_hlen + sizeof(struct udphdr))
+        return false;
+    udph = skb_header_pointer(skb, network_offset + ip_hlen,
+                              sizeof(udph_buf), &udph_buf);
+    return udph && udph->dest == htons(3784);
+}
+
+static unsigned int mwan_dispatch_encap(struct sk_buff *skb,
+                                        struct mwan_config *cfg,
+                                        u8 tun_idx)
+{
+    struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
+
+    switch (tun->encap_type) {
+    case MWAN_ENCAP_NONE:
+        return mwan_handle_encap_none(skb, cfg, tun_idx);
+    case MWAN_ENCAP_MACSEC:
+        return mwan_handle_encap_macsec(skb, tun);
+    case MWAN_ENCAP_L3_CUSTOM:
+        return mwan_handle_encap_l3(skb, tun);
+    case MWAN_ENCAP_L3_PQC:
+        return mwan_handle_encap_l3_pqc(skb, tun);
+    case MWAN_ENCAP_L2_PQC:
+        return mwan_handle_encap_l2_pqc(skb, cfg, tun_idx);
+    default:
+        return mwan_handle_encap_none(skb, cfg, tun_idx);
+    }
+}
+
 /* The core TX steering logic */
 static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
 {
@@ -157,6 +203,31 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                              "ACCEPT_UNMANAGED_OUT", NULL);
         rcu_read_unlock();
         return NF_ACCEPT;
+    }
+
+    /* Preserve BFD path identity: use the tunnel chosen by routing and the
+     * bound socket, while retaining the normal conntrack + encap pipeline.
+     * This observes liveness only; it does not alter the weighted data LUT. */
+    if (is_bfd_control_packet(skb, iph)) {
+        struct mwan_tunnel *tun = find_mwan_tunnel(cfg,
+                                                   state->out->ifindex);
+        u8 tun_idx;
+        int confirm_ret;
+        unsigned int ret;
+
+        if (!tun) {
+            rcu_read_unlock();
+            return NF_DROP;
+        }
+        tun_idx = (u8)(tun - cfg->tunnels);
+        confirm_ret = nf_conntrack_confirm(skb);
+        if (unlikely(confirm_ret != NF_ACCEPT)) {
+            rcu_read_unlock();
+            return (unsigned int)confirm_ret;
+        }
+        ret = mwan_dispatch_encap(skb, cfg, tun_idx);
+        rcu_read_unlock();
+        return ret;
     }
 
     /* Bypass PQC handshake traffic (UDP port 7090) */
@@ -209,26 +280,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,
                          "DISPATCH", tun->dev ? tun->dev->name : NULL);
 
-        switch (tun->encap_type) {
-            case MWAN_ENCAP_NONE:
-                ret = mwan_handle_encap_none(skb, cfg, tun_idx);
-                break;
-            case MWAN_ENCAP_MACSEC:
-                ret = mwan_handle_encap_macsec(skb, tun);
-                break;
-            case MWAN_ENCAP_L3_CUSTOM:
-                ret = mwan_handle_encap_l3(skb, tun);
-                break;
-            case MWAN_ENCAP_L3_PQC:
-                ret = mwan_handle_encap_l3_pqc(skb, tun);
-                break;
-            case MWAN_ENCAP_L2_PQC:
-                ret = mwan_handle_encap_l2_pqc(skb, cfg, tun_idx);
-                break;
-            default:
-                ret = mwan_handle_encap_none(skb, cfg, tun_idx);
-                break;
-        }
+        ret = mwan_dispatch_encap(skb, cfg, tun_idx);
         
         rcu_read_unlock();
         return ret;

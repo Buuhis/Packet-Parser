@@ -21,8 +21,10 @@ ExecStartPre=/bin/sh -ec 'test -d /sys/module/mwan_kmod || { echo "[SDWAN-PRE] E
 ExecStartPre=/bin/sh -ec '/usr/sbin/genl ctrl list | /usr/bin/grep -qw MWAN_STEER || { echo "[SDWAN-PRE] ERROR: Generic Netlink family MWAN_STEER is absent" >&2; exit 1; }; echo "[SDWAN-PRE] netlink_family=MWAN_STEER ready=1"'
 ExecStart=/usr/local/bin/sd-wan
 ExecStopPost=-/sbin/rmmod mwan_kmod
+
 Restart=always
-RestartSec=3s
+RestartSec=5s
+
 StandardOutput=journal
 StandardError=journal
 

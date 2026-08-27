@@ -2,6 +2,7 @@
 #include "app_context.h"
 #include "kernel_sync.h"
 #include "runtime_config.h"
+#include "failover.h"
 #include "system/cpu_tune.h"
 #include "config/db_client.h"
 #include "config/vault_db_client.h"
@@ -469,6 +470,7 @@ int main(int argc, char **argv) {
     }
     
     log_info("Server shutting down...");
+    failover_service_stop();
     cpu_tune_restore();
     kernel_sync_cleanup();
     db_client_disconnect();
