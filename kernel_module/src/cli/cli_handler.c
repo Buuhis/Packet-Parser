@@ -202,14 +202,12 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
 
 static unsigned long provision_generation;
 
-/* Current phase: expose the runtime-discovered peer tunnel IP. The command
- * name intentionally remains get-status so BFD can later extend the reply
- * without changing the user-facing syntax. */
+/* Report the BFD-published state currently enforced by kernel steering. */
 static void handle_get_status(int client_fd, const char *ifname,
                               app_context_t *ctx)
 {
-    char peer_ip[INET_ADDRSTRLEN] = {0};
     bool active_tunnel = false;
+    bool up = false;
     int rc;
 
     runtime_config_lock();
@@ -227,18 +225,16 @@ static void handle_get_status(int client_fd, const char *ifname,
         return;
     }
 
-    rc = kernel_sync_get_tunnel_peer(ifname, peer_ip, sizeof(peer_ip));
+    rc = kernel_sync_get_tunnel_status(ifname, &up);
     if (rc == 0) {
-        reply_json(client_fd, 200, peer_ip);
-    } else if (rc == -EAGAIN) {
-        reply_json(client_fd, 503, "Peer tunnel IP not resolved");
+        reply_json(client_fd, 200, up ? "UP" : "DOWN");
     } else if (rc == -ENODEV) {
         reply_json(client_fd, 503,
                    "Kernel module or tunnel interface unavailable");
     } else {
-        log_warn("[GET-STATUS] Failed to query peer for tunnel %s: %s",
+        log_warn("[GET-STATUS] Failed to query state for tunnel %s: %s",
                  ifname, strerror(-rc));
-        reply_json(client_fd, 500, "Failed to query tunnel peer");
+        reply_json(client_fd, 500, "Failed to query tunnel status");
     }
 }
 

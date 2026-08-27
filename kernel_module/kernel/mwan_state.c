@@ -22,6 +22,50 @@ static DEFINE_MUTEX(cfg_lock);
  * cannot reuse an AES-GCM IV while the active key is unchanged. L2 and L3
  * share this monotonic source. */
 static atomic64_t packet_nonce;
+static atomic64_t no_active_tunnel_drops;
+
+static struct mwan_active_paths *
+mwan_active_paths_build(const struct mwan_config *cfg)
+{
+    struct mwan_active_paths *paths;
+    int last_active = -1;
+    u32 current_slot = 0;
+    u32 i;
+
+    paths = kzalloc(sizeof(*paths), GFP_KERNEL);
+    if (!paths)
+        return NULL;
+
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        const struct mwan_tunnel *tun = &cfg->tunnels[i];
+
+        if (!tun->published_up)
+            continue;
+        paths->active_count++;
+        paths->total_weight += tun->weight;
+        last_active = (int)i;
+    }
+
+    if (paths->active_count == 0 || paths->total_weight == 0)
+        return paths;
+
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        const struct mwan_tunnel *tun = &cfg->tunnels[i];
+        u32 count;
+        u32 j;
+
+        if (!tun->published_up)
+            continue;
+        count = (u32)(((u64)tun->weight * MWAN_LUT_SIZE) /
+                      paths->total_weight);
+        for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++)
+            paths->tunnel_idx_lut[current_slot++] = (u8)i;
+    }
+    while (current_slot < MWAN_LUT_SIZE)
+        paths->tunnel_idx_lut[current_slot++] = (u8)last_active;
+
+    return paths;
+}
 
 static void mwan_config_release_devices(struct mwan_config *cfg)
 {
@@ -68,6 +112,9 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
                 spin_unlock_bh(&new_tun->gateway_mac_lock);
             }
             spin_unlock_bh(&old_tun->gateway_mac_lock);
+            new_tun->published_up = old_tun->published_up;
+            /* State sequences are scoped to one full-config generation. */
+            new_tun->state_sequence = 0;
             break;
         }
     }
@@ -78,8 +125,14 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
  * synchronously deleting each per-flow timer (including on kernel 5.19). */
 static void mwan_config_destroy(struct mwan_config *cfg)
 {
+    struct mwan_active_paths *paths;
+
     if (!cfg)
         return;
+
+    paths = rcu_dereference_protected(cfg->active_paths, 1);
+    RCU_INIT_POINTER(cfg->active_paths, NULL);
+    kfree(paths);
 
     /* No RCU reader can enqueue into this config now. Drain worker-owned
      * references first, then destroy the per-connection flow tables/timers. */
@@ -103,6 +156,7 @@ void mwan_state_init(void)
 {
     BUILD_BUG_ON(sizeof(struct mwan_l2_pqc_hdr) != MWAN_L2_HDR_LEN);
     atomic64_set(&packet_nonce, get_random_u64());
+    atomic64_set(&no_active_tunnel_drops, 0);
 }
 
 u64 mwan_next_packet_nonce(void)
@@ -134,6 +188,7 @@ void mwan_state_cleanup(void)
 int mwan_state_update(struct mwan_config *new_cfg)
 {
     struct mwan_config *old;
+    struct mwan_active_paths *new_paths;
     struct crypto_aead *tfm = NULL;
     struct crypto_aead *prev_tfm = NULL;
     int i, err = 0;
@@ -386,6 +441,13 @@ int mwan_state_update(struct mwan_config *new_cfg)
      * config. Preserve the independently learned MAC/IP tuple for an
      * unchanged data tunnel so traffic and failover do not rediscover it. */
     mwan_config_preserve_peer_state(new_cfg, old);
+    new_paths = mwan_active_paths_build(new_cfg);
+    if (!new_paths) {
+        mutex_unlock(&cfg_lock);
+        err = -ENOMEM;
+        goto err_free_tfm;
+    }
+    RCU_INIT_POINTER(new_cfg->active_paths, new_paths);
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
     synchronize_rcu();
     mwan_config_destroy(old);
@@ -411,4 +473,116 @@ err_release_devices:
     mwan_l2_flow_manager_stop(new_cfg);
     mwan_config_release_devices(new_cfg);
     return err;
+}
+
+int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
+                                u32 sequence, bool up)
+{
+    struct mwan_active_paths *new_paths;
+    struct mwan_active_paths *old_paths;
+    struct mwan_config *cfg;
+    struct mwan_tunnel *tun = NULL;
+    bool old_up;
+    u32 i;
+    int ret = 0;
+
+    if (ifindex == 0 || generation == 0 || sequence == 0)
+        return -EINVAL;
+
+    mutex_lock(&cfg_lock);
+    cfg = rcu_dereference_protected(g_mwan_cfg,
+                                    lockdep_is_held(&cfg_lock));
+    if (!cfg) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    if (cfg->generation != generation) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].configured_ifindex == ifindex ||
+            cfg->tunnels[i].ifindex == ifindex) {
+            tun = &cfg->tunnels[i];
+            break;
+        }
+    }
+    if (!tun) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    if (sequence < tun->state_sequence ||
+        (sequence == tun->state_sequence && tun->published_up != up)) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    if (sequence == tun->state_sequence && tun->published_up == up)
+        goto out_unlock;
+    if (tun->published_up == up) {
+        tun->state_sequence = sequence;
+        goto out_unlock;
+    }
+
+    old_up = tun->published_up;
+    tun->published_up = up;
+    new_paths = mwan_active_paths_build(cfg);
+    if (!new_paths) {
+        tun->published_up = old_up;
+        ret = -ENOMEM;
+        goto out_unlock;
+    }
+    tun->state_sequence = sequence;
+    old_paths = rcu_dereference_protected(cfg->active_paths,
+                                          lockdep_is_held(&cfg_lock));
+    rcu_assign_pointer(cfg->active_paths, new_paths);
+    synchronize_rcu();
+    kfree(old_paths);
+
+    pr_info("mwan_kmod: BFD-STATE ifindex=%u %s->%s active=%u\n",
+            ifindex, old_up ? "UP" : "DOWN", up ? "UP" : "DOWN",
+            new_paths->active_count);
+
+out_unlock:
+    mutex_unlock(&cfg_lock);
+    return ret;
+}
+
+int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,
+                                u32 *sequence, bool *up)
+{
+    struct mwan_config *cfg;
+    u32 i;
+    int ret = -ENOENT;
+
+    if (ifindex == 0 || !generation || !sequence || !up)
+        return -EINVAL;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (!cfg)
+        goto out;
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        const struct mwan_tunnel *tun = &cfg->tunnels[i];
+
+        if (tun->configured_ifindex != ifindex && tun->ifindex != ifindex)
+            continue;
+        *generation = cfg->generation;
+        *sequence = READ_ONCE(tun->state_sequence);
+        *up = READ_ONCE(tun->published_up);
+        ret = 0;
+        break;
+    }
+out:
+    rcu_read_unlock();
+    return ret;
+}
+
+void mwan_state_count_no_active_drop(void)
+{
+    atomic64_inc(&no_active_tunnel_drops);
+}
+
+u64 mwan_state_no_active_drops(void)
+{
+    return (u64)atomic64_read(&no_active_tunnel_drops);
 }

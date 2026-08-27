@@ -2,6 +2,8 @@
 #define KERNEL_SYNC_H
 
 #include "app_context.h"
+#include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 
 enum kernel_sync_result {
@@ -18,6 +20,9 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx);
  * point-to-point discovery protocol. */
 int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
                                 size_t peer_ip_len);
+int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
+                                 uint32_t sequence, bool up);
+int kernel_sync_get_tunnel_status(const char *ifname, bool *up);
 
 /* Cleans up any resources */
 void kernel_sync_cleanup(void);

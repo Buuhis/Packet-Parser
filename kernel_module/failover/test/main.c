@@ -105,7 +105,7 @@ static void usage(const char *program)
     printf("  --tx-ms N              Desired TX interval after UP; default 300\n");
     printf("  --rx-ms N              Required RX interval; default 300\n");
     printf("  --detect-mult N        BFD detection multiplier; default 3\n");
-    printf("  --up-hold-ms N         Continuous raw-UP time before published UP; default 3000\n");
+    printf("  --up-hold-ms N         Continuous raw-UP time before published UP; default 5000\n");
     printf("  --down-hold-ms N       Continuous raw-DOWN time before published DOWN; default 0\n");
     printf("  --half-life-ms N       Penalty half-life; default 15000 (0 disables damping)\n");
     printf("  --flap-penalty N       Penalty for a raw UP->DOWN; default 1000\n");
@@ -142,7 +142,7 @@ int main(int argc, char **argv)
         .duration_s = 30,
         .detect_mult = 3,
         .stability = {
-            .up_hold_ms = 3000,
+            .up_hold_ms = 5000,
             .down_hold_ms = 0,
             .half_life_ms = 15000,
             .flap_penalty = 1000,

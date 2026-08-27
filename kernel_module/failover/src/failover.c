@@ -18,6 +18,7 @@
 #define FAILOVER_RECONCILE_MS       250
 #define FAILOVER_BFD_INTERVAL_US    300000U
 #define FAILOVER_BFD_DETECT_MULT    3U
+#define FAILOVER_BFD_UP_HOLD_MS     5000U
 
 struct failover_desired_tunnel {
     char ifname[IFNAMSIZ];
@@ -26,6 +27,7 @@ struct failover_desired_tunnel {
 
 struct failover_snapshot {
     int node_id;
+    uint32_t config_generation;
     size_t count;
     struct failover_desired_tunnel tunnels[MAX_SDWAN_TUNS];
 };
@@ -38,6 +40,10 @@ struct failover_runtime_entry {
     struct in_addr peer_ip;
     struct bfd_session *session;
     enum bfd_stable_state published;
+    enum bfd_stable_state kernel_published;
+    uint32_t config_generation;
+    uint32_t state_sequence;
+    bool state_dirty;
 };
 
 struct failover_service {
@@ -141,16 +147,14 @@ static void published_state_changed(const struct bfd_session *session,
                                     void *user)
 {
     struct failover_runtime_entry *entry = user;
-    char peer[INET_ADDRSTRLEN] = "unknown";
-
     (void)session;
     if (!entry || old_state == new_state)
         return;
     entry->published = new_state;
-    (void)inet_ntop(AF_INET, &entry->peer_ip, peer, sizeof(peer));
-    log_info("[BFD-STATE] tunnel=%s peer=%s %s->%s",
-             entry->ifname, peer, bfd_stable_state_name(old_state),
-             bfd_stable_state_name(new_state));
+    entry->state_sequence++;
+    if (entry->state_sequence == 0)
+        entry->state_sequence = 1;
+    entry->state_dirty = true;
 }
 
 static void remove_runtime_entry(struct bfd_manager *manager,
@@ -201,7 +205,7 @@ static void reconcile_sessions(
     const struct failover_snapshot *snapshot)
 {
     const struct bfd_stability_config stability = {
-        .up_hold_ms = 3000,
+        .up_hold_ms = FAILOVER_BFD_UP_HOLD_MS,
         .down_hold_ms = 0,
         .half_life_ms = 15000,
         .flap_penalty = 1000,
@@ -227,8 +231,14 @@ static void reconcile_sessions(
             continue;
         entry = find_runtime(entries, desired->ifname);
         if (entry && entry->ifindex == ifindex &&
-            entry->local_ip.s_addr == desired->local_ip.s_addr)
+            entry->local_ip.s_addr == desired->local_ip.s_addr) {
+            if (entry->config_generation != snapshot->config_generation) {
+                entry->config_generation = snapshot->config_generation;
+                entry->state_sequence = 1;
+                entry->state_dirty = true;
+            }
             continue;
+        }
         if (kernel_sync_get_tunnel_peer(desired->ifname, peer_text,
                                         sizeof(peer_text)) != 0 ||
             inet_pton(AF_INET, peer_text, &peer_ip) != 1)
@@ -248,6 +258,10 @@ static void reconcile_sessions(
         entry->local_ip = desired->local_ip;
         entry->peer_ip = peer_ip;
         entry->published = BFD_STABLE_DOWN;
+        entry->kernel_published = BFD_STABLE_DOWN;
+        entry->config_generation = snapshot->config_generation;
+        entry->state_sequence = 1;
+        entry->state_dirty = true;
         snprintf(entry->ifname, sizeof(entry->ifname), "%s",
                  desired->ifname);
 
@@ -265,6 +279,37 @@ static void reconcile_sessions(
                                                  &stability, &callbacks);
         if (!entry->session)
             memset(entry, 0, sizeof(*entry));
+    }
+}
+
+static void flush_published_states(
+    struct failover_runtime_entry entries[MAX_SDWAN_TUNS])
+{
+    size_t i;
+
+    for (i = 0; i < MAX_SDWAN_TUNS; i++) {
+        struct failover_runtime_entry *entry = &entries[i];
+
+        if (!entry->in_use || !entry->session || !entry->state_dirty ||
+            entry->config_generation == 0 || entry->state_sequence == 0)
+            continue;
+        if (kernel_sync_set_tunnel_state(
+                entry->ifname, entry->config_generation,
+                entry->state_sequence,
+                entry->published == BFD_STABLE_UP) == 0) {
+            if (entry->kernel_published != entry->published) {
+                char peer[INET_ADDRSTRLEN] = "unknown";
+
+                (void)inet_ntop(AF_INET, &entry->peer_ip, peer,
+                                sizeof(peer));
+                log_info("[BFD-STATE] tunnel=%s peer=%s %s->%s",
+                         entry->ifname, peer,
+                         bfd_stable_state_name(entry->kernel_published),
+                         bfd_stable_state_name(entry->published));
+                entry->kernel_published = entry->published;
+            }
+            entry->state_dirty = false;
+        }
     }
 }
 
@@ -305,8 +350,10 @@ static void *failover_worker(void *unused)
             break;
 
         reconcile_sessions(manager, entries, &snapshot);
+        flush_published_states(entries);
         applied_generation = desired_generation;
         (void)bfd_manager_poll(manager, FAILOVER_RECONCILE_MS);
+        flush_published_states(entries);
     }
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
@@ -315,14 +362,16 @@ static void *failover_worker(void *unused)
     return NULL;
 }
 
-int failover_service_reconcile(const app_context_t *ctx)
+int failover_service_reconcile(const app_context_t *ctx,
+                               uint32_t config_generation)
 {
     struct failover_snapshot next = {0};
     size_t i;
 
-    if (!ctx)
+    if (!ctx || config_generation == 0)
         return -EINVAL;
     next.node_id = ctx->cfg.node_id;
+    next.config_generation = config_generation;
     for (i = 0; i < ctx->cfg.sdwan_tun_count &&
                 next.count < MAX_SDWAN_TUNS; i++) {
         const sdwan_tun_cfg_t *source = &ctx->cfg.sdwan_tuns[i];

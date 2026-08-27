@@ -21,6 +21,13 @@ struct tunnel_peer_reply {
     bool valid;
 };
 
+struct tunnel_state_reply {
+    unsigned int expected_ifindex;
+    bool up;
+    bool received;
+    bool valid;
+};
+
 static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
 {
     struct tunnel_peer_reply *reply = arg;
@@ -54,12 +61,36 @@ static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
     return NL_STOP;
 }
 
+static int kernel_sync_tunnel_state_valid_cb(struct nl_msg *msg, void *arg)
+{
+    struct tunnel_state_reply *reply = arg;
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *ghdr = nlmsg_data(nlh);
+    struct nlattr *attrs[MWAN_ATTR_MAX + 1] = {0};
+
+    reply->received = true;
+    if (!ghdr || ghdr->cmd != MWAN_CMD_GET_TUNNEL_STATE ||
+        genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
+        !attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !attrs[MWAN_ATTR_TUNNEL_STATE] ||
+        nla_get_u32(attrs[MWAN_ATTR_QUERY_IFINDEX]) !=
+            reply->expected_ifindex ||
+        nla_get_u8(attrs[MWAN_ATTR_TUNNEL_STATE]) > 1)
+        return NL_STOP;
+
+    reply->up = nla_get_u8(attrs[MWAN_ATTR_TUNNEL_STATE]) != 0;
+    reply->valid = true;
+    return NL_STOP;
+}
+
 
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     struct nl_sock *sock;
     struct nl_msg *msg;
     static unsigned long push_generation;
+    static uint32_t config_generation;
     unsigned long push_id;
+    uint32_t generation;
     unsigned int nl_seq = 0;
     int family_id;
     enum kernel_sync_result ret = KERNEL_SYNC_ERROR;
@@ -89,6 +120,12 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
                  push_id, ctx->cfg.encrypt.key_len);
         return KERNEL_SYNC_DEFERRED;
     }
+
+    generation = __atomic_add_fetch(&config_generation, 1,
+                                    __ATOMIC_RELAXED);
+    if (generation == 0)
+        generation = __atomic_add_fetch(&config_generation, 1,
+                                        __ATOMIC_RELAXED);
 
     if (ctx->cfg.encrypt.enabled &&
         ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
@@ -128,6 +165,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MWAN_CMD_SET_CONFIG, MWAN_GENL_VERSION);
 
     nla_put_u32(msg, MWAN_ATTR_NODE_ID, ctx->cfg.node_id);
+    nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation);
     
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
     for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
@@ -209,11 +247,121 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
              ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
              ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
     ret = KERNEL_SYNC_APPLIED;
-    (void)failover_service_reconcile(ctx);
+    (void)failover_service_reconcile(ctx, generation);
 
 out:
     nlmsg_free(msg);
     nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
+                                 uint32_t sequence, bool up)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    unsigned int ifindex;
+    int family_id;
+    int ret = -EIO;
+
+    if (!ifname || !ifname[0] || generation == 0 || sequence == 0)
+        return -EINVAL;
+    ifindex = if_nametoindex(ifname);
+    if (ifindex == 0)
+        return -ENODEV;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_SET_TUNNEL_STATE, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_QUERY_IFINDEX, ifindex) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_STATE_SEQUENCE, sequence) < 0 ||
+        nla_put_u8(msg, MWAN_ATTR_TUNNEL_STATE, up ? 1 : 0) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret >= 0)
+        ret = 0;
+
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
+{
+    struct tunnel_state_reply reply = {0};
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    unsigned int ifindex;
+    int family_id;
+    int ret = -EIO;
+
+    if (!ifname || !ifname[0] || !up)
+        return -EINVAL;
+    ifindex = if_nametoindex(ifname);
+    if (ifindex == 0)
+        return -ENODEV;
+    reply.expected_ifindex = ifindex;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_GET_TUNNEL_STATE, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_QUERY_IFINDEX, ifindex) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    if (nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                            kernel_sync_tunnel_state_valid_cb,
+                            &reply) < 0 ||
+        nl_send_auto(sock, msg) < 0 || nl_recvmsgs_default(sock) < 0)
+        goto out;
+    if (!reply.received || !reply.valid) {
+        ret = -EPROTO;
+        goto out;
+    }
+    *up = reply.up;
+    ret = 0;
+
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
     return ret;
 }
 

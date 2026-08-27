@@ -254,12 +254,29 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         hash = skb_get_hash(skb);
     }
     
-    /* 3. Steer: Choose a tunnel based on the weight-proportional LUT (O(1)) */
-    if (cfg->total_weight > 0 && cfg->num_tunnels > 0) {
-        u8 tun_idx = cfg->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
-        struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
-        int confirm_ret;
+    /* 3. Steer only across BFD-published UP tunnels.  The view is immutable
+     * for the lifetime of this RCU read-side critical section. */
+    {
+        const struct mwan_active_paths *active =
+            rcu_dereference(cfg->active_paths);
+        struct mwan_tunnel *tun;
         unsigned int ret = NF_ACCEPT;
+        int confirm_ret;
+        u8 tun_idx;
+
+        if (!active || active->active_count == 0 ||
+            active->total_weight == 0) {
+            mwan_state_count_no_active_drop();
+            rcu_read_unlock();
+            return NF_DROP;
+        }
+
+        tun_idx = active->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
+        if (unlikely(tun_idx >= cfg->num_tunnels)) {
+            rcu_read_unlock();
+            return NF_DROP;
+        }
+        tun = &cfg->tunnels[tun_idx];
 
         /* Every asynchronous encap handler below takes ownership of skb and
          * normally returns NF_STOLEN.  Confirm a NEW conntrack entry first,
@@ -285,10 +302,6 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         rcu_read_unlock();
         return ret;
     }
-
-
-    rcu_read_unlock();
-    return NF_ACCEPT; 
 }
 
 /* The core Inbound processing logic */

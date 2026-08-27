@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 2
+#define MWAN_GENL_VERSION 3
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
@@ -53,6 +53,8 @@ enum mwan_genl_cmds {
     MWAN_CMD_UNSPEC = 0,
     MWAN_CMD_SET_CONFIG,  /* sdwan send to mwan_kmod */
     MWAN_CMD_GET_TUNNEL_PEERS, /* query runtime peer learned by discovery */
+    MWAN_CMD_SET_TUNNEL_STATE, /* publish one BFD-stabilized data-path state */
+    MWAN_CMD_GET_TUNNEL_STATE, /* query the state currently enforced by kernel */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -73,6 +75,9 @@ enum mwan_genl_attrs {
     MWAN_ATTR_QUERY_IFINDEX, /* u32: data tunnel requested by userspace */
     MWAN_ATTR_PEER_TUNNEL_IP,/* NLA_BINARY: network-order IPv4 address */
     MWAN_ATTR_PEER_RESOLVED, /* u8: peer tunnel IP discovery completed */
+    MWAN_ATTR_CONFIG_GENERATION, /* u32: full-config generation */
+    MWAN_ATTR_TUNNEL_STATE,      /* u8: 0=DOWN, 1=UP */
+    MWAN_ATTR_STATE_SEQUENCE,    /* u32: monotonic within one generation */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

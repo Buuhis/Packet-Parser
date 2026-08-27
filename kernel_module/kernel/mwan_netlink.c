@@ -24,6 +24,9 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_QUERY_IFINDEX] = { .type = NLA_U32 },
     [MWAN_ATTR_PEER_TUNNEL_IP] = NLA_POLICY_EXACT_LEN(sizeof(__be32)),
     [MWAN_ATTR_PEER_RESOLVED] = { .type = NLA_U8 },
+    [MWAN_ATTR_CONFIG_GENERATION] = { .type = NLA_U32 },
+    [MWAN_ATTR_TUNNEL_STATE] = { .type = NLA_U8 },
+    [MWAN_ATTR_STATE_SEQUENCE] = { .type = NLA_U32 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -43,8 +46,9 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     pr_info("mwan_kmod: CFG-TRACE nlseq=%u portid=%u ENTER SET_CONFIG\n",
             info->snd_seq, info->snd_portid);
 
-    if (!info->attrs[MWAN_ATTR_NODE_ID]) {
-        pr_err("mwan_kmod: CFG-TRACE nlseq=%u REJECT missing_node_id ret=%d\n",
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION]) {
+        pr_err("mwan_kmod: CFG-TRACE nlseq=%u REJECT missing_node_or_generation ret=%d\n",
                info->snd_seq, -EINVAL);
         return -EINVAL;
     }
@@ -54,6 +58,12 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
         return -ENOMEM;
 
     new_cfg->node_id   = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    new_cfg->generation =
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    if (new_cfg->generation == 0) {
+        ret = -EINVAL;
+        goto err_free_config;
+    }
     new_cfg->num_tunnels = 0;
 
     nla_tunnels = info->attrs[MWAN_ATTR_TUNNELS];
@@ -189,6 +199,76 @@ err_free_config:
     return ret;
 }
 
+static int mwan_genl_set_tunnel_state(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+    u32 ifindex;
+    u32 generation;
+    u32 sequence;
+    u8 state;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_STATE_SEQUENCE] ||
+        !info->attrs[MWAN_ATTR_TUNNEL_STATE])
+        return -EINVAL;
+
+    ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    generation = nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    sequence = nla_get_u32(info->attrs[MWAN_ATTR_STATE_SEQUENCE]);
+    state = nla_get_u8(info->attrs[MWAN_ATTR_TUNNEL_STATE]);
+    if (state > 1)
+        return -EINVAL;
+
+    return mwan_state_set_tunnel_state(ifindex, generation, sequence,
+                                       state != 0);
+}
+
+static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+    struct sk_buff *reply;
+    void *reply_hdr;
+    u32 ifindex;
+    u32 generation;
+    u32 sequence;
+    bool up;
+    int ret;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_QUERY_IFINDEX])
+        return -EINVAL;
+    ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    ret = mwan_state_get_tunnel_state(ifindex, &generation, &sequence, &up);
+    if (ret)
+        return ret;
+
+    reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+    if (!reply)
+        return -ENOMEM;
+    reply_hdr = genlmsg_put_reply(reply, info, &mwan_genl_family, 0,
+                                  MWAN_CMD_GET_TUNNEL_STATE);
+    if (!reply_hdr) {
+        nlmsg_free(reply);
+        return -EMSGSIZE;
+    }
+    ret = nla_put_u32(reply, MWAN_ATTR_QUERY_IFINDEX, ifindex);
+    if (!ret)
+        ret = nla_put_u32(reply, MWAN_ATTR_CONFIG_GENERATION, generation);
+    if (!ret)
+        ret = nla_put_u32(reply, MWAN_ATTR_STATE_SEQUENCE, sequence);
+    if (!ret)
+        ret = nla_put_u8(reply, MWAN_ATTR_TUNNEL_STATE, up ? 1 : 0);
+    if (ret) {
+        genlmsg_cancel(reply, reply_hdr);
+        nlmsg_free(reply);
+        return ret;
+    }
+    genlmsg_end(reply, reply_hdr);
+    return genlmsg_reply(reply, info);
+}
+
 /* Read-only runtime query. Discovery owns the peer tuple; userspace supplies
  * only the data-tunnel ifindex so no database value can become authoritative
  * for liveness/failover. */
@@ -270,6 +350,20 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = 0,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_get_tunnel_peers,
+        .dumpit = NULL,
+    },
+    {
+        .cmd    = MWAN_CMD_SET_TUNNEL_STATE,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_set_tunnel_state,
+        .dumpit = NULL,
+    },
+    {
+        .cmd    = MWAN_CMD_GET_TUNNEL_STATE,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_get_tunnel_state,
         .dumpit = NULL,
     },
 };

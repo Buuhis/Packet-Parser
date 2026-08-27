@@ -53,7 +53,17 @@ struct mwan_tunnel {
     u64 discovery_nonce;
     bool peer_ip_resolved;
     bool is_ethernet;
+    bool published_up;
+    u32 state_sequence;
     enum mwan_encap_type encap_type;
+};
+
+/* Immutable path-selection view.  Writers build a complete replacement and
+ * publish it with RCU, while POST_ROUTING only performs an O(1) lookup. */
+struct mwan_active_paths {
+    u32 active_count;
+    u32 total_weight;
+    u8 tunnel_idx_lut[MWAN_LUT_SIZE];
 };
 
 struct mwan_l2_flow_key {
@@ -244,6 +254,7 @@ struct mwan_l2_worker {
 
 struct mwan_config {
     u32 node_id;
+    u32 generation;
     u32 num_tunnels;
     u32 total_weight; /* Pre-calculated total weight */
     
@@ -251,6 +262,7 @@ struct mwan_config {
     u8  tunnel_idx_lut[MWAN_LUT_SIZE];
     
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
+    struct mwan_active_paths __rcu *active_paths;
 
     /* Encryption (AES-GCM) */
     bool encrypt_on;
@@ -290,6 +302,12 @@ extern unsigned int mwan_l2_max_shed_pct;
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
+int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
+                                u32 sequence, bool up);
+int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,
+                                u32 *sequence, bool *up);
+void mwan_state_count_no_active_drop(void);
+u64 mwan_state_no_active_drops(void);
 u64 mwan_next_packet_nonce(void);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
