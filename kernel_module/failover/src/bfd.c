@@ -63,7 +63,6 @@ struct bfd_session {
 struct bfd_manager {
     int rx_fd;
     int epoll_fd;
-    struct in_addr listen_ip;
     struct bfd_session *sessions[BFD_MAX_SESSIONS];
     size_t session_count;
 };
@@ -112,6 +111,50 @@ static int set_nonblocking(int fd)
     if (flags < 0)
         return -1;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+static bool session_key_matches(const struct bfd_session *session,
+                                const struct bfd_session_config *config)
+{
+    const char *ifname = config->ifname ? config->ifname : "";
+
+    return session->local_ip.s_addr == config->local_ip.s_addr &&
+           session->peer_ip.s_addr == config->peer_ip.s_addr &&
+           strncmp(session->ifname, ifname, IFNAMSIZ) == 0;
+}
+
+static bool manager_has_session(const struct bfd_manager *manager,
+                                const struct bfd_session_config *config)
+{
+    size_t i;
+
+    for (i = 0; i < manager->session_count; i++) {
+        if (session_key_matches(manager->sessions[i], config))
+            return true;
+    }
+    return false;
+}
+
+static bool manager_has_discriminator(const struct bfd_manager *manager,
+                                      uint32_t discriminator)
+{
+    size_t i;
+
+    for (i = 0; i < manager->session_count; i++) {
+        if (manager->sessions[i]->local_discriminator == discriminator)
+            return true;
+    }
+    return false;
+}
+
+static uint32_t manager_new_discriminator(const struct bfd_manager *manager)
+{
+    uint32_t discriminator;
+
+    do {
+        discriminator = nonzero_random_u32();
+    } while (manager_has_discriminator(manager, discriminator));
+    return discriminator;
 }
 
 const char *bfd_state_name(enum bfd_state state)
@@ -596,22 +639,18 @@ static int manager_wait_timeout_ms(const struct bfd_manager *manager,
     }
 }
 
-struct bfd_manager *bfd_manager_create(const struct in_addr *listen_ip)
+struct bfd_manager *bfd_manager_create(void)
 {
     struct bfd_manager *manager;
     struct sockaddr_in address;
     struct epoll_event event;
     int one = 1;
 
-    if (!listen_ip)
-        return NULL;
     manager = calloc(1, sizeof(*manager));
     if (!manager)
         return NULL;
     manager->rx_fd = -1;
     manager->epoll_fd = -1;
-    manager->listen_ip = *listen_ip;
-
     manager->rx_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (manager->rx_fd < 0)
         goto error;
@@ -624,7 +663,7 @@ struct bfd_manager *bfd_manager_create(const struct in_addr *listen_ip)
     memset(&address, 0, sizeof(address));
     address.sin_family = AF_INET;
     address.sin_port = htons(BFD_CONTROL_PORT);
-    address.sin_addr = *listen_ip;
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
     if (bind(manager->rx_fd, (const struct sockaddr *)&address, sizeof(address)) < 0)
         goto error;
 
@@ -671,9 +710,11 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
     int ttl = 255;
 
     if (!manager || !config || !stability || manager->session_count >= BFD_MAX_SESSIONS ||
+        config->local_ip.s_addr == htonl(INADDR_ANY) ||
+        config->peer_ip.s_addr == htonl(INADDR_ANY) ||
         config->desired_min_tx_us < BFD_MIN_INTERVAL_US ||
         config->required_min_rx_us < BFD_MIN_INTERVAL_US || config->detect_mult == 0 ||
-        config->local_ip.s_addr != manager->listen_ip.s_addr)
+        manager_has_session(manager, config))
         return NULL;
 
     session = calloc(1, sizeof(*session));
@@ -688,7 +729,7 @@ struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
     session->local_detect_mult = config->detect_mult;
     session->raw_state = BFD_STATE_DOWN;
     session->remote_state = BFD_STATE_DOWN;
-    session->local_discriminator = nonzero_random_u32();
+    session->local_discriminator = manager_new_discriminator(manager);
     session->prng = nonzero_random_u32();
     session->stabilizer.config = *stability;
     session->stabilizer.published = BFD_STABLE_DOWN;

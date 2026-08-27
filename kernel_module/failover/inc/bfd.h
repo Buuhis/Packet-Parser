@@ -92,7 +92,12 @@ struct bfd_counters {
     uint64_t published_state_transitions;
 };
 
-struct bfd_manager *bfd_manager_create(const struct in_addr *listen_ip);
+/*
+ * Create one manager for all local BFD sessions.  The manager listens on
+ * INADDR_ANY:BFD_CONTROL_PORT; each session owns its local/peer address and
+ * optional output interface.
+ */
+struct bfd_manager *bfd_manager_create(void);
 void bfd_manager_destroy(struct bfd_manager *manager);
 
 struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,

@@ -97,7 +97,7 @@ static void usage(const char *program)
 {
     printf("Usage: %s --bind IPv4 --peer IPv4 [options]\n", program);
     printf("\n");
-    printf("Run one instance at each endpoint of the tunnel. Both peers must use\n");
+    printf("Run one instance on each endpoint device. Both peers must use\n");
     printf("the same tx/rx interval and detect multiplier during the standalone test.\n");
     printf("\n");
     printf("Options:\n");
@@ -113,9 +113,8 @@ static void usage(const char *program)
     printf("  --reuse N              Penalty below which recovery resumes; default 750\n");
     printf("  --duration-s N         Test duration; 0 means until Ctrl-C; default 30\n");
     printf("\n");
-    printf("Local two-peer smoke test (two terminals):\n");
-    printf("  %s --bind 127.0.0.1 --peer 127.0.0.2 --duration-s 15\n", program);
-    printf("  %s --bind 127.0.0.2 --peer 127.0.0.1 --duration-s 15\n", program);
+    printf("Local multi-session smoke test:\n");
+    printf("  make check\n");
 }
 
 int main(int argc, char **argv)
@@ -257,7 +256,7 @@ invalid_number:
     config.required_min_rx_us = options.rx_ms * 1000U;
     config.detect_mult = options.detect_mult;
 
-    manager = bfd_manager_create(&options.bind_ip);
+    manager = bfd_manager_create();
     if (!manager) {
         perror("bfd_manager_create");
         return EXIT_FAILURE;
