@@ -145,6 +145,9 @@ typedef struct {
     atomic_bool handshake_give_up;
     atomic_bool send_poke;
     bool keepalive_enabled;
+    /* Liveness is independent from key validity.  A missed keepalive must
+     * not clear CURRENT or start an authentication retry storm. */
+    bool keepalive_peer_unreachable;
     bool is_tunnel;
     bool l2_rekey_enabled;
     atomic_bool thread_exit_sig;

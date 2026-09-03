@@ -648,6 +648,7 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     pqc_key_rotation_init(&b->rotation);
     if (b->is_tunnel) {
         b->keepalive_enabled = true;
+        b->keepalive_peer_unreachable = false;
         b->keepalive_monitor_start_time = now;
         b->last_keepalive_rx_time = 0;
         b->next_auto_retry_time = 0;
@@ -659,8 +660,10 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     }
 
     fprintf(stderr,
-            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted key ID %d to CURRENT.\n",
-            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT]);
+            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
+            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT],
+            derived_master[0], derived_master[1], derived_master[2],
+            derived_master[3]);
 
 }
 
@@ -1363,6 +1366,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             uint8_t local_state;
             uint8_t local_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ];
             const char *recovery_reason = NULL;
+            bool peer_was_unreachable;
             int verify_rc;
 
             memset(&peer_status, 0, sizeof(peer_status));
@@ -1396,6 +1400,14 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             b->keepalive_monitor_start_time =
                 b->last_keepalive_rx_time;
             b->next_auto_retry_time = 0;
+            peer_was_unreachable = b->keepalive_peer_unreachable;
+            b->keepalive_peer_unreachable = false;
+
+            if (peer_was_unreachable) {
+                fprintf(stderr,
+                        "[PQC-HS-L3] Signed keepalive reception restored for Profile %d; evaluating peer key state.\n",
+                        b->profile_id);
+            }
 
             local_state = pqc_hs_l3_state_locked(b);
             if (local_state == PQC_HS_STATE_HANDSHAKING ||
@@ -1408,6 +1420,8 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 peer_status.state == PQC_HS_STATE_READY) {
                 if (pqc_hs_l3_key_fingerprint_locked(
                         b, local_fingerprint) == 0 &&
+                    peer_status.key_id ==
+                        b->key_ids[KEY_SLOT_CURRENT] &&
                     memcmp(local_fingerprint,
                            peer_status.key_fingerprint,
                            sizeof(local_fingerprint)) == 0) {
@@ -1423,7 +1437,7 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                     pthread_mutex_unlock(&g_key_mutex);
                     return;
                 }
-                recovery_reason = "peer key fingerprint mismatch";
+                recovery_reason = "peer key ID/fingerprint mismatch";
             } else if (local_state == PQC_HS_STATE_FAILED) {
                 recovery_reason = "local profile has no usable key";
             } else if (peer_status.state == PQC_HS_STATE_FAILED) {
@@ -1857,7 +1871,7 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         uint64_t loop_now = get_time_ms_hs();
         bool keepalive_enabled;
         bool handshake_give_up;
-        bool keepalive_timeout_recovery = false;
+        bool keepalive_timeout_detected = false;
         bool auto_retry_started = false;
         bool flush_rx_queue = false;
         uint8_t keepalive_state = PQC_HS_STATE_FAILED;
@@ -1870,10 +1884,14 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
             if (monitor_from != 0 && loop_now >= monitor_from &&
                 loop_now - monitor_from >=
-                    PQC_HS_KEEPALIVE_TIMEOUT_MS) {
-                pqc_hs_begin_profile_recovery_locked(b, loop_now);
-                keepalive_timeout_recovery = true;
-                flush_rx_queue = true;
+                    PQC_HS_KEEPALIVE_TIMEOUT_MS &&
+                !b->keepalive_peer_unreachable) {
+                /* A liveness timeout does not prove that either traffic key
+                 * is invalid.  Retain CURRENT and continue only the cheap
+                 * signed keepalive probe.  A valid peer status can later
+                 * decide whether a standard handshake is actually needed. */
+                b->keepalive_peer_unreachable = true;
+                keepalive_timeout_detected = true;
             }
         }
 
@@ -1896,11 +1914,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
         if (flush_rx_queue)
             pqc_flush_rx_queue(b);
-        if (keepalive_timeout_recovery) {
+        if (keepalive_timeout_detected) {
             fprintf(stderr,
-                    "[PQC-HS-L3] Profile %d missed %d keepalive intervals; starting independent recovery as %s.\n",
-                    profile_id, PQC_HS_KEEPALIVE_MISSED_LIMIT,
-                    is_initiator ? "Initiator" : "Responder");
+                    "[PQC-HS-L3] Profile %d missed %d keepalive intervals; peer marked unreachable and CURRENT retained.\n",
+                    profile_id, PQC_HS_KEEPALIVE_MISSED_LIMIT);
         } else if (auto_retry_started) {
             fprintf(stderr,
                     "[PQC-HS-L3] Profile %d automatically retrying after handshake give-up as %s.\n",
@@ -2599,6 +2616,7 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->last_keepalive_rx_time = 0;
         b->next_auto_retry_time = 0;
         b->keepalive_enabled = false;
+        b->keepalive_peer_unreachable = false;
         for (int slot = 0; slot < KEY_SLOT_COUNT; slot++) {
             memset(b->keys[slot], 0, PQC_TRAFFIC_KEY_SZ);
             b->key_ids[slot] = 0;
@@ -2651,6 +2669,7 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
             b->keepalive_monitor_start_time = 0;
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->keepalive_peer_unreachable = false;
             b->keepalive_rx_last_error = 0;
             b->request_rx_last_error = 0;
             b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
@@ -2698,6 +2717,7 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->keepalive_monitor_start_time = get_time_ms_hs();
         b->last_keepalive_rx_time = 0;
         b->next_auto_retry_time = 0;
+        b->keepalive_peer_unreachable = false;
 
         if (b->local_priv) free(b->local_priv);
         if (b->local_pub) free(b->local_pub);
@@ -2829,6 +2849,7 @@ void sig_pqc_finalize_reload(void) {
             b->keepalive_monitor_start_time = 0;
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->keepalive_peer_unreachable = false;
             b->worker_state = PQC_RUNTIME_STOPPED;
             b->worker_last_error = 0;
             b->keepalive_rx_last_error = 0;
@@ -2969,6 +2990,7 @@ int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_m
             b->keepalive_monitor_start_time = get_time_ms_hs();
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
+            b->keepalive_peer_unreachable = false;
             b->keepalive_rx_last_error = 0;
             b->request_rx_last_error = 0;
             b->hello_rx_last_status = PQC_HS_HELLO_DIAG_OK;
