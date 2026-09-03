@@ -303,8 +303,23 @@ static int mwan_worker_set_l2_keys(struct mwan_l2_worker *worker,
                                      cfg->encrypt_salt);
         if (err)
             goto err_free_tx;
+        err = mwan_worker_alloc_aead(&worker->tx_prev_tfm,
+                                     &worker->tx_prev_req,
+                                     cfg->prev_key, cfg->prev_key_len,
+                                     cfg->encrypt_salt);
+        if (err)
+            goto err_free_prev_rx;
+        worker->crypto_prev_id = cfg->prev_key_id;
+        worker->crypto_prev_valid = true;
     }
+    worker->crypto_current_id = cfg->key_id;
     return 0;
+
+err_free_prev_rx:
+    aead_request_free(worker->prev_req);
+    worker->prev_req = NULL;
+    crypto_free_aead(worker->prev_tfm);
+    worker->prev_tfm = NULL;
 
 err_free_tx:
     aead_request_free(worker->tx_req);
@@ -317,6 +332,251 @@ err_free_rx:
     crypto_free_aead(worker->tfm);
     worker->tfm = NULL;
     return err;
+}
+
+static void mwan_worker_free_pair(struct crypto_aead **rx_tfm,
+                                  struct aead_request **rx_req,
+                                  struct crypto_aead **tx_tfm,
+                                  struct aead_request **tx_req)
+{
+    if (*rx_req)
+        aead_request_free(*rx_req);
+    if (*rx_tfm)
+        crypto_free_aead(*rx_tfm);
+    if (*tx_req)
+        aead_request_free(*tx_req);
+    if (*tx_tfm)
+        crypto_free_aead(*tx_tfm);
+    *rx_req = NULL;
+    *rx_tfm = NULL;
+    *tx_req = NULL;
+    *tx_tfm = NULL;
+}
+
+static int mwan_worker_stage_next_key(struct mwan_l2_worker *worker,
+                                      const u8 *key, u8 key_len, u8 key_id,
+                                      const u8 salt[MWAN_SALT_LEN])
+{
+    struct crypto_aead *rx_tfm = NULL;
+    struct aead_request *rx_req = NULL;
+    struct crypto_aead *tx_tfm = NULL;
+    struct aead_request *tx_req = NULL;
+    int err;
+
+    err = mwan_worker_alloc_aead(&rx_tfm, &rx_req, key, key_len, salt);
+    if (err)
+        return err;
+    err = mwan_worker_alloc_aead(&tx_tfm, &tx_req, key, key_len, salt);
+    if (err) {
+        mwan_worker_free_pair(&rx_tfm, &rx_req, &tx_tfm, &tx_req);
+        return err;
+    }
+
+    mutex_lock(&worker->crypto_lock);
+    if (worker->crypto_next_valid) {
+        mutex_unlock(&worker->crypto_lock);
+        mwan_worker_free_pair(&rx_tfm, &rx_req, &tx_tfm, &tx_req);
+        return -EEXIST;
+    }
+    worker->next_tfm = rx_tfm;
+    worker->next_req = rx_req;
+    worker->tx_next_tfm = tx_tfm;
+    worker->tx_next_req = tx_req;
+    worker->crypto_next_id = key_id;
+    worker->crypto_next_valid = true;
+    mutex_unlock(&worker->crypto_lock);
+    return 0;
+}
+
+int mwan_l2_workers_stage_next_key(struct mwan_config *cfg, const u8 *key,
+                                   u8 key_len, u8 key_id)
+{
+    int i;
+    int err;
+
+    if (!cfg || !cfg->l2_workers || !key || key_len != MWAN_MAX_KEY_LEN ||
+        !key_id)
+        return -EINVAL;
+    for (i = 0; i < cfg->num_workers; i++) {
+        err = mwan_worker_stage_next_key(&cfg->l2_workers[i], key, key_len,
+                                         key_id, cfg->encrypt_salt);
+        if (err)
+            goto rollback;
+    }
+    return 0;
+
+rollback:
+    while (--i >= 0) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        mwan_worker_free_pair(&worker->next_tfm, &worker->next_req,
+                              &worker->tx_next_tfm,
+                              &worker->tx_next_req);
+        worker->crypto_next_id = 0;
+        worker->crypto_next_valid = false;
+        mutex_unlock(&worker->crypto_lock);
+    }
+    return err;
+}
+
+int mwan_l2_workers_activate_next_key(struct mwan_config *cfg, u8 key_id)
+{
+    int i;
+
+    if (!cfg || !cfg->l2_workers || !key_id)
+        return -EINVAL;
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        if (!worker->crypto_next_valid ||
+            worker->crypto_next_id != key_id ||
+            worker->crypto_prev_valid) {
+            mutex_unlock(&worker->crypto_lock);
+            return -EBUSY;
+        }
+        mutex_unlock(&worker->crypto_lock);
+    }
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        worker->prev_tfm = worker->tfm;
+        worker->prev_req = worker->req;
+        worker->tx_prev_tfm = worker->tx_tfm;
+        worker->tx_prev_req = worker->tx_req;
+        worker->crypto_prev_id = worker->crypto_current_id;
+        worker->crypto_prev_valid = true;
+
+        worker->tfm = worker->next_tfm;
+        worker->req = worker->next_req;
+        worker->tx_tfm = worker->tx_next_tfm;
+        worker->tx_req = worker->tx_next_req;
+        worker->crypto_current_id = worker->crypto_next_id;
+
+        worker->next_tfm = NULL;
+        worker->next_req = NULL;
+        worker->tx_next_tfm = NULL;
+        worker->tx_next_req = NULL;
+        worker->crypto_next_id = 0;
+        worker->crypto_next_valid = false;
+        mutex_unlock(&worker->crypto_lock);
+    }
+    return 0;
+}
+
+int mwan_l2_workers_retire_prev_key(struct mwan_config *cfg, u8 key_id)
+{
+    int i;
+
+    if (!cfg || !cfg->l2_workers || !key_id)
+        return -EINVAL;
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        if (atomic_read(&worker->crypto_key_pending[key_id]) != 0)
+            return -EBUSY;
+        mutex_lock(&worker->crypto_lock);
+        if (worker->crypto_prev_valid &&
+            worker->crypto_prev_id != key_id) {
+            mutex_unlock(&worker->crypto_lock);
+            return -ESTALE;
+        }
+        mutex_unlock(&worker->crypto_lock);
+    }
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        mwan_worker_free_pair(&worker->prev_tfm, &worker->prev_req,
+                              &worker->tx_prev_tfm,
+                              &worker->tx_prev_req);
+        worker->crypto_prev_id = 0;
+        worker->crypto_prev_valid = false;
+        mutex_unlock(&worker->crypto_lock);
+    }
+    return 0;
+}
+
+int mwan_l2_workers_abort_next_key(struct mwan_config *cfg, u8 key_id)
+{
+    int i;
+
+    if (!cfg || !cfg->l2_workers || !key_id)
+        return -EINVAL;
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        if (worker->crypto_next_valid &&
+            worker->crypto_next_id != key_id) {
+            mutex_unlock(&worker->crypto_lock);
+            return -ESTALE;
+        }
+        mutex_unlock(&worker->crypto_lock);
+    }
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+        mutex_lock(&worker->crypto_lock);
+        mwan_worker_free_pair(&worker->next_tfm, &worker->next_req,
+                              &worker->tx_next_tfm,
+                              &worker->tx_next_req);
+        worker->crypto_next_id = 0;
+        worker->crypto_next_valid = false;
+        mutex_unlock(&worker->crypto_lock);
+    }
+    return 0;
+}
+
+static int mwan_l2_worker_crypto_lock(struct mwan_l2_worker *worker,
+                                      u8 key_id, bool tx,
+                                      struct crypto_aead **tfm,
+                                      struct aead_request **req)
+{
+    if (!worker || !key_id || !tfm || !req)
+        return -EINVAL;
+    mutex_lock(&worker->crypto_lock);
+    if (key_id == worker->crypto_current_id) {
+        *tfm = tx ? worker->tx_tfm : worker->tfm;
+        *req = tx ? worker->tx_req : worker->req;
+    } else if (worker->crypto_prev_valid &&
+               key_id == worker->crypto_prev_id) {
+        *tfm = tx ? worker->tx_prev_tfm : worker->prev_tfm;
+        *req = tx ? worker->tx_prev_req : worker->prev_req;
+    } else if (worker->crypto_next_valid &&
+               key_id == worker->crypto_next_id) {
+        *tfm = tx ? worker->tx_next_tfm : worker->next_tfm;
+        *req = tx ? worker->tx_next_req : worker->next_req;
+    } else {
+        mutex_unlock(&worker->crypto_lock);
+        return -ENOKEY;
+    }
+    if (!*tfm || !*req) {
+        mutex_unlock(&worker->crypto_lock);
+        return -ENODEV;
+    }
+    return 0;
+}
+
+int mwan_l2_worker_tx_crypto_lock(struct mwan_l2_worker *worker, u8 key_id,
+                                  struct crypto_aead **tfm,
+                                  struct aead_request **req)
+{
+    return mwan_l2_worker_crypto_lock(worker, key_id, true, tfm, req);
+}
+
+int mwan_l2_worker_rx_crypto_lock(struct mwan_l2_worker *worker, u8 key_id,
+                                  struct crypto_aead **tfm,
+                                  struct aead_request **req)
+{
+    return mwan_l2_worker_crypto_lock(worker, key_id, false, tfm, req);
+}
+
+void mwan_l2_worker_crypto_unlock(struct mwan_l2_worker *worker)
+{
+    mutex_unlock(&worker->crypto_lock);
 }
 
 static u32 mwan_l2_tx_cb_checksum(const struct mwan_l2_tx_cb *cb)
@@ -368,6 +628,9 @@ static bool mwan_release_rx_queue_ref(struct mwan_l2_worker *worker,
         return false;
     memcpy(&flow_token_be, &l2_hdr->flow_token, sizeof(flow_token_be));
     flow_token = be64_to_cpu(flow_token_be);
+    if ((u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT))
+        atomic_dec(&worker->crypto_key_pending[
+            (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
     owner = (int)(worker - worker->cfg->l2_workers);
     return mwan_l2_rx_flow_release_queued(worker->cfg, flow_token, owner);
 }
@@ -422,6 +685,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         worker = &cfg->l2_workers[idx];
         worker->cfg = cfg;
         worker->cpu = cpu;
+        mutex_init(&worker->crypto_lock);
         skb_queue_head_init(&worker->rx_queue);
         skb_queue_head_init(&worker->tx_queue);
         INIT_WORK(&worker->work, mwan_l2_rx_worker_fn);
@@ -483,6 +747,10 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             atomic64_inc(&worker->dropped_packets);
             if (cb_ok)
                 flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
+            if (cb_ok)
+                atomic_dec(&worker->crypto_key_pending[
+                    (u8)(cb.dispatch_flow_token >>
+                         MWAN_FLOW_KEY_ID_SHIFT)]);
             if (flow) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_rx_flow_put(flow);
@@ -503,6 +771,9 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             atomic64_inc(&worker->tx_dropped_packets);
             if (cb_ok)
                 flow = (struct mwan_l2_tx_flow *)cb.flow_ptr;
+            if (cb_ok && cb.encap_type == MWAN_ENCAP_L2_PQC)
+                atomic_dec(&worker->crypto_key_pending[
+                    (u8)(cb.flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
             if (flow) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_tx_flow_put(flow);
@@ -520,6 +791,18 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             aead_request_free(worker->prev_req);
         if (worker->prev_tfm)
             crypto_free_aead(worker->prev_tfm);
+        if (worker->next_req)
+            aead_request_free(worker->next_req);
+        if (worker->next_tfm)
+            crypto_free_aead(worker->next_tfm);
+        if (worker->tx_prev_req)
+            aead_request_free(worker->tx_prev_req);
+        if (worker->tx_prev_tfm)
+            crypto_free_aead(worker->tx_prev_tfm);
+        if (worker->tx_next_req)
+            aead_request_free(worker->tx_next_req);
+        if (worker->tx_next_tfm)
+            crypto_free_aead(worker->tx_next_tfm);
         if (worker->tx_req)
             aead_request_free(worker->tx_req);
         if (worker->tx_tfm)
@@ -983,7 +1266,9 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     BUILD_BUG_ON(sizeof(struct mwan_l2_tx_cb) > sizeof(skb->cb));
     memset(skb->cb, 0, sizeof(skb->cb));
     MWAN_L2_TX_CB(skb)->flow_ptr = (uintptr_t)flow;
-    MWAN_L2_TX_CB(skb)->flow_token = flow->flow_token;
+    MWAN_L2_TX_CB(skb)->flow_token =
+        ((u64)READ_ONCE(cfg->key_id) << MWAN_FLOW_KEY_ID_SHIFT) |
+        (flow->flow_token & MWAN_FLOW_COOKIE_MASK);
     MWAN_L2_TX_CB(skb)->flow_seq = seq;
     MWAN_L2_TX_CB(skb)->accounted_bytes = accounted_bytes;
     MWAN_L2_TX_CB(skb)->tunnel_idx = (u16)tunnel_idx;
@@ -991,6 +1276,10 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     MWAN_L2_TX_CB(skb)->encap_type = (u8)tun->encap_type;
     MWAN_L2_TX_CB(skb)->check =
         mwan_l2_tx_cb_checksum(MWAN_L2_TX_CB(skb));
+    if (tun->encap_type == MWAN_ENCAP_L2_PQC)
+        atomic_inc(&worker->crypto_key_pending[
+            (u8)(MWAN_L2_TX_CB(skb)->flow_token >>
+                 MWAN_FLOW_KEY_ID_SHIFT)]);
     __skb_queue_tail(&worker->tx_queue, skb);
     atomic64_inc(&worker->tx_queued_packets);
     atomic64_add(accounted_bytes, &worker->tx_queued_bytes);
@@ -1075,6 +1364,10 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             } else {
                 err = -EOPNOTSUPP;
             }
+
+            if (cb_ok && encap_type == MWAN_ENCAP_L2_PQC)
+                atomic_dec(&worker->crypto_key_pending[
+                    (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
 
             mwan_atomic64_update_ewma(&worker->tx_processing_ewma_ns,
                                       ktime_get_ns() - start_ns);

@@ -28,6 +28,15 @@ struct tunnel_state_reply {
     bool valid;
 };
 
+struct pqc_key_state_reply {
+    unsigned int expected_node_id;
+    struct kernel_pqc_key_state state;
+    bool received;
+    bool valid;
+};
+
+static uint32_t active_kernel_config_generation;
+
 static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
 {
     struct tunnel_peer_reply *reply = arg;
@@ -79,6 +88,36 @@ static int kernel_sync_tunnel_state_valid_cb(struct nl_msg *msg, void *arg)
         return NL_STOP;
 
     reply->up = nla_get_u8(attrs[MWAN_ATTR_TUNNEL_STATE]) != 0;
+    reply->valid = true;
+    return NL_STOP;
+}
+
+static int kernel_sync_pqc_key_state_valid_cb(struct nl_msg *msg, void *arg)
+{
+    struct pqc_key_state_reply *reply = arg;
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *ghdr = nlmsg_data(nlh);
+    struct nlattr *attrs[MWAN_ATTR_MAX + 1] = {0};
+
+    reply->received = true;
+    if (!ghdr || ghdr->cmd != MWAN_CMD_GET_PQC_KEY_STATE ||
+        genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
+        !attrs[MWAN_ATTR_NODE_ID] ||
+        !attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !attrs[MWAN_ATTR_REKEY_EPOCH] ||
+        !attrs[MWAN_ATTR_KEY_STATE] || !attrs[MWAN_ATTR_KEY_ID] ||
+        nla_get_u32(attrs[MWAN_ATTR_NODE_ID]) != reply->expected_node_id)
+        return NL_STOP;
+
+    reply->state.generation =
+        nla_get_u32(attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    reply->state.epoch = nla_get_u64(attrs[MWAN_ATTR_REKEY_EPOCH]);
+    reply->state.state = nla_get_u8(attrs[MWAN_ATTR_KEY_STATE]);
+    reply->state.current_id = nla_get_u8(attrs[MWAN_ATTR_KEY_ID]);
+    reply->state.prev_id = attrs[MWAN_ATTR_PREV_KEY_ID] ?
+        nla_get_u8(attrs[MWAN_ATTR_PREV_KEY_ID]) : 0;
+    reply->state.next_id = attrs[MWAN_ATTR_NEXT_KEY_ID] ?
+        nla_get_u8(attrs[MWAN_ATTR_NEXT_KEY_ID]) : 0;
     reply->valid = true;
     return NL_STOP;
 }
@@ -242,6 +281,9 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         goto out;
     }
 
+    __atomic_store_n(&active_kernel_config_generation, generation,
+                     __ATOMIC_RELEASE);
+
     log_info("[CFG-TRACE push=%lu nlseq=%u] KERNEL_ACK_OK node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
              push_id, nl_seq, ctx->cfg.node_id, ctx->cfg.encrypt.enabled,
              ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
@@ -252,6 +294,153 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
 out:
     nlmsg_free(msg);
     nl_socket_free(sock);
+    return ret;
+}
+
+uint32_t kernel_sync_current_config_generation(void)
+{
+    return __atomic_load_n(&active_kernel_config_generation,
+                           __ATOMIC_ACQUIRE);
+}
+
+static int kernel_sync_pqc_key_command(uint8_t command, int profile_id,
+                                       uint64_t epoch, uint8_t key_id,
+                                       const uint8_t *key)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    uint32_t generation = kernel_sync_current_config_generation();
+    int family_id;
+    int ret = -EIO;
+
+    if (profile_id <= 0 || !generation || !key_id ||
+        (!epoch && command != MWAN_CMD_RETIRE_PQC_KEY))
+        return -EINVAL;
+    if (command == MWAN_CMD_STAGE_PQC_KEY && !key)
+        return -EINVAL;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     command, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID, (uint32_t)profile_id) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0 ||
+        nla_put_u64(msg, MWAN_ATTR_REKEY_EPOCH, epoch) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    if (command == MWAN_CMD_RETIRE_PQC_KEY) {
+        if (nla_put_u8(msg, MWAN_ATTR_PREV_KEY_ID, key_id) < 0) {
+            ret = -EMSGSIZE;
+            goto out;
+        }
+    } else if (nla_put_u8(msg, MWAN_ATTR_NEXT_KEY_ID, key_id) < 0 ||
+               (command == MWAN_CMD_STAGE_PQC_KEY &&
+                nla_put(msg, MWAN_ATTR_NEXT_KEY, PQC_TRAFFIC_KEY_SZ,
+                        key) < 0)) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret >= 0)
+        ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_stage_pqc_key(int profile_id, uint64_t epoch, uint8_t key_id,
+                              const uint8_t key[PQC_TRAFFIC_KEY_SZ])
+{
+    return kernel_sync_pqc_key_command(MWAN_CMD_STAGE_PQC_KEY, profile_id,
+                                       epoch, key_id, key);
+}
+
+int kernel_sync_activate_pqc_key(int profile_id, uint64_t epoch,
+                                 uint8_t key_id)
+{
+    return kernel_sync_pqc_key_command(MWAN_CMD_ACTIVATE_PQC_KEY, profile_id,
+                                       epoch, key_id, NULL);
+}
+
+int kernel_sync_retire_pqc_key(int profile_id, uint64_t epoch,
+                               uint8_t key_id)
+{
+    return kernel_sync_pqc_key_command(MWAN_CMD_RETIRE_PQC_KEY, profile_id,
+                                       epoch, key_id, NULL);
+}
+
+int kernel_sync_abort_pqc_key(int profile_id, uint64_t epoch,
+                              uint8_t key_id)
+{
+    return kernel_sync_pqc_key_command(MWAN_CMD_ABORT_PQC_KEY, profile_id,
+                                       epoch, key_id, NULL);
+}
+
+int kernel_sync_get_pqc_key_state(int profile_id,
+                                  struct kernel_pqc_key_state *state)
+{
+    struct pqc_key_state_reply reply = {0};
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    int family_id;
+    int ret = -EIO;
+
+    if (profile_id <= 0 || !state)
+        return -EINVAL;
+    reply.expected_node_id = (unsigned int)profile_id;
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_GET_PQC_KEY_STATE, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID, (uint32_t)profile_id) < 0 ||
+        nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                            kernel_sync_pqc_key_state_valid_cb,
+                            &reply) < 0 ||
+        nl_send_auto(sock, msg) < 0 || nl_recvmsgs_default(sock) < 0)
+        goto out;
+    if (!reply.received || !reply.valid) {
+        ret = -EPROTO;
+        goto out;
+    }
+    *state = reply.state;
+    ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
     return ret;
 }
 

@@ -17,7 +17,7 @@
 #include <net/dst.h>
 #include <crypto/aead.h>
 #include <linux/version.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 10)
 #include <net/gso.h>
 #else
 #include <linux/skbuff.h>
@@ -428,7 +428,8 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
                              u32 seq)
 {
     struct net_device *target_dev = tun->dev;
-    struct aead_request *req = worker->tx_req;
+    struct aead_request *req = NULL;
+    struct crypto_aead *tfm = NULL;
     u8 iv[MWAN_RFC4106_IV_LEN];
     u64 packet_nonce;
     __be64 flow_token_be, nonce_be;
@@ -436,7 +437,7 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     u8 peer_mac[ETH_ALEN];
     int ip_pkt_len, err;
 
-    if (unlikely(!target_dev || !worker->tx_tfm || !req))
+    if (unlikely(!target_dev || !worker))
         return -ENODEV;
     if (unlikely(!tun->is_ethernet))
         return -EAFNOSUPPORT;
@@ -512,10 +513,17 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
         if (unlikely(nents < 0))
             return nents;
 
+        err = mwan_l2_worker_tx_crypto_lock(
+            worker, (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT),
+            &tfm, &req);
+        if (unlikely(err))
+            return err;
+
         aead_request_set_crypt(req, sg, sg, ip_pkt_len, iv);
         aead_request_set_ad(req, MWAN_L2_HDR_LEN);
 
         err = crypto_aead_encrypt(req);
+        mwan_l2_worker_crypto_unlock(worker);
         if (err)
             return err;
     }

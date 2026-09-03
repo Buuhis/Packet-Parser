@@ -15,6 +15,7 @@ SRC := \
     failover/src/failover.c \
     sig_encrypt/src/traffic_crypto.c \
     sig_encrypt/src/pqc_handshake.c \
+    sig_encrypt/src/pqc_key_rotation.c \
     sig_encrypt/src/pqc_logger.c \
     sig_encrypt/src/pqc_vault.c \
     $(wildcard src/cli/*.c) \

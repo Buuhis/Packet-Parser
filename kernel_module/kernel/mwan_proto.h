@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 3
+#define MWAN_GENL_VERSION 4
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
@@ -55,6 +55,11 @@ enum mwan_genl_cmds {
     MWAN_CMD_GET_TUNNEL_PEERS, /* query runtime peer learned by discovery */
     MWAN_CMD_SET_TUNNEL_STATE, /* publish one BFD-stabilized data-path state */
     MWAN_CMD_GET_TUNNEL_STATE, /* query the state currently enforced by kernel */
+    MWAN_CMD_STAGE_PQC_KEY,    /* install NEXT without changing TX CURRENT */
+    MWAN_CMD_ACTIVATE_PQC_KEY, /* atomically make NEXT the TX CURRENT key */
+    MWAN_CMD_RETIRE_PQC_KEY,   /* stop accepting and erase PREV */
+    MWAN_CMD_GET_PQC_KEY_STATE,/* query key generations, never key material */
+    MWAN_CMD_ABORT_PQC_KEY,    /* discard an uncommitted NEXT key */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -78,9 +83,19 @@ enum mwan_genl_attrs {
     MWAN_ATTR_CONFIG_GENERATION, /* u32: full-config generation */
     MWAN_ATTR_TUNNEL_STATE,      /* u8: 0=DOWN, 1=UP */
     MWAN_ATTR_STATE_SEQUENCE,    /* u32: monotonic within one generation */
+    MWAN_ATTR_REKEY_EPOCH,       /* u64: idempotent userspace transaction */
+    MWAN_ATTR_NEXT_KEY,          /* NLA_BINARY: staged 32-byte PQC key */
+    MWAN_ATTR_NEXT_KEY_ID,       /* u8: staged traffic-key generation */
+    MWAN_ATTR_KEY_STATE,         /* u8: enum mwan_pqc_key_state */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)
+
+enum mwan_pqc_key_state {
+    MWAN_PQC_KEY_STABLE = 0,
+    MWAN_PQC_KEY_STAGED,
+    MWAN_PQC_KEY_ACTIVE_WITH_PREV,
+};
 
 /* ---- Tunnel Sub-Attributes ---- */
 enum mwan_tun_attrs {

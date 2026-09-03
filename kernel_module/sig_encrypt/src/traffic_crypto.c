@@ -531,15 +531,15 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     
     if (!key_obj) return TRF_PQC_ERR_INIT;
 
-    fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
-    fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
+    // fprintf(stderr, "[DEBUG-VERIFY] Entering trf_dsa_verify_payload...\n");
+    // fprintf(stderr, "[DEBUG-VERIFY] pub_sz = %d, len = %d, sig_sz = %d\n", pub_sz, len, sig_sz);
 
     // Calculate fingerprint of incoming public key to verify
     uint8_t hash[64];
     trf_calculate_digest(DIGEST_TYPE_SHA256, pub_key_in, pub_sz, hash);
     char fingerprint[16];
     for(int i=0; i<4; i++) sprintf(fingerprint + i*2, "%02x", hash[i]);
-    fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
+    // fprintf(stderr, "[DEBUG-VERIFY] Key fingerprint to verify: %s\n", fingerprint);
 
     int import_ret = scrypt_MlDsaImportPublicKey(key_obj, pub_key_in, pub_sz, MLDSA_LEVEL_5);
     if (import_ret != 0) {
@@ -552,7 +552,7 @@ int trf_dsa_verify_payload(const byte* pub_key_in, int pub_sz,
     if (ret != 0) {
         fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify failed: %d\n", ret);
     } else {
-        fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
+        // fprintf(stderr, "[DEBUG-VERIFY] scrypt_MlDsaVerify SUCCESS\n");
     }
     scrypt_MlDsaKeyFree(key_obj);
     return (ret == 0) ? TRF_PQC_OK : TRF_PQC_ERR_SIG;

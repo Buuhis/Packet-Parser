@@ -11,7 +11,7 @@
 #include <net/tcp.h>
 #include <net/dst.h>
 #include <linux/version.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 0, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 10)
 #include <net/gso.h>
 #else
 #include <linux/skbuff.h>

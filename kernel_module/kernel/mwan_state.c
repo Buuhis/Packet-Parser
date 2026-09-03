@@ -16,7 +16,7 @@ struct mwan_config __rcu *g_mwan_cfg = NULL;
 
 /* Configuration updates run from Generic Netlink process context and may
  * sleep while waiting for an RCU grace period and shutting down timers. */
-static DEFINE_MUTEX(cfg_lock);
+DEFINE_MUTEX(mwan_cfg_update_lock);
 
 /* Keep the packet nonce outside mwan_config so pushing the same config again
  * cannot reuse an AES-GCM IV while the active key is unchanged. L2 and L3
@@ -175,14 +175,14 @@ void mwan_state_cleanup(void)
 {
     struct mwan_config *old;
 
-    mutex_lock(&cfg_lock);
-    old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
+    mutex_lock(&mwan_cfg_update_lock);
+    old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
     if (old) {
         RCU_INIT_POINTER(g_mwan_cfg, NULL);
         synchronize_rcu();
         mwan_config_destroy(old);
     }
-    mutex_unlock(&cfg_lock);
+    mutex_unlock(&mwan_cfg_update_lock);
 }
 
 int mwan_state_update(struct mwan_config *new_cfg)
@@ -228,6 +228,12 @@ int mwan_state_update(struct mwan_config *new_cfg)
 
     if (new_cfg->key_id == 0)
         new_cfg->key_id = 1;
+    new_cfg->next_key_id = 0;
+    new_cfg->next_key_len = 0;
+    new_cfg->next_key_valid = false;
+    new_cfg->rekey_epoch = 0;
+    new_cfg->key_state = new_cfg->prev_key_valid ?
+        MWAN_PQC_KEY_ACTIVE_WITH_PREV : MWAN_PQC_KEY_STABLE;
     err = mwan_l2_flow_manager_init(new_cfg);
     if (err)
         return err;
@@ -424,8 +430,8 @@ int mwan_state_update(struct mwan_config *new_cfg)
     /* Phase 2: publish, wait for old readers, stop the old timer and destroy
      * the old config in this process context. No RCU callback survives module
      * unload, and no blocking operation runs from softirq context. */
-    mutex_lock(&cfg_lock);
-    old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&cfg_lock));
+    mutex_lock(&mwan_cfg_update_lock);
+    old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
     if (old) {
         pr_info("mwan_kmod: CFG-TRACE REPLACE old=%u/%u/%u/%u new=%u/%u/%u/%u\n",
                 old->node_id, old->encrypt_on, old->encrypt_layer,
@@ -443,7 +449,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     mwan_config_preserve_peer_state(new_cfg, old);
     new_paths = mwan_active_paths_build(new_cfg);
     if (!new_paths) {
-        mutex_unlock(&cfg_lock);
+        mutex_unlock(&mwan_cfg_update_lock);
         err = -ENOMEM;
         goto err_free_tfm;
     }
@@ -455,7 +461,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
             new_cfg->node_id, new_cfg->encrypt_on,
             new_cfg->encrypt_layer, new_cfg->encrypt_type,
             new_cfg->num_tunnels);
-    mutex_unlock(&cfg_lock);
+    mutex_unlock(&mwan_cfg_update_lock);
 
     mwan_l2_flow_manager_start(new_cfg);
     /* Resolve one independent peer MAC/IP tuple for every bonding tunnel. */
@@ -489,9 +495,9 @@ int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
     if (ifindex == 0 || generation == 0 || sequence == 0)
         return -EINVAL;
 
-    mutex_lock(&cfg_lock);
+    mutex_lock(&mwan_cfg_update_lock);
     cfg = rcu_dereference_protected(g_mwan_cfg,
-                                    lockdep_is_held(&cfg_lock));
+                                    lockdep_is_held(&mwan_cfg_update_lock));
     if (!cfg) {
         ret = -ENOENT;
         goto out_unlock;
@@ -533,7 +539,7 @@ int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
     }
     tun->state_sequence = sequence;
     old_paths = rcu_dereference_protected(cfg->active_paths,
-                                          lockdep_is_held(&cfg_lock));
+                                          lockdep_is_held(&mwan_cfg_update_lock));
     rcu_assign_pointer(cfg->active_paths, new_paths);
     synchronize_rcu();
     kfree(old_paths);
@@ -543,7 +549,7 @@ int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
             new_paths->active_count);
 
 out_unlock:
-    mutex_unlock(&cfg_lock);
+    mutex_unlock(&mwan_cfg_update_lock);
     return ret;
 }
 

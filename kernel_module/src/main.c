@@ -117,6 +117,15 @@ int pqc_bind_node(int node_id, uint64_t config_generation) {
     char key_id[256] = {0};
     char local_fg_db[32] = {0};
     char peer_pub_name[256] = {0};
+    bool l2_rekey_enabled = false;
+
+    runtime_config_lock();
+    if (running_ctx.cfg.node_id == node_id &&
+        running_ctx.cfg.encrypt.enabled &&
+        running_ctx.cfg.encrypt.layer == 2 &&
+        running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM)
+        l2_rekey_enabled = true;
+    runtime_config_unlock();
 
     // Load PQC identity config from DB
     if (db_client_load_pqc_identity(node_id,
@@ -225,7 +234,8 @@ int pqc_bind_node(int node_id, uint64_t config_generation) {
         int bind_rc = sig_pqc_bind_profile(
             node_id, key_id, role_mode, local_ip, peer_ip,
             local_fg, peer_fg_buf, hs_tun_name,
-            found_priv, found_pub, deobf_pub, config_generation);
+            found_priv, found_pub, deobf_pub, config_generation,
+            l2_rekey_enabled);
         if (bind_rc != 0) {
             log_error("[PQC] Failed to retain binding for profile %d: %s",
                       node_id, strerror(-bind_rc));
@@ -299,6 +309,31 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
                  running_ctx.cfg.encrypt.layer,
                  running_ctx.cfg.encrypt.type);
         log_warn("[PQC] Handshake key ready for Node %d but no active tunnel/encryption is configured for it.", profile_id);
+    }
+    runtime_config_unlock();
+}
+
+/* A rotation has already been committed through the key-only Netlink API.
+ * Keep the userspace snapshot aligned without replacing mwan_config, which
+ * would otherwise reset workers, flow ownership and reorder state. */
+void sig_pqc_on_key_activated(int profile_id, const uint8_t *key_bytes,
+                              uint64_t config_generation)
+{
+    runtime_config_lock();
+    if (key_bytes &&
+        runtime_config_generation_is_current_locked(config_generation) &&
+        running_ctx.cfg.node_id == profile_id &&
+        running_ctx.cfg.encrypt.enabled &&
+        running_ctx.cfg.encrypt.layer == 2 &&
+        running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        memcpy(running_ctx.cfg.encrypt.key, key_bytes,
+               PQC_TRAFFIC_KEY_SZ);
+        running_ctx.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
+        log_info("[PQC-REKEY] Userspace active key metadata updated for Node %d without full config reload",
+                 profile_id);
+    } else {
+        log_warn("[PQC-REKEY] Ignored stale key activation for Node %d",
+                 profile_id);
     }
     runtime_config_unlock();
 }

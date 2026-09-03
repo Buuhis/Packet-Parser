@@ -13,6 +13,7 @@
 #include <linux/if_ether.h>
 #include <linux/refcount.h>
 #include <linux/list.h>
+#include <linux/mutex.h>
 #include "mwan_proto.h"
 
 #define MWAN_REORDER_TIMEOUT       msecs_to_jiffies(30)
@@ -193,6 +194,22 @@ struct mwan_l2_worker {
     struct aead_request *req;
     struct crypto_aead *prev_tfm;
     struct aead_request *prev_req;
+    struct crypto_aead *next_tfm;
+    struct aead_request *next_req;
+    struct crypto_aead *tx_prev_tfm;
+    struct aead_request *tx_prev_req;
+    struct crypto_aead *tx_next_tfm;
+    struct aead_request *tx_next_req;
+    struct mutex crypto_lock;
+    u8 crypto_current_id;
+    u8 crypto_prev_id;
+    u8 crypto_next_id;
+    bool crypto_prev_valid;
+    bool crypto_next_valid;
+    /* Queue/in-flight references indexed by the on-wire key id.  Keeping
+     * these counters per worker avoids a cross-CPU cache-line hotspot while
+     * allowing PREV to be retired without racing queued crypto work. */
+    atomic_t crypto_key_pending[256];
     int cpu;
 
     atomic64_t queued_packets;
@@ -283,6 +300,12 @@ struct mwan_config {
     u8 prev_key[MWAN_MAX_KEY_LEN];
     u8 prev_key_len;
     bool prev_key_valid;
+    u8 next_key_id;
+    u8 next_key[MWAN_MAX_KEY_LEN];
+    u8 next_key_len;
+    bool next_key_valid;
+    u64 rekey_epoch;
+    u8 key_state;
     int num_workers;
     int worker_start_cpu;
     struct mwan_l2_worker *l2_workers;
@@ -291,6 +314,7 @@ struct mwan_config {
 
 /* Global pointer to the current active configuration */
 extern struct mwan_config __rcu *g_mwan_cfg;
+extern struct mutex mwan_cfg_update_lock;
 extern bool mwan_l2_diag_enabled;
 extern bool mwan_fw_diag_enabled;
 extern unsigned int mwan_l2_diag_limit;
@@ -309,6 +333,17 @@ int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
                                 u32 sequence, bool up);
 int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,
                                 u32 *sequence, bool *up);
+int mwan_state_stage_pqc_key(u32 node_id, u32 generation, u64 epoch,
+                             u8 key_id, const u8 *key, u8 key_len);
+int mwan_state_activate_pqc_key(u32 node_id, u32 generation, u64 epoch,
+                                u8 key_id);
+int mwan_state_retire_pqc_key(u32 node_id, u32 generation, u64 epoch,
+                              u8 key_id);
+int mwan_state_abort_pqc_key(u32 node_id, u32 generation, u64 epoch,
+                             u8 key_id);
+int mwan_state_get_pqc_key_state(u32 node_id, u32 *generation, u64 *epoch,
+                                 u8 *state, u8 *current_id, u8 *prev_id,
+                                 u8 *next_id);
 void mwan_state_count_no_active_drop(void);
 u64 mwan_state_no_active_drops(void);
 u64 mwan_next_packet_nonce(void);
@@ -324,6 +359,18 @@ bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_rx_worker_fn(struct work_struct *work);
 void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker);
+int mwan_l2_workers_stage_next_key(struct mwan_config *cfg, const u8 *key,
+                                   u8 key_len, u8 key_id);
+int mwan_l2_workers_activate_next_key(struct mwan_config *cfg, u8 key_id);
+int mwan_l2_workers_retire_prev_key(struct mwan_config *cfg, u8 key_id);
+int mwan_l2_workers_abort_next_key(struct mwan_config *cfg, u8 key_id);
+int mwan_l2_worker_tx_crypto_lock(struct mwan_l2_worker *worker, u8 key_id,
+                                  struct crypto_aead **tfm,
+                                  struct aead_request **req);
+int mwan_l2_worker_rx_crypto_lock(struct mwan_l2_worker *worker, u8 key_id,
+                                  struct crypto_aead **tfm,
+                                  struct aead_request **req);
+void mwan_l2_worker_crypto_unlock(struct mwan_l2_worker *worker);
 int mwan_multicore_init(void);
 void mwan_multicore_cleanup(void);
 u64 mwan_multicore_worker_score(const struct mwan_l2_worker *worker);

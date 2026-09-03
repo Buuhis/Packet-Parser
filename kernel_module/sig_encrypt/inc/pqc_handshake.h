@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "pqc_key_rotation.h"
 
 #define PQC_HS_PORT        7090
 #define PQC_HS_MAGIC       0x50514348 // "PQCH"
@@ -15,6 +16,12 @@
 #define PQC_HS_MSG_KEEPALIVE 3
 /* Signed responder-to-initiator request to restart HELLO after reboot. */
 #define PQC_HS_MSG_POKE    4
+#define PQC_HS_MSG_REKEY_HELLO 5
+#define PQC_HS_MSG_REKEY_RESP  6
+#define PQC_HS_MSG_REKEY_READY 7
+#define PQC_HS_MSG_REKEY_COMMIT 8
+#define PQC_HS_MSG_REKEY_COMMIT_ACK 9
+#define PQC_HS_MSG_REKEY_ABORT 10
 
 #define PQC_KEM_PK_SIZE    1184 // ML-KEM-768 PK size
 #define PQC_KEM_CT_SIZE    1088 // ML-KEM-768 CT size
@@ -70,6 +77,7 @@ typedef struct {
     uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
     bool valid;
     bool key_promoted;
+    bool is_rekey;
 } pqc_hs_cache_entry_t;
 
 typedef struct {
@@ -78,7 +86,6 @@ typedef struct {
     atomic_uint_fast64_t last_sent_time;
     atomic_uint_fast64_t last_recv_time;
     atomic_uint_fast64_t handshake_start_time;
-    atomic_uint_fast64_t rotation_start_time;
     uint64_t config_generation;
     uint64_t local_request_id;
     uint64_t peer_request_id;
@@ -136,11 +143,12 @@ typedef struct {
     bool is_initiator;
     atomic_bool thread_started;
     atomic_bool handshake_give_up;
-    atomic_bool rotation_give_up;
     atomic_bool send_poke;
     bool keepalive_enabled;
     bool is_tunnel;
+    bool l2_rekey_enabled;
     atomic_bool thread_exit_sig;
+    pqc_key_rotation_t rotation;
 } policy_key_binding_t;
 
 typedef struct {
@@ -219,7 +227,8 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
                          const char *local_fg, const char *peer_fg,
                          const char *wan_ifname,
                          const char *local_priv, const char *local_pub,
-                         const char *peer_pub, uint64_t config_generation);
+                         const char *peer_pub, uint64_t config_generation,
+                         bool l2_rekey_enabled);
 int sig_pqc_find_identity(const char *fingerprint, char **out_priv, char **out_pub);
 int sig_pqc_load_key_from_vault(const char *fingerprint_key);
 char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fingerprint);
@@ -238,8 +247,6 @@ void sig_pqc_record_recv(int profile_id);
 int sig_pqc_get_keys(int profile_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]);
 int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
                           uint8_t key_ids[3], bool key_slots_valid[3]);
-void sig_pqc_promote_responder_key(int profile_id);
-void sig_pqc_discard_prev_key(int profile_id);
 void sig_pqc_trigger_retry(int profile_id);
 int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_max);
 

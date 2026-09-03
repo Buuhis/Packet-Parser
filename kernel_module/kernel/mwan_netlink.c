@@ -27,6 +27,10 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_CONFIG_GENERATION] = { .type = NLA_U32 },
     [MWAN_ATTR_TUNNEL_STATE] = { .type = NLA_U8 },
     [MWAN_ATTR_STATE_SEQUENCE] = { .type = NLA_U32 },
+    [MWAN_ATTR_REKEY_EPOCH] = { .type = NLA_U64 },
+    [MWAN_ATTR_NEXT_KEY] = NLA_POLICY_EXACT_LEN(MWAN_MAX_KEY_LEN),
+    [MWAN_ATTR_NEXT_KEY_ID] = { .type = NLA_U8 },
+    [MWAN_ATTR_KEY_STATE] = { .type = NLA_U8 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -269,6 +273,136 @@ static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
     return genlmsg_reply(reply, info);
 }
 
+static int mwan_genl_stage_pqc_key(struct sk_buff *skb,
+                                   struct genl_info *info)
+{
+    u32 node_id;
+    u32 generation;
+    u64 epoch;
+    u8 key_id;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_REKEY_EPOCH] ||
+        !info->attrs[MWAN_ATTR_NEXT_KEY_ID] ||
+        !info->attrs[MWAN_ATTR_NEXT_KEY])
+        return -EINVAL;
+
+    node_id = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    generation = nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    epoch = nla_get_u64(info->attrs[MWAN_ATTR_REKEY_EPOCH]);
+    key_id = nla_get_u8(info->attrs[MWAN_ATTR_NEXT_KEY_ID]);
+    return mwan_state_stage_pqc_key(
+        node_id, generation, epoch, key_id,
+        nla_data(info->attrs[MWAN_ATTR_NEXT_KEY]),
+        nla_len(info->attrs[MWAN_ATTR_NEXT_KEY]));
+}
+
+static int mwan_genl_activate_pqc_key(struct sk_buff *skb,
+                                      struct genl_info *info)
+{
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_REKEY_EPOCH] ||
+        !info->attrs[MWAN_ATTR_NEXT_KEY_ID])
+        return -EINVAL;
+    return mwan_state_activate_pqc_key(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        nla_get_u64(info->attrs[MWAN_ATTR_REKEY_EPOCH]),
+        nla_get_u8(info->attrs[MWAN_ATTR_NEXT_KEY_ID]));
+}
+
+static int mwan_genl_retire_pqc_key(struct sk_buff *skb,
+                                    struct genl_info *info)
+{
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_REKEY_EPOCH] ||
+        !info->attrs[MWAN_ATTR_PREV_KEY_ID])
+        return -EINVAL;
+    return mwan_state_retire_pqc_key(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        nla_get_u64(info->attrs[MWAN_ATTR_REKEY_EPOCH]),
+        nla_get_u8(info->attrs[MWAN_ATTR_PREV_KEY_ID]));
+}
+
+static int mwan_genl_abort_pqc_key(struct sk_buff *skb,
+                                   struct genl_info *info)
+{
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_REKEY_EPOCH] ||
+        !info->attrs[MWAN_ATTR_NEXT_KEY_ID])
+        return -EINVAL;
+    return mwan_state_abort_pqc_key(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        nla_get_u64(info->attrs[MWAN_ATTR_REKEY_EPOCH]),
+        nla_get_u8(info->attrs[MWAN_ATTR_NEXT_KEY_ID]));
+}
+
+static int mwan_genl_get_pqc_key_state(struct sk_buff *skb,
+                                       struct genl_info *info)
+{
+    struct sk_buff *reply;
+    void *reply_hdr;
+    u32 node_id;
+    u32 generation;
+    u64 epoch;
+    u8 state;
+    u8 current_id;
+    u8 prev_id;
+    u8 next_id;
+    int ret;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID])
+        return -EINVAL;
+    node_id = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    ret = mwan_state_get_pqc_key_state(node_id, &generation, &epoch,
+                                       &state, &current_id, &prev_id,
+                                       &next_id);
+    if (ret)
+        return ret;
+
+    reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+    if (!reply)
+        return -ENOMEM;
+    reply_hdr = genlmsg_put_reply(reply, info, &mwan_genl_family, 0,
+                                  MWAN_CMD_GET_PQC_KEY_STATE);
+    if (!reply_hdr) {
+        nlmsg_free(reply);
+        return -EMSGSIZE;
+    }
+    ret = nla_put_u32(reply, MWAN_ATTR_NODE_ID, node_id);
+    if (!ret)
+        ret = nla_put_u32(reply, MWAN_ATTR_CONFIG_GENERATION, generation);
+    if (!ret)
+        ret = nla_put_u64_64bit(reply, MWAN_ATTR_REKEY_EPOCH, epoch,
+                                MWAN_ATTR_UNSPEC);
+    if (!ret)
+        ret = nla_put_u8(reply, MWAN_ATTR_KEY_STATE, state);
+    if (!ret)
+        ret = nla_put_u8(reply, MWAN_ATTR_KEY_ID, current_id);
+    if (!ret && prev_id)
+        ret = nla_put_u8(reply, MWAN_ATTR_PREV_KEY_ID, prev_id);
+    if (!ret && next_id)
+        ret = nla_put_u8(reply, MWAN_ATTR_NEXT_KEY_ID, next_id);
+    if (ret) {
+        genlmsg_cancel(reply, reply_hdr);
+        nlmsg_free(reply);
+        return ret;
+    }
+    genlmsg_end(reply, reply_hdr);
+    return genlmsg_reply(reply, info);
+}
+
 /* Read-only runtime query. Discovery owns the peer tuple; userspace supplies
  * only the data-tunnel ifindex so no database value can become authoritative
  * for liveness/failover. */
@@ -365,6 +499,36 @@ static const struct genl_ops mwan_genl_ops[] = {
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_get_tunnel_state,
         .dumpit = NULL,
+    },
+    {
+        .cmd    = MWAN_CMD_STAGE_PQC_KEY,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_stage_pqc_key,
+    },
+    {
+        .cmd    = MWAN_CMD_ACTIVATE_PQC_KEY,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_activate_pqc_key,
+    },
+    {
+        .cmd    = MWAN_CMD_RETIRE_PQC_KEY,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_retire_pqc_key,
+    },
+    {
+        .cmd    = MWAN_CMD_GET_PQC_KEY_STATE,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_get_pqc_key_state,
+    },
+    {
+        .cmd    = MWAN_CMD_ABORT_PQC_KEY,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_abort_pqc_key,
     },
 };
 

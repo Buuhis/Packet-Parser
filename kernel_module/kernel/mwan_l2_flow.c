@@ -26,7 +26,8 @@ static u32 mwan_l2_tx_bucket(const struct mwan_l2_flow_key *key)
 
 static u32 mwan_l2_rx_bucket(u64 flow_token)
 {
-    return hash_64(flow_token, ilog2(MWAN_FLOW_HASH_SIZE));
+    return hash_64(flow_token & MWAN_FLOW_COOKIE_MASK,
+                   ilog2(MWAN_FLOW_HASH_SIZE));
 }
 
 static bool mwan_l2_flow_key_equal(const struct mwan_l2_flow_key *a,
@@ -35,14 +36,14 @@ static bool mwan_l2_flow_key_equal(const struct mwan_l2_flow_key *a,
     return !memcmp(a, b, sizeof(*a));
 }
 
-static u64 mwan_l2_new_flow_token(u8 key_id)
+static u64 mwan_l2_new_flow_token(void)
 {
     u64 cookie;
 
     do {
         cookie = get_random_u64() & MWAN_FLOW_COOKIE_MASK;
     } while (!cookie);
-    return ((u64)key_id << MWAN_FLOW_KEY_ID_SHIFT) | cookie;
+    return cookie;
 }
 
 static bool mwan_l2_flow_expired(unsigned long last_seen, bool closing)
@@ -307,7 +308,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
         return NULL;
     }
     candidate->key = *key;
-    candidate->flow_token = mwan_l2_new_flow_token(cfg->key_id);
+    candidate->flow_token = mwan_l2_new_flow_token();
     refcount_set(&candidate->refs, 1); /* table reference */
     atomic_set(&candidate->next_seq, 0);
     atomic_set(&candidate->pending_crypto, 0);
@@ -395,6 +396,7 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
     u32 index;
     int owner;
 
+    flow_token &= MWAN_FLOW_COOKIE_MASK;
     if (!cfg || !flow_token || READ_ONCE(cfg->flows.stopping))
         return NULL;
     index = mwan_l2_rx_bucket(flow_token);
@@ -472,6 +474,7 @@ bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
     u32 index;
     bool released = false;
 
+    flow_token &= MWAN_FLOW_COOKIE_MASK;
     if (!cfg || !flow_token || owner_worker < 0 ||
         owner_worker >= cfg->num_workers)
         return false;
