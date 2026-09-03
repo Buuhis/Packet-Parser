@@ -75,6 +75,7 @@ typedef struct {
     int response_len;
     uint8_t hello_hash[32];
     uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
+    uint8_t agreed_key_id;
     bool valid;
     bool key_promoted;
     bool is_rekey;

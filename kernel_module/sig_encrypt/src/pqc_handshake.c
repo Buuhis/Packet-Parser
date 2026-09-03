@@ -37,6 +37,9 @@
 #define PQC_HS_STATE_READY 1
 #define PQC_HS_STATE_FAILED 2
 #define PQC_HS_STATE_HANDSHAKING 3
+#define PQC_HS_INIT_WIRE_VERSION 1
+#define PQC_HS_INIT_HAS_CURRENT 0x01
+#define PQC_HS_INIT_HAS_PREVIOUS 0x02
 
 enum pqc_hs_hello_diag_status {
     PQC_HS_HELLO_DIAG_OK = 0,
@@ -67,6 +70,21 @@ typedef struct {
     uint64_t epoch;
     uint64_t sequence;
 } pqc_hs_keepalive_status_t;
+
+#pragma pack(push, 1)
+typedef struct {
+    uint8_t version;
+    uint8_t flags;
+    uint8_t current_key_id;
+    uint8_t previous_key_id;
+} pqc_hs_init_hello_wire_t;
+
+typedef struct {
+    uint8_t version;
+    uint8_t agreed_key_id;
+    uint8_t key_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ];
+} pqc_hs_init_resp_wire_t;
+#pragma pack(pop)
 
 #define PQC_HS_KEEPALIVE_DATA_SZ \
     ((uint16_t)sizeof(pqc_hs_keepalive_wire_t))
@@ -610,13 +628,70 @@ static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t
     memcpy(out_key, hash, PQC_TRAFFIC_KEY_SZ);
 }
 
+static bool pqc_hs_key_id_reserved(uint8_t candidate,
+                                   uint8_t local_current,
+                                   uint8_t local_previous,
+                                   uint8_t peer_current,
+                                   uint8_t peer_previous)
+{
+    return candidate == 0 || candidate == local_current ||
+           candidate == local_previous || candidate == peer_current ||
+           candidate == peer_previous;
+}
+
+/* Select one ID from the derived key fingerprint, while excluding every ID
+ * that either peer still associates with CURRENT or PREVIOUS.  The responder
+ * signs this decision and the initiator must install the exact same ID. */
+static uint8_t pqc_hs_choose_agreed_key_id(
+    const policy_key_binding_t *b,
+    const pqc_hs_init_hello_wire_t *peer_state,
+    const uint8_t key_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ])
+{
+    uint8_t local_current = 0;
+    uint8_t local_previous = 0;
+    uint8_t peer_current = 0;
+    uint8_t peer_previous = 0;
+
+    if (!b || !peer_state || !key_fingerprint)
+        return 0;
+    if (b->key_slots_valid[KEY_SLOT_CURRENT])
+        local_current = b->key_ids[KEY_SLOT_CURRENT];
+    if (b->key_slots_valid[KEY_SLOT_PREV])
+        local_previous = b->key_ids[KEY_SLOT_PREV];
+    if (peer_state->flags & PQC_HS_INIT_HAS_CURRENT)
+        peer_current = peer_state->current_key_id;
+    if (peer_state->flags & PQC_HS_INIT_HAS_PREVIOUS)
+        peer_previous = peer_state->previous_key_id;
+
+    for (size_t i = 0; i < PQC_HS_KEY_FINGERPRINT_SZ; i++) {
+        uint8_t candidate = key_fingerprint[i];
+
+        if (!pqc_hs_key_id_reserved(candidate, local_current,
+                                    local_previous, peer_current,
+                                    peer_previous))
+            return candidate;
+    }
+    for (unsigned int i = 1; i <= UINT8_MAX; i++) {
+        uint8_t candidate = (uint8_t)i;
+
+        if (!pqc_hs_key_id_reserved(candidate, local_current,
+                                    local_previous, peer_current,
+                                    peer_previous))
+            return candidate;
+    }
+    return 0;
+}
+
 static uint64_t get_time_ms_hs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
 
-static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *derived_master, const char *role) {
+static void handle_handshake_success(policy_key_binding_t *b,
+                                     const uint8_t *derived_master,
+                                     uint8_t agreed_key_id,
+                                     const char *role) {
     uint64_t now = get_time_ms_hs();
 
     if (b->key_ready) {
@@ -630,8 +705,7 @@ static void handle_handshake_success(policy_key_binding_t *b, const uint8_t *der
     b->key_slots_valid[KEY_SLOT_PREV] = b->key_slots_valid[KEY_SLOT_CURRENT];
 
     memcpy(b->keys[KEY_SLOT_CURRENT], derived_master, PQC_TRAFFIC_KEY_SZ);
-    b->key_ids[KEY_SLOT_CURRENT] = (b->key_ids[KEY_SLOT_CURRENT] + 1) & 0xFF;
-    if (b->key_ids[KEY_SLOT_CURRENT] == 0) b->key_ids[KEY_SLOT_CURRENT] = 1;
+    b->key_ids[KEY_SLOT_CURRENT] = agreed_key_id;
     b->key_slots_valid[KEY_SLOT_CURRENT] = true;
 
     b->key_slots_valid[KEY_SLOT_NEXT] = false;
@@ -674,6 +748,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
     uint8_t *response = NULL;
     uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
     int response_len = 0;
+    uint8_t agreed_key_id = 0;
     bool already_promoted = false;
     bool is_rekey = false;
     bool promote_now = false;
@@ -696,6 +771,7 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
     if (response) {
         memcpy(response, b->hs_cache[cache_slot].response, (size_t)response_len);
         memcpy(master_key, b->hs_cache[cache_slot].master_key, sizeof(master_key));
+        agreed_key_id = b->hs_cache[cache_slot].agreed_key_id;
         already_promoted = b->hs_cache[cache_slot].key_promoted;
         is_rekey = b->hs_cache[cache_slot].is_rekey;
     }
@@ -724,7 +800,8 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
             memcmp(b->hs_cache[cache_slot].hello_hash, hello_hash, 32) == 0 &&
             !b->hs_cache[cache_slot].key_promoted) {
             b->hs_cache[cache_slot].key_promoted = true;
-            handle_handshake_success(b, master_key, "Responder");
+            handle_handshake_success(b, master_key, agreed_key_id,
+                                     "Responder");
             memset(b->hs_cache[cache_slot].master_key, 0,
                    sizeof(b->hs_cache[cache_slot].master_key));
             callback_generation = b->config_generation;
@@ -771,6 +848,11 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     int cached_slot = -1;
     bool session_conflict = false;
     bool is_rekey;
+    pqc_hs_init_hello_wire_t peer_init_state = {0};
+    const uint8_t *kem_public_key;
+    size_t kem_public_key_len;
+    uint8_t init_key_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ] = {0};
+    uint8_t init_agreed_key_id = 0;
     uint8_t rekey_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ] = {0};
     uint8_t rekey_id = 0;
     size_t response_prefix = 0;
@@ -793,6 +875,39 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     is_rekey = msg->msg_type == PQC_HS_MSG_REKEY_HELLO;
     if (is_rekey && !b->l2_rekey_enabled)
         return -EOPNOTSUPP;
+    if (!is_rekey) {
+        if (msg->data_len <= sizeof(peer_init_state)) {
+            if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                    PQC_HS_HELLO_DIAG_MALFORMED))
+                fprintf(stderr,
+                        "[PQC-HS-L3] Rejected legacy/malformed INIT HELLO for Profile %d.\n",
+                        b->profile_id);
+            return -EPROTO;
+        }
+        memcpy(&peer_init_state, msg->payload, sizeof(peer_init_state));
+        if (peer_init_state.version != PQC_HS_INIT_WIRE_VERSION ||
+            (peer_init_state.flags &
+             ~(PQC_HS_INIT_HAS_CURRENT | PQC_HS_INIT_HAS_PREVIOUS)) ||
+            ((peer_init_state.flags & PQC_HS_INIT_HAS_CURRENT) != 0) !=
+                (peer_init_state.current_key_id != 0) ||
+            ((peer_init_state.flags & PQC_HS_INIT_HAS_PREVIOUS) != 0) !=
+                (peer_init_state.previous_key_id != 0) ||
+            (peer_init_state.current_key_id != 0 &&
+             peer_init_state.current_key_id ==
+                 peer_init_state.previous_key_id)) {
+            if (pqc_hs_diag_changed(&b->hello_rx_last_status,
+                                    PQC_HS_HELLO_DIAG_MALFORMED))
+                fprintf(stderr,
+                        "[PQC-HS-L3] Rejected invalid INIT key metadata for Profile %d.\n",
+                        b->profile_id);
+            return -EPROTO;
+        }
+        kem_public_key = msg->payload + sizeof(peer_init_state);
+        kem_public_key_len = msg->data_len - sizeof(peer_init_state);
+    } else {
+        kem_public_key = msg->payload;
+        kem_public_key_len = msg->data_len;
+    }
 
     if (trf_calculate_digest(DIGEST_TYPE_SHA256, rx_buf, rx_len, hello_hash) != TRF_PQC_OK) {
         if (pqc_hs_diag_changed(&b->hello_rx_last_status,
@@ -864,7 +979,8 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         return -1;
     }
 
-    if (trf_kem_encapsulate(msg->payload, msg->data_len, ct, &ct_sz, ss) != TRF_PQC_OK) {
+    if (trf_kem_encapsulate(kem_public_key, (int)kem_public_key_len,
+                            ct, &ct_sz, ss) != TRF_PQC_OK) {
         if (pqc_hs_diag_changed(&b->hello_rx_last_status,
                                 PQC_HS_HELLO_DIAG_ENCAPSULATE)) {
             fprintf(stderr, "[PQC-HS-L3] KEM encapsulation failed for Profile %d, session %u.\n",
@@ -888,6 +1004,18 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         if (!rekey_id)
             return -1;
         response_prefix = sizeof(pqc_rekey_wire_t);
+    } else {
+        if (trf_calculate_digest(DIGEST_TYPE_SHA256, derived_master,
+                                 sizeof(derived_master),
+                                 init_key_fingerprint) != TRF_PQC_OK)
+            return -EIO;
+        pthread_mutex_lock(&g_key_mutex);
+        init_agreed_key_id = pqc_hs_choose_agreed_key_id(
+            b, &peer_init_state, init_key_fingerprint);
+        pthread_mutex_unlock(&g_key_mutex);
+        if (!init_agreed_key_id)
+            return -ENOSPC;
+        response_prefix = sizeof(pqc_hs_init_resp_wire_t);
     }
 
     struct pqc_hs_msg *resp = (struct pqc_hs_msg *)response_buf;
@@ -903,6 +1031,14 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         memcpy(wire->epoch_be, &epoch_be, sizeof(epoch_be));
         wire->key_id = rekey_id;
         memcpy(wire->key_fingerprint, rekey_fingerprint,
+               sizeof(wire->key_fingerprint));
+    } else {
+        pqc_hs_init_resp_wire_t *wire =
+            (pqc_hs_init_resp_wire_t *)resp->payload;
+
+        wire->version = PQC_HS_INIT_WIRE_VERSION;
+        wire->agreed_key_id = init_agreed_key_id;
+        memcpy(wire->key_fingerprint, init_key_fingerprint,
                sizeof(wire->key_fingerprint));
     }
     memcpy(resp->payload + response_prefix, ct, (size_t)ct_sz);
@@ -959,6 +1095,7 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     if (!is_rekey)
         memcpy(b->hs_cache[cached_slot].master_key, derived_master,
                sizeof(derived_master));
+    b->hs_cache[cached_slot].agreed_key_id = init_agreed_key_id;
     b->hs_cache[cached_slot].valid = true;
     b->hs_cache[cached_slot].is_rekey = is_rekey;
     pthread_mutex_unlock(&g_key_mutex);
@@ -2026,14 +2163,30 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     continue;
                 }
                 struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+                pqc_hs_init_hello_wire_t *init_wire =
+                    (pqc_hs_init_hello_wire_t *)msg->payload;
                 msg->magic = PQC_HS_MAGIC;
                 msg->msg_type = PQC_HS_MSG_HELLO;
                 msg->session_id = session_id;
                 msg->profile_id = profile_id;
-                msg->data_len = (uint16_t)pk_sz;
-                memcpy(msg->payload, pk, pk_sz);
+                msg->data_len = (uint16_t)(sizeof(*init_wire) +
+                                            (size_t)pk_sz);
+                memset(init_wire, 0, sizeof(*init_wire));
+                init_wire->version = PQC_HS_INIT_WIRE_VERSION;
+                memcpy(msg->payload + sizeof(*init_wire), pk,
+                       (size_t)pk_sz);
 
                 pthread_mutex_lock(&g_key_mutex);
+                if (b->key_slots_valid[KEY_SLOT_CURRENT]) {
+                    init_wire->flags |= PQC_HS_INIT_HAS_CURRENT;
+                    init_wire->current_key_id =
+                        b->key_ids[KEY_SLOT_CURRENT];
+                }
+                if (b->key_slots_valid[KEY_SLOT_PREV]) {
+                    init_wire->flags |= PQC_HS_INIT_HAS_PREVIOUS;
+                    init_wire->previous_key_id =
+                        b->key_ids[KEY_SLOT_PREV];
+                }
                 if (b->local_priv && strlen(b->local_priv) > 0) {
                     if (my_priv) free(my_priv);
                     my_priv = strdup(b->local_priv);
@@ -2047,7 +2200,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
                 int sig_sz = 0;
                 if (pqc_hs_sign_message(raw_priv, raw_priv_sz, msg,
-                                        msg->payload + pk_sz, &sig_sz) != TRF_PQC_OK) {
+                                        msg->payload + msg->data_len,
+                                        &sig_sz) != TRF_PQC_OK) {
                     pthread_mutex_unlock(&g_key_mutex);
                     if (last_prepare_error != 2) {
                         fprintf(stderr, "[PQC-HS-L3] Failed to sign HELLO for Profile %d.\n",
@@ -2073,7 +2227,8 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                         break;
                     }
                     size_t hello_len = sizeof(struct pqc_hs_msg) +
-                                       (size_t)pk_sz + (size_t)sig_sz;
+                                       (size_t)msg->data_len +
+                                       (size_t)sig_sz;
                     ssize_t sent = sendto(
                         sockfd, buffer, hello_len, 0,
                         (const struct sockaddr *)&peeraddr, sizeof(peeraddr));
@@ -2126,15 +2281,50 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 trf_base64_decode(peer_pub, raw_pub, &raw_pub_sz);
                                 pthread_mutex_unlock(&g_key_mutex);
 
-                                if (pqc_hs_verify_message(raw_pub, raw_pub_sz, resp) == TRF_PQC_OK) {
-                                    if (trf_kem_decapsulate(sk, sk_sz, resp->payload, resp->data_len, ss) == TRF_PQC_OK) {
+                                if (pqc_hs_verify_message(raw_pub, raw_pub_sz,
+                                                          resp) ==
+                                        TRF_PQC_OK &&
+                                    resp->data_len >
+                                        sizeof(pqc_hs_init_resp_wire_t)) {
+                                    const pqc_hs_init_resp_wire_t *resp_wire =
+                                        (const pqc_hs_init_resp_wire_t *)
+                                            resp->payload;
+
+                                    if (resp_wire->version !=
+                                            PQC_HS_INIT_WIRE_VERSION ||
+                                        resp_wire->agreed_key_id == 0)
+                                        continue;
+                                    if (trf_kem_decapsulate(
+                                            sk, sk_sz,
+                                            resp->payload +
+                                                sizeof(*resp_wire),
+                                            resp->data_len -
+                                                sizeof(*resp_wire),
+                                            ss) == TRF_PQC_OK) {
                                         uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
+                                        uint8_t calculated_fingerprint[
+                                            PQC_HS_KEY_FINGERPRINT_SZ];
                                         derive_traffic_key(ss, 32, derived_master);
+
+                                        if (trf_calculate_digest(
+                                                DIGEST_TYPE_SHA256,
+                                                derived_master,
+                                                sizeof(derived_master),
+                                                calculated_fingerprint) !=
+                                                TRF_PQC_OK ||
+                                            memcmp(calculated_fingerprint,
+                                                   resp_wire->key_fingerprint,
+                                                   sizeof(calculated_fingerprint)) !=
+                                                0)
+                                            continue;
 
                                         uint64_t callback_generation;
 
                                         pthread_mutex_lock(&g_key_mutex);
-                                        handle_handshake_success(b, derived_master, "Initiator");
+                                        handle_handshake_success(
+                                            b, derived_master,
+                                            resp_wire->agreed_key_id,
+                                            "Initiator");
                                         callback_generation = b->config_generation;
                                         pthread_mutex_unlock(&g_key_mutex);
 
