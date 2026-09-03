@@ -519,6 +519,8 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     spin_lock_bh(&flow->reorder_lock);
     if (unlikely((s32)(flow_seq - flow->expected_seq) < 0)) {
         atomic64_inc(&flow->manager->reorder_late);
+        mwan_rekey_diag_count_drop(flow->manager->cfg,
+                                   MWAN_REKEY_DROP_REORDER_LATE, 0);
         spin_unlock_bh(&flow->reorder_lock);
         kfree_skb(skb);
         return;
@@ -534,6 +536,8 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
          * unchanged would permanently black-hole a high-rate UDP flow after
          * a failover gap larger than MWAN_FLOW_RING_SIZE. */
         atomic64_inc(&flow->manager->reorder_too_far);
+        mwan_rekey_diag_count_drop(flow->manager->cfg,
+                                   MWAN_REKEY_DROP_REORDER_TOO_FAR, 0);
         atomic64_inc(&flow->manager->reorder_resync);
         atomic64_add(delta, &flow->manager->reorder_resync_skipped);
         for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {

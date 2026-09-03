@@ -1186,6 +1186,8 @@ static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
 
     atomic64_inc(&worker->tx_overload_dropped);
     atomic64_inc(&worker->tx_dropped_packets);
+    mwan_rekey_diag_count_drop(worker->cfg, MWAN_REKEY_DROP_TX_OVERLOAD,
+                               0);
     return true;
 }
 
@@ -1229,12 +1231,15 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     packet_class = mwan_packet_classify(skb);
     flow = mwan_l2_tx_flow_get(cfg, &info->key, info->flow_id,
                                packet_class == MWAN_PACKET_CONTROL);
-    if (!flow)
+    if (!flow) {
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         return -ENOSPC;
+    }
     mwan_l2_tx_flow_touch(flow, closing);
     owner = flow->owner_worker;
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu)) {
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         mwan_l2_tx_flow_put(flow);
         return -ENODEV;
     }
@@ -1257,6 +1262,7 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         spin_unlock(&worker->tx_queue.lock);
         spin_unlock_bh(&flow->submit_lock);
         atomic64_inc(&worker->tx_dropped_packets);
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
         mwan_l2_tx_flow_put(flow);
         return -ENOSPC;
     }
@@ -1373,6 +1379,14 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                                       ktime_get_ns() - start_ns);
             atomic64_inc(&worker->tx_processed_packets);
             if (unlikely(err)) {
+                u8 packet_key_id =
+                    (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
+
+                mwan_rekey_diag_count_drop(
+                    cfg, err == -ENOKEY ?
+                        MWAN_REKEY_DROP_TX_CRYPTO_NO_KEY :
+                        MWAN_REKEY_DROP_TX_WORKER,
+                    packet_key_id);
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);

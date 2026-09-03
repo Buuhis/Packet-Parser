@@ -234,6 +234,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     new_cfg->rekey_epoch = 0;
     new_cfg->key_state = new_cfg->prev_key_valid ?
         MWAN_PQC_KEY_ACTIVE_WITH_PREV : MWAN_PQC_KEY_STABLE;
+    mwan_rekey_diag_init(new_cfg);
     err = mwan_l2_flow_manager_init(new_cfg);
     if (err)
         return err;

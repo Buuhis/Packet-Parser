@@ -32,6 +32,47 @@
 #define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
 #define MWAN_FLOW_KEY_ID_SHIFT 56
 
+/* Diagnostic-only rekey phases.  These values never drive key selection or
+ * packet handling; they only tag an already-existing drop with the phase in
+ * which it occurred. */
+enum mwan_rekey_diag_phase {
+    MWAN_REKEY_DIAG_STABLE = 0,
+    MWAN_REKEY_DIAG_STAGING,
+    MWAN_REKEY_DIAG_STAGED,
+    MWAN_REKEY_DIAG_ACTIVATING,
+    MWAN_REKEY_DIAG_DRAINING,
+    MWAN_REKEY_DIAG_RETIRING,
+    MWAN_REKEY_DIAG_ABORTING,
+    MWAN_REKEY_DIAG_PHASE_MAX,
+};
+
+enum mwan_rekey_drop_reason {
+    MWAN_REKEY_DROP_RX_KEY_REJECT = 0,
+    MWAN_REKEY_DROP_RX_CRYPTO_NO_KEY,
+    MWAN_REKEY_DROP_RX_AUTH,
+    MWAN_REKEY_DROP_RX_CRYPTO_OTHER,
+    MWAN_REKEY_DROP_RX_QUEUE,
+    MWAN_REKEY_DROP_RX_FLOW,
+    MWAN_REKEY_DROP_TX_CRYPTO_NO_KEY,
+    MWAN_REKEY_DROP_TX_WORKER,
+    MWAN_REKEY_DROP_TX_QUEUE,
+    MWAN_REKEY_DROP_TX_OVERLOAD,
+    MWAN_REKEY_DROP_TX_FLOW,
+    MWAN_REKEY_DROP_REORDER_LATE,
+    MWAN_REKEY_DROP_REORDER_TOO_FAR,
+    MWAN_REKEY_DROP_REASON_MAX,
+};
+
+struct mwan_rekey_diag {
+    atomic_t phase;
+    atomic64_t event_seq;
+    atomic64_t drop_by_phase[MWAN_REKEY_DIAG_PHASE_MAX];
+    atomic64_t drop_by_reason[MWAN_REKEY_DROP_REASON_MAX];
+    /* Direct proof that a PREV packet reached RX after retire admission had
+     * been closed but before the retire transaction completed. */
+    atomic64_t prev_rejected_while_retiring;
+};
+
 enum mwan_encap_type {
     MWAN_ENCAP_NONE = 0,
     MWAN_ENCAP_MACSEC,
@@ -306,6 +347,7 @@ struct mwan_config {
     bool next_key_valid;
     u64 rekey_epoch;
     u8 key_state;
+    struct mwan_rekey_diag rekey_diag;
     int num_workers;
     int worker_start_cpu;
     struct mwan_l2_worker *l2_workers;
@@ -344,6 +386,13 @@ int mwan_state_abort_pqc_key(u32 node_id, u32 generation, u64 epoch,
 int mwan_state_get_pqc_key_state(u32 node_id, u32 *generation, u64 *epoch,
                                  u8 *state, u8 *current_id, u8 *prev_id,
                                  u8 *next_id);
+void mwan_rekey_diag_init(struct mwan_config *cfg);
+void mwan_rekey_diag_reset(struct mwan_config *cfg);
+void mwan_rekey_diag_count_drop(struct mwan_config *cfg,
+                                enum mwan_rekey_drop_reason reason,
+                                u8 packet_key_id);
+const char *mwan_rekey_diag_phase_name(int phase);
+const char *mwan_rekey_drop_reason_name(int reason);
 void mwan_state_count_no_active_drop(void);
 u64 mwan_state_no_active_drops(void);
 u64 mwan_next_packet_nonce(void);

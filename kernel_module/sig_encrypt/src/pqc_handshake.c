@@ -1493,9 +1493,9 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
         policy_key_binding_t *b = &g_policy_bindings[binding_idx];
 #if PQC_TEST_ALLOW_PROFILE_MISMATCH
         if (b->profile_id != (int)profile_id) {
-            fprintf(stderr,
-                    "[PQC-HS-TEST] Accepting wire profile %u on local profile %d.\n",
-                    profile_id, b->profile_id);
+            // fprintf(stderr,
+            //         "[PQC-HS-TEST] Accepting wire profile %u on local profile %d.\n",
+            //         profile_id, b->profile_id);
         }
 #endif
         if (msg->msg_type == PQC_HS_MSG_KEEPALIVE && b->is_tunnel) {

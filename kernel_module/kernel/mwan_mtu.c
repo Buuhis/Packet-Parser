@@ -297,10 +297,6 @@ int mwan_mtu_fragment_ipv4(struct sk_buff *skb,
 		pr_warn_ratelimited("mwan_kmod: MTU fragment failed dev=%s inner=%u limit=%u fragments=%u ret=%d\n",
 				    target_dev->name, original_len,
 				    max_inner_len, dispatch.fragments, ret);
-	else
-		// pr_info_ratelimited("mwan_kmod: MTU fragmented dev=%s inner=%u limit=%u fragments=%u\n",
-		// 		    target_dev->name, original_len,
-		// 		    max_inner_len, dispatch.fragments);
 	return ret;
 }
 

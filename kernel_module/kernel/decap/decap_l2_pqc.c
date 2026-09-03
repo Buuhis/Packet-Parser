@@ -48,6 +48,7 @@ u32 mwan_l2_diag_generation_get(void)
 
 void mwan_l2_diag_reset_all(void)
 {
+    struct mwan_config *cfg;
     int cpu;
     u32 generation;
 
@@ -83,6 +84,12 @@ void mwan_l2_diag_reset_all(void)
     atomic64_set(&mwan_l2_diag_cookie, 0);
     for (cpu = 0; cpu < NR_CPUS; cpu++)
         atomic64_set(&mwan_l2_rx_diag_cpu_flows[cpu], 0);
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (cfg)
+        mwan_rekey_diag_reset(cfg);
+    rcu_read_unlock();
 
     generation = (u32)atomic_inc_return(&mwan_l2_diag_generation);
     pr_info("mwan_kmod: L2D RESET g=%u\n", generation);
@@ -195,6 +202,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
             MWAN_L2_QUEUE_MAX_BYTES) {
         spin_unlock(&worker->rx_queue.lock);
         atomic64_inc(&worker->dropped_packets);
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_QUEUE, 0);
         return -ENOSPC;
     }
 
@@ -524,6 +532,21 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
 
             memset(skb->cb, 0, sizeof(skb->cb));
             if (unlikely(ret < 0)) {
+                u8 packet_key_id =
+                    (u8)(dispatch_flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
+
+                if (ret == -ENOKEY)
+                    mwan_rekey_diag_count_drop(
+                        worker->cfg, MWAN_REKEY_DROP_RX_CRYPTO_NO_KEY,
+                        packet_key_id);
+                else if (ret == -EBADMSG)
+                    mwan_rekey_diag_count_drop(
+                        worker->cfg, MWAN_REKEY_DROP_RX_AUTH,
+                        packet_key_id);
+                else
+                    mwan_rekey_diag_count_drop(
+                        worker->cfg, MWAN_REKEY_DROP_RX_CRYPTO_OTHER,
+                        packet_key_id);
                 atomic64_inc(&worker->decrypt_failures);
                 kfree_skb(skb);
             } else {
@@ -644,6 +667,11 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     struct mwan_mtu_stats_snapshot bypass_mtu;
     struct mwan_mtu_stats_snapshot l2_mtu;
     struct mwan_config *cfg;
+    u64 pending_current = 0;
+    u64 pending_previous = 0;
+    u64 pending_next = 0;
+    int phase;
+    int reason;
     int cpu;
 
     (void)unused;
@@ -695,6 +723,50 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.reorder_resync),
                    atomic64_read(&cfg->flows.reorder_resync_skipped),
                    atomic64_read(&cfg->flows.reorder_resync_flushed));
+        if (cfg->l2_workers) {
+            int i;
+
+            for (i = 0; i < cfg->num_workers; i++) {
+                struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+                if (cfg->key_id)
+                    pending_current += (u64)max_t(
+                        int, atomic_read(&worker->crypto_key_pending[
+                            cfg->key_id]), 0);
+                if (cfg->prev_key_id)
+                    pending_previous += (u64)max_t(
+                        int, atomic_read(&worker->crypto_key_pending[
+                            cfg->prev_key_id]), 0);
+                if (cfg->next_key_id)
+                    pending_next += (u64)max_t(
+                        int, atomic_read(&worker->crypto_key_pending[
+                            cfg->next_key_id]), 0);
+            }
+        }
+        phase = atomic_read(&cfg->rekey_diag.phase);
+        seq_printf(m, "rekey_diag event_seq=%lld epoch=%llu phase=%s key_state=%u keys=%u/%u/%u valid=%u/%u pending=%llu/%llu/%llu prev_reject_retire=%lld\n",
+                   atomic64_read(&cfg->rekey_diag.event_seq),
+                   cfg->rekey_epoch,
+                   mwan_rekey_diag_phase_name(phase), cfg->key_state,
+                   cfg->key_id, cfg->prev_key_id, cfg->next_key_id,
+                   cfg->prev_key_valid, cfg->next_key_valid,
+                   pending_current, pending_previous, pending_next,
+                   atomic64_read(
+                       &cfg->rekey_diag.prev_rejected_while_retiring));
+        seq_puts(m, "rekey_drop_phase:");
+        for (phase = 0; phase < MWAN_REKEY_DIAG_PHASE_MAX; phase++)
+            seq_printf(m, " %s=%lld",
+                       mwan_rekey_diag_phase_name(phase),
+                       atomic64_read(
+                           &cfg->rekey_diag.drop_by_phase[phase]));
+        seq_putc(m, '\n');
+        seq_puts(m, "rekey_drop_reason:");
+        for (reason = 0; reason < MWAN_REKEY_DROP_REASON_MAX; reason++)
+            seq_printf(m, " %s=%lld",
+                       mwan_rekey_drop_reason_name(reason),
+                       atomic64_read(
+                           &cfg->rekey_diag.drop_by_reason[reason]));
+        seq_putc(m, '\n');
     }
     rcu_read_unlock();
     seq_printf(m, "cpu_high=%u recover_load=%u idle_unblock=%u emergency=%u max_shed=%u sample_ms=%u admitted=%llu no_eligible=%llu\n",
@@ -754,6 +826,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     u64 flow_token;
     u32 flow_seq;
     u64 packet_nonce;
+    u8 packet_key_id;
     u32 rx_headlen;
     bool rx_nonlinear;
     int ingress_cpu;
@@ -783,6 +856,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     memcpy(&flow_seq_be, &l2_hdr->flow_seq, sizeof(flow_seq_be));
     memcpy(&nonce_be, &l2_hdr->packet_nonce, sizeof(nonce_be));
     flow_token = be64_to_cpu(flow_token_be);
+    packet_key_id = (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
     flow_seq = be32_to_cpu(flow_seq_be);
     packet_nonce = be64_to_cpu(nonce_be);
     rx_headlen = skb_headlen(skb);
@@ -796,11 +870,13 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         kfree_skb(skb);
         return NET_RX_DROP;
     }
-    if ((u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) != cfg->key_id &&
+    if (packet_key_id != cfg->key_id &&
         (!cfg->prev_key_valid ||
-         (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) != cfg->prev_key_id) &&
+         packet_key_id != cfg->prev_key_id) &&
         (!cfg->next_key_valid ||
-         (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT) != cfg->next_key_id)) {
+         packet_key_id != cfg->next_key_id)) {
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_KEY_REJECT,
+                                   packet_key_id);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -808,6 +884,8 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
 
     flow = mwan_l2_rx_flow_get(cfg, flow_token, flow_seq);
     if (!flow) {
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_FLOW,
+                                   packet_key_id);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
