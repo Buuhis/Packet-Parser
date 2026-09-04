@@ -26,6 +26,7 @@ struct mwan_tx_flow_info {
 const char *mwan_multicore_hash_source_name(enum mwan_flow_hash_source source);
 u32 mwan_multicore_flow_info(struct sk_buff *skb,
                              struct mwan_tx_flow_info *info);
+bool mwan_multicore_packet_is_control(struct sk_buff *skb);
 bool mwan_multicore_rx_congestion_feedback(struct mwan_l2_worker *worker,
                                            struct sk_buff *skb);
 

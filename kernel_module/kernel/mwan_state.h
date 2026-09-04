@@ -98,6 +98,14 @@ struct mwan_tunnel {
     bool published_up;
     u32 state_sequence;
     enum mwan_encap_type encap_type;
+
+    /* Flow-aware path selection statistics. balance_tx_bytes is updated on
+     * successful worker transmission; the sampled/EWMA fields are protected
+     * by mwan_config::tunnel_balance_lock. */
+    atomic64_t balance_tx_bytes;
+    atomic_t balance_active_flows;
+    u64 balance_sample_bytes;
+    u64 balance_ewma_bps;
 };
 
 /* Immutable path-selection view.  Writers build a complete replacement and
@@ -130,6 +138,7 @@ struct mwan_l2_tx_flow {
      * to enter its sticky owner's FIFO. */
     spinlock_t submit_lock;
     int owner_worker;
+    u16 tunnel_idx;
     unsigned long last_seen;
     bool closing;
 };
@@ -325,6 +334,11 @@ struct mwan_config {
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
     struct mwan_active_paths __rcu *active_paths;
 
+    /* Serializes new-flow tunnel admission and its recent-load samples. This
+     * lock is never taken for ordinary packets of an existing flow. */
+    spinlock_t tunnel_balance_lock;
+    u64 tunnel_balance_sample_ns;
+
     /* Encryption (AES-GCM) */
     bool encrypt_on;
     u8   encrypt_layer;                   /* 2=L2 (MACsec), 3=L3 (Overlay) */
@@ -438,7 +452,12 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg);
 struct mwan_l2_tx_flow *
 mwan_l2_tx_flow_get(struct mwan_config *cfg,
                     const struct mwan_l2_flow_key *key, u32 flow_hash,
-                    bool control_packet);
+                    bool control_packet, int requested_tunnel_idx,
+                    bool allow_tunnel_remap);
+int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
+                                  const struct mwan_l2_flow_key *key,
+                                  u32 flow_hash, bool control_packet,
+                                  u16 *tunnel_idx);
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);

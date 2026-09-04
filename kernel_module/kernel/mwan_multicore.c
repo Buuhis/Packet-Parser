@@ -1,5 +1,6 @@
 #include "mwan_multicore.h"
 #include "mwan_steer.h"
+#include "mwan_tunnel_balance.h"
 
 #include <linux/cpu.h>
 #include <linux/ip.h>
@@ -1124,6 +1125,11 @@ static enum mwan_packet_class mwan_packet_classify(struct sk_buff *skb)
     return MWAN_PACKET_OTHER_DATA;
 }
 
+bool mwan_multicore_packet_is_control(struct sk_buff *skb)
+{
+    return mwan_packet_classify(skb) == MWAN_PACKET_CONTROL;
+}
+
 static unsigned int mwan_worker_pressure(const struct mwan_l2_worker *worker)
 {
     unsigned int pressure = 0;
@@ -1226,15 +1232,24 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         return -EINVAL;
     if (!cfg->l2_workers || cfg->num_workers <= 0)
         return -ENODEV;
-    tun = &cfg->tunnels[tunnel_idx];
-
     packet_class = mwan_packet_classify(skb);
     flow = mwan_l2_tx_flow_get(cfg, &info->key, info->flow_id,
-                               packet_class == MWAN_PACKET_CONTROL);
+                               packet_class == MWAN_PACKET_CONTROL,
+                               (int)tunnel_idx, false);
     if (!flow) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         return -ENOSPC;
     }
+    /* POST_ROUTING selected and pinned the data flow before MTU handling.
+     * A mismatch here means a stale caller or a path-state transition raced
+     * this packet. Drop this one packet instead of moving fragments or
+     * already-normalized data onto a different-MTU tunnel. */
+    if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx)) {
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
+        mwan_l2_tx_flow_put(flow);
+        return -ESTALE;
+    }
+    tun = &cfg->tunnels[tunnel_idx];
     mwan_l2_tx_flow_touch(flow, closing);
     owner = flow->owner_worker;
     if (owner < 0 || owner >= cfg->num_workers ||
@@ -1335,6 +1350,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             bool cb_ok;
             bool flow_released = false;
             u32 accounted_bytes = skb->truesize;
+            u32 transmitted_bytes = skb->len;
             struct mwan_l2_tx_flow *flow;
             u64 flow_token;
             u32 flow_seq;
@@ -1390,6 +1406,9 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
+            } else {
+                mwan_tunnel_balance_account_bytes(
+                    cfg, tunnel_idx, transmitted_bytes);
             }
             if (flow) {
                 atomic_dec(&flow->pending_crypto);

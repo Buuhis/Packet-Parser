@@ -1,4 +1,5 @@
 #include "mwan_state.h"
+#include "mwan_tunnel_balance.h"
 
 #include <linux/etherdevice.h>
 #include <linux/jhash.h>
@@ -155,6 +156,7 @@ static void mwan_l2_flow_gc_workfn(struct work_struct *work)
                 flow->owner_worker < cfg->num_workers)
                 atomic64_dec(&cfg->l2_workers[flow->owner_worker]
                                                .tx_assigned_flows);
+            mwan_tunnel_balance_release_flow(cfg, flow->tunnel_idx);
             mwan_l2_tx_flow_put(flow);
         }
         spin_unlock_bh(&bucket->lock);
@@ -250,6 +252,7 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
         spin_lock_bh(&cfg->flows.tx[i].lock);
         hlist_for_each_entry_safe(tx, tmp, &cfg->flows.tx[i].head, node) {
             hlist_del_init(&tx->node);
+            mwan_tunnel_balance_release_flow(cfg, tx->tunnel_idx);
             mwan_l2_tx_flow_put(tx);
         }
         spin_unlock_bh(&cfg->flows.tx[i].lock);
@@ -271,13 +274,15 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
 struct mwan_l2_tx_flow *
 mwan_l2_tx_flow_get(struct mwan_config *cfg,
                     const struct mwan_l2_flow_key *key, u32 flow_hash,
-                    bool control_packet)
+                    bool control_packet, int requested_tunnel_idx,
+                    bool allow_tunnel_remap)
 {
     struct mwan_l2_tx_flow *flow;
     struct mwan_l2_tx_flow *candidate;
     struct mwan_l2_flow_bucket *bucket;
     u32 index;
     int owner;
+    int tunnel_idx;
 
     if (!cfg || !key || READ_ONCE(cfg->flows.stopping))
         return NULL;
@@ -287,6 +292,13 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
         if (mwan_l2_flow_key_equal(&flow->key, key)) {
+            if (allow_tunnel_remap &&
+                !mwan_tunnel_balance_is_active(cfg, flow->tunnel_idx)) {
+                tunnel_idx = mwan_tunnel_balance_reassign_flow(
+                    cfg, flow->tunnel_idx, flow_hash);
+                if (tunnel_idx >= 0)
+                    WRITE_ONCE(flow->tunnel_idx, (u16)tunnel_idx);
+            }
             refcount_inc(&flow->refs);
             WRITE_ONCE(flow->last_seen, jiffies);
             spin_unlock_bh(&bucket->lock);
@@ -307,6 +319,16 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
         kfree(candidate);
         return NULL;
     }
+    if (requested_tunnel_idx >= 0)
+        tunnel_idx = mwan_tunnel_balance_assign_exact(
+            cfg, (u16)requested_tunnel_idx);
+    else
+        tunnel_idx = mwan_tunnel_balance_assign_flow(cfg, flow_hash);
+    if (tunnel_idx < 0) {
+        atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
+        kfree(candidate);
+        return NULL;
+    }
     candidate->key = *key;
     candidate->flow_token = mwan_l2_new_flow_token();
     refcount_set(&candidate->refs, 1); /* table reference */
@@ -314,6 +336,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     atomic_set(&candidate->pending_crypto, 0);
     spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
+    candidate->tunnel_idx = (u16)tunnel_idx;
     candidate->last_seen = jiffies;
     INIT_HLIST_NODE(&candidate->node);
 
@@ -323,6 +346,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             refcount_inc(&flow->refs);
             spin_unlock_bh(&bucket->lock);
             atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
+            mwan_tunnel_balance_release_flow(cfg,
+                                              candidate->tunnel_idx);
             kfree(candidate);
             return flow;
         }
@@ -333,6 +358,30 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     refcount_inc(&candidate->refs); /* caller reference */
     spin_unlock_bh(&bucket->lock);
     return candidate;
+}
+
+int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
+                                  const struct mwan_l2_flow_key *key,
+                                  u32 flow_hash, bool control_packet,
+                                  u16 *tunnel_idx)
+{
+    struct mwan_l2_tx_flow *flow;
+    u16 selected;
+
+    if (!cfg || !key || !tunnel_idx)
+        return -EINVAL;
+    flow = mwan_l2_tx_flow_get(cfg, key, flow_hash, control_packet, -1,
+                               true);
+    if (!flow)
+        return -ENOSPC;
+    selected = READ_ONCE(flow->tunnel_idx);
+    if (!mwan_tunnel_balance_is_active(cfg, selected)) {
+        mwan_l2_tx_flow_put(flow);
+        return -ENETDOWN;
+    }
+    *tunnel_idx = selected;
+    mwan_l2_tx_flow_put(flow);
+    return 0;
 }
 
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow)

@@ -2,6 +2,7 @@
 #include "mwan_state.h"
 #include "mwan_proto.h"
 #include "mwan_mac_discovery.h"
+#include "mwan_multicore.h"
 
 #include <linux/module.h>
 #include <linux/netfilter.h>
@@ -260,8 +261,11 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         const struct mwan_active_paths *active =
             rcu_dereference(cfg->active_paths);
         struct mwan_tunnel *tun;
+        struct mwan_tx_flow_info flow_info;
         unsigned int ret = NF_ACCEPT;
         int confirm_ret;
+        int select_ret;
+        u16 selected_tun_idx;
         u8 tun_idx;
 
         if (!active || active->active_count == 0 ||
@@ -271,6 +275,8 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             return NF_DROP;
         }
 
+        /* Keep the weighted active LUT as the fallback and as the stable
+         * final tie-breaker used by the flow-aware selector. */
         tun_idx = active->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         if (unlikely(tun_idx >= cfg->num_tunnels)) {
             rcu_read_unlock();
@@ -292,6 +298,28 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                                 confirm_ret);
             rcu_read_unlock();
             return (unsigned int)confirm_ret;
+        }
+
+        /* Only the two established asynchronous datapaths participate in
+         * stateful least-load selection. BFD and PQC handshake traffic have
+         * already returned through their dedicated branches above; other
+         * encryption modes retain their existing weighted-LUT behaviour. */
+        if (tun->encap_type == MWAN_ENCAP_NONE ||
+            tun->encap_type == MWAN_ENCAP_L2_PQC) {
+            hash = mwan_multicore_flow_info(skb, &flow_info);
+            select_ret = mwan_l2_tx_flow_select_tunnel(
+                cfg, &flow_info.key, hash,
+                mwan_multicore_packet_is_control(skb), &selected_tun_idx);
+            if (unlikely(select_ret)) {
+                rcu_read_unlock();
+                return NF_DROP;
+            }
+            if (unlikely(selected_tun_idx >= cfg->num_tunnels)) {
+                rcu_read_unlock();
+                return NF_DROP;
+            }
+            tun_idx = (u8)selected_tun_idx;
+            tun = &cfg->tunnels[tun_idx];
         }
 
         mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,

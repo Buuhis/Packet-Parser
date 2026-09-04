@@ -1,5 +1,6 @@
 #include "mwan_state.h"
 #include "mwan_mac_discovery.h"
+#include "mwan_tunnel_balance.h"
 #include <linux/timer.h>
 #include <linux/version.h>
 #include <linux/slab.h>
@@ -235,6 +236,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     new_cfg->key_state = new_cfg->prev_key_valid ?
         MWAN_PQC_KEY_ACTIVE_WITH_PREV : MWAN_PQC_KEY_STABLE;
     mwan_rekey_diag_init(new_cfg);
+    mwan_tunnel_balance_init(new_cfg);
     err = mwan_l2_flow_manager_init(new_cfg);
     if (err)
         return err;
