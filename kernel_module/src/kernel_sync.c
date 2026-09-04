@@ -8,8 +8,10 @@
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netlink/netlink.h>
+#include <netlink/errno.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
+#include <netlink/socket.h>
 #include "../kernel/mwan_proto.h"
 #include "../sig_encrypt/inc/pqc_handshake.h"
 
@@ -36,6 +38,84 @@ struct pqc_key_state_reply {
 };
 
 static uint32_t active_kernel_config_generation;
+
+/* libnl normally returns its own NLE_* error namespace, while a Generic
+ * Netlink error reply contains the real negative kernel errno.  Keep the
+ * kernel errno when one is available and translate transport-side libnl
+ * failures before returning them to CLI/failover callers. */
+static int kernel_sync_nl_to_errno(int rc)
+{
+    if (rc >= 0)
+        return rc;
+
+    switch (-rc) {
+    case NLE_INTR:
+        return -EINTR;
+    case NLE_BAD_SOCK:
+        return -EBADF;
+    case NLE_AGAIN:
+        return -EAGAIN;
+    case NLE_NOMEM:
+        return -ENOMEM;
+    case NLE_EXIST:
+        return -EEXIST;
+    case NLE_INVAL:
+        return -EINVAL;
+    case NLE_RANGE:
+        return -ERANGE;
+    case NLE_MSGSIZE:
+    case NLE_MSG_TRUNC:
+    case NLE_ATTRSIZE:
+        return -EMSGSIZE;
+    case NLE_OPNOTSUPP:
+        return -EOPNOTSUPP;
+    case NLE_AF_NOSUPPORT:
+        return -EAFNOSUPPORT;
+    case NLE_OBJ_NOTFOUND:
+        return -ENOENT;
+    case NLE_NOATTR:
+        return -ENODATA;
+    case NLE_MISSING_ATTR:
+        return -EINVAL;
+    case NLE_SEQ_MISMATCH:
+    case NLE_PROTO_MISMATCH:
+    case NLE_PARSE_ERR:
+        return -EPROTO;
+    case NLE_MSG_OVERFLOW:
+        return -EOVERFLOW;
+    case NLE_NOADDR:
+        return -EADDRNOTAVAIL;
+    case NLE_BUSY:
+        return -EBUSY;
+    case NLE_NOACCESS:
+        return -EACCES;
+    case NLE_PERM:
+        return -EPERM;
+    case NLE_NODEV:
+        return -ENODEV;
+    default:
+        return -EIO;
+    }
+}
+
+static int kernel_sync_nl_error_cb(struct sockaddr_nl *nla,
+                                   struct nlmsgerr *error, void *arg)
+{
+    int *kernel_error = arg;
+
+    (void)nla;
+    if (!error) {
+        if (kernel_error)
+            *kernel_error = -EIO;
+        return NL_STOP;
+    }
+    /* NLMSG_ERROR with error == 0 is a successful ACK, not a failure. */
+    if (!error->error)
+        return NL_OK;
+    if (kernel_error)
+        *kernel_error = error->error;
+    return NL_STOP;
+}
 
 static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
 {
@@ -503,7 +583,9 @@ int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
     struct nl_sock *sock = NULL;
     struct nl_msg *msg = NULL;
     unsigned int ifindex;
+    int kernel_error = 0;
     int family_id;
+    int nl_rc;
     int ret = -EIO;
 
     if (!ifname || !ifname[0] || !up)
@@ -516,11 +598,16 @@ int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
     sock = nl_socket_alloc();
     if (!sock)
         return -ENOMEM;
-    if (genl_connect(sock) < 0)
+    nl_rc = genl_connect(sock);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
         goto out;
+    }
     family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
     if (family_id < 0) {
-        ret = -ENODEV;
+        ret = kernel_sync_nl_to_errno(family_id);
+        if (ret == -ENOENT)
+            ret = -ENODEV;
         goto out;
     }
     msg = nlmsg_alloc();
@@ -534,11 +621,33 @@ int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
         ret = -EMSGSIZE;
         goto out;
     }
-    if (nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
-                            kernel_sync_tunnel_state_valid_cb,
-                            &reply) < 0 ||
-        nl_send_auto(sock, msg) < 0 || nl_recvmsgs_default(sock) < 0)
+    nl_rc = nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                               kernel_sync_tunnel_state_valid_cb, &reply);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
         goto out;
+    }
+    nl_rc = nl_socket_modify_err_cb(sock, NL_CB_CUSTOM,
+                                    kernel_sync_nl_error_cb,
+                                    &kernel_error);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_send_auto(sock, msg);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_recvmsgs_default(sock);
+    if (kernel_error) {
+        ret = kernel_error;
+        goto out;
+    }
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
     if (!reply.received || !reply.valid) {
         ret = -EPROTO;
         goto out;
@@ -561,7 +670,9 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
     struct nl_sock *sock = NULL;
     struct nl_msg *msg = NULL;
     unsigned int ifindex;
+    int kernel_error = 0;
     int family_id;
+    int nl_rc;
     int ret = -EIO;
 
     if (!ifname || !ifname[0] || !peer_ip || peer_ip_len == 0)
@@ -575,11 +686,16 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
     sock = nl_socket_alloc();
     if (!sock)
         return -ENOMEM;
-    if (genl_connect(sock) < 0)
+    nl_rc = genl_connect(sock);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
         goto out;
+    }
     family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
     if (family_id < 0) {
-        ret = -ENODEV;
+        ret = kernel_sync_nl_to_errno(family_id);
+        if (ret == -ENOENT)
+            ret = -ENODEV;
         goto out;
     }
 
@@ -594,11 +710,33 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
         ret = -EMSGSIZE;
         goto out;
     }
-    if (nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
-                            kernel_sync_tunnel_peer_valid_cb,
-                            &reply) < 0 ||
-        nl_send_auto(sock, msg) < 0 || nl_recvmsgs_default(sock) < 0)
+    nl_rc = nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                               kernel_sync_tunnel_peer_valid_cb, &reply);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
         goto out;
+    }
+    nl_rc = nl_socket_modify_err_cb(sock, NL_CB_CUSTOM,
+                                    kernel_sync_nl_error_cb,
+                                    &kernel_error);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_send_auto(sock, msg);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_recvmsgs_default(sock);
+    if (kernel_error) {
+        ret = kernel_error;
+        goto out;
+    }
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
 
     if (!reply.received || !reply.valid) {
         ret = -EPROTO;

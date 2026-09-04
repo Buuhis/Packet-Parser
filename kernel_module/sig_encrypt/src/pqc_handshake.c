@@ -2441,7 +2441,24 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                     const struct pqc_hs_msg *msg = NULL;
                     if (pqc_hs_validate_message(rx_buf, rx_len, &msg) == 0 &&
                         msg->magic == PQC_HS_MAGIC) {
-                        if (msg->msg_type == PQC_HS_MSG_REKEY_HELLO) {
+                        /* A restarted initiator has lost its ephemeral KEM
+                         * state and starts again with a normal HELLO.  The
+                         * responder may still have a valid CURRENT key, so
+                         * this established-state loop must also service that
+                         * HELLO.  The common handler authenticates it, rejects
+                         * conflicting/replayed sessions, caches the response,
+                         * and moves the old CURRENT key to PREV only after a
+                         * replacement response has been built successfully.
+                         *
+                         * Keep this recovery local to the handshake control
+                         * plane: do not reset the worker, flow ownership,
+                         * failover state, or the datapath before the HELLO has
+                         * passed all validation. */
+                        if (msg->msg_type == PQC_HS_MSG_HELLO) {
+                            pqc_hs_handle_responder_hello(
+                                b, sockfd, &peeraddr, rx_buf, rx_len,
+                                &my_priv, &peer_pub);
+                        } else if (msg->msg_type == PQC_HS_MSG_REKEY_HELLO) {
                             pqc_hs_handle_responder_hello(
                                 b, sockfd, &peeraddr, rx_buf, rx_len,
                                 &my_priv, &peer_pub);
