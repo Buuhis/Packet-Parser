@@ -55,6 +55,22 @@ static bool mwan_l2_flow_expired(unsigned long last_seen, bool closing)
     return time_after(jiffies, last_seen + timeout);
 }
 
+static bool mwan_l2_tx_balance_inactive(const struct mwan_l2_tx_flow *flow)
+{
+    if (READ_ONCE(flow->closing))
+        return true;
+    return time_after(jiffies, READ_ONCE(flow->last_seen) +
+                               MWAN_FLOW_BALANCE_IDLE_TIMEOUT);
+}
+
+static void mwan_l2_tx_balance_deactivate(struct mwan_config *cfg,
+                                          struct mwan_l2_tx_flow *flow)
+{
+    if (atomic_cmpxchg(&flow->balance_counted, 1, 0) == 1)
+        mwan_tunnel_balance_release_flow(cfg,
+                                         READ_ONCE(flow->tunnel_idx));
+}
+
 static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
 {
     struct mwan_l2_rx_flow *flow =
@@ -145,6 +161,9 @@ static void mwan_l2_flow_gc_workfn(struct work_struct *work)
 
         spin_lock_bh(&bucket->lock);
         hlist_for_each_entry_safe(flow, tmp, &bucket->head, node) {
+            if (!atomic_read(&flow->pending_crypto) &&
+                mwan_l2_tx_balance_inactive(flow))
+                mwan_l2_tx_balance_deactivate(cfg, flow);
             if (atomic_read(&flow->pending_crypto) ||
                 !mwan_l2_flow_expired(READ_ONCE(flow->last_seen),
                                       READ_ONCE(flow->closing)))
@@ -156,7 +175,7 @@ static void mwan_l2_flow_gc_workfn(struct work_struct *work)
                 flow->owner_worker < cfg->num_workers)
                 atomic64_dec(&cfg->l2_workers[flow->owner_worker]
                                                .tx_assigned_flows);
-            mwan_tunnel_balance_release_flow(cfg, flow->tunnel_idx);
+            mwan_l2_tx_balance_deactivate(cfg, flow);
             mwan_l2_tx_flow_put(flow);
         }
         spin_unlock_bh(&bucket->lock);
@@ -252,7 +271,7 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
         spin_lock_bh(&cfg->flows.tx[i].lock);
         hlist_for_each_entry_safe(tx, tmp, &cfg->flows.tx[i].head, node) {
             hlist_del_init(&tx->node);
-            mwan_tunnel_balance_release_flow(cfg, tx->tunnel_idx);
+            mwan_l2_tx_balance_deactivate(cfg, tx);
             mwan_l2_tx_flow_put(tx);
         }
         spin_unlock_bh(&cfg->flows.tx[i].lock);
@@ -294,10 +313,20 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
         if (mwan_l2_flow_key_equal(&flow->key, key)) {
             if (allow_tunnel_remap &&
                 !mwan_tunnel_balance_is_active(cfg, flow->tunnel_idx)) {
+                bool old_counted =
+                    atomic_read(&flow->balance_counted) != 0;
+
                 tunnel_idx = mwan_tunnel_balance_reassign_flow(
-                    cfg, flow->tunnel_idx, flow_hash);
-                if (tunnel_idx >= 0)
+                    cfg, flow->tunnel_idx, flow_hash, old_counted);
+                if (tunnel_idx >= 0) {
                     WRITE_ONCE(flow->tunnel_idx, (u16)tunnel_idx);
+                    atomic_set(&flow->balance_counted, 1);
+                }
+            } else if (allow_tunnel_remap &&
+                       !READ_ONCE(flow->closing) &&
+                       atomic_cmpxchg(&flow->balance_counted, 0, 1) == 0) {
+                mwan_tunnel_balance_activate_flow(cfg,
+                                                   flow->tunnel_idx);
             }
             refcount_inc(&flow->refs);
             WRITE_ONCE(flow->last_seen, jiffies);
@@ -319,11 +348,19 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
         kfree(candidate);
         return NULL;
     }
-    if (requested_tunnel_idx >= 0)
-        tunnel_idx = mwan_tunnel_balance_assign_exact(
-            cfg, (u16)requested_tunnel_idx);
-    else
+    if (requested_tunnel_idx >= 0) {
+        if (requested_tunnel_idx >= cfg->num_tunnels) {
+            atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
+            kfree(candidate);
+            return NULL;
+        }
+        /* Exact-path callers are control probes (notably BFD). Data flows
+         * are created by mwan_l2_tx_flow_select_tunnel() before encap and
+         * therefore already exist when the worker submit path gets here. */
+        tunnel_idx = requested_tunnel_idx;
+    } else {
         tunnel_idx = mwan_tunnel_balance_assign_flow(cfg, flow_hash);
+    }
     if (tunnel_idx < 0) {
         atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
         kfree(candidate);
@@ -334,6 +371,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     refcount_set(&candidate->refs, 1); /* table reference */
     atomic_set(&candidate->next_seq, 0);
     atomic_set(&candidate->pending_crypto, 0);
+    atomic_set(&candidate->balance_counted,
+               requested_tunnel_idx < 0 ? 1 : 0);
     spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
     candidate->tunnel_idx = (u16)tunnel_idx;
@@ -346,8 +385,9 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             refcount_inc(&flow->refs);
             spin_unlock_bh(&bucket->lock);
             atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
-            mwan_tunnel_balance_release_flow(cfg,
-                                              candidate->tunnel_idx);
+            if (atomic_read(&candidate->balance_counted))
+                mwan_tunnel_balance_release_flow(
+                    cfg, candidate->tunnel_idx);
             kfree(candidate);
             return flow;
         }
@@ -429,6 +469,16 @@ void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing)
     WRITE_ONCE(flow->last_seen, jiffies);
     if (closing)
         WRITE_ONCE(flow->closing, true);
+}
+
+void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
+                              struct mwan_l2_tx_flow *flow)
+{
+    if (!cfg || !flow)
+        return;
+    if (atomic_dec_return(&flow->pending_crypto) == 0 &&
+        READ_ONCE(flow->closing))
+        mwan_l2_tx_balance_deactivate(cfg, flow);
 }
 
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow)

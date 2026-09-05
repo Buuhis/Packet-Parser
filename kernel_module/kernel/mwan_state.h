@@ -26,6 +26,7 @@
 #define MWAN_FLOW_IDLE_TIMEOUT msecs_to_jiffies(60000)
 #define MWAN_FLOW_CLOSING_TIMEOUT msecs_to_jiffies(2000)
 #define MWAN_FLOW_GC_INTERVAL msecs_to_jiffies(5000)
+#define MWAN_FLOW_BALANCE_IDLE_TIMEOUT msecs_to_jiffies(2000)
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
@@ -99,13 +100,15 @@ struct mwan_tunnel {
     u32 state_sequence;
     enum mwan_encap_type encap_type;
 
-    /* Flow-aware path selection statistics. balance_tx_bytes is updated on
-     * successful worker transmission; the sampled/EWMA fields are protected
-     * by mwan_config::tunnel_balance_lock. */
+    /* Flow-aware path selection statistics. balance_tx_bytes is updated only
+     * for data flows accepted by a TX worker; BFD/control probes are excluded.
+     * The sampled/EWMA fields are protected by tunnel_balance_lock. */
     atomic64_t balance_tx_bytes;
     atomic_t balance_active_flows;
+    atomic_t balance_admitted_flows;
     u64 balance_sample_bytes;
     u64 balance_ewma_bps;
+    unsigned long balance_last_data;
 };
 
 /* Immutable path-selection view.  Writers build a complete replacement and
@@ -133,6 +136,10 @@ struct mwan_l2_tx_flow {
     u64 flow_token;
     atomic_t next_seq;
     atomic_t pending_crypto;
+    /* Independent from the flow-table lifetime. A UDP mapping may remain in
+     * the table for reorder/stickiness after it is no longer counted as
+     * current tunnel load. */
+    atomic_t balance_counted;
     /* Serializes admission + sequence allocation + queue insertion for one
      * flow.  A sequence number is consumed only after the packet is certain
      * to enter its sticky owner's FIFO. */
@@ -460,6 +467,8 @@ int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
                                   u16 *tunnel_idx);
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
+void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
+                              struct mwan_l2_tx_flow *flow);
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);
 bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
                                    const struct mwan_l2_flow_key *key,

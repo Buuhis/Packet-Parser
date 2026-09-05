@@ -776,7 +776,7 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
                 atomic_dec(&worker->crypto_key_pending[
                     (u8)(cb.flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
             if (flow) {
-                atomic_dec(&flow->pending_crypto);
+                mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
             } else if (!mwan_release_tx_queue_ref(worker, skb))
                 pr_warn_ratelimited("mwan_kmod: unable to recover corrupt TX queue reference during cleanup on CPU %d\n",
@@ -1406,12 +1406,13 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
-            } else {
+            } else if (flow &&
+                       atomic_read(&flow->balance_counted)) {
                 mwan_tunnel_balance_account_bytes(
                     cfg, tunnel_idx, transmitted_bytes);
             }
             if (flow) {
-                atomic_dec(&flow->pending_crypto);
+                mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
             }
             if (++batch == 64) {

@@ -7,9 +7,11 @@ struct mwan_config;
 
 void mwan_tunnel_balance_init(struct mwan_config *cfg);
 int mwan_tunnel_balance_assign_flow(struct mwan_config *cfg, u32 flow_hash);
-int mwan_tunnel_balance_assign_exact(struct mwan_config *cfg, u16 tunnel_idx);
+void mwan_tunnel_balance_activate_flow(struct mwan_config *cfg,
+                                       u16 tunnel_idx);
 int mwan_tunnel_balance_reassign_flow(struct mwan_config *cfg,
-                                      u16 old_tunnel_idx, u32 flow_hash);
+                                      u16 old_tunnel_idx, u32 flow_hash,
+                                      bool old_counted);
 void mwan_tunnel_balance_release_flow(struct mwan_config *cfg,
                                       u16 tunnel_idx);
 void mwan_tunnel_balance_account_bytes(struct mwan_config *cfg,
