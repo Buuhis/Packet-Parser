@@ -139,6 +139,11 @@ struct mwan_l2_tx_flow {
      * the table for reorder/stickiness after it is no longer counted as
      * current tunnel load. */
     atomic_t balance_counted;
+    /* Worker ownership is independent from the lifetime of the sticky flow
+     * object. UDP mappings remain cached for sequence/tunnel stability, but
+     * an idle mapping must not keep skewing new-flow CPU admission for the
+     * full 60-second table timeout. */
+    atomic_t worker_counted;
     /* Serializes admission + sequence allocation + queue insertion for one
      * flow.  A sequence number is consumed only after the packet is certain
      * to enter its sticky owner's FIFO. */
@@ -224,6 +229,9 @@ struct mwan_l2_flow_manager {
     atomic_t rx_count;
     atomic64_t tx_created;
     atomic64_t tx_expired;
+    atomic64_t tx_worker_deactivated;
+    atomic64_t tx_worker_reactivated;
+    atomic64_t tx_worker_reselected;
     atomic64_t rx_created;
     atomic64_t rx_expired;
     atomic64_t table_full;

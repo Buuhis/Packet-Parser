@@ -910,10 +910,42 @@ static unsigned int mwan_worker_idle(const struct mwan_l2_worker *worker)
                (unsigned int)atomic_read(&worker->idle_ewma_bp));
 }
 
+static u64 mwan_direction_worker_score(
+    const struct mwan_l2_worker *worker, bool tx)
+{
+    u64 queued_bytes;
+    u64 queued_packets;
+    u64 ewma_ns;
+    bool busy;
+
+    if (tx) {
+        queued_bytes = atomic64_read(&worker->tx_queued_bytes);
+        queued_packets = atomic64_read(&worker->tx_queued_packets);
+        ewma_ns = atomic64_read(&worker->tx_processing_ewma_ns);
+        busy = atomic_read(&worker->tx_busy) != 0;
+    } else {
+        queued_bytes = atomic64_read(&worker->queued_bytes);
+        queued_packets = atomic64_read(&worker->queued_packets);
+        ewma_ns = atomic64_read(&worker->processing_ewma_ns);
+        busy = atomic_read(&worker->busy) != 0;
+    }
+
+    return queued_bytes + queued_packets * 2048ULL + (ewma_ns >> 3) +
+           (busy ? 4096ULL : 0);
+}
+
+static bool mwan_tx_worker_queue_high(const struct mwan_l2_worker *worker)
+{
+    return atomic64_read(&worker->tx_queued_packets) >=
+               MWAN_L2_QUEUE_MAX_PACKETS / MWAN_TX_QUEUE_HIGH_DIV ||
+           atomic64_read(&worker->tx_queued_bytes) >=
+               MWAN_L2_QUEUE_MAX_BYTES / MWAN_TX_QUEUE_HIGH_DIV;
+}
+
 static bool mwan_worker_better(const struct mwan_l2_worker *worker,
                                u64 assigned, int best,
                                const struct mwan_l2_worker *best_worker,
-                               u64 best_assigned, bool empty_phase)
+                               u64 best_assigned, bool tx)
 {
     unsigned int idle;
     unsigned int best_idle;
@@ -922,8 +954,14 @@ static bool mwan_worker_better(const struct mwan_l2_worker *worker,
 
     if (best < 0)
         return true;
-    if (empty_phase && ((assigned == 0) != (best_assigned == 0)))
-        return assigned == 0;
+
+    /* Current directional backlog is the strongest signal. A stale cached
+     * flow count must never make a busy TX worker win over one that can accept
+     * work immediately. */
+    score = mwan_direction_worker_score(worker, tx);
+    best_score = mwan_direction_worker_score(best_worker, tx);
+    if (score != best_score)
+        return score < best_score;
 
     idle = mwan_worker_idle(worker);
     best_idle = mwan_worker_idle(best_worker);
@@ -933,9 +971,7 @@ static bool mwan_worker_better(const struct mwan_l2_worker *worker,
         return false;
     if (assigned != best_assigned)
         return assigned < best_assigned;
-    score = mwan_multicore_worker_score(worker);
-    best_score = mwan_multicore_worker_score(best_worker);
-    return score < best_score;
+    return false;
 }
 
 static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
@@ -946,7 +982,6 @@ static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
     int offset;
     int best = -1;
     u64 best_assigned = U64_MAX;
-    bool have_empty = false;
 
     if (!cfg || !cfg->l2_workers || cfg->num_workers <= 0)
         return -1;
@@ -961,24 +996,19 @@ static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
         u64 assigned;
 
         if (!cpu_online(worker->cpu) ||
-            atomic_read(&worker->admission_blocked))
+            atomic_read(&worker->admission_blocked) ||
+            (tx && (atomic_read(&worker->emergency_shed) ||
+                    mwan_tx_worker_queue_high(worker))))
             continue;
-        /* Empty-core spreading is directional.  RX ownership must not make a
-         * CPU look occupied to TX (or vice versa); actual CPU headroom and
-         * queue/processing pressure remain shared between both directions. */
+        /* Ownership is only a tie-breaker. In particular, cached UDP flow
+         * objects from a previous traffic burst must not override live queue
+         * pressure when a new burst starts. */
         assigned = tx ? atomic64_read(&worker->tx_assigned_flows) :
                         atomic64_read(&worker->assigned_flows);
 
-        if (assigned == 0 && !have_empty) {
-            best = -1;
-            best_assigned = U64_MAX;
-            have_empty = true;
-        }
-        if (have_empty && assigned != 0)
-            continue;
         if (mwan_worker_better(worker, assigned, best,
                                best >= 0 ? &cfg->l2_workers[best] : NULL,
-                               best_assigned, have_empty)) {
+                               best_assigned, tx)) {
             best = idx;
             best_assigned = assigned;
         }
@@ -987,8 +1017,8 @@ static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
     /* Preserve liveness when the caller explicitly identifies control
      * traffic, or when RX cannot classify the authenticated inner packet yet.
      * This fallback is used only when the normal admission pass found no CPU;
-     * it chooses the online CPU with the highest idle headroom and never
-     * migrates an existing flow. */
+     * it chooses the online CPU with the lowest directional pressure and then
+     * the highest idle headroom. */
     if (best < 0 && allow_blocked_fallback) {
         best_assigned = U64_MAX;
         for (offset = 0; offset < cfg->num_workers; offset++) {
@@ -1002,7 +1032,7 @@ static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
                             atomic64_read(&worker->assigned_flows);
             if (mwan_worker_better(worker, assigned, best,
                                    best >= 0 ? &cfg->l2_workers[best] : NULL,
-                                   best_assigned, false)) {
+                                   best_assigned, tx)) {
                 best = idx;
                 best_assigned = assigned;
             }
@@ -1347,9 +1377,11 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     }
     tun = &cfg->tunnels[tunnel_idx];
     mwan_l2_tx_flow_touch(flow, closing);
-    owner = flow->owner_worker;
+    spin_lock_bh(&flow->submit_lock);
+    owner = READ_ONCE(flow->owner_worker);
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu)) {
+        spin_unlock_bh(&flow->submit_lock);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         mwan_l2_tx_flow_put(flow);
         return -ENODEV;
@@ -1359,13 +1391,13 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         *owner_cpu = worker->cpu;
 
     if (mwan_tx_should_drop(worker, skb, packet_class)) {
+        spin_unlock_bh(&flow->submit_lock);
         mwan_l2_tx_flow_put(flow);
         return -EAGAIN;
     }
 
     /* ECN marking may make a cloned skb writable and change truesize. */
     accounted_bytes = skb->truesize;
-    spin_lock_bh(&flow->submit_lock);
     spin_lock(&worker->tx_queue.lock);
     if (worker->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&worker->tx_queued_bytes) + accounted_bytes >

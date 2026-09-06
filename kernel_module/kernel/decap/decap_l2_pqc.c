@@ -87,8 +87,12 @@ void mwan_l2_diag_reset_all(void)
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    if (cfg)
+    if (cfg) {
+        atomic64_set(&cfg->flows.tx_worker_deactivated, 0);
+        atomic64_set(&cfg->flows.tx_worker_reactivated, 0);
+        atomic64_set(&cfg->flows.tx_worker_reselected, 0);
         mwan_rekey_diag_reset(cfg);
+    }
     rcu_read_unlock();
 
     generation = (u32)atomic_inc_return(&mwan_l2_diag_generation);
@@ -723,6 +727,10 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.rx_created),
                    atomic64_read(&cfg->flows.rx_expired),
                    atomic64_read(&cfg->flows.table_full));
+        seq_printf(m, "tx_worker_lifecycle deactivated=%lld reactivated=%lld reselected=%lld\n",
+                   atomic64_read(&cfg->flows.tx_worker_deactivated),
+                   atomic64_read(&cfg->flows.tx_worker_reactivated),
+                   atomic64_read(&cfg->flows.tx_worker_reselected));
         seq_printf(m, "reorder late=%lld duplicate=%lld too_far=%lld skipped_on_timeout=%lld resync=%lld resync_skipped=%lld resync_flushed=%lld\n",
                    atomic64_read(&cfg->flows.reorder_late),
                    atomic64_read(&cfg->flows.reorder_duplicate),

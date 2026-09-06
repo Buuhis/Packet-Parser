@@ -1,7 +1,9 @@
 #include "mwan_state.h"
 #include "mwan_tunnel_balance.h"
 
+#include <linux/cpu.h>
 #include <linux/etherdevice.h>
+#include <linux/in.h>
 #include <linux/jhash.h>
 #include <linux/random.h>
 #include <linux/slab.h>
@@ -71,6 +73,66 @@ static void mwan_l2_tx_balance_deactivate(struct mwan_config *cfg,
                                          READ_ONCE(flow->tunnel_idx));
 }
 
+static bool mwan_l2_tx_worker_inactive(const struct mwan_l2_tx_flow *flow)
+{
+    if (READ_ONCE(flow->closing))
+        return true;
+    if (flow->key.protocol != IPPROTO_UDP)
+        return false;
+    return time_after(jiffies, READ_ONCE(flow->last_seen) +
+                               MWAN_FLOW_BALANCE_IDLE_TIMEOUT);
+}
+
+static void mwan_l2_tx_worker_deactivate(struct mwan_config *cfg,
+                                         struct mwan_l2_tx_flow *flow)
+{
+    int owner;
+
+    if (!cfg || !flow ||
+        atomic_cmpxchg(&flow->worker_counted, 1, 0) != 1)
+        return;
+    owner = READ_ONCE(flow->owner_worker);
+    if (cfg->l2_workers && owner >= 0 && owner < cfg->num_workers)
+        atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
+    atomic64_inc(&cfg->flows.tx_worker_deactivated);
+}
+
+/* Called with both the TX flow bucket and submit locks held. An inactive UDP
+ * mapping may select a fresh worker only after its old queue references
+ * reached zero. The flow object, tunnel and sequence stay intact, so this is
+ * not migration of a live flow. */
+static bool mwan_l2_tx_worker_reactivate(struct mwan_config *cfg,
+                                         struct mwan_l2_tx_flow *flow,
+                                         u32 flow_hash,
+                                         bool control_packet)
+{
+    int old_owner;
+    int owner;
+
+    if (atomic_read(&flow->worker_counted))
+        return true;
+    old_owner = READ_ONCE(flow->owner_worker);
+    if (READ_ONCE(flow->closing) ||
+        atomic_read(&flow->pending_crypto)) {
+        owner = old_owner;
+        if (!cfg->l2_workers || owner < 0 || owner >= cfg->num_workers ||
+            !cpu_online(cfg->l2_workers[owner].cpu))
+            return false;
+        atomic64_inc(&cfg->l2_workers[owner].tx_assigned_flows);
+    } else {
+        owner = mwan_l2_select_tx_worker(cfg, flow_hash, -1,
+                                         control_packet);
+        if (owner < 0)
+            return false;
+    }
+    WRITE_ONCE(flow->owner_worker, owner);
+    atomic_set(&flow->worker_counted, 1);
+    atomic64_inc(&cfg->flows.tx_worker_reactivated);
+    if (owner != old_owner)
+        atomic64_inc(&cfg->flows.tx_worker_reselected);
+    return true;
+}
+
 static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
 {
     struct mwan_l2_rx_flow *flow =
@@ -127,6 +189,9 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic_set(&cfg->flows.rx_count, 0);
     atomic64_set(&cfg->flows.tx_created, 0);
     atomic64_set(&cfg->flows.tx_expired, 0);
+    atomic64_set(&cfg->flows.tx_worker_deactivated, 0);
+    atomic64_set(&cfg->flows.tx_worker_reactivated, 0);
+    atomic64_set(&cfg->flows.tx_worker_reselected, 0);
     atomic64_set(&cfg->flows.rx_created, 0);
     atomic64_set(&cfg->flows.rx_expired, 0);
     atomic64_set(&cfg->flows.table_full, 0);
@@ -161,20 +226,25 @@ static void mwan_l2_flow_gc_workfn(struct work_struct *work)
 
         spin_lock_bh(&bucket->lock);
         hlist_for_each_entry_safe(flow, tmp, &bucket->head, node) {
+            bool expired;
+
+            spin_lock(&flow->submit_lock);
             if (!atomic_read(&flow->pending_crypto) &&
-                mwan_l2_tx_balance_inactive(flow))
+                mwan_l2_tx_balance_inactive(flow)) {
                 mwan_l2_tx_balance_deactivate(cfg, flow);
-            if (atomic_read(&flow->pending_crypto) ||
-                !mwan_l2_flow_expired(READ_ONCE(flow->last_seen),
-                                      READ_ONCE(flow->closing)))
+                if (mwan_l2_tx_worker_inactive(flow))
+                    mwan_l2_tx_worker_deactivate(cfg, flow);
+            }
+            expired = !atomic_read(&flow->pending_crypto) &&
+                      mwan_l2_flow_expired(READ_ONCE(flow->last_seen),
+                                           READ_ONCE(flow->closing));
+            spin_unlock(&flow->submit_lock);
+            if (!expired)
                 continue;
             hlist_del_init(&flow->node);
             atomic_dec(&manager->tx_count);
             atomic64_inc(&manager->tx_expired);
-            if (flow->owner_worker >= 0 &&
-                flow->owner_worker < cfg->num_workers)
-                atomic64_dec(&cfg->l2_workers[flow->owner_worker]
-                                               .tx_assigned_flows);
+            mwan_l2_tx_worker_deactivate(cfg, flow);
             mwan_l2_tx_balance_deactivate(cfg, flow);
             mwan_l2_tx_flow_put(flow);
         }
@@ -272,6 +342,7 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
         hlist_for_each_entry_safe(tx, tmp, &cfg->flows.tx[i].head, node) {
             hlist_del_init(&tx->node);
             mwan_l2_tx_balance_deactivate(cfg, tx);
+            mwan_l2_tx_worker_deactivate(cfg, tx);
             mwan_l2_tx_flow_put(tx);
         }
         spin_unlock_bh(&cfg->flows.tx[i].lock);
@@ -311,6 +382,20 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
         if (mwan_l2_flow_key_equal(&flow->key, key)) {
+            spin_lock(&flow->submit_lock);
+            if (allow_tunnel_remap &&
+                !READ_ONCE(flow->closing) &&
+                !atomic_read(&flow->pending_crypto) &&
+                mwan_l2_tx_worker_inactive(flow)) {
+                mwan_l2_tx_balance_deactivate(cfg, flow);
+                mwan_l2_tx_worker_deactivate(cfg, flow);
+            }
+            if (!mwan_l2_tx_worker_reactivate(cfg, flow, flow_hash,
+                                              control_packet)) {
+                spin_unlock(&flow->submit_lock);
+                spin_unlock_bh(&bucket->lock);
+                return NULL;
+            }
             if (allow_tunnel_remap &&
                 !mwan_tunnel_balance_is_active(cfg, flow->tunnel_idx)) {
                 bool old_counted =
@@ -330,6 +415,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             }
             refcount_inc(&flow->refs);
             WRITE_ONCE(flow->last_seen, jiffies);
+            spin_unlock(&flow->submit_lock);
             spin_unlock_bh(&bucket->lock);
             return flow;
         }
@@ -373,6 +459,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     atomic_set(&candidate->pending_crypto, 0);
     atomic_set(&candidate->balance_counted,
                requested_tunnel_idx < 0 ? 1 : 0);
+    atomic_set(&candidate->worker_counted, 1);
     spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
     candidate->tunnel_idx = (u16)tunnel_idx;
