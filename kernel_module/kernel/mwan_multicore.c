@@ -910,28 +910,32 @@ static unsigned int mwan_worker_idle(const struct mwan_l2_worker *worker)
                (unsigned int)atomic_read(&worker->idle_ewma_bp));
 }
 
-static u64 mwan_direction_worker_score(
+static u64 mwan_direction_queue_score(
     const struct mwan_l2_worker *worker, bool tx)
 {
     u64 queued_bytes;
     u64 queued_packets;
-    u64 ewma_ns;
     bool busy;
 
     if (tx) {
         queued_bytes = atomic64_read(&worker->tx_queued_bytes);
         queued_packets = atomic64_read(&worker->tx_queued_packets);
-        ewma_ns = atomic64_read(&worker->tx_processing_ewma_ns);
         busy = atomic_read(&worker->tx_busy) != 0;
     } else {
         queued_bytes = atomic64_read(&worker->queued_bytes);
         queued_packets = atomic64_read(&worker->queued_packets);
-        ewma_ns = atomic64_read(&worker->processing_ewma_ns);
         busy = atomic_read(&worker->busy) != 0;
     }
 
-    return queued_bytes + queued_packets * 2048ULL + (ewma_ns >> 3) +
+    return queued_bytes + queued_packets * 2048ULL +
            (busy ? 4096ULL : 0);
+}
+
+static u64 mwan_direction_processing_ewma(
+    const struct mwan_l2_worker *worker, bool tx)
+{
+    return tx ? (u64)atomic64_read(&worker->tx_processing_ewma_ns) :
+                (u64)atomic64_read(&worker->processing_ewma_ns);
 }
 
 static bool mwan_tx_worker_queue_high(const struct mwan_l2_worker *worker)
@@ -955,11 +959,18 @@ static bool mwan_worker_better(const struct mwan_l2_worker *worker,
     if (best < 0)
         return true;
 
-    /* Current directional backlog is the strongest signal. A stale cached
-     * flow count must never make a busy TX worker win over one that can accept
-     * work immediately. */
-    score = mwan_direction_worker_score(worker, tx);
-    best_score = mwan_direction_worker_score(best_worker, tx);
+    /* Each admission increments assigned before the next admission can run,
+     * making it an immediate reservation even if a worker drains its first
+     * packet before the rest of a burst is classified. This prevents a small,
+     * persistent processing-EWMA difference from attracting every later
+     * flow to the same CPU. */
+    if (assigned != best_assigned)
+        return assigned < best_assigned;
+
+    /* Compare only live directional pressure here. Historical service time
+     * is deliberately excluded until the final tie-break. */
+    score = mwan_direction_queue_score(worker, tx);
+    best_score = mwan_direction_queue_score(best_worker, tx);
     if (score != best_score)
         return score < best_score;
 
@@ -969,9 +980,9 @@ static bool mwan_worker_better(const struct mwan_l2_worker *worker,
         return true;
     if (best_idle > idle + MWAN_IDLE_TIE_BP)
         return false;
-    if (assigned != best_assigned)
-        return assigned < best_assigned;
-    return false;
+
+    return mwan_direction_processing_ewma(worker, tx) <
+           mwan_direction_processing_ewma(best_worker, tx);
 }
 
 static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
@@ -1000,9 +1011,8 @@ static int mwan_select_worker(const struct mwan_config *cfg, u32 flow_id,
             (tx && (atomic_read(&worker->emergency_shed) ||
                     mwan_tx_worker_queue_high(worker))))
             continue;
-        /* Ownership is only a tie-breaker. In particular, cached UDP flow
-         * objects from a previous traffic burst must not override live queue
-         * pressure when a new burst starts. */
+        /* Idle UDP mappings release this ownership reservation independently
+         * from their longer-lived sticky flow object. */
         assigned = tx ? atomic64_read(&worker->tx_assigned_flows) :
                         atomic64_read(&worker->assigned_flows);
 
