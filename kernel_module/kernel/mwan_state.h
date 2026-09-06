@@ -100,10 +100,9 @@ struct mwan_tunnel {
     u32 state_sequence;
     enum mwan_encap_type encap_type;
 
-    /* Flow-aware path selection statistics. balance_tx_bytes is updated only
-     * for data flows accepted by a TX worker; BFD/control probes are excluded.
-     * The sampled/EWMA fields are protected by tunnel_balance_lock. */
-    atomic64_t balance_tx_bytes;
+    /* Flow-aware path selection statistics. Per-worker byte counters include
+     * only data accepted by TX; BFD/control probes are excluded. These
+     * sampled/EWMA fields are protected by tunnel_balance_lock. */
     atomic_t balance_active_flows;
     atomic_t balance_admitted_flows;
     u64 balance_sample_bytes;
@@ -312,7 +311,11 @@ struct mwan_l2_worker {
     u64 cpu_prev_system;
     u64 cpu_prev_softirq;
     u64 cpu_prev_idle;
+    u64 cpu_prev_tx_queued_packets;
+    u64 cpu_prev_tx_queued_bytes;
     unsigned int cpu_cool_samples;
+    unsigned int emergency_hot_samples;
+    unsigned int emergency_cool_samples;
     atomic_t system_raw_bp;
     atomic_t system_ewma_bp;
     atomic_t softirq_raw_bp;
@@ -323,10 +326,21 @@ struct mwan_l2_worker {
     atomic_t busy_ewma_bp;
     atomic_t admission_blocked;
     atomic_t emergency_shed;
+    atomic_t busy_peak_bp;
+    atomic_t idle_min_bp;
+    atomic64_t emergency_enter_count;
+    atomic64_t emergency_last_enter_ns;
+    atomic64_t overload_last_drop_ns;
     atomic64_t tx_ecn_marked;
     atomic64_t rx_ecn_marked;
     atomic64_t tx_overload_dropped;
     atomic64_t tx_control_preserved;
+
+    /* One counter set per worker prevents every TX CPU from modifying the
+     * same tunnel cache line for every packet. The balance sampler aggregates
+     * these only when a new flow needs a path. */
+    atomic64_t *balance_tx_bytes;
+    unsigned long *balance_last_data;
 };
 
 struct mwan_config {
@@ -464,7 +478,10 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
 int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
                                   const struct mwan_l2_flow_key *key,
                                   u32 flow_hash, bool control_packet,
-                                  u16 *tunnel_idx);
+                                  u16 *tunnel_idx,
+                                  struct mwan_l2_tx_flow **flow_out);
+struct mwan_l2_tx_flow *
+mwan_l2_tx_flow_hold(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
 void mwan_l2_tx_flow_complete(struct mwan_config *cfg,

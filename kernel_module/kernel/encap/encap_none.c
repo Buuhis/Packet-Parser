@@ -140,11 +140,13 @@ static bool mwan_none_tcp_closing(struct sk_buff *skb)
 
 static unsigned int
 mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
-                              u16 tunnel_idx);
+                              u16 tunnel_idx,
+                              const struct mwan_tx_flow_context *tx_ctx);
 
 struct mwan_none_fragment_context {
     struct mwan_config *cfg;
     u16 tunnel_idx;
+    const struct mwan_tx_flow_context *tx_ctx;
 };
 
 static int mwan_none_fragment_output(struct sk_buff *fragment, void *context)
@@ -153,7 +155,8 @@ static int mwan_none_fragment_output(struct sk_buff *fragment, void *context)
     unsigned int verdict;
 
     verdict = mwan_handle_encap_none_single(
-        fragment, fragment_context->cfg, fragment_context->tunnel_idx);
+        fragment, fragment_context->cfg, fragment_context->tunnel_idx,
+        fragment_context->tx_ctx);
     if (verdict == NF_STOLEN)
         return 0;
 
@@ -163,9 +166,13 @@ static int mwan_none_fragment_output(struct sk_buff *fragment, void *context)
 
 static unsigned int
 mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
-                              u16 tunnel_idx)
+                              u16 tunnel_idx,
+                              const struct mwan_tx_flow_context *tx_ctx)
 {
-    struct mwan_tx_flow_info info;
+    struct mwan_tx_flow_info local_info;
+    const struct mwan_tx_flow_info *info;
+    struct mwan_l2_tx_flow *flow = NULL;
+    enum mwan_packet_class packet_class;
     struct mwan_tunnel *tun;
     struct mwan_mtu_decision decision;
     enum mwan_mtu_result mtu_result;
@@ -183,6 +190,7 @@ mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
         struct mwan_none_fragment_context fragment_context = {
             .cfg = cfg,
             .tunnel_idx = tunnel_idx,
+            .tx_ctx = tx_ctx,
         };
         bool consumed = false;
 
@@ -207,14 +215,26 @@ mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
     if (!mwan_none_normalize_ipv4_extent(skb, &decision))
         return NF_DROP;
 
-    mwan_multicore_flow_info(skb, &info);
-    err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, &info,
+    if (tx_ctx) {
+        info = &tx_ctx->info;
+        packet_class = tx_ctx->packet_class;
+        flow = mwan_l2_tx_flow_hold(tx_ctx->flow);
+        if (!flow)
+            return NF_DROP;
+    } else {
+        mwan_multicore_flow_info(skb, &local_info);
+        info = &local_info;
+        packet_class = mwan_multicore_packet_classify(skb);
+    }
+    err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, info, flow,
+                                   packet_class,
                                    mwan_none_tcp_closing(skb), NULL, NULL);
     return err ? NF_DROP : NF_STOLEN;
 }
 
 unsigned int mwan_handle_encap_none(struct sk_buff *skb,
-                                    struct mwan_config *cfg, u16 tunnel_idx)
+                                    struct mwan_config *cfg, u16 tunnel_idx,
+                                    const struct mwan_tx_flow_context *tx_ctx)
 {
     if (skb_is_gso(skb)) {
         struct sk_buff *segs;
@@ -229,7 +249,8 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb,
             next = nskb->next;
             nskb->next = NULL;
             nskb->prev = NULL;
-            if (mwan_handle_encap_none_single(nskb, cfg, tunnel_idx) !=
+            if (mwan_handle_encap_none_single(nskb, cfg, tunnel_idx,
+                                              tx_ctx) !=
                 NF_STOLEN)
                 kfree_skb(nskb);
         }
@@ -237,5 +258,5 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb,
         return NF_STOLEN;
     }
 
-    return mwan_handle_encap_none_single(skb, cfg, tunnel_idx);
+    return mwan_handle_encap_none_single(skb, cfg, tunnel_idx, tx_ctx);
 }

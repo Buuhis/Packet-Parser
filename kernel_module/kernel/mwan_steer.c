@@ -151,13 +151,14 @@ static inline bool is_bfd_control_packet(struct sk_buff *skb,
 
 static unsigned int mwan_dispatch_encap(struct sk_buff *skb,
                                         struct mwan_config *cfg,
-                                        u8 tun_idx)
+                                        u8 tun_idx,
+                                        const struct mwan_tx_flow_context *tx_ctx)
 {
     struct mwan_tunnel *tun = &cfg->tunnels[tun_idx];
 
     switch (tun->encap_type) {
     case MWAN_ENCAP_NONE:
-        return mwan_handle_encap_none(skb, cfg, tun_idx);
+        return mwan_handle_encap_none(skb, cfg, tun_idx, tx_ctx);
     case MWAN_ENCAP_MACSEC:
         return mwan_handle_encap_macsec(skb, tun);
     case MWAN_ENCAP_L3_CUSTOM:
@@ -165,9 +166,9 @@ static unsigned int mwan_dispatch_encap(struct sk_buff *skb,
     case MWAN_ENCAP_L3_PQC:
         return mwan_handle_encap_l3_pqc(skb, tun);
     case MWAN_ENCAP_L2_PQC:
-        return mwan_handle_encap_l2_pqc(skb, cfg, tun_idx);
+        return mwan_handle_encap_l2_pqc(skb, cfg, tun_idx, tx_ctx);
     default:
-        return mwan_handle_encap_none(skb, cfg, tun_idx);
+        return mwan_handle_encap_none(skb, cfg, tun_idx, tx_ctx);
     }
 }
 
@@ -226,7 +227,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             rcu_read_unlock();
             return (unsigned int)confirm_ret;
         }
-        ret = mwan_dispatch_encap(skb, cfg, tun_idx);
+        ret = mwan_dispatch_encap(skb, cfg, tun_idx, NULL);
         rcu_read_unlock();
         return ret;
     }
@@ -261,7 +262,8 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         const struct mwan_active_paths *active =
             rcu_dereference(cfg->active_paths);
         struct mwan_tunnel *tun;
-        struct mwan_tx_flow_info flow_info;
+        struct mwan_tx_flow_context tx_ctx = { 0 };
+        const struct mwan_tx_flow_context *dispatch_ctx = NULL;
         unsigned int ret = NF_ACCEPT;
         int confirm_ret;
         int select_ret;
@@ -306,26 +308,31 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
          * encryption modes retain their existing weighted-LUT behaviour. */
         if (tun->encap_type == MWAN_ENCAP_NONE ||
             tun->encap_type == MWAN_ENCAP_L2_PQC) {
-            hash = mwan_multicore_flow_info(skb, &flow_info);
+            hash = mwan_multicore_flow_info(skb, &tx_ctx.info);
+            tx_ctx.packet_class = mwan_multicore_packet_classify(skb);
             select_ret = mwan_l2_tx_flow_select_tunnel(
-                cfg, &flow_info.key, hash,
-                mwan_multicore_packet_is_control(skb), &selected_tun_idx);
+                cfg, &tx_ctx.info.key, hash,
+                tx_ctx.packet_class == MWAN_PACKET_CONTROL,
+                &selected_tun_idx, &tx_ctx.flow);
             if (unlikely(select_ret)) {
                 rcu_read_unlock();
                 return NF_DROP;
             }
             if (unlikely(selected_tun_idx >= cfg->num_tunnels)) {
+                mwan_l2_tx_flow_put(tx_ctx.flow);
                 rcu_read_unlock();
                 return NF_DROP;
             }
             tun_idx = (u8)selected_tun_idx;
             tun = &cfg->tunnels[tun_idx];
+            dispatch_ctx = &tx_ctx;
         }
 
         mwan_fw_diag_log("TX_POST", skb, state, tun->encap_type,
                          "DISPATCH", tun->dev ? tun->dev->name : NULL);
 
-        ret = mwan_dispatch_encap(skb, cfg, tun_idx);
+        ret = mwan_dispatch_encap(skb, cfg, tun_idx, dispatch_ctx);
+        mwan_l2_tx_flow_put(tx_ctx.flow);
         
         rcu_read_unlock();
         return ret;

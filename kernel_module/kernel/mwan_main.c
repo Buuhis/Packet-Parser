@@ -38,7 +38,7 @@ MODULE_PARM_DESC(l2_idle_unblock,
                  "Raw and EWMA idle percent required to unblock a CPU");
 module_param_named(l2_emergency, mwan_l2_emergency_pct, uint, 0644);
 MODULE_PARM_DESC(l2_emergency,
-                 "Busy/sys/soft percent that enables packet-level shedding");
+                 "Busy/sys/soft candidate threshold; shedding also requires three samples and TX queue pressure");
 module_param_named(l2_max_shed, mwan_l2_max_shed_pct, uint, 0644);
 MODULE_PARM_DESC(l2_max_shed,
                  "Maximum percentage of eligible data packets shed per CPU");

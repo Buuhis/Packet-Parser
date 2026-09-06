@@ -286,16 +286,19 @@ static void mwan_l2_clamp_mss(struct sk_buff *skb, struct net_device *dev)
 
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
-                                u16 tunnel_idx);
+                                u16 tunnel_idx,
+                                const struct mwan_tx_flow_context *tx_ctx);
 
 struct mwan_l2_fragment_context {
     struct mwan_config *cfg;
     u16 tunnel_idx;
+    const struct mwan_tx_flow_context *tx_ctx;
     /* ip_do_fragment() removes the UDP header from every non-initial
      * fragment and marks the first one with IP_MF.  Preserve the flow
      * identity extracted from the complete datagram so all fragments keep
      * the original 4-tuple and owner worker. */
     struct mwan_tx_flow_info flow_info;
+    enum mwan_packet_class packet_class;
     bool preserve_flow;
 };
 
@@ -307,6 +310,9 @@ mwan_l2_submit_fragment(struct sk_buff *fragment,
     struct mwan_mtu_decision decision;
     struct mwan_tunnel *tun;
     enum mwan_mtu_result mtu_result;
+    const struct mwan_tx_flow_info *info;
+    struct mwan_l2_tx_flow *flow = NULL;
+    enum mwan_packet_class packet_class;
     u32 flow_idx;
     u32 seq = 0;
     int owner_cpu = -1;
@@ -330,31 +336,39 @@ mwan_l2_submit_fragment(struct sk_buff *fragment,
     if (!mwan_l2_normalize_ipv4_extent(fragment, &decision))
         return -EINVAL;
 
+    if (fragment_context->tx_ctx) {
+        info = &fragment_context->tx_ctx->info;
+        packet_class = fragment_context->tx_ctx->packet_class;
+        flow = mwan_l2_tx_flow_hold(fragment_context->tx_ctx->flow);
+        if (!flow)
+            return -ENOENT;
+    } else {
+        info = &fragment_context->flow_info;
+        packet_class = fragment_context->packet_class;
+    }
     err = mwan_multicore_tx_submit(
         fragment, fragment_context->cfg, fragment_context->tunnel_idx,
-        &fragment_context->flow_info, false, &seq, &owner_cpu);
+        info, flow, packet_class, false, &seq, &owner_cpu);
     if (err)
         return err;
 
     memset(&flow_diag, 0, sizeof(flow_diag));
-    flow_diag.saddr = fragment_context->flow_info.key.saddr;
-    flow_diag.daddr = fragment_context->flow_info.key.daddr;
-    flow_diag.sport = fragment_context->flow_info.key.sport;
-    flow_diag.dport = fragment_context->flow_info.key.dport;
-    flow_diag.protocol = fragment_context->flow_info.key.protocol;
-    flow_diag.hash_before = fragment_context->flow_info.hash_before;
-    flow_diag.tuple_valid = fragment_context->flow_info.tuple_valid;
+    flow_diag.saddr = info->key.saddr;
+    flow_diag.daddr = info->key.daddr;
+    flow_diag.sport = info->key.sport;
+    flow_diag.dport = info->key.dport;
+    flow_diag.protocol = info->key.protocol;
+    flow_diag.hash_before = info->hash_before;
+    flow_diag.tuple_valid = info->tuple_valid;
     flow_diag.hash_was_cached =
-        fragment_context->flow_info.hash_was_cached;
-    flow_diag.hash_is_l4 = fragment_context->flow_info.hash_is_l4;
-    flow_diag.hash_is_sw = fragment_context->flow_info.hash_is_sw;
+        info->hash_was_cached;
+    flow_diag.hash_is_l4 = info->hash_is_l4;
+    flow_diag.hash_is_sw = info->hash_is_sw;
     flow_diag.hash_source = mwan_multicore_hash_source_name(
-        fragment_context->flow_info.hash_source);
-    flow_idx = fragment_context->flow_info.flow_id &
-               (MWAN_FLOW_HASH_SIZE - 1);
+        info->hash_source);
+    flow_idx = info->flow_id & (MWAN_FLOW_HASH_SIZE - 1);
     mwan_l2_tx_diag_log(&flow_diag, tun,
-                        fragment_context->flow_info.flow_id, flow_idx, seq,
-                        owner_cpu);
+                        info->flow_id, flow_idx, seq, owner_cpu);
     return 0;
 }
 
@@ -379,7 +393,8 @@ static int mwan_l2_fragment_output(struct sk_buff *fragment, void *context)
     }
 
     verdict = mwan_handle_encap_l2_pqc_single(
-        fragment, fragment_context->cfg, fragment_context->tunnel_idx);
+        fragment, fragment_context->cfg, fragment_context->tunnel_idx,
+        fragment_context->tx_ctx);
     if (verdict == NF_STOLEN)
         return 0;
 
@@ -389,7 +404,8 @@ static int mwan_l2_fragment_output(struct sk_buff *fragment, void *context)
 
 unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
                                       struct mwan_config *cfg,
-                                      u16 tunnel_idx)
+                                      u16 tunnel_idx,
+                                      const struct mwan_tx_flow_context *tx_ctx)
 {
     if (skb_is_gso(skb)) {
         struct sk_buff *segs, *nskb, *next;
@@ -408,7 +424,8 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
             nskb->next = NULL;
             nskb->prev = NULL;
 
-            if (mwan_handle_encap_l2_pqc_single(nskb, cfg, tunnel_idx) !=
+            if (mwan_handle_encap_l2_pqc_single(nskb, cfg, tunnel_idx,
+                                                tx_ctx) !=
                 NF_STOLEN) {
                 kfree_skb(nskb);
             }
@@ -419,7 +436,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
         return NF_STOLEN;
     }
 
-    return mwan_handle_encap_l2_pqc_single(skb, cfg, tunnel_idx);
+    return mwan_handle_encap_l2_pqc_single(skb, cfg, tunnel_idx, tx_ctx);
 }
 
 int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
@@ -568,9 +585,13 @@ static bool mwan_l2_tcp_flow_closing(struct sk_buff *skb)
 
 static unsigned int
 mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
-                                u16 tunnel_idx)
+                                u16 tunnel_idx,
+                                const struct mwan_tx_flow_context *tx_ctx)
 {
-    struct mwan_tx_flow_info info;
+    struct mwan_tx_flow_info local_info;
+    const struct mwan_tx_flow_info *info;
+    struct mwan_l2_tx_flow *flow = NULL;
+    enum mwan_packet_class packet_class;
     struct mwan_l2_tx_diag flow_diag;
     struct mwan_mtu_decision decision;
     struct mwan_tunnel *tun;
@@ -595,6 +616,7 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
         struct mwan_l2_fragment_context fragment_context = {
             .cfg = cfg,
             .tunnel_idx = tunnel_idx,
+            .tx_ctx = tx_ctx,
         };
         bool consumed = false;
 
@@ -609,8 +631,11 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
          * available, so capture it before ip_do_fragment() creates packets
          * whose IP fragment flags intentionally hide the L4 ports from the
          * generic flow dissector. */
-        if (decision.ip_protocol == IPPROTO_UDP) {
+        if (tx_ctx) {
+            fragment_context.preserve_flow = true;
+        } else if (decision.ip_protocol == IPPROTO_UDP) {
             mwan_multicore_flow_info(skb, &fragment_context.flow_info);
+            fragment_context.packet_class = MWAN_PACKET_UDP_DATA;
             fragment_context.preserve_flow = true;
         }
 
@@ -633,22 +658,34 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
      * plaintext. */
     mwan_l2_clamp_mss(skb, target_dev);
 
-    flow_id = mwan_multicore_flow_info(skb, &info);
+    if (tx_ctx) {
+        info = &tx_ctx->info;
+        packet_class = tx_ctx->packet_class;
+        flow = mwan_l2_tx_flow_hold(tx_ctx->flow);
+        if (!flow)
+            return NF_DROP;
+        flow_id = info->flow_id;
+    } else {
+        flow_id = mwan_multicore_flow_info(skb, &local_info);
+        info = &local_info;
+        packet_class = mwan_multicore_packet_classify(skb);
+    }
     memset(&flow_diag, 0, sizeof(flow_diag));
-    flow_diag.saddr = info.key.saddr;
-    flow_diag.daddr = info.key.daddr;
-    flow_diag.sport = info.key.sport;
-    flow_diag.dport = info.key.dport;
-    flow_diag.protocol = info.key.protocol;
-    flow_diag.hash_before = info.hash_before;
-    flow_diag.tuple_valid = info.tuple_valid;
-    flow_diag.hash_was_cached = info.hash_was_cached;
-    flow_diag.hash_is_l4 = info.hash_is_l4;
-    flow_diag.hash_is_sw = info.hash_is_sw;
+    flow_diag.saddr = info->key.saddr;
+    flow_diag.daddr = info->key.daddr;
+    flow_diag.sport = info->key.sport;
+    flow_diag.dport = info->key.dport;
+    flow_diag.protocol = info->key.protocol;
+    flow_diag.hash_before = info->hash_before;
+    flow_diag.tuple_valid = info->tuple_valid;
+    flow_diag.hash_was_cached = info->hash_was_cached;
+    flow_diag.hash_is_l4 = info->hash_is_l4;
+    flow_diag.hash_is_sw = info->hash_is_sw;
     flow_diag.hash_source =
-        mwan_multicore_hash_source_name(info.hash_source);
+        mwan_multicore_hash_source_name(info->hash_source);
     flow_idx = flow_id & (MWAN_FLOW_HASH_SIZE - 1);
-    err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, &info,
+    err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, info, flow,
+                                   packet_class,
                                    mwan_l2_tcp_flow_closing(skb), &seq,
                                    &owner_cpu);
     if (!err)

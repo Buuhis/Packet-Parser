@@ -403,13 +403,15 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
 int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
                                   const struct mwan_l2_flow_key *key,
                                   u32 flow_hash, bool control_packet,
-                                  u16 *tunnel_idx)
+                                  u16 *tunnel_idx,
+                                  struct mwan_l2_tx_flow **flow_out)
 {
     struct mwan_l2_tx_flow *flow;
     u16 selected;
 
-    if (!cfg || !key || !tunnel_idx)
+    if (!cfg || !key || !tunnel_idx || !flow_out)
         return -EINVAL;
+    *flow_out = NULL;
     flow = mwan_l2_tx_flow_get(cfg, key, flow_hash, control_packet, -1,
                                true);
     if (!flow)
@@ -420,8 +422,16 @@ int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
         return -ENETDOWN;
     }
     *tunnel_idx = selected;
-    mwan_l2_tx_flow_put(flow);
+    *flow_out = flow;
     return 0;
+}
+
+struct mwan_l2_tx_flow *
+mwan_l2_tx_flow_hold(struct mwan_l2_tx_flow *flow)
+{
+    if (!flow || !refcount_inc_not_zero(&flow->refs))
+        return NULL;
+    return flow;
 }
 
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow)

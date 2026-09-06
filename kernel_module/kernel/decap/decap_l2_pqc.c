@@ -587,7 +587,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
-    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved\n");
+    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp\n");
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -628,7 +628,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->tx_work_runs),
                    atomic64_read(&w->tx_schedule_failures),
                    atomic_read(&w->tx_busy));
-        seq_printf(m, "%llu %d %d %d %d %d %d %d %d %d %d %lld %lld %lld %lld\n",
+        seq_printf(m, "%llu %d %d %d %d %d %d %d %d %d %d %lld %lld %lld %lld ",
                    mwan_multicore_worker_score(w),
                    atomic_read(&w->system_raw_bp),
                    atomic_read(&w->system_ewma_bp),
@@ -644,6 +644,14 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->rx_ecn_marked),
                    atomic64_read(&w->tx_overload_dropped),
                    atomic64_read(&w->tx_control_preserved));
+        seq_printf(m, "%u %u %lld %lld %lld %d %d\n",
+                   READ_ONCE(w->emergency_hot_samples),
+                   READ_ONCE(w->emergency_cool_samples),
+                   atomic64_read(&w->emergency_enter_count),
+                   atomic64_read(&w->emergency_last_enter_ns),
+                   atomic64_read(&w->overload_last_drop_ns),
+                   atomic_read(&w->busy_peak_bp),
+                   atomic_read(&w->idle_min_bp));
     }
     rcu_read_unlock();
     return 0;

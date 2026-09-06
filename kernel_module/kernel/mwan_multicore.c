@@ -21,17 +21,15 @@
 #define MWAN_CPU_MIN_SAMPLE_MS           10U
 #define MWAN_CPU_MAX_SAMPLE_MS         1000U
 #define MWAN_IDLE_TIE_BP                100U
+#define MWAN_EMERGENCY_HOT_SAMPLES        3U
+#define MWAN_EMERGENCY_COOL_SAMPLES       3U
+#define MWAN_TX_QUEUE_HIGH_DIV             8U
+#define MWAN_TX_QUEUE_LOW_DIV             32U
+#define MWAN_SHED_START_BP               100U
 #define MWAN_CONTROL_PQC_PORT           7090U
 #define MWAN_CONTROL_BFD_PORT_1         3784U
 #define MWAN_CONTROL_BFD_PORT_2         3785U
 #define MWAN_CONTROL_BFD_PORT_3         4784U
-
-enum mwan_packet_class {
-    MWAN_PACKET_CONTROL = 0,
-    MWAN_PACKET_TCP_DATA,
-    MWAN_PACKET_UDP_DATA,
-    MWAN_PACKET_OTHER_DATA,
-};
 
 static struct workqueue_struct *mwan_tx_wq;
 static DEFINE_SPINLOCK(mwan_admission_lock);
@@ -102,6 +100,10 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
                              &worker->cpu_prev_softirq,
                              &worker->cpu_prev_idle);
     worker->cpu_cool_samples = 0;
+    worker->emergency_hot_samples = 0;
+    worker->emergency_cool_samples = 0;
+    worker->cpu_prev_tx_queued_packets = 0;
+    worker->cpu_prev_tx_queued_bytes = 0;
     atomic_set(&worker->system_raw_bp, 0);
     atomic_set(&worker->system_ewma_bp, 0);
     atomic_set(&worker->softirq_raw_bp, 0);
@@ -112,6 +114,11 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     atomic_set(&worker->busy_ewma_bp, 0);
     atomic_set(&worker->admission_blocked, 0);
     atomic_set(&worker->emergency_shed, 0);
+    atomic_set(&worker->busy_peak_bp, 0);
+    atomic_set(&worker->idle_min_bp, MWAN_CPU_BP_MAX);
+    atomic64_set(&worker->emergency_enter_count, 0);
+    atomic64_set(&worker->emergency_last_enter_ns, 0);
+    atomic64_set(&worker->overload_last_drop_ns, 0);
 }
 
 static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
@@ -139,11 +146,19 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
     u64 delta_system;
     u64 delta_softirq;
     u64 delta_idle;
+    u64 tx_queued_packets;
+    u64 tx_queued_bytes;
+    bool emergency_load;
+    bool queue_growing;
+    bool queue_high;
+    bool queue_low;
 
     if (!cpu_online(worker->cpu)) {
         atomic_set(&worker->admission_blocked, 1);
         atomic_set(&worker->emergency_shed, 1);
         worker->cpu_cool_samples = 0;
+        worker->emergency_hot_samples = 0;
+        worker->emergency_cool_samples = 0;
         return;
     }
 
@@ -173,6 +188,10 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
     atomic_set(&worker->softirq_raw_bp, raw_softirq);
     atomic_set(&worker->idle_raw_bp, raw_idle);
     atomic_set(&worker->busy_raw_bp, raw_busy);
+    if (raw_busy > (unsigned int)atomic_read(&worker->busy_peak_bp))
+        atomic_set(&worker->busy_peak_bp, raw_busy);
+    if (raw_idle < (unsigned int)atomic_read(&worker->idle_min_bp))
+        atomic_set(&worker->idle_min_bp, raw_idle);
     ewma_system = mwan_bp_ewma(&worker->system_ewma_bp, raw_system);
     ewma_softirq = mwan_bp_ewma(&worker->softirq_ewma_bp, raw_softirq);
     ewma_idle = mwan_bp_ewma(&worker->idle_ewma_bp, raw_idle);
@@ -190,13 +209,58 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
     recover_load_bp = min_t(unsigned int,
         READ_ONCE(mwan_l2_softirq_low_pct), high_pct - 1U) * 100U;
 
-    if (max(max(raw_busy, ewma_busy),
+    emergency_load =
+        max(max(raw_busy, ewma_busy),
             max(max(raw_system, ewma_system),
                 max(raw_softirq, ewma_softirq))) >= emergency_bp ||
-        min(raw_idle, ewma_idle) <= MWAN_CPU_BP_MAX - emergency_bp)
-        atomic_set(&worker->emergency_shed, 1);
-    else
-        atomic_set(&worker->emergency_shed, 0);
+        min(raw_idle, ewma_idle) <= MWAN_CPU_BP_MAX - emergency_bp;
+    tx_queued_packets = (u64)atomic64_read(&worker->tx_queued_packets);
+    tx_queued_bytes = (u64)atomic64_read(&worker->tx_queued_bytes);
+    queue_growing =
+        tx_queued_packets > worker->cpu_prev_tx_queued_packets ||
+        tx_queued_bytes > worker->cpu_prev_tx_queued_bytes;
+    queue_high =
+        tx_queued_packets >= MWAN_L2_QUEUE_MAX_PACKETS /
+                             MWAN_TX_QUEUE_HIGH_DIV ||
+        tx_queued_bytes >= MWAN_L2_QUEUE_MAX_BYTES /
+                           MWAN_TX_QUEUE_HIGH_DIV;
+    queue_low =
+        tx_queued_packets <= MWAN_L2_QUEUE_MAX_PACKETS /
+                             MWAN_TX_QUEUE_LOW_DIV &&
+        tx_queued_bytes <= MWAN_L2_QUEUE_MAX_BYTES /
+                           MWAN_TX_QUEUE_LOW_DIV;
+    worker->cpu_prev_tx_queued_packets = tx_queued_packets;
+    worker->cpu_prev_tx_queued_bytes = tx_queued_bytes;
+
+    /* A short CPU accounting spike does not prove that TX is falling behind.
+     * Require three consecutive high-load samples with a growing or already
+     * material queue before shedding data. Conversely, a drained queue is
+     * direct evidence of headroom and clears shedding with hysteresis. */
+    if (emergency_load && (queue_growing || queue_high)) {
+        if (worker->emergency_hot_samples < MWAN_EMERGENCY_HOT_SAMPLES)
+            worker->emergency_hot_samples++;
+        worker->emergency_cool_samples = 0;
+        if (worker->emergency_hot_samples >= MWAN_EMERGENCY_HOT_SAMPLES &&
+            atomic_cmpxchg(&worker->emergency_shed, 0, 1) == 0) {
+            atomic64_inc(&worker->emergency_enter_count);
+            atomic64_set(&worker->emergency_last_enter_ns,
+                         ktime_get_ns());
+        }
+    } else {
+        worker->emergency_hot_samples = 0;
+        if (atomic_read(&worker->emergency_shed) && queue_low) {
+            if (worker->emergency_cool_samples <
+                MWAN_EMERGENCY_COOL_SAMPLES)
+                worker->emergency_cool_samples++;
+            if (worker->emergency_cool_samples >=
+                MWAN_EMERGENCY_COOL_SAMPLES) {
+                atomic_set(&worker->emergency_shed, 0);
+                worker->emergency_cool_samples = 0;
+            }
+        } else {
+            worker->emergency_cool_samples = 0;
+        }
+    }
 
     if (max(max(raw_busy, ewma_busy),
             max(max(raw_system, ewma_system),
@@ -691,6 +755,16 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         skb_queue_head_init(&worker->tx_queue);
         INIT_WORK(&worker->work, mwan_l2_rx_worker_fn);
         INIT_WORK(&worker->tx_work, mwan_l2_tx_worker_fn);
+        worker->balance_tx_bytes = kcalloc(
+            cfg->num_tunnels, sizeof(*worker->balance_tx_bytes), GFP_KERNEL);
+        worker->balance_last_data = kcalloc(
+            cfg->num_tunnels, sizeof(*worker->balance_last_data), GFP_KERNEL);
+        if (!worker->balance_tx_bytes || !worker->balance_last_data) {
+            cfg->num_workers = idx + 1;
+            cpus_read_unlock();
+            mwan_l2_workers_cleanup(cfg);
+            return -ENOMEM;
+        }
         mwan_multicore_worker_cpu_init(worker);
         err = l2_pqc ? mwan_worker_set_l2_keys(worker, cfg) : 0;
         if (err) {
@@ -808,6 +882,8 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             aead_request_free(worker->tx_req);
         if (worker->tx_tfm)
             crypto_free_aead(worker->tx_tfm);
+        kfree(worker->balance_tx_bytes);
+        kfree(worker->balance_last_data);
     }
     kfree(cfg->l2_workers);
     cfg->l2_workers = NULL;
@@ -1073,7 +1149,7 @@ static bool mwan_is_control_udp_port(__be16 port)
            host == MWAN_CONTROL_BFD_PORT_3;
 }
 
-static enum mwan_packet_class mwan_packet_classify(struct sk_buff *skb)
+enum mwan_packet_class mwan_multicore_packet_classify(struct sk_buff *skb)
 {
     struct iphdr iph_buf;
     const struct iphdr *iph;
@@ -1125,11 +1201,6 @@ static enum mwan_packet_class mwan_packet_classify(struct sk_buff *skb)
     return MWAN_PACKET_OTHER_DATA;
 }
 
-bool mwan_multicore_packet_is_control(struct sk_buff *skb)
-{
-    return mwan_packet_classify(skb) == MWAN_PACKET_CONTROL;
-}
-
 static unsigned int mwan_worker_pressure(const struct mwan_l2_worker *worker)
 {
     unsigned int pressure = 0;
@@ -1158,13 +1229,31 @@ static unsigned int mwan_drop_probability_bp(
     unsigned int max_drop_bp = clamp_t(unsigned int,
         READ_ONCE(mwan_l2_max_shed_pct), 1U, 100U) * 100U;
     unsigned int pressure = mwan_worker_pressure(worker);
-    unsigned int minimum = min(1000U, max_drop_bp);
+    u64 queued_packets = (u64)atomic64_read(&worker->tx_queued_packets);
+    u64 queued_bytes = (u64)atomic64_read(&worker->tx_queued_bytes);
+    unsigned int cpu_drop_bp = 0;
+    unsigned int queue_pressure_bp;
+    unsigned int queue_drop_bp;
+    unsigned int drop_bp;
 
-    if (pressure <= emergency_bp || emergency_bp >= MWAN_CPU_BP_MAX)
-        return minimum;
-    return minimum + div_u64((u64)(pressure - emergency_bp) *
-                             (max_drop_bp - minimum),
-                             MWAN_CPU_BP_MAX - emergency_bp);
+    if (pressure > emergency_bp && emergency_bp < MWAN_CPU_BP_MAX)
+        cpu_drop_bp = (unsigned int)div_u64(
+            (u64)(pressure - emergency_bp) * max_drop_bp,
+            MWAN_CPU_BP_MAX - emergency_bp);
+    queue_pressure_bp = max_t(unsigned int,
+        min_t(u64, MWAN_CPU_BP_MAX,
+              div64_u64(queued_packets * MWAN_CPU_BP_MAX,
+                        MWAN_L2_QUEUE_MAX_PACKETS)),
+        min_t(u64, MWAN_CPU_BP_MAX,
+              div64_u64(queued_bytes * MWAN_CPU_BP_MAX,
+                        MWAN_L2_QUEUE_MAX_BYTES)));
+    queue_drop_bp = (unsigned int)div_u64(
+        (u64)queue_pressure_bp * max_drop_bp, MWAN_CPU_BP_MAX);
+    drop_bp = min(max(cpu_drop_bp, queue_drop_bp), max_drop_bp);
+
+    /* Shedding is already gated by sustained CPU load plus queue pressure.
+     * Start gently at 1%, rather than the previous immediate 10% step. */
+    return max(min(MWAN_SHED_START_BP, max_drop_bp), drop_bp);
 }
 
 static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
@@ -1191,6 +1280,7 @@ static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
         return false;
 
     atomic64_inc(&worker->tx_overload_dropped);
+    atomic64_set(&worker->overload_last_drop_ns, ktime_get_ns());
     atomic64_inc(&worker->tx_dropped_packets);
     mwan_rekey_diag_count_drop(worker->cfg, MWAN_REKEY_DROP_TX_OVERLOAD,
                                0);
@@ -1203,7 +1293,7 @@ bool mwan_multicore_rx_congestion_feedback(struct mwan_l2_worker *worker,
     int network_offset;
 
     if (!worker || !skb || !atomic_read(&worker->admission_blocked) ||
-        mwan_packet_classify(skb) != MWAN_PACKET_TCP_DATA)
+        mwan_multicore_packet_classify(skb) != MWAN_PACKET_TCP_DATA)
         return false;
     network_offset = skb_network_offset(skb);
     if (network_offset < 0 ||
@@ -1217,25 +1307,31 @@ bool mwan_multicore_rx_congestion_feedback(struct mwan_l2_worker *worker,
 int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              u16 tunnel_idx,
                              const struct mwan_tx_flow_info *info,
+                             struct mwan_l2_tx_flow *preselected_flow,
+                             enum mwan_packet_class packet_class,
                              bool closing, u32 *flow_seq, int *owner_cpu)
 {
     struct mwan_l2_tx_flow *flow;
     struct mwan_l2_worker *worker;
     struct mwan_tunnel *tun;
-    enum mwan_packet_class packet_class;
     unsigned int accounted_bytes;
     int owner;
     int was_scheduled;
     u32 seq = 0;
 
-    if (!skb || !cfg || !info || tunnel_idx >= cfg->num_tunnels)
+    flow = preselected_flow;
+    if (!skb || !cfg || !info || tunnel_idx >= cfg->num_tunnels) {
+        mwan_l2_tx_flow_put(flow);
         return -EINVAL;
-    if (!cfg->l2_workers || cfg->num_workers <= 0)
+    }
+    if (!cfg->l2_workers || cfg->num_workers <= 0) {
+        mwan_l2_tx_flow_put(flow);
         return -ENODEV;
-    packet_class = mwan_packet_classify(skb);
-    flow = mwan_l2_tx_flow_get(cfg, &info->key, info->flow_id,
-                               packet_class == MWAN_PACKET_CONTROL,
-                               (int)tunnel_idx, false);
+    }
+    if (!flow)
+        flow = mwan_l2_tx_flow_get(cfg, &info->key, info->flow_id,
+                                   packet_class == MWAN_PACKET_CONTROL,
+                                   (int)tunnel_idx, false);
     if (!flow) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         return -ENOSPC;
@@ -1409,7 +1505,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             } else if (flow &&
                        atomic_read(&flow->balance_counted)) {
                 mwan_tunnel_balance_account_bytes(
-                    cfg, tunnel_idx, transmitted_bytes);
+                    cfg, worker, tunnel_idx, transmitted_bytes);
             }
             if (flow) {
                 mwan_l2_tx_flow_complete(cfg, flow);

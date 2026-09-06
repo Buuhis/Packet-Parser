@@ -13,6 +13,38 @@
 #define MWAN_BALANCE_STALE_NS       (2000ULL * NSEC_PER_MSEC)
 #define MWAN_BALANCE_FLOW_SCALE     1000000ULL
 
+static u64
+mwan_tunnel_balance_read_bytes(const struct mwan_config *cfg, u16 tunnel_idx,
+                               unsigned long *last_data)
+{
+    u64 total = 0;
+    unsigned long latest = 0;
+    int i;
+
+    if (!cfg || tunnel_idx >= cfg->num_tunnels)
+        return 0;
+    for (i = 0; i < cfg->num_workers; i++) {
+        const struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+        u64 value;
+        unsigned long worker_last;
+
+        if (!worker->balance_tx_bytes || !worker->balance_last_data)
+            continue;
+        value = (u64)atomic64_read(
+            &worker->balance_tx_bytes[tunnel_idx]);
+        if (U64_MAX - total < value)
+            total = U64_MAX;
+        else
+            total += value;
+        worker_last = READ_ONCE(worker->balance_last_data[tunnel_idx]);
+        if (time_after(worker_last, latest))
+            latest = worker_last;
+    }
+    if (last_data)
+        *last_data = latest;
+    return total;
+}
+
 static void mwan_tunnel_balance_refresh_locked(struct mwan_config *cfg,
                                                u64 now_ns)
 {
@@ -22,9 +54,13 @@ static void mwan_tunnel_balance_refresh_locked(struct mwan_config *cfg,
 
     if (!cfg->tunnel_balance_sample_ns) {
         cfg->tunnel_balance_sample_ns = now_ns;
-        for (i = 0; i < cfg->num_tunnels; i++)
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            unsigned long last_data = 0;
+
             cfg->tunnels[i].balance_sample_bytes =
-                (u64)atomic64_read(&cfg->tunnels[i].balance_tx_bytes);
+                mwan_tunnel_balance_read_bytes(cfg, (u16)i, &last_data);
+            cfg->tunnels[i].balance_last_data = last_data;
+        }
         return;
     }
 
@@ -34,26 +70,32 @@ static void mwan_tunnel_balance_refresh_locked(struct mwan_config *cfg,
      * and this clears the last data EWMA without waiting for the flow-table
      * object to expire. Keep same-window admissions: they represent new data
      * flows whose packets may not have reached the worker yet. */
-    for (i = 0; i < cfg->num_tunnels; i++) {
-        struct mwan_tunnel *tun = &cfg->tunnels[i];
-        unsigned long last_data = READ_ONCE(tun->balance_last_data);
+    if (elapsed_ns < MWAN_BALANCE_SAMPLE_NS) {
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            struct mwan_tunnel *tun = &cfg->tunnels[i];
+            unsigned long last_data = 0;
 
-        if (last_data &&
-            time_after(now, last_data + MWAN_FLOW_BALANCE_IDLE_TIMEOUT))
-            tun->balance_ewma_bps = 0;
+            (void)mwan_tunnel_balance_read_bytes(cfg, (u16)i,
+                                                 &last_data);
+            tun->balance_last_data = last_data;
+            if (last_data && time_after(
+                    now, last_data + MWAN_FLOW_BALANCE_IDLE_TIMEOUT))
+                tun->balance_ewma_bps = 0;
+        }
+        return;
     }
 
-    if (elapsed_ns < MWAN_BALANCE_SAMPLE_NS)
-        return;
-
     for (i = 0; i < cfg->num_tunnels; i++) {
         struct mwan_tunnel *tun = &cfg->tunnels[i];
-        u64 current_bytes = (u64)atomic64_read(&tun->balance_tx_bytes);
+        unsigned long last_data = 0;
+        u64 current_bytes = mwan_tunnel_balance_read_bytes(
+            cfg, (u16)i, &last_data);
         u64 delta_bytes = current_bytes - tun->balance_sample_bytes;
-        unsigned long last_data = READ_ONCE(tun->balance_last_data);
         bool data_idle = last_data &&
             time_after(now, last_data + MWAN_FLOW_BALANCE_IDLE_TIMEOUT);
         u64 current_bps;
+
+        tun->balance_last_data = last_data;
 
         if (data_idle) {
             tun->balance_ewma_bps = 0;
@@ -186,7 +228,6 @@ void mwan_tunnel_balance_init(struct mwan_config *cfg)
     spin_lock_init(&cfg->tunnel_balance_lock);
     cfg->tunnel_balance_sample_ns = 0;
     for (i = 0; i < cfg->num_tunnels; i++) {
-        atomic64_set(&cfg->tunnels[i].balance_tx_bytes, 0);
         atomic_set(&cfg->tunnels[i].balance_active_flows, 0);
         atomic_set(&cfg->tunnels[i].balance_admitted_flows, 0);
         cfg->tunnels[i].balance_sample_bytes = 0;
@@ -263,10 +304,12 @@ void mwan_tunnel_balance_release_flow(struct mwan_config *cfg,
 }
 
 void mwan_tunnel_balance_account_bytes(struct mwan_config *cfg,
+                                       struct mwan_l2_worker *worker,
                                        u16 tunnel_idx, u32 bytes)
 {
-    if (!cfg || tunnel_idx >= cfg->num_tunnels || !bytes)
+    if (!cfg || !worker || tunnel_idx >= cfg->num_tunnels || !bytes ||
+        !worker->balance_tx_bytes || !worker->balance_last_data)
         return;
-    atomic64_add(bytes, &cfg->tunnels[tunnel_idx].balance_tx_bytes);
-    WRITE_ONCE(cfg->tunnels[tunnel_idx].balance_last_data, jiffies);
+    atomic64_add(bytes, &worker->balance_tx_bytes[tunnel_idx]);
+    WRITE_ONCE(worker->balance_last_data[tunnel_idx], jiffies);
 }
