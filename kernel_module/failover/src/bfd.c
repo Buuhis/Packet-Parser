@@ -21,6 +21,7 @@
 #define BFD_SOURCE_PORT_MIN     49152U
 #define BFD_SOURCE_PORT_COUNT   16384U
 #define BFD_SOURCE_BIND_TRIES   128U
+#define BFD_DIAG_LOG_INTERVAL_NS UINT64_C(1000000000)
 
 #define BFD_FLAG_POLL           0x20U
 #define BFD_FLAG_FINAL          0x10U
@@ -64,6 +65,8 @@ struct bfd_session {
     uint32_t prng;
     bool poll_active;
     bool send_final;
+    uint64_t next_diag_log_ns;
+    uint64_t suppressed_diag_logs;
 
     struct bfd_stabilizer stabilizer;
     struct bfd_callbacks callbacks;
@@ -75,6 +78,8 @@ struct bfd_manager {
     int epoll_fd;
     struct bfd_session *sessions[BFD_MAX_SESSIONS];
     size_t session_count;
+    uint64_t next_diag_log_ns;
+    uint64_t suppressed_diag_logs;
 };
 
 _Static_assert(sizeof(struct bfd_control_packet) == BFD_CONTROL_LEN,
@@ -518,6 +523,89 @@ static bool session_path_matches(const struct bfd_session *session,
            (session->ifindex == 0 || session->ifindex == ifindex);
 }
 
+/* Diagnostic-only lookup.  Deliberately do not use this result to steer the
+ * packet: these logs must expose the current demultiplexing behaviour without
+ * changing it. */
+static struct bfd_session *find_session_by_path(
+    struct bfd_manager *manager,
+    const struct in_addr *source,
+    const struct in_addr *destination,
+    unsigned int ifindex)
+{
+    size_t i;
+
+    for (i = 0; i < manager->session_count; i++) {
+        struct bfd_session *session = manager->sessions[i];
+
+        if (session->peer_ip.s_addr == source->s_addr &&
+            session_path_matches(session, destination, ifindex))
+            return session;
+    }
+    return NULL;
+}
+
+static void log_rx_drop(struct bfd_manager *manager,
+                        struct bfd_session *selected,
+                        const char *reason,
+                        const struct sockaddr_in *source,
+                        const struct in_addr *destination,
+                        unsigned int ifindex,
+                        int ttl,
+                        uint32_t your_discriminator,
+                        uint32_t remote_discriminator,
+                        uint64_t now_ns)
+{
+    struct bfd_session *path_candidate;
+    uint64_t *next_log_ns;
+    uint64_t *suppressed;
+    char source_text[INET_ADDRSTRLEN] = "unknown";
+    char destination_text[INET_ADDRSTRLEN] = "unknown";
+    char selected_local[INET_ADDRSTRLEN] = "none";
+    char selected_peer[INET_ADDRSTRLEN] = "none";
+
+    next_log_ns = selected ? &selected->next_diag_log_ns
+                           : &manager->next_diag_log_ns;
+    suppressed = selected ? &selected->suppressed_diag_logs
+                          : &manager->suppressed_diag_logs;
+    if (now_ns < *next_log_ns) {
+        (*suppressed)++;
+        return;
+    }
+
+    path_candidate = destination
+        ? find_session_by_path(manager, &source->sin_addr, destination, ifindex)
+        : NULL;
+    (void)inet_ntop(AF_INET, &source->sin_addr, source_text,
+                    sizeof(source_text));
+    if (destination)
+        (void)inet_ntop(AF_INET, destination, destination_text,
+                        sizeof(destination_text));
+    if (selected) {
+        (void)inet_ntop(AF_INET, &selected->local_ip, selected_local,
+                        sizeof(selected_local));
+        (void)inet_ntop(AF_INET, &selected->peer_ip, selected_peer,
+                        sizeof(selected_peer));
+    }
+
+    fprintf(stderr,
+            "[BFD-DIAG] event=rx_drop reason=%s src=%s:%u dst=%s "
+            "rx_ifindex=%u ttl=%d your_disc=%" PRIu32
+            " remote_disc=%" PRIu32 " selected=%s selected_local=%s "
+            "selected_peer=%s selected_ifindex=%u path_candidate=%s "
+            "suppressed=%" PRIu64 "\n",
+            reason, source_text, (unsigned int)ntohs(source->sin_port),
+            destination_text, ifindex, ttl, your_discriminator,
+            remote_discriminator,
+            selected && selected->ifname[0] ? selected->ifname : "none",
+            selected_local, selected_peer, selected ? selected->ifindex : 0,
+            path_candidate && path_candidate->ifname[0]
+                ? path_candidate->ifname : "none",
+            *suppressed);
+    fflush(stderr);
+    *suppressed = 0;
+    *next_log_ns = now_ns + BFD_DIAG_LOG_INTERVAL_NS;
+}
+
 static void update_detection_timer(struct bfd_session *session, uint64_t now_ns)
 {
     uint32_t base_us;
@@ -563,27 +651,43 @@ static void process_packet(struct bfd_manager *manager,
     remote_discriminator = ntohl(packet->my_discriminator);
     remote_state = (enum bfd_state)((packet->state_flags >> 6U) & 0x03U);
     session = find_session(manager, your_discriminator, &source->sin_addr);
-    if (!session)
+    if (!session) {
+        log_rx_drop(manager, NULL, "NO_SESSION", source, destination,
+                    ifindex, ttl, your_discriminator,
+                    remote_discriminator, now_ns);
         return;
+    }
     if (ttl != 255) {
         session->counters.ttl_drops++;
+        log_rx_drop(manager, session, "TTL", source, destination, ifindex,
+                    ttl, your_discriminator, remote_discriminator, now_ns);
         return;
     }
     if (source->sin_addr.s_addr != session->peer_ip.s_addr) {
         session->counters.peer_drops++;
+        log_rx_drop(manager, session, "PEER", source, destination, ifindex,
+                    ttl, your_discriminator, remote_discriminator, now_ns);
         return;
     }
     if (!session_path_matches(session, destination, ifindex)) {
         session->counters.path_drops++;
+        log_rx_drop(manager, session, "PATH", source, destination, ifindex,
+                    ttl, your_discriminator, remote_discriminator, now_ns);
         return;
     }
     if (your_discriminator != 0 && your_discriminator != session->local_discriminator) {
         session->counters.discriminator_drops++;
+        log_rx_drop(manager, session, "DISCRIMINATOR", source, destination,
+                    ifindex, ttl, your_discriminator,
+                    remote_discriminator, now_ns);
         return;
     }
     if (your_discriminator == 0 && remote_state != BFD_STATE_DOWN &&
         remote_state != BFD_STATE_ADMIN_DOWN) {
         session->counters.discriminator_drops++;
+        log_rx_drop(manager, session, "ZERO_DISCRIMINATOR_STATE", source,
+                    destination, ifindex, ttl, your_discriminator,
+                    remote_discriminator, now_ns);
         return;
     }
 

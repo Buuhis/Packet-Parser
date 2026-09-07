@@ -6,6 +6,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>
+#include <inttypes.h>
 #include <net/if.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -141,6 +142,45 @@ static struct failover_runtime_entry *find_free_runtime(
     return NULL;
 }
 
+static const char *format_ipv4(const struct in_addr *address,
+                               char buffer[INET_ADDRSTRLEN])
+{
+    return address && inet_ntop(AF_INET, address, buffer, INET_ADDRSTRLEN)
+        ? buffer : "unknown";
+}
+
+static void raw_state_changed(const struct bfd_session *session,
+                              enum bfd_state old_state,
+                              enum bfd_state new_state,
+                              const char *reason,
+                              void *user)
+{
+    const struct bfd_counters *counters = bfd_session_counters(session);
+    struct failover_runtime_entry *entry = user;
+    char local[INET_ADDRSTRLEN];
+    char peer[INET_ADDRSTRLEN];
+
+    if (!entry || !session || old_state == new_state)
+        return;
+    log_info("[BFD-DIAG] event=raw_state tunnel=%s ifindex=%u local=%s "
+             "peer=%s generation=%" PRIu32 " old=%s new=%s reason=%s "
+             "detect_us=%" PRIu32 " tx=%" PRIu64 " rx=%" PRIu64
+             " path_drops=%" PRIu64 " peer_drops=%" PRIu64
+             " discriminator_drops=%" PRIu64 " timeouts=%" PRIu64,
+             entry->ifname, entry->ifindex,
+             format_ipv4(bfd_session_local_ip(session), local),
+             format_ipv4(bfd_session_peer_ip(session), peer),
+             entry->config_generation, bfd_state_name(old_state),
+             bfd_state_name(new_state), reason ? reason : "unknown",
+             bfd_session_detection_time_us(session),
+             counters ? counters->tx_packets : 0,
+             counters ? counters->rx_packets : 0,
+             counters ? counters->path_drops : 0,
+             counters ? counters->peer_drops : 0,
+             counters ? counters->discriminator_drops : 0,
+             counters ? counters->timeouts : 0);
+}
+
 static void published_state_changed(const struct bfd_session *session,
                                     enum bfd_stable_state old_state,
                                     enum bfd_stable_state new_state,
@@ -158,10 +198,25 @@ static void published_state_changed(const struct bfd_session *session,
 }
 
 static void remove_runtime_entry(struct bfd_manager *manager,
-                                 struct failover_runtime_entry *entry)
+                                 struct failover_runtime_entry *entry,
+                                 const char *reason)
 {
+    char local[INET_ADDRSTRLEN];
+    char peer[INET_ADDRSTRLEN];
+
     if (!entry || !entry->in_use)
         return;
+    log_info("[BFD-DIAG] event=session_remove tunnel=%s ifindex=%u "
+             "local=%s peer=%s generation=%" PRIu32 " raw=%s "
+             "published=%s reason=%s",
+             entry->ifname, entry->ifindex,
+             format_ipv4(&entry->local_ip, local),
+             format_ipv4(&entry->peer_ip, peer), entry->config_generation,
+             entry->session
+                 ? bfd_state_name(bfd_session_raw_state(entry->session))
+                 : "NO_SESSION",
+             bfd_stable_state_name(entry->published),
+             reason ? reason : "unknown");
     if (entry->session)
         (void)bfd_manager_remove_session(manager, entry->session);
     memset(entry, 0, sizeof(*entry));
@@ -192,10 +247,15 @@ static void remove_stale_entries(
             continue;
         desired = find_desired(snapshot, entries[i].ifname);
         current_ifindex = if_nametoindex(entries[i].ifname);
-        if (!desired || current_ifindex == 0 ||
-            current_ifindex != entries[i].ifindex ||
-            desired->local_ip.s_addr != entries[i].local_ip.s_addr)
-            remove_runtime_entry(manager, &entries[i]);
+        if (!desired) {
+            remove_runtime_entry(manager, &entries[i], "NOT_DESIRED");
+        } else if (current_ifindex == 0) {
+            remove_runtime_entry(manager, &entries[i], "INTERFACE_MISSING");
+        } else if (current_ifindex != entries[i].ifindex) {
+            remove_runtime_entry(manager, &entries[i], "IFINDEX_CHANGED");
+        } else if (desired->local_ip.s_addr != entries[i].local_ip.s_addr) {
+            remove_runtime_entry(manager, &entries[i], "LOCAL_IP_CHANGED");
+        }
     }
 }
 
@@ -233,9 +293,37 @@ static void reconcile_sessions(
         if (entry && entry->ifindex == ifindex &&
             entry->local_ip.s_addr == desired->local_ip.s_addr) {
             if (entry->config_generation != snapshot->config_generation) {
+                uint32_t old_generation = entry->config_generation;
+                char local[INET_ADDRSTRLEN];
+                char peer[INET_ADDRSTRLEN];
+                char kernel_peer[INET_ADDRSTRLEN] = "unavailable";
+                struct in_addr current_peer_ip;
+                const char *peer_match = "unknown";
+
+                if (kernel_sync_get_tunnel_peer(
+                        desired->ifname, kernel_peer,
+                        sizeof(kernel_peer)) == 0 &&
+                    inet_pton(AF_INET, kernel_peer, &current_peer_ip) == 1) {
+                    peer_match = current_peer_ip.s_addr == entry->peer_ip.s_addr
+                        ? "yes" : "no";
+                }
+
                 entry->config_generation = snapshot->config_generation;
                 entry->state_sequence = 1;
                 entry->state_dirty = true;
+                log_info("[BFD-DIAG] event=session_reuse tunnel=%s "
+                         "ifindex=%u local=%s stored_peer=%s kernel_peer=%s "
+                         "peer_match=%s old_generation=%" PRIu32
+                         " new_generation=%" PRIu32 " raw=%s published=%s",
+                         entry->ifname, entry->ifindex,
+                         format_ipv4(&entry->local_ip, local),
+                         format_ipv4(&entry->peer_ip, peer), kernel_peer,
+                         peer_match, old_generation, entry->config_generation,
+                         entry->session
+                             ? bfd_state_name(
+                                   bfd_session_raw_state(entry->session))
+                             : "NO_SESSION",
+                         bfd_stable_state_name(entry->published));
             }
             continue;
         }
@@ -247,7 +335,7 @@ static void reconcile_sessions(
         if (runtime_matches(entry, ifindex, &desired->local_ip, &peer_ip))
             continue;
         if (entry)
-            remove_runtime_entry(manager, entry);
+            remove_runtime_entry(manager, entry, "IDENTITY_CHANGED");
         entry = find_free_runtime(entries);
         if (!entry)
             continue;
@@ -273,12 +361,33 @@ static void reconcile_sessions(
         config.required_min_rx_us = FAILOVER_BFD_INTERVAL_US;
         config.detect_mult = FAILOVER_BFD_DETECT_MULT;
         memset(&callbacks, 0, sizeof(callbacks));
+        callbacks.raw_state_changed = raw_state_changed;
         callbacks.published_state_changed = published_state_changed;
         callbacks.user = entry;
         entry->session = bfd_manager_add_session(manager, &config,
                                                  &stability, &callbacks);
-        if (!entry->session)
+        if (!entry->session) {
+            char local[INET_ADDRSTRLEN];
+            char peer[INET_ADDRSTRLEN];
+
+            log_warn("[BFD-DIAG] event=session_create_failed tunnel=%s "
+                     "ifindex=%u local=%s peer=%s generation=%" PRIu32,
+                     entry->ifname, entry->ifindex,
+                     format_ipv4(&entry->local_ip, local),
+                     format_ipv4(&entry->peer_ip, peer),
+                     entry->config_generation);
             memset(entry, 0, sizeof(*entry));
+        } else {
+            char local[INET_ADDRSTRLEN];
+            char peer[INET_ADDRSTRLEN];
+
+            log_info("[BFD-DIAG] event=session_create tunnel=%s ifindex=%u "
+                     "local=%s peer=%s generation=%" PRIu32,
+                     entry->ifname, entry->ifindex,
+                     format_ipv4(&entry->local_ip, local),
+                     format_ipv4(&entry->peer_ip, peer),
+                     entry->config_generation);
+        }
     }
 }
 
@@ -357,7 +466,7 @@ static void *failover_worker(void *unused)
     }
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
-        remove_runtime_entry(manager, &entries[i]);
+        remove_runtime_entry(manager, &entries[i], "SERVICE_STOP");
     bfd_manager_destroy(manager);
     return NULL;
 }
