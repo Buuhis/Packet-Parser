@@ -20,10 +20,35 @@
 #define FAILOVER_BFD_INTERVAL_US    300000U
 #define FAILOVER_BFD_DETECT_MULT    3U
 #define FAILOVER_BFD_UP_HOLD_MS     5000U
+#define FAILOVER_DIAG_REPEAT_MS     5000U
+
+enum failover_wait_stage {
+    FAILOVER_WAIT_NONE = 0,
+    FAILOVER_WAIT_INTERFACE,
+    FAILOVER_WAIT_LOCAL_IP,
+    FAILOVER_WAIT_RUNTIME_SLOT,
+    FAILOVER_WAIT_KERNEL_STATE,
+    FAILOVER_WAIT_DOWN_ACK,
+    FAILOVER_WAIT_REBIND,
+    FAILOVER_WAIT_PEER,
+    FAILOVER_WAIT_SESSION_CREATE,
+    FAILOVER_WAIT_STATE_PUBLISH,
+};
+
+struct failover_wait_diag {
+    bool in_use;
+    char ifname[IFNAMSIZ];
+    enum failover_wait_stage stage;
+    int error;
+    uint32_t observed_generation;
+    uint64_t last_log_ms;
+};
 
 struct failover_desired_tunnel {
     char ifname[IFNAMSIZ];
+    char physical_ifname[IFNAMSIZ];
     struct in_addr local_ip;
+    int segment_id;
 };
 
 struct failover_snapshot {
@@ -36,15 +61,18 @@ struct failover_snapshot {
 struct failover_runtime_entry {
     bool in_use;
     char ifname[IFNAMSIZ];
+    char physical_ifname[IFNAMSIZ];
     unsigned int ifindex;
     struct in_addr local_ip;
     struct in_addr peer_ip;
+    int segment_id;
     struct bfd_session *session;
     enum bfd_stable_state published;
     enum bfd_stable_state kernel_published;
     uint32_t config_generation;
     uint32_t state_sequence;
     bool state_dirty;
+    bool rebind_pending;
 };
 
 struct failover_service {
@@ -149,6 +177,97 @@ static const char *format_ipv4(const struct in_addr *address,
         ? buffer : "unknown";
 }
 
+static uint64_t monotonic_ms(void)
+{
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0;
+    return (uint64_t)now.tv_sec * 1000U +
+           (uint64_t)now.tv_nsec / 1000000U;
+}
+
+static const char *wait_stage_name(enum failover_wait_stage stage)
+{
+    switch (stage) {
+    case FAILOVER_WAIT_INTERFACE: return "WAIT_INTERFACE";
+    case FAILOVER_WAIT_LOCAL_IP: return "WAIT_LOCAL_IP";
+    case FAILOVER_WAIT_RUNTIME_SLOT: return "WAIT_RUNTIME_SLOT";
+    case FAILOVER_WAIT_KERNEL_STATE: return "WAIT_KERNEL_STATE";
+    case FAILOVER_WAIT_DOWN_ACK: return "WAIT_DOWN_ACK";
+    case FAILOVER_WAIT_REBIND: return "WAIT_REBIND";
+    case FAILOVER_WAIT_PEER: return "WAIT_PEER_DISCOVERY";
+    case FAILOVER_WAIT_SESSION_CREATE: return "WAIT_SESSION_CREATE";
+    case FAILOVER_WAIT_STATE_PUBLISH: return "WAIT_STATE_PUBLISH";
+    default: return "READY";
+    }
+}
+
+static struct failover_wait_diag *find_wait_diag(
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
+    const char *ifname)
+{
+    struct failover_wait_diag *free_entry = NULL;
+    size_t i;
+
+    for (i = 0; i < MAX_SDWAN_TUNS; i++) {
+        if (diagnostics[i].in_use &&
+            strncmp(diagnostics[i].ifname, ifname, IFNAMSIZ) == 0)
+            return &diagnostics[i];
+        if (!diagnostics[i].in_use && !free_entry)
+            free_entry = &diagnostics[i];
+    }
+    if (free_entry) {
+        memset(free_entry, 0, sizeof(*free_entry));
+        free_entry->in_use = true;
+        snprintf(free_entry->ifname, sizeof(free_entry->ifname), "%s",
+                 ifname);
+    }
+    return free_entry;
+}
+
+static void report_wait_stage(
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
+    const char *ifname, enum failover_wait_stage stage, int error,
+    unsigned int ifindex, const struct in_addr *local_ip,
+    uint32_t expected_generation, uint32_t observed_generation)
+{
+    struct failover_wait_diag *diag;
+    char local[INET_ADDRSTRLEN];
+    uint64_t now = monotonic_ms();
+
+    diag = find_wait_diag(diagnostics, ifname);
+    if (!diag)
+        return;
+    if (diag->stage == stage && diag->error == error &&
+        diag->observed_generation == observed_generation &&
+        now >= diag->last_log_ms &&
+        now - diag->last_log_ms < FAILOVER_DIAG_REPEAT_MS)
+        return;
+
+    diag->stage = stage;
+    diag->error = error;
+    diag->observed_generation = observed_generation;
+    diag->last_log_ms = now;
+    log_warn("[BFD-RECONCILE] tunnel=%s stage=%s ifindex=%u local=%s "
+             "expected_generation=%" PRIu32 " observed_generation=%" PRIu32
+             " error=%d(%s) retry=1",
+             ifname, wait_stage_name(stage), ifindex,
+             format_ipv4(local_ip, local), expected_generation,
+             observed_generation, error,
+             error < 0 ? strerror(-error) : "none");
+}
+
+static void clear_wait_stage(
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
+    const char *ifname)
+{
+    struct failover_wait_diag *diag = find_wait_diag(diagnostics, ifname);
+
+    if (diag)
+        memset(diag, 0, sizeof(*diag));
+}
+
 static void raw_state_changed(const struct bfd_session *session,
                               enum bfd_state old_state,
                               enum bfd_state new_state,
@@ -222,17 +341,120 @@ static void remove_runtime_entry(struct bfd_manager *manager,
     memset(entry, 0, sizeof(*entry));
 }
 
-static bool runtime_matches(const struct failover_runtime_entry *entry,
-                            unsigned int ifindex,
-                            const struct in_addr *local_ip,
-                            const struct in_addr *peer_ip)
+static void stop_runtime_session(struct bfd_manager *manager,
+                                 struct failover_runtime_entry *entry,
+                                 const char *reason)
 {
-    return entry && entry->in_use && entry->ifindex == ifindex &&
-           entry->local_ip.s_addr == local_ip->s_addr &&
-           entry->peer_ip.s_addr == peer_ip->s_addr;
+    char local[INET_ADDRSTRLEN];
+    char peer[INET_ADDRSTRLEN];
+
+    if (!entry || !entry->in_use || !entry->session)
+        return;
+    log_info("[BFD-DIAG] event=session_pause tunnel=%s ifindex=%u "
+             "local=%s peer=%s generation=%" PRIu32 " reason=%s",
+             entry->ifname, entry->ifindex,
+             format_ipv4(&entry->local_ip, local),
+             format_ipv4(&entry->peer_ip, peer), entry->config_generation,
+             reason ? reason : "unknown");
+    (void)bfd_manager_remove_session(manager, entry->session);
+    entry->session = NULL;
 }
 
-static void remove_stale_entries(
+static bool desired_identity_matches(
+    const struct failover_runtime_entry *entry,
+    const struct failover_desired_tunnel *desired)
+{
+    return entry->local_ip.s_addr == desired->local_ip.s_addr &&
+           entry->segment_id == desired->segment_id &&
+           strncmp(entry->physical_ifname, desired->physical_ifname,
+                   IFNAMSIZ) == 0;
+}
+
+/* Force one tunnel out of active_paths before its device identity is
+ * changed.  Sequence is read from the kernel first, so a daemon-side BFD
+ * session restart can never regress the monotonic state sequence. */
+static int publish_runtime_down(struct failover_runtime_entry *entry)
+{
+    struct kernel_tunnel_state state;
+    uint32_t sequence;
+    int ret;
+
+    ret = kernel_sync_get_tunnel_state_by_ifindex(entry->ifindex, &state);
+    if (ret)
+        return ret;
+    if (state.generation != entry->config_generation)
+        return -ESTALE;
+
+    entry->state_sequence = state.sequence;
+    entry->kernel_published = state.up ? BFD_STABLE_UP : BFD_STABLE_DOWN;
+    entry->published = BFD_STABLE_DOWN;
+    entry->state_dirty = false;
+    if (!state.up)
+        return 0;
+    if (state.sequence == UINT32_MAX)
+        return -EOVERFLOW;
+    sequence = state.sequence + 1;
+    ret = kernel_sync_set_tunnel_state_by_ifindex(
+        entry->ifindex, state.generation, sequence, false);
+    if (ret)
+        return ret;
+
+    entry->state_sequence = sequence;
+    entry->kernel_published = BFD_STABLE_DOWN;
+    log_info("[BFD-STATE] tunnel=%s ifindex=%u UP->DOWN reason=CONFIG_REBIND",
+             entry->ifname, entry->ifindex);
+    return 0;
+}
+
+static void update_runtime_identity(
+    struct failover_runtime_entry *entry,
+    const struct failover_desired_tunnel *desired)
+{
+    entry->local_ip = desired->local_ip;
+    entry->segment_id = desired->segment_id;
+    snprintf(entry->physical_ifname, sizeof(entry->physical_ifname), "%s",
+             desired->physical_ifname);
+}
+
+static int create_runtime_session(
+    struct bfd_manager *manager, struct failover_runtime_entry *entry,
+    const struct bfd_stability_config *stability)
+{
+    struct bfd_session_config config = {0};
+    struct bfd_callbacks callbacks = {0};
+    char local[INET_ADDRSTRLEN];
+    char peer[INET_ADDRSTRLEN];
+
+    config.ifname = entry->ifname;
+    config.local_ip = entry->local_ip;
+    config.peer_ip = entry->peer_ip;
+    config.desired_min_tx_us = FAILOVER_BFD_INTERVAL_US;
+    config.required_min_rx_us = FAILOVER_BFD_INTERVAL_US;
+    config.detect_mult = FAILOVER_BFD_DETECT_MULT;
+    callbacks.raw_state_changed = raw_state_changed;
+    callbacks.published_state_changed = published_state_changed;
+    callbacks.user = entry;
+    entry->session = bfd_manager_add_session(manager, &config, stability,
+                                             &callbacks);
+    if (!entry->session) {
+        log_warn("[BFD-DIAG] event=session_create_failed tunnel=%s "
+                 "ifindex=%u local=%s peer=%s generation=%" PRIu32,
+                 entry->ifname, entry->ifindex,
+                 format_ipv4(&entry->local_ip, local),
+                 format_ipv4(&entry->peer_ip, peer),
+                 entry->config_generation);
+        return -EIO;
+    }
+    log_info("[BFD-DIAG] event=session_create tunnel=%s ifindex=%u "
+             "local=%s peer=%s generation=%" PRIu32,
+             entry->ifname, entry->ifindex,
+             format_ipv4(&entry->local_ip, local),
+             format_ipv4(&entry->peer_ip, peer),
+             entry->config_generation);
+    return 0;
+}
+
+static void remove_undesired_entries(
     struct bfd_manager *manager,
     struct failover_runtime_entry entries[MAX_SDWAN_TUNS],
     const struct failover_snapshot *snapshot)
@@ -241,27 +463,19 @@ static void remove_stale_entries(
 
     for (i = 0; i < MAX_SDWAN_TUNS; i++) {
         const struct failover_desired_tunnel *desired;
-        unsigned int current_ifindex;
 
         if (!entries[i].in_use)
             continue;
         desired = find_desired(snapshot, entries[i].ifname);
-        current_ifindex = if_nametoindex(entries[i].ifname);
-        if (!desired) {
+        if (!desired)
             remove_runtime_entry(manager, &entries[i], "NOT_DESIRED");
-        } else if (current_ifindex == 0) {
-            remove_runtime_entry(manager, &entries[i], "INTERFACE_MISSING");
-        } else if (current_ifindex != entries[i].ifindex) {
-            remove_runtime_entry(manager, &entries[i], "IFINDEX_CHANGED");
-        } else if (desired->local_ip.s_addr != entries[i].local_ip.s_addr) {
-            remove_runtime_entry(manager, &entries[i], "LOCAL_IP_CHANGED");
-        }
     }
 }
 
 static void reconcile_sessions(
     struct bfd_manager *manager,
     struct failover_runtime_entry entries[MAX_SDWAN_TUNS],
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
     const struct failover_snapshot *snapshot)
 {
     const struct bfd_stability_config stability = {
@@ -274,138 +488,293 @@ static void reconcile_sessions(
     };
     size_t i;
 
-    remove_stale_entries(manager, entries, snapshot);
+    remove_undesired_entries(manager, entries, snapshot);
     for (i = 0; i < snapshot->count; i++) {
         const struct failover_desired_tunnel *desired =
             &snapshot->tunnels[i];
         struct failover_runtime_entry *entry;
-        struct bfd_session_config config;
-        struct bfd_callbacks callbacks;
+        struct kernel_tunnel_state kernel_state;
         struct in_addr peer_ip;
         char peer_text[INET_ADDRSTRLEN];
         unsigned int ifindex;
+        bool identity_changed;
+        bool has_local_ip;
+        int ret;
 
         ifindex = if_nametoindex(desired->ifname);
-        if (ifindex == 0 ||
-            !interface_has_ipv4(desired->ifname, &desired->local_ip))
-            continue;
+        has_local_ip = ifindex &&
+            interface_has_ipv4(desired->ifname, &desired->local_ip);
         entry = find_runtime(entries, desired->ifname);
-        if (entry && entry->ifindex == ifindex &&
-            entry->local_ip.s_addr == desired->local_ip.s_addr) {
-            if (entry->config_generation != snapshot->config_generation) {
-                uint32_t old_generation = entry->config_generation;
-                char local[INET_ADDRSTRLEN];
-                char peer[INET_ADDRSTRLEN];
-                char kernel_peer[INET_ADDRSTRLEN] = "unavailable";
-                struct in_addr current_peer_ip;
-                const char *peer_match = "unknown";
+        if (entry && entry->config_generation !=
+                     snapshot->config_generation) {
+            uint32_t old_generation = entry->config_generation;
 
-                if (kernel_sync_get_tunnel_peer(
-                        desired->ifname, kernel_peer,
-                        sizeof(kernel_peer)) == 0 &&
-                    inet_pton(AF_INET, kernel_peer, &current_peer_ip) == 1) {
-                    peer_match = current_peer_ip.s_addr == entry->peer_ip.s_addr
-                        ? "yes" : "no";
-                }
-
-                entry->config_generation = snapshot->config_generation;
-                entry->state_sequence = 1;
-                entry->state_dirty = true;
+            /* A full-config push also happens for -d/-a. Reuse a healthy
+             * tunnel's live BFD session when its identity did not change;
+             * only its kernel sequence namespace changed. */
+            ret = ifindex ? kernel_sync_get_tunnel_state_by_ifindex(
+                                ifindex, &kernel_state) : -ENODEV;
+            if (ret || kernel_state.generation !=
+                       snapshot->config_generation ||
+                entry->ifindex != ifindex) {
+                remove_runtime_entry(manager, entry,
+                                     "CONFIG_DEVICE_CHANGED");
+                entry = NULL;
+            } else {
+                entry->config_generation = kernel_state.generation;
+                entry->state_sequence = kernel_state.sequence;
+                entry->kernel_published = kernel_state.up ?
+                    BFD_STABLE_UP : BFD_STABLE_DOWN;
+                entry->state_dirty =
+                    (kernel_state.up !=
+                     (entry->published == BFD_STABLE_UP));
                 log_info("[BFD-DIAG] event=session_reuse tunnel=%s "
-                         "ifindex=%u local=%s stored_peer=%s kernel_peer=%s "
-                         "peer_match=%s old_generation=%" PRIu32
-                         " new_generation=%" PRIu32 " raw=%s published=%s",
-                         entry->ifname, entry->ifindex,
-                         format_ipv4(&entry->local_ip, local),
-                         format_ipv4(&entry->peer_ip, peer), kernel_peer,
-                         peer_match, old_generation, entry->config_generation,
-                         entry->session
-                             ? bfd_state_name(
-                                   bfd_session_raw_state(entry->session))
-                             : "NO_SESSION",
+                         "ifindex=%u old_generation=%" PRIu32
+                         " new_generation=%" PRIu32 " published=%s",
+                         entry->ifname, entry->ifindex, old_generation,
+                         entry->config_generation,
                          bfd_stable_state_name(entry->published));
             }
-            continue;
         }
-        if (kernel_sync_get_tunnel_peer(desired->ifname, peer_text,
-                                        sizeof(peer_text)) != 0 ||
-            inet_pton(AF_INET, peer_text, &peer_ip) != 1)
-            continue;
-
-        if (runtime_matches(entry, ifindex, &desired->local_ip, &peer_ip))
-            continue;
-        if (entry)
-            remove_runtime_entry(manager, entry, "IDENTITY_CHANGED");
-        entry = find_free_runtime(entries);
-        if (!entry)
-            continue;
-
-        memset(entry, 0, sizeof(*entry));
-        entry->in_use = true;
-        entry->ifindex = ifindex;
-        entry->local_ip = desired->local_ip;
-        entry->peer_ip = peer_ip;
-        entry->published = BFD_STABLE_DOWN;
-        entry->kernel_published = BFD_STABLE_DOWN;
-        entry->config_generation = snapshot->config_generation;
-        entry->state_sequence = 1;
-        entry->state_dirty = true;
-        snprintf(entry->ifname, sizeof(entry->ifname), "%s",
-                 desired->ifname);
-
-        memset(&config, 0, sizeof(config));
-        config.ifname = entry->ifname;
-        config.local_ip = entry->local_ip;
-        config.peer_ip = entry->peer_ip;
-        config.desired_min_tx_us = FAILOVER_BFD_INTERVAL_US;
-        config.required_min_rx_us = FAILOVER_BFD_INTERVAL_US;
-        config.detect_mult = FAILOVER_BFD_DETECT_MULT;
-        memset(&callbacks, 0, sizeof(callbacks));
-        callbacks.raw_state_changed = raw_state_changed;
-        callbacks.published_state_changed = published_state_changed;
-        callbacks.user = entry;
-        entry->session = bfd_manager_add_session(manager, &config,
-                                                 &stability, &callbacks);
-        if (!entry->session) {
-            char local[INET_ADDRSTRLEN];
-            char peer[INET_ADDRSTRLEN];
-
-            log_warn("[BFD-DIAG] event=session_create_failed tunnel=%s "
-                     "ifindex=%u local=%s peer=%s generation=%" PRIu32,
-                     entry->ifname, entry->ifindex,
-                     format_ipv4(&entry->local_ip, local),
-                     format_ipv4(&entry->peer_ip, peer),
-                     entry->config_generation);
+        if (!entry) {
+            if (!ifindex) {
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_INTERFACE, -ENODEV, 0,
+                                  &desired->local_ip,
+                                  snapshot->config_generation, 0);
+                continue;
+            }
+            if (!has_local_ip) {
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_LOCAL_IP,
+                                  -EADDRNOTAVAIL, ifindex,
+                                  &desired->local_ip,
+                                  snapshot->config_generation, 0);
+                continue;
+            }
+            entry = find_free_runtime(entries);
+            if (!entry) {
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_RUNTIME_SLOT, -ENOSPC,
+                                  ifindex, &desired->local_ip,
+                                  snapshot->config_generation, 0);
+                continue;
+            }
             memset(entry, 0, sizeof(*entry));
-        } else {
-            char local[INET_ADDRSTRLEN];
-            char peer[INET_ADDRSTRLEN];
-
-            log_info("[BFD-DIAG] event=session_create tunnel=%s ifindex=%u "
-                     "local=%s peer=%s generation=%" PRIu32,
-                     entry->ifname, entry->ifindex,
-                     format_ipv4(&entry->local_ip, local),
-                     format_ipv4(&entry->peer_ip, peer),
-                     entry->config_generation);
+            entry->in_use = true;
+            entry->ifindex = ifindex;
+            entry->config_generation = snapshot->config_generation;
+            entry->published = BFD_STABLE_DOWN;
+            snprintf(entry->ifname, sizeof(entry->ifname), "%s",
+                     desired->ifname);
+            update_runtime_identity(entry, desired);
+            ret = kernel_sync_get_tunnel_state_by_ifindex(ifindex,
+                                                          &kernel_state);
+            if (ret || kernel_state.generation !=
+                       snapshot->config_generation) {
+                report_wait_stage(
+                    diagnostics, desired->ifname,
+                    FAILOVER_WAIT_KERNEL_STATE,
+                    ret ? ret : -ESTALE, ifindex, &desired->local_ip,
+                    snapshot->config_generation,
+                    ret ? 0 : kernel_state.generation);
+                memset(entry, 0, sizeof(*entry));
+                continue;
+            }
+            entry->state_sequence = kernel_state.sequence;
+            entry->kernel_published = kernel_state.up ?
+                BFD_STABLE_UP : BFD_STABLE_DOWN;
+            entry->state_dirty = false;
+            ret = kernel_state.up ? publish_runtime_down(entry) : 0;
+            if (ret) {
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_DOWN_ACK, ret, ifindex,
+                                  &desired->local_ip,
+                                  snapshot->config_generation,
+                                  kernel_state.generation);
+                memset(entry, 0, sizeof(*entry));
+                continue;
+            }
         }
+
+        identity_changed = !desired_identity_matches(entry, desired);
+        if (identity_changed || !ifindex || ifindex != entry->ifindex ||
+            !has_local_ip) {
+            ret = publish_runtime_down(entry);
+            if (ret) {
+                log_warn("[BFD-DIAG] event=rebind_down_failed tunnel=%s "
+                         "ifindex=%u error=%s",
+                         entry->ifname, entry->ifindex, strerror(-ret));
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_DOWN_ACK, ret,
+                                  entry->ifindex, &desired->local_ip,
+                                  snapshot->config_generation, 0);
+                continue;
+            }
+            stop_runtime_session(manager, entry,
+                                 identity_changed ? "CONFIG_CHANGED" :
+                                 (!ifindex ? "INTERFACE_MISSING" :
+                                  "INTERFACE_IDENTITY_CHANGED"));
+            update_runtime_identity(entry, desired);
+            entry->rebind_pending = true;
+        }
+
+        if (!ifindex) {
+            report_wait_stage(diagnostics, desired->ifname,
+                              FAILOVER_WAIT_INTERFACE, -ENODEV, 0,
+                              &desired->local_ip,
+                              snapshot->config_generation, 0);
+            continue;
+        }
+        if (!has_local_ip) {
+            report_wait_stage(diagnostics, desired->ifname,
+                              FAILOVER_WAIT_LOCAL_IP, -EADDRNOTAVAIL,
+                              ifindex, &desired->local_ip,
+                              snapshot->config_generation, 0);
+            continue;
+        }
+
+        if (entry->rebind_pending) {
+            unsigned int old_ifindex = entry->ifindex;
+
+            ret = kernel_sync_rebind_tunnel(
+                snapshot->node_id, snapshot->config_generation,
+                old_ifindex, ifindex);
+            if (ret) {
+                struct kernel_tunnel_state old_state;
+
+                /* Netlink delivery and the ACK are separate. If only the
+                 * ACK was lost, the old identity is gone and the new one is
+                 * already queryable; accept that completed transaction. */
+                if (old_ifindex != ifindex &&
+                    kernel_sync_get_tunnel_state_by_ifindex(
+                        old_ifindex, &old_state) == -ENOENT &&
+                    kernel_sync_get_tunnel_state_by_ifindex(
+                        ifindex, &kernel_state) == 0 &&
+                    kernel_state.generation == entry->config_generation &&
+                    !kernel_state.up) {
+                    log_info("[BFD-DIAG] event=rebind_ack_recovered "
+                             "tunnel=%s old_ifindex=%u new_ifindex=%u",
+                             entry->ifname, old_ifindex, ifindex);
+                    ret = 0;
+                }
+            }
+            if (ret) {
+                log_warn("[BFD-DIAG] event=rebind_deferred tunnel=%s "
+                         "old_ifindex=%u new_ifindex=%u error=%s",
+                         entry->ifname, old_ifindex, ifindex,
+                         strerror(-ret));
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_REBIND, ret, ifindex,
+                                  &desired->local_ip,
+                                  snapshot->config_generation, 0);
+                continue;
+            }
+            entry->ifindex = ifindex;
+            entry->peer_ip.s_addr = 0;
+            entry->rebind_pending = false;
+            ret = kernel_sync_get_tunnel_state_by_ifindex(
+                entry->ifindex, &kernel_state);
+            if (ret || kernel_state.generation !=
+                       entry->config_generation) {
+                report_wait_stage(
+                    diagnostics, desired->ifname,
+                    FAILOVER_WAIT_KERNEL_STATE,
+                    ret ? ret : -ESTALE, entry->ifindex,
+                    &desired->local_ip, entry->config_generation,
+                    ret ? 0 : kernel_state.generation);
+                entry->rebind_pending = true;
+                continue;
+            }
+            entry->state_sequence = kernel_state.sequence;
+            entry->kernel_published = kernel_state.up ?
+                BFD_STABLE_UP : BFD_STABLE_DOWN;
+            log_info("[BFD-DIAG] event=rebind_complete tunnel=%s "
+                     "old_ifindex=%u new_ifindex=%u segment_id=%d",
+                     entry->ifname, old_ifindex, entry->ifindex,
+                     entry->segment_id);
+        }
+
+        if (entry->session) {
+            clear_wait_stage(diagnostics, desired->ifname);
+            continue;
+        }
+        ret = kernel_sync_get_tunnel_peer(desired->ifname, peer_text,
+                                          sizeof(peer_text));
+        if (ret) {
+            report_wait_stage(diagnostics, desired->ifname,
+                              FAILOVER_WAIT_PEER, ret, entry->ifindex,
+                              &desired->local_ip,
+                              entry->config_generation,
+                              entry->config_generation);
+            continue;
+        }
+        if (inet_pton(AF_INET, peer_text, &peer_ip) != 1) {
+            report_wait_stage(diagnostics, desired->ifname,
+                              FAILOVER_WAIT_PEER, -EPROTO,
+                              entry->ifindex, &desired->local_ip,
+                              entry->config_generation,
+                              entry->config_generation);
+            continue;
+        }
+        entry->peer_ip = peer_ip;
+        ret = create_runtime_session(manager, entry, &stability);
+        if (ret)
+            report_wait_stage(diagnostics, desired->ifname,
+                              FAILOVER_WAIT_SESSION_CREATE, ret,
+                              entry->ifindex, &desired->local_ip,
+                              entry->config_generation,
+                              entry->config_generation);
+        else
+            clear_wait_stage(diagnostics, desired->ifname);
     }
 }
 
 static void flush_published_states(
-    struct failover_runtime_entry entries[MAX_SDWAN_TUNS])
+    struct failover_runtime_entry entries[MAX_SDWAN_TUNS],
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS])
 {
     size_t i;
 
     for (i = 0; i < MAX_SDWAN_TUNS; i++) {
         struct failover_runtime_entry *entry = &entries[i];
+        struct kernel_tunnel_state state;
+        uint32_t sequence;
+        bool target_up;
+        int ret;
 
         if (!entry->in_use || !entry->session || !entry->state_dirty ||
-            entry->config_generation == 0 || entry->state_sequence == 0)
+            entry->config_generation == 0)
             continue;
-        if (kernel_sync_set_tunnel_state(
-                entry->ifname, entry->config_generation,
-                entry->state_sequence,
-                entry->published == BFD_STABLE_UP) == 0) {
+        ret = kernel_sync_get_tunnel_state_by_ifindex(entry->ifindex,
+                                                      &state);
+        if (ret || state.generation != entry->config_generation) {
+            report_wait_stage(
+                diagnostics, entry->ifname,
+                FAILOVER_WAIT_STATE_PUBLISH, ret ? ret : -ESTALE,
+                entry->ifindex, &entry->local_ip,
+                entry->config_generation, ret ? 0 : state.generation);
+            continue;
+        }
+        target_up = entry->published == BFD_STABLE_UP;
+        entry->state_sequence = state.sequence;
+        entry->kernel_published = state.up ? BFD_STABLE_UP : BFD_STABLE_DOWN;
+        if (state.up == target_up) {
+            entry->state_dirty = false;
+            continue;
+        }
+        if (state.sequence == UINT32_MAX) {
+            report_wait_stage(diagnostics, entry->ifname,
+                              FAILOVER_WAIT_STATE_PUBLISH, -EOVERFLOW,
+                              entry->ifindex, &entry->local_ip,
+                              entry->config_generation, state.generation);
+            continue;
+        }
+        sequence = state.sequence + 1;
+        ret = kernel_sync_set_tunnel_state_by_ifindex(
+            entry->ifindex, entry->config_generation,
+            sequence, target_up);
+        if (ret == 0) {
             if (entry->kernel_published != entry->published) {
                 char peer[INET_ADDRSTRLEN] = "unknown";
 
@@ -417,7 +786,14 @@ static void flush_published_states(
                          bfd_stable_state_name(entry->published));
                 entry->kernel_published = entry->published;
             }
+            entry->state_sequence = sequence;
             entry->state_dirty = false;
+            clear_wait_stage(diagnostics, entry->ifname);
+        } else {
+            report_wait_stage(diagnostics, entry->ifname,
+                              FAILOVER_WAIT_STATE_PUBLISH, ret,
+                              entry->ifindex, &entry->local_ip,
+                              entry->config_generation, state.generation);
         }
     }
 }
@@ -425,6 +801,7 @@ static void flush_published_states(
 static void *failover_worker(void *unused)
 {
     struct failover_runtime_entry entries[MAX_SDWAN_TUNS] = {{0}};
+    struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS] = {{0}};
     struct failover_snapshot snapshot = {0};
     struct bfd_manager *manager;
     uint64_t applied_generation = 0;
@@ -458,11 +835,11 @@ static void *failover_worker(void *unused)
         if (stop)
             break;
 
-        reconcile_sessions(manager, entries, &snapshot);
-        flush_published_states(entries);
+        reconcile_sessions(manager, entries, diagnostics, &snapshot);
+        flush_published_states(entries, diagnostics);
         applied_generation = desired_generation;
         (void)bfd_manager_poll(manager, FAILOVER_RECONCILE_MS);
-        flush_published_states(entries);
+        flush_published_states(entries, diagnostics);
     }
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
@@ -493,6 +870,9 @@ int failover_service_reconcile(const app_context_t *ctx,
             continue;
         snprintf(target->ifname, sizeof(target->ifname), "%s",
                  source->tunnel_ifname);
+        snprintf(target->physical_ifname, sizeof(target->physical_ifname),
+                 "%s", source->physical_ifname);
+        target->segment_id = source->segment_id;
         next.count++;
     }
 

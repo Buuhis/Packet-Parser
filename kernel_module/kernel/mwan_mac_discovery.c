@@ -240,6 +240,9 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     cfg = rcu_dereference(g_mwan_cfg);
     tun = mwan_mac_find_tunnel(cfg, ingress_ifindex);
     if (!tun || !tun->is_ethernet) {
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u\n",
+                            ingress_ifindex,
+                            tun && tun->is_ethernet ? 1 : 0);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -252,6 +255,10 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
         spin_unlock_bh(&tun->gateway_mac_lock);
     }
     if (!nonce_matches) {
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=NONCE_MISMATCH tunnel=%s ingress_ifindex=%d received_nonce=%llu\n",
+                            tun->dev ? tun->dev->name : "unknown",
+                            ingress_ifindex,
+                            (unsigned long long)nonce);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -261,10 +268,21 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
      * source MAC comes from Ethernet; peer tunnel IP is explicitly carried
      * in the discovery payload and is never inferred from a subnet. */
     mwan_mac_learn_peer(tun, eth->h_source, hdr->tunnel_ip);
-    if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST)
-        mwan_mac_send(tun, eth->h_source,
-                      MWAN_MAC_DISCOVERY_RESPONSE, cfg->node_id, nonce,
-                      GFP_ATOMIC);
+    if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST) {
+        int response_ret = mwan_mac_send(
+            tun, eth->h_source, MWAN_MAC_DISCOVERY_RESPONSE,
+            cfg->node_id, nonce, GFP_ATOMIC);
+
+        if (response_ret)
+            pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_FAILED tunnel=%s ifindex=%d error=%d\n",
+                                tun->dev ? tun->dev->name : "unknown",
+                                tun->dev ? tun->dev->ifindex : 0,
+                                response_ret);
+        else
+            pr_info_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d\n",
+                                tun->dev ? tun->dev->name : "unknown",
+                                tun->dev ? tun->dev->ifindex : 0);
+    }
     rcu_read_unlock();
 
     kfree_skb(skb);
@@ -291,14 +309,25 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
     if (cfg) {
         for (i = 0; i < cfg->num_tunnels; i++) {
             struct mwan_tunnel *tun = &cfg->tunnels[i];
+            bool tunnel_resolved;
+            int send_ret;
 
             if (!tun->is_ethernet || !tun->dev)
                 continue;
-            if (!mwan_mac_is_resolved(tun))
+            tunnel_resolved = mwan_mac_is_resolved(tun);
+            if (!tunnel_resolved)
                 unresolved = true;
-            mwan_mac_send(tun, tun->dev->broadcast,
-                          MWAN_MAC_DISCOVERY_REQUEST, cfg->node_id, 0,
-                          GFP_ATOMIC);
+            send_ret = mwan_mac_send(tun, tun->dev->broadcast,
+                                     MWAN_MAC_DISCOVERY_REQUEST,
+                                     cfg->node_id, 0, GFP_ATOMIC);
+            if (send_ret)
+                pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=SEND_FAILED tunnel=%s ifindex=%d error=%d resolved=%u\n",
+                                    tun->dev->name, tun->dev->ifindex,
+                                    send_ret,
+                                    mwan_mac_is_resolved(tun) ? 1 : 0);
+            else if (!tunnel_resolved)
+                pr_info_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=REQUEST_SENT tunnel=%s ifindex=%d\n",
+                                    tun->dev->name, tun->dev->ifindex);
         }
     }
     rcu_read_unlock();
