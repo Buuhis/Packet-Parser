@@ -192,6 +192,9 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.tx_worker_deactivated, 0);
     atomic64_set(&cfg->flows.tx_worker_reactivated, 0);
     atomic64_set(&cfg->flows.tx_worker_reselected, 0);
+    atomic64_set(&cfg->flows.tx_degraded_admitted, 0);
+    atomic64_set(&cfg->flows.tx_recovery_updated, 0);
+    atomic64_set(&cfg->flows.tx_recovery_moved, 0);
     atomic64_set(&cfg->flows.rx_created, 0);
     atomic64_set(&cfg->flows.rx_expired, 0);
     atomic64_set(&cfg->flows.table_full, 0);
@@ -373,6 +376,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     u32 index;
     int owner;
     int tunnel_idx;
+    u16 admission_active_count = 0;
 
     if (!cfg || !key || READ_ONCE(cfg->flows.stopping))
         return NULL;
@@ -430,8 +434,38 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                     atomic_set(&flow->balance_counted, 1);
                 }
             } else if (allow_tunnel_remap &&
+                       READ_ONCE(flow->tunnel_idx) ==
+                           READ_ONCE(flow->home_tunnel_idx) &&
+                       READ_ONCE(flow->rebalance_on_recovery) &&
                        !READ_ONCE(flow->closing) &&
-                       atomic_cmpxchg(&flow->balance_counted, 0, 1) == 0) {
+                       !atomic_read(&flow->pending_crypto) &&
+                       refcount_read(&flow->refs) == 1) {
+                u16 old_tunnel_idx = READ_ONCE(flow->tunnel_idx);
+                u16 active_count = 0;
+                bool old_counted =
+                    atomic_read(&flow->balance_counted) != 0;
+
+                tunnel_idx = mwan_tunnel_balance_recover_flow(
+                    cfg, old_tunnel_idx, flow_hash, old_counted,
+                    READ_ONCE(flow->admission_active_count),
+                    &active_count);
+                if (tunnel_idx >= 0) {
+                    WRITE_ONCE(flow->tunnel_idx, (u16)tunnel_idx);
+                    WRITE_ONCE(flow->home_tunnel_idx, (u16)tunnel_idx);
+                    WRITE_ONCE(flow->admission_active_count,
+                               active_count);
+                    WRITE_ONCE(flow->rebalance_on_recovery,
+                               active_count < cfg->num_tunnels);
+                    atomic_set(&flow->balance_counted, 1);
+                    atomic64_inc(&cfg->flows.tx_recovery_updated);
+                    if (tunnel_idx != old_tunnel_idx)
+                        atomic64_inc(&cfg->flows.tx_recovery_moved);
+                }
+            }
+            if (allow_tunnel_remap && !READ_ONCE(flow->closing) &&
+                mwan_tunnel_balance_is_active(
+                    cfg, READ_ONCE(flow->tunnel_idx)) &&
+                atomic_cmpxchg(&flow->balance_counted, 0, 1) == 0) {
                 mwan_tunnel_balance_activate_flow(cfg,
                                                    flow->tunnel_idx);
             }
@@ -467,7 +501,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
          * therefore already exist when the worker submit path gets here. */
         tunnel_idx = requested_tunnel_idx;
     } else {
-        tunnel_idx = mwan_tunnel_balance_assign_flow(cfg, flow_hash);
+        tunnel_idx = mwan_tunnel_balance_assign_flow(
+            cfg, flow_hash, &admission_active_count);
     }
     if (tunnel_idx < 0) {
         atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
@@ -486,6 +521,10 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     candidate->owner_worker = owner;
     candidate->home_tunnel_idx = (u16)tunnel_idx;
     candidate->tunnel_idx = (u16)tunnel_idx;
+    candidate->admission_active_count = admission_active_count;
+    candidate->rebalance_on_recovery =
+        requested_tunnel_idx < 0 &&
+        admission_active_count < cfg->num_tunnels;
     candidate->last_seen = jiffies;
     INIT_HLIST_NODE(&candidate->node);
 
@@ -505,6 +544,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     hlist_add_head(&candidate->node, &bucket->head);
     atomic_inc(&cfg->flows.tx_count);
     atomic64_inc(&cfg->flows.tx_created);
+    if (candidate->rebalance_on_recovery)
+        atomic64_inc(&cfg->flows.tx_degraded_admitted);
     refcount_inc(&candidate->refs); /* caller reference */
     spin_unlock_bh(&bucket->lock);
     return candidate;

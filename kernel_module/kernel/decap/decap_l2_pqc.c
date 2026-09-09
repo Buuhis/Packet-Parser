@@ -91,6 +91,9 @@ void mwan_l2_diag_reset_all(void)
         atomic64_set(&cfg->flows.tx_worker_deactivated, 0);
         atomic64_set(&cfg->flows.tx_worker_reactivated, 0);
         atomic64_set(&cfg->flows.tx_worker_reselected, 0);
+        atomic64_set(&cfg->flows.tx_degraded_admitted, 0);
+        atomic64_set(&cfg->flows.tx_recovery_updated, 0);
+        atomic64_set(&cfg->flows.tx_recovery_moved, 0);
         mwan_rekey_diag_reset(cfg);
     }
     rcu_read_unlock();
@@ -731,6 +734,10 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.tx_worker_deactivated),
                    atomic64_read(&cfg->flows.tx_worker_reactivated),
                    atomic64_read(&cfg->flows.tx_worker_reselected));
+        seq_printf(m, "tx_path_recovery degraded_admitted=%lld updated=%lld moved=%lld\n",
+                   atomic64_read(&cfg->flows.tx_degraded_admitted),
+                   atomic64_read(&cfg->flows.tx_recovery_updated),
+                   atomic64_read(&cfg->flows.tx_recovery_moved));
         for (u32 i = 0; i < cfg->num_tunnels; i++) {
             const struct mwan_tunnel *tun = &cfg->tunnels[i];
 

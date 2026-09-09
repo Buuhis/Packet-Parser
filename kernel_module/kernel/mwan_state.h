@@ -154,8 +154,14 @@ struct mwan_l2_tx_flow {
      * disturbing flows that were never failed over. */
     u16 home_tunnel_idx;
     u16 tunnel_idx;
+    /* A data flow admitted while only part of the configured path set was
+     * usable must be reconsidered when capacity returns. This marker is
+     * per-flow state only; it is never added to packet metadata or the wire
+     * format. */
+    u16 admission_active_count;
     unsigned long last_seen;
     bool closing;
+    bool rebalance_on_recovery;
 };
 
 struct mwan_l2_rx_flow {
@@ -236,6 +242,9 @@ struct mwan_l2_flow_manager {
     atomic64_t tx_worker_deactivated;
     atomic64_t tx_worker_reactivated;
     atomic64_t tx_worker_reselected;
+    atomic64_t tx_degraded_admitted;
+    atomic64_t tx_recovery_updated;
+    atomic64_t tx_recovery_moved;
     atomic64_t rx_created;
     atomic64_t rx_expired;
     atomic64_t table_full;
