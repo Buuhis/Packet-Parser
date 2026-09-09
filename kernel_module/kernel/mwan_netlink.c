@@ -229,6 +229,48 @@ static int mwan_genl_set_tunnel_state(struct sk_buff *skb,
                                        state != 0);
 }
 
+static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
+                                        struct genl_info *info)
+{
+    u32 ifindices[MAX_MWAN_TUNNELS];
+    u32 weights[MAX_MWAN_TUNNELS];
+    struct nlattr *nla_tunnels;
+    struct nlattr *tun;
+    u32 count = 0;
+    int rem;
+    int err;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_TUNNELS])
+        return -EINVAL;
+
+    nla_tunnels = info->attrs[MWAN_ATTR_TUNNELS];
+    nla_for_each_nested(tun, nla_tunnels, rem) {
+        struct nlattr *tb[MWAN_TUN_MAX + 1];
+
+        if (count >= MAX_MWAN_TUNNELS)
+            return -E2BIG;
+        err = nla_parse_nested_deprecated(tb, MWAN_TUN_MAX, tun,
+                                          mwan_tunnel_policy, NULL);
+        if (err < 0)
+            return err;
+        if (!tb[MWAN_TUN_IFINDEX] || !tb[MWAN_TUN_WEIGHT])
+            return -EINVAL;
+        ifindices[count] = nla_get_u32(tb[MWAN_TUN_IFINDEX]);
+        weights[count] = nla_get_u32(tb[MWAN_TUN_WEIGHT]);
+        if (!ifindices[count] || !weights[count])
+            return -EINVAL;
+        count++;
+    }
+
+    return mwan_state_update_tunnel_weights(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        ifindices, weights, count);
+}
+
 static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
                                       struct genl_info *info)
 {
@@ -529,6 +571,12 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = GENL_ADMIN_PERM,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_abort_pqc_key,
+    },
+    {
+        .cmd    = MWAN_CMD_SET_TUNNEL_WEIGHTS,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_set_tunnel_weights,
     },
 };
 

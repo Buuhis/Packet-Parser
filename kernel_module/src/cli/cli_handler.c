@@ -642,6 +642,8 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 
     bool runtime_update_needed = false;
     bool sync_needed = false;
+    bool weight_only_update = false;
+    bool used_weight_update = false;
     bool failover_reconcile_needed = false;
     bool reload_pqc_lifecycle = false;
     bool trigger_pqc_handshake = false;
@@ -674,6 +676,9 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         runtime_update_needed = !config_runtime_equal(&ctx->cfg,
                                                       &candidate.cfg);
         sync_needed = !config_kernel_equal(&ctx->cfg, &candidate.cfg);
+        weight_only_update = sync_needed &&
+            config_kernel_weight_only_changed(&ctx->cfg,
+                                              &candidate.cfg);
         failover_reconcile_needed = !config_failover_equal(
             &ctx->cfg, &candidate.cfg);
         if (runtime_update_needed)
@@ -712,7 +717,16 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 
     // 3. Sync config to kernel if needed
     if (sync_needed) {
-        if (kernel_sync_push_config(&candidate) == KERNEL_SYNC_ERROR) {
+        int sync_failed;
+
+        used_weight_update = weight_only_update &&
+            kernel_sync_current_config_generation() != 0;
+        if (used_weight_update)
+            sync_failed = kernel_sync_update_tunnel_weights(&candidate) != 0;
+        else
+            sync_failed = kernel_sync_push_config(&candidate) ==
+                          KERNEL_SYNC_ERROR;
+        if (sync_failed) {
             runtime_config_unlock();
             if (reload_pqc_lifecycle)
                 runtime_config_cancel_reload(config_generation,
@@ -721,9 +735,14 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
             return;
         }
         *ctx = candidate;
-        log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
-                 profile_id);
-        log_info("[EDIT] Config changes successfully synced to kernel");
+        if (used_weight_update)
+            log_info("[EDIT] Tunnel weights updated in place for profile %d; flow/BFD/worker state preserved",
+                     profile_id);
+        else {
+            log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
+                     profile_id);
+            log_info("[EDIT] Config changes successfully synced to kernel");
+        }
     } else if (runtime_update_needed) {
         /* Monitoring and other userspace-only values must be refreshed in
          * the active snapshot without replacing the kernel datapath. */
@@ -740,7 +759,8 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         trigger_pqc_handshake = true;
     runtime_config_unlock();
 
-    if (failover_reconcile_needed && !sync_needed) {
+    if (failover_reconcile_needed &&
+        (!sync_needed || used_weight_update)) {
         uint32_t kernel_generation =
             kernel_sync_current_config_generation();
         int failover_rc = failover_service_reconcile(&candidate,

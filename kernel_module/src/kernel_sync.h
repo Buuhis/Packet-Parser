@@ -16,6 +16,7 @@ enum kernel_sync_result {
  * while a PQC config waits for its authenticated userspace session key. */
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx);
 uint32_t kernel_sync_current_config_generation(void);
+int kernel_sync_update_tunnel_weights(const app_context_t *ctx);
 int kernel_sync_stage_pqc_key(int profile_id, uint64_t epoch, uint8_t key_id,
                               const uint8_t key[32]);
 int kernel_sync_activate_pqc_key(int profile_id, uint64_t epoch,

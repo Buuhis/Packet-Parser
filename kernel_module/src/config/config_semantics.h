@@ -14,6 +14,11 @@ bool config_runtime_equal(const app_config_t *left,
 bool config_kernel_equal(const app_config_t *left,
                          const app_config_t *right);
 
+/* True when the only values visible to the kernel that changed are tunnel
+ * weights. This permits an in-place update without replacing runtime state. */
+bool config_kernel_weight_only_changed(const app_config_t *left,
+                                       const app_config_t *right);
+
 /* Compare the identity used to reconcile BFD sessions. */
 bool config_failover_equal(const app_config_t *left,
                            const app_config_t *right);

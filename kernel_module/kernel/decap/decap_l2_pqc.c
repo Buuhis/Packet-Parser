@@ -731,6 +731,17 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.tx_worker_deactivated),
                    atomic64_read(&cfg->flows.tx_worker_reactivated),
                    atomic64_read(&cfg->flows.tx_worker_reselected));
+        for (u32 i = 0; i < cfg->num_tunnels; i++) {
+            const struct mwan_tunnel *tun = &cfg->tunnels[i];
+
+            seq_printf(m, "balance tunnel=%u ifindex=%u weight=%u up=%u active=%d admitted=%d ewma_bps=%llu\n",
+                       i, tun->configured_ifindex,
+                       READ_ONCE(tun->weight),
+                       READ_ONCE(tun->published_up),
+                       atomic_read(&tun->balance_active_flows),
+                       atomic_read(&tun->balance_admitted_flows),
+                       READ_ONCE(tun->balance_ewma_bps));
+        }
         seq_printf(m, "reorder late=%lld duplicate=%lld too_far=%lld skipped_on_timeout=%lld resync=%lld resync_skipped=%lld resync_flushed=%lld\n",
                    atomic64_read(&cfg->flows.reorder_late),
                    atomic64_read(&cfg->flows.reorder_duplicate),

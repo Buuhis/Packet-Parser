@@ -26,7 +26,8 @@ static atomic64_t packet_nonce;
 static atomic64_t no_active_tunnel_drops;
 
 static struct mwan_active_paths *
-mwan_active_paths_build(const struct mwan_config *cfg)
+mwan_active_paths_build_weights(const struct mwan_config *cfg,
+                                const u32 *weights)
 {
     struct mwan_active_paths *paths;
     int last_active = -1;
@@ -39,11 +40,12 @@ mwan_active_paths_build(const struct mwan_config *cfg)
 
     for (i = 0; i < cfg->num_tunnels; i++) {
         const struct mwan_tunnel *tun = &cfg->tunnels[i];
+        u32 weight = weights ? weights[i] : tun->weight;
 
         if (!tun->published_up)
             continue;
         paths->active_count++;
-        paths->total_weight += tun->weight;
+        paths->total_weight += weight;
         last_active = (int)i;
     }
 
@@ -52,12 +54,13 @@ mwan_active_paths_build(const struct mwan_config *cfg)
 
     for (i = 0; i < cfg->num_tunnels; i++) {
         const struct mwan_tunnel *tun = &cfg->tunnels[i];
+        u32 weight = weights ? weights[i] : tun->weight;
         u32 count;
         u32 j;
 
         if (!tun->published_up)
             continue;
-        count = (u32)(((u64)tun->weight * MWAN_LUT_SIZE) /
+        count = (u32)(((u64)weight * MWAN_LUT_SIZE) /
                       paths->total_weight);
         for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++)
             paths->tunnel_idx_lut[current_slot++] = (u8)i;
@@ -66,6 +69,36 @@ mwan_active_paths_build(const struct mwan_config *cfg)
         paths->tunnel_idx_lut[current_slot++] = (u8)last_active;
 
     return paths;
+}
+
+static struct mwan_active_paths *
+mwan_active_paths_build(const struct mwan_config *cfg)
+{
+    return mwan_active_paths_build_weights(cfg, NULL);
+}
+
+static void mwan_legacy_weight_lut_build(struct mwan_config *cfg,
+                                         const u32 *weights,
+                                         u32 total_weight)
+{
+    u32 current_slot = 0;
+    u32 i;
+
+    memset(cfg->tunnel_idx_lut, 0, sizeof(cfg->tunnel_idx_lut));
+    if (!cfg->num_tunnels || !total_weight)
+        return;
+
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        u32 count = (u32)(((u64)weights[i] * MWAN_LUT_SIZE) /
+                          total_weight);
+        u32 j;
+
+        for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++)
+            cfg->tunnel_idx_lut[current_slot++] = (u8)i;
+    }
+    while (current_slot < MWAN_LUT_SIZE)
+        cfg->tunnel_idx_lut[current_slot++] =
+            (u8)(cfg->num_tunnels - 1);
 }
 
 static void mwan_config_release_devices(struct mwan_config *cfg)
@@ -482,6 +515,111 @@ err_release_devices:
     mwan_l2_flow_manager_stop(new_cfg);
     mwan_config_release_devices(new_cfg);
     return err;
+}
+
+int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
+                                     const u32 *ifindices,
+                                     const u32 *weights,
+                                     u32 count)
+{
+    struct mwan_active_paths *new_paths;
+    struct mwan_active_paths *old_paths;
+    struct mwan_config *cfg;
+    u32 new_weights[MAX_MWAN_TUNNELS] = {0};
+    bool seen[MAX_MWAN_TUNNELS] = {false};
+    u32 total_weight = 0;
+    u32 i;
+    u32 j;
+    int ret = 0;
+
+    if (!node_id || !generation || !ifindices || !weights || !count ||
+        count > MAX_MWAN_TUNNELS)
+        return -EINVAL;
+
+    mutex_lock(&mwan_cfg_update_lock);
+    cfg = rcu_dereference_protected(g_mwan_cfg,
+                                    lockdep_is_held(&mwan_cfg_update_lock));
+    if (!cfg) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    if (cfg->node_id != node_id) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    if (cfg->generation != generation) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    if (count != cfg->num_tunnels) {
+        ret = -EINVAL;
+        goto out_unlock;
+    }
+
+    for (i = 0; i < count; i++) {
+        bool matched = false;
+
+        if (!ifindices[i] || !weights[i]) {
+            ret = -EINVAL;
+            goto out_unlock;
+        }
+        for (j = 0; j < cfg->num_tunnels; j++) {
+            if (cfg->tunnels[j].configured_ifindex != ifindices[i] &&
+                cfg->tunnels[j].ifindex != ifindices[i])
+                continue;
+            if (seen[j]) {
+                ret = -EINVAL;
+                goto out_unlock;
+            }
+            if (U32_MAX - total_weight < weights[i]) {
+                ret = -EOVERFLOW;
+                goto out_unlock;
+            }
+            seen[j] = true;
+            new_weights[j] = weights[i];
+            total_weight += weights[i];
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            ret = -ENOENT;
+            goto out_unlock;
+        }
+    }
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (!seen[i]) {
+            ret = -EINVAL;
+            goto out_unlock;
+        }
+    }
+
+    new_paths = mwan_active_paths_build_weights(cfg, new_weights);
+    if (!new_paths) {
+        ret = -ENOMEM;
+        goto out_unlock;
+    }
+
+    /* New-flow selection reads both weight and active_paths while holding
+     * this lock. Existing flows never consult either value and stay pinned. */
+    spin_lock_bh(&cfg->tunnel_balance_lock);
+    for (i = 0; i < cfg->num_tunnels; i++)
+        WRITE_ONCE(cfg->tunnels[i].weight, new_weights[i]);
+    cfg->total_weight = total_weight;
+    mwan_legacy_weight_lut_build(cfg, new_weights, total_weight);
+    old_paths = rcu_dereference_protected(
+        cfg->active_paths,
+        lockdep_is_held(&mwan_cfg_update_lock));
+    rcu_assign_pointer(cfg->active_paths, new_paths);
+    spin_unlock_bh(&cfg->tunnel_balance_lock);
+
+    synchronize_rcu();
+    kfree(old_paths);
+    pr_info("mwan_kmod: WEIGHT-UPDATE generation=%u tunnels=%u total=%u runtime_preserved=1\n",
+            generation, count, total_weight);
+
+out_unlock:
+    mutex_unlock(&mwan_cfg_update_lock);
+    return ret;
 }
 
 int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,

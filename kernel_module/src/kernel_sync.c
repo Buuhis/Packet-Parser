@@ -383,6 +383,89 @@ uint32_t kernel_sync_current_config_generation(void)
                            __ATOMIC_ACQUIRE);
 }
 
+int kernel_sync_update_tunnel_weights(const app_context_t *ctx)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    struct nlattr *tunnels;
+    uint32_t generation = kernel_sync_current_config_generation();
+    int family_id;
+    int ret = -EIO;
+    size_t i;
+
+    if (!ctx || ctx->cfg.node_id <= 0 || !generation ||
+        ctx->cfg.sdwan_tun_count == 0)
+        return -EINVAL;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_SET_TUNNEL_WEIGHTS, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID,
+                    (uint32_t)ctx->cfg.node_id) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+
+    tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
+    if (!tunnels) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    for (i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
+        struct nlattr *tun_node;
+        unsigned int ifindex;
+
+        ifindex = if_nametoindex(tun->tunnel_ifname);
+        if (!ifindex || tun->weight <= 0) {
+            ret = ifindex ? -EINVAL : -ENODEV;
+            goto out;
+        }
+        tun_node = nla_nest_start(msg, (int)i + 1);
+        if (!tun_node ||
+            nla_put_u32(msg, MWAN_TUN_IFINDEX, ifindex) < 0 ||
+            nla_put_u32(msg, MWAN_TUN_WEIGHT,
+                        (uint32_t)tun->weight) < 0) {
+            ret = -EMSGSIZE;
+            goto out;
+        }
+        nla_nest_end(msg, tun_node);
+    }
+    nla_nest_end(msg, tunnels);
+
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret >= 0) {
+        log_info("[WEIGHT-UPDATE] profile=%d generation=%u tunnels=%zu runtime_preserved=1",
+                 ctx->cfg.node_id, generation,
+                 ctx->cfg.sdwan_tun_count);
+        ret = 0;
+    }
+
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
 static int kernel_sync_pqc_key_command(uint8_t command, int profile_id,
                                        uint64_t epoch, uint8_t key_id,
                                        const uint8_t *key)

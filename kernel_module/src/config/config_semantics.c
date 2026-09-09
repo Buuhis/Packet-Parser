@@ -81,6 +81,31 @@ bool config_kernel_equal(const app_config_t *left,
     return true;
 }
 
+bool config_kernel_weight_only_changed(const app_config_t *left,
+                                       const app_config_t *right)
+{
+    bool weight_changed = false;
+    size_t i;
+
+    if (!left || !right ||
+        left->node_id != right->node_id ||
+        left->sdwan_tun_count != right->sdwan_tun_count ||
+        !encrypt_equal(&left->encrypt, &right->encrypt))
+        return false;
+
+    for (i = 0; i < left->sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *left_tun = &left->sdwan_tuns[i];
+        const sdwan_tun_cfg_t *right_tun = &right->sdwan_tuns[i];
+
+        if (strcmp(left_tun->tunnel_ifname,
+                   right_tun->tunnel_ifname) != 0)
+            return false;
+        if (left_tun->weight != right_tun->weight)
+            weight_changed = true;
+    }
+    return weight_changed;
+}
+
 bool config_failover_equal(const app_config_t *left,
                            const app_config_t *right)
 {

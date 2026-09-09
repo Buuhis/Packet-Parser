@@ -60,6 +60,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_RETIRE_PQC_KEY,   /* stop accepting and erase PREV */
     MWAN_CMD_GET_PQC_KEY_STATE,/* query key generations, never key material */
     MWAN_CMD_ABORT_PQC_KEY,    /* discard an uncommitted NEXT key */
+    MWAN_CMD_SET_TUNNEL_WEIGHTS, /* update weights without replacing runtime */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)

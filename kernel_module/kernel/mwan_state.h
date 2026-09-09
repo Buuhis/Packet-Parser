@@ -414,6 +414,10 @@ extern unsigned int mwan_l2_max_shed_pct;
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
 int mwan_state_update(struct mwan_config *new_cfg);
+int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
+                                     const u32 *ifindices,
+                                     const u32 *weights,
+                                     u32 count);
 int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
                                 u32 sequence, bool up);
 int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,
