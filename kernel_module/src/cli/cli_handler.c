@@ -1,5 +1,7 @@
 #include "cli/cli_handler.h"
+#include "config/config_semantics.h"
 #include "config/db_client.h"
+#include "failover.h"
 #include "kernel_sync.h"
 #include "runtime_config.h"
 #include "system/cpu_tune.h"
@@ -577,7 +579,8 @@ static void handle_del_profile(int client_fd, int profile_id,
 /* ---------- handle: edit <profile_id> <fields...> ----------------- */
 static void handle_edit_config_multi(int client_fd, int profile_id, const char *fields_str, app_context_t *ctx)
 {
-    app_context_t candidate;
+    app_context_t candidate = {0};
+    app_config_t refreshed = {0};
     uint64_t previous_config_generation = 0;
     uint64_t config_generation = 0;
 
@@ -587,6 +590,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     bool refresh_tunnels = false;
     bool refresh_pqc_keys = false;
     bool refresh_pqc_tunnels = false;
+    bool metadata_seen = false;
     bool unknown_prefix = false;
     char unknown_name[128] = {0};
 
@@ -601,6 +605,11 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     int token_count = 0;
     while (token != NULL) {
         token_count++;
+        if (config_edit_field_is_metadata(token)) {
+            metadata_seen = true;
+            token = strtok(NULL, " \t\r\n");
+            continue;
+        }
         if (strncmp(token, "sdwan_profiles.", 15) == 0) {
             refresh_profiles = true;
         } else if (strncmp(token, "sdwan_tunnels.", 14) == 0) {
@@ -631,33 +640,29 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         return;
     }
 
+    bool runtime_update_needed = false;
     bool sync_needed = false;
-    bool reload_pqc_lifecycle = refresh_profiles || refresh_pqc_keys ||
-                                refresh_pqc_tunnels;
+    bool failover_reconcile_needed = false;
+    bool reload_pqc_lifecycle = false;
     bool trigger_pqc_handshake = false;
-
-    if (reload_pqc_lifecycle)
-        config_generation = runtime_config_begin_reload(
-            &previous_config_generation);
-
-    runtime_config_lock();
-    candidate = *ctx;
 
     /* Profile weight_enable changes affect every tunnel's effective weight,
      * so profile and tunnel refreshes both reload one coherent snapshot. */
     if (refresh_profiles || refresh_tunnels) {
-        app_config_t refreshed;
         if (db_client_load_config(profile_id, &refreshed) != 0) {
-            runtime_config_unlock();
-            if (reload_pqc_lifecycle)
-                runtime_config_cancel_reload(config_generation,
-                                             previous_config_generation);
             reply_json(client_fd, 500, "Failed to reload profile config from DB");
             return;
         }
+    }
+
+    runtime_config_lock();
+    candidate = *ctx;
+
+    if (refresh_profiles || refresh_tunnels) {
 
         /* Keep an already-derived PQC session key until the requested
-         * handshake refresh below replaces it. */
+         * handshake refresh below replaces it. The DB intentionally does
+         * not contain this ephemeral traffic key. */
         if (ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
             ctx->cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
             refreshed.encrypt.type == MWAN_CRYPT_PQC_GCM) {
@@ -666,7 +671,43 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
             refreshed.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
         }
         candidate.cfg = refreshed;
-        sync_needed = true;
+        runtime_update_needed = !config_runtime_equal(&ctx->cfg,
+                                                      &candidate.cfg);
+        sync_needed = !config_kernel_equal(&ctx->cfg, &candidate.cfg);
+        failover_reconcile_needed = !config_failover_equal(
+            &ctx->cfg, &candidate.cfg);
+        if (runtime_update_needed)
+            reload_pqc_lifecycle = config_pqc_policy_changed(
+                &ctx->cfg, &candidate.cfg);
+    }
+
+    if (refresh_pqc_keys || refresh_pqc_tunnels)
+        reload_pqc_lifecycle = true;
+    runtime_config_unlock();
+
+    if (!runtime_update_needed && !reload_pqc_lifecycle) {
+        log_info("[EDIT] NOOP profile=%d metadata=%d; runtime datapath unchanged",
+                 profile_id, metadata_seen ? 1 : 0);
+        reply_json(client_fd, 200,
+                   "Config updated; runtime datapath unchanged");
+        return;
+    }
+
+    if (reload_pqc_lifecycle)
+        config_generation = runtime_config_begin_reload(
+            &previous_config_generation);
+
+    runtime_config_lock();
+
+    /* A PQC key callback may have completed between the DB read and this
+     * commit. Preserve that newest runtime key in the candidate as well. */
+    if (sync_needed &&
+        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+        ctx->cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
+        candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        memcpy(candidate.cfg.encrypt.key, ctx->cfg.encrypt.key,
+               PQC_TRAFFIC_KEY_SZ);
+        candidate.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
     }
 
     // 3. Sync config to kernel if needed
@@ -683,15 +724,32 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
                  profile_id);
         log_info("[EDIT] Config changes successfully synced to kernel");
+    } else if (runtime_update_needed) {
+        /* Monitoring and other userspace-only values must be refreshed in
+         * the active snapshot without replacing the kernel datapath. */
+        *ctx = candidate;
+        log_info("[EDIT] Userspace config refreshed for profile %d without kernel reload",
+                 profile_id);
     }
 
-    // 4. Trigger PQC handshake if PQC encryption is active and PQC params or profiles refreshed
-    if (ctx->cfg.encrypt.enabled && ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-        if (refresh_pqc_keys || refresh_pqc_tunnels || refresh_profiles) {
-            trigger_pqc_handshake = true;
-        }
-    }
+    /* Weight, monitoring and other non-PQC profile changes must not disturb
+     * an established PQC session. A new handshake is needed only when the
+     * PQC lifecycle was deliberately reloaded above. */
+    if (reload_pqc_lifecycle && ctx->cfg.encrypt.enabled &&
+        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM)
+        trigger_pqc_handshake = true;
     runtime_config_unlock();
+
+    if (failover_reconcile_needed && !sync_needed) {
+        uint32_t kernel_generation =
+            kernel_sync_current_config_generation();
+        int failover_rc = failover_service_reconcile(&candidate,
+                                                      kernel_generation);
+
+        if (failover_rc != 0)
+            log_warn("[EDIT] BFD reconcile deferred for profile %d: %s",
+                     profile_id, strerror(-failover_rc));
+    }
 
     if (reload_pqc_lifecycle) {
         sig_pqc_prepare_reload();
