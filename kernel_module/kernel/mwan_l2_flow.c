@@ -408,6 +408,28 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                     atomic_set(&flow->balance_counted, 1);
                 }
             } else if (allow_tunnel_remap &&
+                       READ_ONCE(flow->tunnel_idx) !=
+                           READ_ONCE(flow->home_tunnel_idx) &&
+                       !atomic_read(&flow->pending_crypto) &&
+                       refcount_read(&flow->refs) == 1 &&
+                       mwan_tunnel_balance_is_active(
+                           cfg, READ_ONCE(flow->home_tunnel_idx))) {
+                u16 old_tunnel_idx = READ_ONCE(flow->tunnel_idx);
+                u16 home_tunnel_idx = READ_ONCE(flow->home_tunnel_idx);
+                bool old_counted =
+                    atomic_read(&flow->balance_counted) != 0;
+
+                /* The single remaining reference belongs to the flow table;
+                 * together with pending_crypto == 0 this proves that no
+                 * packet is queued, in flight, or already preselected on the
+                 * old path. Preserve the sticky worker, token and sequence. */
+                tunnel_idx = mwan_tunnel_balance_move_flow(
+                    cfg, old_tunnel_idx, home_tunnel_idx, old_counted);
+                if (!tunnel_idx) {
+                    WRITE_ONCE(flow->tunnel_idx, home_tunnel_idx);
+                    atomic_set(&flow->balance_counted, 1);
+                }
+            } else if (allow_tunnel_remap &&
                        !READ_ONCE(flow->closing) &&
                        atomic_cmpxchg(&flow->balance_counted, 0, 1) == 0) {
                 mwan_tunnel_balance_activate_flow(cfg,
@@ -462,6 +484,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     atomic_set(&candidate->worker_counted, 1);
     spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
+    candidate->home_tunnel_idx = (u16)tunnel_idx;
     candidate->tunnel_idx = (u16)tunnel_idx;
     candidate->last_seen = jiffies;
     INIT_HLIST_NODE(&candidate->node);

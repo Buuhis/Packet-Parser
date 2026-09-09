@@ -149,6 +149,10 @@ struct mwan_l2_tx_flow {
      * to enter its sticky owner's FIFO. */
     spinlock_t submit_lock;
     int owner_worker;
+    /* Keep the path chosen when the flow was admitted. Failover changes only
+     * tunnel_idx, so a recovered path can be restored without re-hashing or
+     * disturbing flows that were never failed over. */
+    u16 home_tunnel_idx;
     u16 tunnel_idx;
     unsigned long last_seen;
     bool closing;

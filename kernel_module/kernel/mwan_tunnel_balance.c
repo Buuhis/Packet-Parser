@@ -292,6 +292,39 @@ int mwan_tunnel_balance_reassign_flow(struct mwan_config *cfg,
     return selected >= 0 ? selected : -ENETDOWN;
 }
 
+int mwan_tunnel_balance_move_flow(struct mwan_config *cfg,
+                                  u16 old_tunnel_idx, u16 new_tunnel_idx,
+                                  bool old_counted)
+{
+    int ret = 0;
+
+    if (!cfg || old_tunnel_idx >= cfg->num_tunnels ||
+        new_tunnel_idx >= cfg->num_tunnels)
+        return -EINVAL;
+
+    spin_lock_bh(&cfg->tunnel_balance_lock);
+    if (!mwan_tunnel_balance_is_active(cfg, new_tunnel_idx)) {
+        ret = -ENETDOWN;
+        goto out_unlock;
+    }
+
+    if (new_tunnel_idx != old_tunnel_idx) {
+        atomic_inc(&cfg->tunnels[new_tunnel_idx].balance_active_flows);
+        atomic_inc(&cfg->tunnels[new_tunnel_idx].balance_admitted_flows);
+        if (old_counted)
+            atomic_add_unless(
+                &cfg->tunnels[old_tunnel_idx].balance_active_flows,
+                -1, 0);
+    } else if (!old_counted) {
+        atomic_inc(&cfg->tunnels[new_tunnel_idx].balance_active_flows);
+        atomic_inc(&cfg->tunnels[new_tunnel_idx].balance_admitted_flows);
+    }
+
+out_unlock:
+    spin_unlock_bh(&cfg->tunnel_balance_lock);
+    return ret;
+}
+
 void mwan_tunnel_balance_release_flow(struct mwan_config *cfg,
                                       u16 tunnel_idx)
 {
