@@ -31,6 +31,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NEXT_KEY] = NLA_POLICY_EXACT_LEN(MWAN_MAX_KEY_LEN),
     [MWAN_ATTR_NEXT_KEY_ID] = { .type = NLA_U8 },
     [MWAN_ATTR_KEY_STATE] = { .type = NLA_U8 },
+    [MWAN_ATTR_NEW_IFINDEX] = { .type = NLA_U32 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -269,6 +270,23 @@ static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
         nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
         nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
         ifindices, weights, count);
+}
+
+static int mwan_genl_rebind_tunnel(struct sk_buff *skb,
+                                   struct genl_info *info)
+{
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !info->attrs[MWAN_ATTR_NEW_IFINDEX])
+        return -EINVAL;
+
+    return mwan_state_rebind_tunnel(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]),
+        nla_get_u32(info->attrs[MWAN_ATTR_NEW_IFINDEX]));
 }
 
 static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
@@ -577,6 +595,12 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = 0,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_set_tunnel_weights,
+    },
+    {
+        .cmd    = MWAN_CMD_REBIND_TUNNEL,
+        .flags  = 0,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_rebind_tunnel,
     },
 };
 

@@ -25,6 +25,8 @@ struct tunnel_peer_reply {
 
 struct tunnel_state_reply {
     unsigned int expected_ifindex;
+    uint32_t generation;
+    uint32_t sequence;
     bool up;
     bool received;
     bool valid;
@@ -161,12 +163,16 @@ static int kernel_sync_tunnel_state_valid_cb(struct nl_msg *msg, void *arg)
     if (!ghdr || ghdr->cmd != MWAN_CMD_GET_TUNNEL_STATE ||
         genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
         !attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !attrs[MWAN_ATTR_STATE_SEQUENCE] ||
         !attrs[MWAN_ATTR_TUNNEL_STATE] ||
         nla_get_u32(attrs[MWAN_ATTR_QUERY_IFINDEX]) !=
             reply->expected_ifindex ||
         nla_get_u8(attrs[MWAN_ATTR_TUNNEL_STATE]) > 1)
         return NL_STOP;
 
+    reply->generation = nla_get_u32(attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    reply->sequence = nla_get_u32(attrs[MWAN_ATTR_STATE_SEQUENCE]);
     reply->up = nla_get_u8(attrs[MWAN_ATTR_TUNNEL_STATE]) != 0;
     reply->valid = true;
     return NL_STOP;
@@ -607,20 +613,17 @@ out:
     return ret;
 }
 
-int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
-                                 uint32_t sequence, bool up)
+int kernel_sync_set_tunnel_state_by_ifindex(unsigned int ifindex,
+                                            uint32_t generation,
+                                            uint32_t sequence, bool up)
 {
     struct nl_sock *sock = NULL;
     struct nl_msg *msg = NULL;
-    unsigned int ifindex;
     int family_id;
     int ret = -EIO;
 
-    if (!ifname || !ifname[0] || generation == 0 || sequence == 0)
+    if (ifindex == 0 || generation == 0 || sequence == 0)
         return -EINVAL;
-    ifindex = if_nametoindex(ifname);
-    if (ifindex == 0)
-        return -ENODEV;
 
     sock = nl_socket_alloc();
     if (!sock)
@@ -660,22 +663,33 @@ out:
     return ret;
 }
 
-int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
+int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
+                                 uint32_t sequence, bool up)
+{
+    unsigned int ifindex;
+
+    if (!ifname || !ifname[0])
+        return -EINVAL;
+    ifindex = if_nametoindex(ifname);
+    if (!ifindex)
+        return -ENODEV;
+    return kernel_sync_set_tunnel_state_by_ifindex(
+        ifindex, generation, sequence, up);
+}
+
+int kernel_sync_get_tunnel_state_by_ifindex(
+    unsigned int ifindex, struct kernel_tunnel_state *state)
 {
     struct tunnel_state_reply reply = {0};
     struct nl_sock *sock = NULL;
     struct nl_msg *msg = NULL;
-    unsigned int ifindex;
     int kernel_error = 0;
     int family_id;
     int nl_rc;
     int ret = -EIO;
 
-    if (!ifname || !ifname[0] || !up)
+    if (ifindex == 0 || !state)
         return -EINVAL;
-    ifindex = if_nametoindex(ifname);
-    if (ifindex == 0)
-        return -ENODEV;
     reply.expected_ifindex = ifindex;
 
     sock = nl_socket_alloc();
@@ -735,9 +749,76 @@ int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
         ret = -EPROTO;
         goto out;
     }
-    *up = reply.up;
+    state->generation = reply.generation;
+    state->sequence = reply.sequence;
+    state->up = reply.up;
     ret = 0;
 
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_get_tunnel_status(const char *ifname, bool *up)
+{
+    struct kernel_tunnel_state state;
+    unsigned int ifindex;
+    int ret;
+
+    if (!ifname || !ifname[0] || !up)
+        return -EINVAL;
+    ifindex = if_nametoindex(ifname);
+    if (!ifindex)
+        return -ENODEV;
+    ret = kernel_sync_get_tunnel_state_by_ifindex(ifindex, &state);
+    if (!ret)
+        *up = state.up;
+    return ret;
+}
+
+int kernel_sync_rebind_tunnel(int node_id, uint32_t generation,
+                              unsigned int old_ifindex,
+                              unsigned int new_ifindex)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    int family_id;
+    int ret = -EIO;
+
+    if (node_id <= 0 || !generation || !old_ifindex || !new_ifindex)
+        return -EINVAL;
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    if (genl_connect(sock) < 0)
+        goto out;
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = -ENODEV;
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_REBIND_TUNNEL, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID, (uint32_t)node_id) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_QUERY_IFINDEX, old_ifindex) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_NEW_IFINDEX, new_ifindex) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret >= 0)
+        ret = 0;
 out:
     if (msg)
         nlmsg_free(msg);

@@ -122,7 +122,10 @@ bool config_failover_equal(const app_config_t *left,
 
         if (strcmp(left_tun->tunnel_ifname,
                    right_tun->tunnel_ifname) != 0 ||
-            strcmp(left_tun->tunnel_ip, right_tun->tunnel_ip) != 0)
+            strcmp(left_tun->physical_ifname,
+                   right_tun->physical_ifname) != 0 ||
+            strcmp(left_tun->tunnel_ip, right_tun->tunnel_ip) != 0 ||
+            left_tun->segment_id != right_tun->segment_id)
             return false;
     }
     return true;

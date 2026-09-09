@@ -1596,3 +1596,12 @@ void mwan_multicore_cleanup(void)
         mwan_tx_wq = NULL;
     }
 }
+
+/* A tunnel rebind changes the net_device referenced by one stable tunnel
+ * slot.  Drain packets selected before the tunnel was published DOWN before
+ * that pointer is replaced; no worker or flow state is reset here. */
+void mwan_l2_workers_flush(void)
+{
+    if (mwan_tx_wq)
+        flush_workqueue(mwan_tx_wq);
+}

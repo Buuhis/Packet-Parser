@@ -61,6 +61,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_GET_PQC_KEY_STATE,/* query key generations, never key material */
     MWAN_CMD_ABORT_PQC_KEY,    /* discard an uncommitted NEXT key */
     MWAN_CMD_SET_TUNNEL_WEIGHTS, /* update weights without replacing runtime */
+    MWAN_CMD_REBIND_TUNNEL,    /* replace one DOWN tunnel's net_device */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -88,6 +89,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_NEXT_KEY,          /* NLA_BINARY: staged 32-byte PQC key */
     MWAN_ATTR_NEXT_KEY_ID,       /* u8: staged traffic-key generation */
     MWAN_ATTR_KEY_STATE,         /* u8: enum mwan_pqc_key_state */
+    MWAN_ATTR_NEW_IFINDEX,       /* u32: replacement data-tunnel ifindex */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

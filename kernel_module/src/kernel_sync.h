@@ -34,6 +34,12 @@ struct kernel_pqc_key_state {
     uint8_t prev_id;
     uint8_t next_id;
 };
+
+struct kernel_tunnel_state {
+    uint32_t generation;
+    uint32_t sequence;
+    bool up;
+};
 int kernel_sync_get_pqc_key_state(int profile_id,
                                   struct kernel_pqc_key_state *state);
 
@@ -43,7 +49,15 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
                                 size_t peer_ip_len);
 int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
                                  uint32_t sequence, bool up);
+int kernel_sync_set_tunnel_state_by_ifindex(unsigned int ifindex,
+                                            uint32_t generation,
+                                            uint32_t sequence, bool up);
 int kernel_sync_get_tunnel_status(const char *ifname, bool *up);
+int kernel_sync_get_tunnel_state_by_ifindex(
+    unsigned int ifindex, struct kernel_tunnel_state *state);
+int kernel_sync_rebind_tunnel(int node_id, uint32_t generation,
+                              unsigned int old_ifindex,
+                              unsigned int new_ifindex);
 
 /* Cleans up any resources */
 void kernel_sync_cleanup(void);

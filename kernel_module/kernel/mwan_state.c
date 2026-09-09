@@ -724,6 +724,122 @@ out:
     return ret;
 }
 
+int mwan_state_rebind_tunnel(u32 node_id, u32 generation,
+                             u32 old_ifindex, u32 new_ifindex)
+{
+    struct net_device *configured_dev;
+    struct net_device *replacement_dev;
+    struct net_device *upper_dev;
+    struct net_device *old_dev = NULL;
+    struct net_device *macsec_dev = NULL;
+    struct mwan_config *cfg;
+    struct mwan_tunnel *tun = NULL;
+    struct list_head *iter;
+    u32 effective_ifindex;
+    u32 i;
+    int ret = 0;
+
+    if (!node_id || !generation || !old_ifindex || !new_ifindex)
+        return -EINVAL;
+
+    configured_dev = dev_get_by_index(&init_net, new_ifindex);
+    if (!configured_dev)
+        return -ENODEV;
+    replacement_dev = configured_dev;
+
+    /* Match full-config setup: when MACsec is stacked on the configured
+     * tunnel, data must continue to use that upper device. */
+    rcu_read_lock();
+    netdev_for_each_upper_dev_rcu(configured_dev, upper_dev, iter) {
+        if (upper_dev->rtnl_link_ops && upper_dev->rtnl_link_ops->kind &&
+            strcmp(upper_dev->rtnl_link_ops->kind, "macsec") == 0) {
+            dev_hold(upper_dev);
+            macsec_dev = upper_dev;
+            break;
+        }
+    }
+    rcu_read_unlock();
+    if (macsec_dev) {
+        replacement_dev = macsec_dev;
+        dev_put(configured_dev);
+    }
+    effective_ifindex = replacement_dev->ifindex;
+
+    mutex_lock(&mwan_cfg_update_lock);
+    cfg = rcu_dereference_protected(g_mwan_cfg,
+                                    lockdep_is_held(&mwan_cfg_update_lock));
+    if (!cfg) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    if (cfg->node_id != node_id || cfg->generation != generation) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].configured_ifindex == old_ifindex ||
+            cfg->tunnels[i].ifindex == old_ifindex) {
+            tun = &cfg->tunnels[i];
+            break;
+        }
+    }
+    if (!tun) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        const struct mwan_tunnel *other = &cfg->tunnels[i];
+
+        if (other == tun)
+            continue;
+        if (other->configured_ifindex == new_ifindex ||
+            other->ifindex == new_ifindex ||
+            other->configured_ifindex == effective_ifindex ||
+            other->ifindex == effective_ifindex) {
+            ret = -EEXIST;
+            goto out_unlock;
+        }
+    }
+    if (tun->published_up) {
+        ret = -EBUSY;
+        goto out_unlock;
+    }
+
+    /* SET_TUNNEL_STATE(DOWN) has already removed this slot from the active
+     * RCU path view.  The BFD socket is then stopped by userspace.  Wait for
+     * any last exact-path probe/data reader and finish queued packets before
+     * replacing the cached device. */
+    synchronize_rcu();
+    mwan_l2_workers_flush();
+    old_dev = tun->dev;
+    tun->dev = replacement_dev;
+    replacement_dev = NULL;
+    tun->configured_ifindex = new_ifindex;
+    tun->ifindex = effective_ifindex;
+    tun->is_ethernet = tun->dev->type == ARPHRD_ETHER;
+    spin_lock_bh(&tun->gateway_mac_lock);
+    eth_zero_addr(tun->gateway_mac);
+    tun->mac_resolved = false;
+    tun->peer_tunnel_ip = 0;
+    tun->peer_ip_resolved = false;
+    tun->discovery_nonce = 0;
+    spin_unlock_bh(&tun->gateway_mac_lock);
+
+    /* Discovery readers use cfg under RCU and may still hold old_dev. */
+    synchronize_rcu();
+    if (old_dev)
+        dev_put(old_dev);
+    pr_info("mwan_kmod: TUNNEL-REBIND old_ifindex=%u configured_ifindex=%u effective_ifindex=%u state=DOWN runtime_preserved=1\n",
+            old_ifindex, new_ifindex, effective_ifindex);
+    mwan_mac_discovery_kick();
+
+out_unlock:
+    mutex_unlock(&mwan_cfg_update_lock);
+    if (replacement_dev)
+        dev_put(replacement_dev);
+    return ret;
+}
+
 void mwan_state_count_no_active_drop(void)
 {
     atomic64_inc(&no_active_tunnel_drops);
