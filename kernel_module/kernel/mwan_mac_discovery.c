@@ -60,6 +60,25 @@ static bool mwan_mac_is_resolved(struct mwan_tunnel *tun)
     return resolved;
 }
 
+/* Return true once for each unresolved episode.  The flag is diagnostic only:
+ * callers continue sending every discovery request on the normal schedule. */
+static bool mwan_mac_report_unresolved_once(struct mwan_tunnel *tun)
+{
+    bool report = false;
+    bool resolved;
+
+    spin_lock_bh(&tun->gateway_mac_lock);
+    resolved = tun->mac_resolved &&
+               is_valid_ether_addr(tun->gateway_mac) &&
+               tun->peer_ip_resolved && tun->peer_tunnel_ip != 0;
+    if (!resolved && !tun->discovery_unresolved_reported) {
+        tun->discovery_unresolved_reported = true;
+        report = true;
+    }
+    spin_unlock_bh(&tun->gateway_mac_lock);
+    return report;
+}
+
 bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[ETH_ALEN])
 {
     bool resolved;
@@ -98,13 +117,13 @@ bool mwan_mac_get_peer_tunnel_ip(struct mwan_tunnel *tun,
     return resolved;
 }
 
-static void mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
+static bool mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
                                 __be32 peer_tunnel_ip)
 {
     bool changed;
 
     if (!tun || !is_valid_ether_addr(mac) || peer_tunnel_ip == 0)
-        return;
+        return false;
 
     spin_lock_bh(&tun->gateway_mac_lock);
     changed = !tun->mac_resolved || !tun->peer_ip_resolved ||
@@ -114,12 +133,14 @@ static void mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
     tun->mac_resolved = true;
     tun->peer_tunnel_ip = peer_tunnel_ip;
     tun->peer_ip_resolved = true;
+    tun->discovery_unresolved_reported = false;
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     if (changed)
         pr_info("mwan_kmod: learned peer MAC %pM and tunnel IP %pI4 on data tunnel %s\n",
                 mac, &peer_tunnel_ip,
                 tun->dev ? tun->dev->name : "unknown");
+    return changed;
 }
 
 /* Caller holds rcu_read_lock(). A data tunnel is point-to-point and is
@@ -215,6 +236,7 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     struct mwan_config *cfg;
     u64 nonce;
     bool nonce_matches = true;
+    bool peer_changed;
     int ingress_ifindex;
 
     (void)pt;
@@ -267,7 +289,8 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     /* The ingress ifindex identifies the point-to-point data tunnel. The
      * source MAC comes from Ethernet; peer tunnel IP is explicitly carried
      * in the discovery payload and is never inferred from a subnet. */
-    mwan_mac_learn_peer(tun, eth->h_source, hdr->tunnel_ip);
+    peer_changed = mwan_mac_learn_peer(tun, eth->h_source,
+                                       hdr->tunnel_ip);
     if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST) {
         int response_ret = mwan_mac_send(
             tun, eth->h_source, MWAN_MAC_DISCOVERY_RESPONSE,
@@ -278,10 +301,10 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
                                 tun->dev ? tun->dev->name : "unknown",
                                 tun->dev ? tun->dev->ifindex : 0,
                                 response_ret);
-        else
-            pr_info_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d\n",
-                                tun->dev ? tun->dev->name : "unknown",
-                                tun->dev ? tun->dev->ifindex : 0);
+        else if (peer_changed)
+            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED\n",
+                    tun->dev ? tun->dev->name : "unknown",
+                    tun->dev ? tun->dev->ifindex : 0);
     }
     rcu_read_unlock();
 
@@ -325,9 +348,10 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
                                     tun->dev->name, tun->dev->ifindex,
                                     send_ret,
                                     mwan_mac_is_resolved(tun) ? 1 : 0);
-            else if (!tunnel_resolved)
-                pr_info_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=REQUEST_SENT tunnel=%s ifindex=%d\n",
-                                    tun->dev->name, tun->dev->ifindex);
+            else if (!tunnel_resolved &&
+                     mwan_mac_report_unresolved_once(tun))
+                pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=REQUEST_SENT tunnel=%s ifindex=%d peer_state=UNRESOLVED\n",
+                        tun->dev->name, tun->dev->ifindex);
         }
     }
     rcu_read_unlock();

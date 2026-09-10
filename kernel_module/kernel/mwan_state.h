@@ -95,6 +95,8 @@ struct mwan_tunnel {
     __be32 peer_tunnel_ip;
     u64 discovery_nonce;
     bool peer_ip_resolved;
+    /* Logging edge only; discovery retries do not depend on this flag. */
+    bool discovery_unresolved_reported;
     bool is_ethernet;
     bool published_up;
     u32 state_sequence;

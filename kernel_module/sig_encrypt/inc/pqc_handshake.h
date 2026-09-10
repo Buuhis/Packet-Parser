@@ -99,6 +99,11 @@ typedef struct {
     uint64_t keepalive_monitor_start_time;
     uint64_t last_keepalive_rx_time;
     uint64_t next_auto_retry_time;
+    /* Logging-only coalescing; liveness/failover never consult these fields. */
+    uint64_t keepalive_unreachable_log_time;
+    uint64_t keepalive_restored_log_time;
+    uint32_t keepalive_unreachable_suppressed;
+    uint32_t keepalive_restored_suppressed;
 
     char *local_priv;
     char *local_pub;

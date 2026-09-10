@@ -143,6 +143,8 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
                 new_tun->peer_ip_resolved =
                     old_tun->peer_ip_resolved;
                 new_tun->discovery_nonce = old_tun->discovery_nonce;
+                new_tun->discovery_unresolved_reported =
+                    old_tun->discovery_unresolved_reported;
                 spin_unlock_bh(&new_tun->gateway_mac_lock);
             }
             spin_unlock_bh(&old_tun->gateway_mac_lock);
@@ -287,6 +289,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
         tun->peer_tunnel_ip = 0;
         tun->discovery_nonce = 0;
         tun->peer_ip_resolved = false;
+        tun->discovery_unresolved_reported = false;
         if (U32_MAX - new_cfg->total_weight < tun->weight) {
             pr_err("mwan_kmod: Tunnel weight sum overflow\n");
             err = -EOVERFLOW;
@@ -823,6 +826,7 @@ int mwan_state_rebind_tunnel(u32 node_id, u32 generation,
     tun->peer_tunnel_ip = 0;
     tun->peer_ip_resolved = false;
     tun->discovery_nonce = 0;
+    tun->discovery_unresolved_reported = false;
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     /* Discovery readers use cfg under RCU and may still hold old_dev. */

@@ -23,7 +23,7 @@
 #include <limits.h>
 
 #define PQC_RX_PKT_MAX     10000
-#define KEY_ROTATION_INTERVAL_MS 3000000
+#define KEY_ROTATION_INTERVAL_MS (30ULL * 24ULL * 60ULL * 60ULL * 1000ULL)
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 #define PQC_WORKER_STOP_TIMEOUT_MS 3000
 #define PQC_HS_REQUEST_RETRY_MS 1000
@@ -32,6 +32,7 @@
 #define PQC_HS_KEEPALIVE_MISSED_LIMIT 3
 #define PQC_HS_KEEPALIVE_TIMEOUT_MS \
     (PQC_HS_KEEPALIVE_INTERVAL_MS * PQC_HS_KEEPALIVE_MISSED_LIMIT)
+#define PQC_HS_KEEPALIVE_LOG_COALESCE_MS (5ULL * 60ULL * 1000ULL)
 #define PQC_HS_AUTO_RETRY_INTERVAL_MS 15000
 #define PQC_HS_KEY_FINGERPRINT_SZ 32
 #define PQC_HS_STATE_READY 1
@@ -170,6 +171,27 @@ static bool pqc_hs_diag_changed(int *last_status, int new_status) {
     if (!last_status || *last_status == new_status)
         return false;
     *last_status = new_status;
+    return true;
+}
+
+/* Called with g_key_mutex held.  Preserve the first occurrence of each
+ * liveness edge, then coalesce repetitions of that edge for five minutes. */
+static bool pqc_hs_keepalive_log_allowed(uint64_t now,
+                                         uint64_t *last_log_time,
+                                         uint32_t *suppressed,
+                                         uint32_t *previously_suppressed) {
+    if (!last_log_time || !suppressed || !previously_suppressed)
+        return true;
+    *previously_suppressed = 0;
+    if (*last_log_time != 0 && now >= *last_log_time &&
+        now - *last_log_time < PQC_HS_KEEPALIVE_LOG_COALESCE_MS) {
+        if (*suppressed < UINT32_MAX)
+            (*suppressed)++;
+        return false;
+    }
+    *previously_suppressed = *suppressed;
+    *suppressed = 0;
+    *last_log_time = now;
     return true;
 }
 
@@ -734,10 +756,8 @@ static void handle_handshake_success(policy_key_binding_t *b,
     }
 
     fprintf(stderr,
-            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
-            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT],
-            derived_master[0], derived_master[1], derived_master[2],
-            derived_master[3]);
+            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT.\n",
+            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT]);
 
 }
 
@@ -1504,6 +1524,8 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             uint8_t local_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ];
             const char *recovery_reason = NULL;
             bool peer_was_unreachable;
+            bool log_peer_restored = false;
+            uint32_t restored_suppressed = 0;
             int verify_rc;
 
             memset(&peer_status, 0, sizeof(peer_status));
@@ -1541,9 +1563,20 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             b->keepalive_peer_unreachable = false;
 
             if (peer_was_unreachable) {
-                fprintf(stderr,
-                        "[PQC-HS-L3] Signed keepalive reception restored for Profile %d; evaluating peer key state.\n",
-                        b->profile_id);
+                log_peer_restored = pqc_hs_keepalive_log_allowed(
+                    b->last_keepalive_rx_time,
+                    &b->keepalive_restored_log_time,
+                    &b->keepalive_restored_suppressed,
+                    &restored_suppressed);
+                if (log_peer_restored) {
+                    if (restored_suppressed > 0)
+                        fprintf(stderr,
+                                "[PQC-HS-L3] Profile %d coalesced %u additional keepalive-restored transitions.\n",
+                                b->profile_id, restored_suppressed);
+                    fprintf(stderr,
+                            "[PQC-HS-L3] Signed keepalive reception restored for Profile %d; evaluating peer key state.\n",
+                            b->profile_id);
+                }
             }
 
             local_state = pqc_hs_l3_state_locked(b);
@@ -2009,9 +2042,11 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         bool keepalive_enabled;
         bool handshake_give_up;
         bool keepalive_timeout_detected = false;
+        bool log_keepalive_timeout = false;
         bool auto_retry_started = false;
         bool flush_rx_queue = false;
         uint8_t keepalive_state = PQC_HS_STATE_FAILED;
+        uint32_t unreachable_suppressed = 0;
 
         pthread_mutex_lock(&g_key_mutex);
         if (b->keepalive_enabled && b->key_ready) {
@@ -2029,6 +2064,10 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                  * decide whether a standard handshake is actually needed. */
                 b->keepalive_peer_unreachable = true;
                 keepalive_timeout_detected = true;
+                log_keepalive_timeout = pqc_hs_keepalive_log_allowed(
+                    loop_now, &b->keepalive_unreachable_log_time,
+                    &b->keepalive_unreachable_suppressed,
+                    &unreachable_suppressed);
             }
         }
 
@@ -2051,11 +2090,16 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
 
         if (flush_rx_queue)
             pqc_flush_rx_queue(b);
-        if (keepalive_timeout_detected) {
+        if (keepalive_timeout_detected && log_keepalive_timeout) {
+            if (unreachable_suppressed > 0)
+                fprintf(stderr,
+                        "[PQC-HS-L3] Profile %d coalesced %u additional peer-unreachable transitions.\n",
+                        profile_id, unreachable_suppressed);
             fprintf(stderr,
                     "[PQC-HS-L3] Profile %d missed %d keepalive intervals; peer marked unreachable and CURRENT retained.\n",
                     profile_id, PQC_HS_KEEPALIVE_MISSED_LIMIT);
-        } else if (auto_retry_started) {
+        }
+        if (auto_retry_started) {
             fprintf(stderr,
                     "[PQC-HS-L3] Profile %d automatically retrying after handshake give-up as %s.\n",
                     profile_id,

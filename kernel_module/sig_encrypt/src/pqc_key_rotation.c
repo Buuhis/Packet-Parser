@@ -131,11 +131,9 @@ int pqc_key_rotation_activate(pqc_key_rotation_t *rotation, int profile_id,
     rotation->state = PQC_REKEY_ACTIVE_WITH_PREV;
     rotation->activated_ms = now_ms;
     fprintf(stderr,
-            "[PQC-REKEY] Profile %d COMMIT epoch=%llu current=%u prev=%u Key prefix: %02X%02X%02X%02X...\n",
+            "[PQC-REKEY] Profile %d COMMIT epoch=%llu current=%u prev=%u.\n",
             profile_id, (unsigned long long)rotation->epoch,
-            key_ids[KEY_SLOT_CURRENT], key_ids[KEY_SLOT_PREV],
-            keys[KEY_SLOT_CURRENT][0], keys[KEY_SLOT_CURRENT][1],
-            keys[KEY_SLOT_CURRENT][2], keys[KEY_SLOT_CURRENT][3]);
+            key_ids[KEY_SLOT_CURRENT], key_ids[KEY_SLOT_PREV]);
     return 0;
 }
 
