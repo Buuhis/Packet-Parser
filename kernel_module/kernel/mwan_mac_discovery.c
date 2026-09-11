@@ -5,11 +5,14 @@
 #include <linux/if_arp.h>
 #include <linux/inetdevice.h>
 #include <linux/jiffies.h>
+#include <linux/mutex.h>
 #include <linux/netdevice.h>
 #include <linux/random.h>
 #include <linux/rcupdate.h>
+#include <linux/slab.h>
 #include <linux/skbuff.h>
 #include <linux/workqueue.h>
+#include <net/rtnetlink.h>
 
 #define MWAN_MAC_DISCOVERY_ETHERTYPE 0x88B6
 #define MWAN_MAC_DISCOVERY_MAGIC     0x4d574d44U /* "MWMD" */
@@ -34,6 +37,19 @@ static DECLARE_DELAYED_WORK(mwan_mac_discovery_work,
                             mwan_mac_discovery_workfn);
 static bool mwan_mac_discovery_running;
 
+/* Discovery must be able to identify data tunnels before an authenticated
+ * PQC traffic key exists.  This pending registry is control-plane only: it is
+ * never visible to packet steering, crypto workers or active_paths. */
+struct mwan_mac_pending_config {
+    u32 node_id;
+    u32 generation;
+    u32 num_tunnels;
+    struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
+};
+
+static DEFINE_MUTEX(mwan_mac_pending_lock);
+static struct mwan_mac_pending_config __rcu *mwan_mac_pending_cfg;
+
 static struct mwan_tunnel *mwan_mac_find_tunnel(struct mwan_config *cfg,
                                                  int ifindex)
 {
@@ -42,10 +58,361 @@ static struct mwan_tunnel *mwan_mac_find_tunnel(struct mwan_config *cfg,
     if (!cfg)
         return NULL;
     for (i = 0; i < cfg->num_tunnels; i++) {
-        if (cfg->tunnels[i].ifindex == ifindex)
+        if (cfg->tunnels[i].ifindex == ifindex ||
+            cfg->tunnels[i].configured_ifindex == ifindex)
             return &cfg->tunnels[i];
     }
     return NULL;
+}
+
+static struct mwan_tunnel *mwan_mac_find_pending_tunnel(
+    struct mwan_mac_pending_config *cfg, int ifindex)
+{
+    u32 i;
+
+    if (!cfg)
+        return NULL;
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].ifindex == ifindex ||
+            cfg->tunnels[i].configured_ifindex == ifindex)
+            return &cfg->tunnels[i];
+    }
+    return NULL;
+}
+
+static struct net_device *mwan_mac_effective_dev(u32 configured_ifindex)
+{
+    struct net_device *configured_dev;
+    struct net_device *upper_dev;
+    struct net_device *macsec_dev = NULL;
+    struct list_head *iter;
+
+    configured_dev = dev_get_by_index(&init_net, configured_ifindex);
+    if (!configured_dev)
+        return NULL;
+
+    rcu_read_lock();
+    netdev_for_each_upper_dev_rcu(configured_dev, upper_dev, iter) {
+        if (upper_dev->rtnl_link_ops && upper_dev->rtnl_link_ops->kind &&
+            strcmp(upper_dev->rtnl_link_ops->kind, "macsec") == 0) {
+            dev_hold(upper_dev);
+            macsec_dev = upper_dev;
+            break;
+        }
+    }
+    rcu_read_unlock();
+
+    if (!macsec_dev)
+        return configured_dev;
+    dev_put(configured_dev);
+    return macsec_dev;
+}
+
+static void mwan_mac_pending_destroy(struct mwan_mac_pending_config *cfg)
+{
+    u32 i;
+
+    if (!cfg)
+        return;
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].dev)
+            dev_put(cfg->tunnels[i].dev);
+    }
+    kvfree(cfg);
+}
+
+static void mwan_mac_copy_peer_state(struct mwan_tunnel *dst,
+                                     struct mwan_tunnel *src,
+                                     bool copy_health)
+{
+    if (!dst || !src)
+        return;
+
+    spin_lock_bh(&src->gateway_mac_lock);
+    if (src->mac_resolved && src->peer_ip_resolved &&
+        is_valid_ether_addr(src->gateway_mac) &&
+        src->peer_tunnel_ip != 0) {
+        ether_addr_copy(dst->gateway_mac, src->gateway_mac);
+        dst->mac_resolved = true;
+        dst->peer_tunnel_ip = src->peer_tunnel_ip;
+        dst->peer_ip_resolved = true;
+        dst->discovery_nonce = src->discovery_nonce;
+        dst->discovery_unresolved_reported =
+            src->discovery_unresolved_reported;
+    }
+    spin_unlock_bh(&src->gateway_mac_lock);
+    if (copy_health) {
+        dst->published_up = READ_ONCE(src->published_up);
+        dst->state_sequence = 0;
+    }
+}
+
+int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
+                                         const u32 *ifindices,
+                                         u32 num_tunnels)
+{
+    struct mwan_mac_pending_config *new_cfg;
+    struct mwan_mac_pending_config *old_cfg;
+    struct mwan_config *active_cfg;
+    u32 i;
+    u32 j;
+    int ret = 0;
+
+    if (!node_id ||
+        !(generation & MWAN_DISCOVERY_GENERATION_FLAG) ||
+        num_tunnels > MAX_MWAN_TUNNELS ||
+        (num_tunnels && !ifindices))
+        return -EINVAL;
+
+    new_cfg = kvzalloc(sizeof(*new_cfg), GFP_KERNEL);
+    if (!new_cfg)
+        return -ENOMEM;
+    new_cfg->node_id = node_id;
+    new_cfg->generation = generation;
+    new_cfg->num_tunnels = num_tunnels;
+
+    for (i = 0; i < num_tunnels; i++) {
+        struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+
+        if (!ifindices[i]) {
+            ret = -EINVAL;
+            goto err_destroy;
+        }
+        for (j = 0; j < i; j++) {
+            if (ifindices[j] == ifindices[i]) {
+                ret = -EEXIST;
+                goto err_destroy;
+            }
+        }
+        tun->configured_ifindex = ifindices[i];
+        tun->dev = mwan_mac_effective_dev(ifindices[i]);
+        if (!tun->dev) {
+            ret = -ENODEV;
+            goto err_destroy;
+        }
+        tun->ifindex = tun->dev->ifindex;
+        tun->is_ethernet = tun->dev->type == ARPHRD_ETHER;
+        spin_lock_init(&tun->gateway_mac_lock);
+        if (!tun->is_ethernet) {
+            ret = -EAFNOSUPPORT;
+            goto err_destroy;
+        }
+    }
+
+    /* Seed a pending reload from the active datapath without modifying it. */
+    rcu_read_lock();
+    active_cfg = rcu_dereference(g_mwan_cfg);
+    if (active_cfg && active_cfg->node_id == node_id) {
+        for (i = 0; i < new_cfg->num_tunnels; i++) {
+            struct mwan_tunnel *active_tun = mwan_mac_find_tunnel(
+                active_cfg, new_cfg->tunnels[i].configured_ifindex);
+
+            if (active_tun)
+                mwan_mac_copy_peer_state(&new_cfg->tunnels[i], active_tun,
+                                         true);
+        }
+    }
+    rcu_read_unlock();
+
+    mutex_lock(&mwan_mac_pending_lock);
+    old_cfg = rcu_dereference_protected(
+        mwan_mac_pending_cfg,
+        lockdep_is_held(&mwan_mac_pending_lock));
+    if (old_cfg && old_cfg->node_id == node_id) {
+        for (i = 0; i < new_cfg->num_tunnels; i++) {
+            struct mwan_tunnel *old_tun = mwan_mac_find_pending_tunnel(
+                old_cfg, new_cfg->tunnels[i].configured_ifindex);
+
+            if (old_tun)
+                mwan_mac_copy_peer_state(&new_cfg->tunnels[i], old_tun,
+                                         true);
+        }
+    }
+    rcu_assign_pointer(mwan_mac_pending_cfg, new_cfg);
+    synchronize_rcu();
+    mwan_mac_pending_destroy(old_cfg);
+    mutex_unlock(&mwan_mac_pending_lock);
+
+    pr_info("mwan_kmod: MAC-DISCOVERY-CONFIG state=PENDING node=%u generation=%u tunnels=%u datapath_active=0\n",
+            node_id, generation, num_tunnels);
+    mwan_mac_discovery_kick();
+    return 0;
+
+err_destroy:
+    mwan_mac_pending_destroy(new_cfg);
+    return ret;
+}
+
+void mwan_mac_discovery_import_pending(struct mwan_config *cfg)
+{
+    struct mwan_mac_pending_config *pending;
+    u32 i;
+
+    if (!cfg)
+        return;
+
+    mutex_lock(&mwan_mac_pending_lock);
+    pending = rcu_dereference_protected(
+        mwan_mac_pending_cfg,
+        lockdep_is_held(&mwan_mac_pending_lock));
+    if (!pending || pending->node_id != cfg->node_id)
+        goto out;
+
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        struct mwan_tunnel *src = mwan_mac_find_pending_tunnel(
+            pending, cfg->tunnels[i].configured_ifindex);
+
+        if (src)
+            mwan_mac_copy_peer_state(&cfg->tunnels[i], src, true);
+    }
+out:
+    mutex_unlock(&mwan_mac_pending_lock);
+}
+
+void mwan_mac_discovery_clear_pending(u32 node_id)
+{
+    struct mwan_mac_pending_config *old_cfg;
+
+    mutex_lock(&mwan_mac_pending_lock);
+    old_cfg = rcu_dereference_protected(
+        mwan_mac_pending_cfg,
+        lockdep_is_held(&mwan_mac_pending_lock));
+    if (!old_cfg || (node_id && old_cfg->node_id != node_id)) {
+        mutex_unlock(&mwan_mac_pending_lock);
+        return;
+    }
+    RCU_INIT_POINTER(mwan_mac_pending_cfg, NULL);
+    synchronize_rcu();
+    mwan_mac_pending_destroy(old_cfg);
+    mutex_unlock(&mwan_mac_pending_lock);
+}
+
+int mwan_mac_discovery_get_pending_peer(u32 ifindex,
+                                        __be32 *peer_tunnel_ip)
+{
+    struct mwan_mac_pending_config *cfg;
+    struct mwan_tunnel *tun;
+    int ret = -ENOENT;
+
+    if (!ifindex || !peer_tunnel_ip)
+        return -EINVAL;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(mwan_mac_pending_cfg);
+    tun = mwan_mac_find_pending_tunnel(cfg, ifindex);
+    if (tun)
+        ret = mwan_mac_get_peer_tunnel_ip(tun, peer_tunnel_ip) ?
+              0 : -EAGAIN;
+    rcu_read_unlock();
+    return ret;
+}
+
+int mwan_mac_discovery_set_pending_state(u32 ifindex, u32 generation,
+                                         u32 sequence, bool up)
+{
+    struct mwan_mac_pending_config *cfg;
+    struct mwan_tunnel *tun;
+    int ret = 0;
+
+    if (!ifindex || !generation || !sequence)
+        return -EINVAL;
+
+    mutex_lock(&mwan_mac_pending_lock);
+    cfg = rcu_dereference_protected(
+        mwan_mac_pending_cfg,
+        lockdep_is_held(&mwan_mac_pending_lock));
+    if (!cfg) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (cfg->generation != generation) {
+        ret = -ESTALE;
+        goto out;
+    }
+    tun = mwan_mac_find_pending_tunnel(cfg, ifindex);
+    if (!tun) {
+        ret = -ENOENT;
+        goto out;
+    }
+    if (sequence < tun->state_sequence ||
+        (sequence == tun->state_sequence && tun->published_up != up)) {
+        ret = -ESTALE;
+        goto out;
+    }
+    tun->state_sequence = sequence;
+    tun->published_up = up;
+out:
+    mutex_unlock(&mwan_mac_pending_lock);
+    return ret;
+}
+
+int mwan_mac_discovery_get_pending_state(u32 ifindex, u32 *generation,
+                                         u32 *sequence, bool *up)
+{
+    struct mwan_mac_pending_config *cfg;
+    struct mwan_tunnel *tun;
+    int ret = -ENOENT;
+
+    if (!ifindex || !generation || !sequence || !up)
+        return -EINVAL;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(mwan_mac_pending_cfg);
+    tun = mwan_mac_find_pending_tunnel(cfg, ifindex);
+    if (tun) {
+        *generation = cfg->generation;
+        *sequence = READ_ONCE(tun->state_sequence);
+        *up = READ_ONCE(tun->published_up);
+        ret = 0;
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
+int mwan_mac_discovery_rebind_pending(u32 node_id, u32 generation,
+                                      u32 old_ifindex, u32 new_ifindex)
+{
+    struct mwan_mac_pending_config *cfg;
+    u32 ifindices[MAX_MWAN_TUNNELS];
+    u32 num_tunnels;
+    u32 i;
+    bool found = false;
+    int ret = 0;
+
+    if (!node_id || !generation || !old_ifindex || !new_ifindex)
+        return -EINVAL;
+
+    mutex_lock(&mwan_mac_pending_lock);
+    cfg = rcu_dereference_protected(
+        mwan_mac_pending_cfg,
+        lockdep_is_held(&mwan_mac_pending_lock));
+    if (!cfg) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    if (cfg->node_id != node_id || cfg->generation != generation) {
+        ret = -ESTALE;
+        goto out_unlock;
+    }
+    num_tunnels = cfg->num_tunnels;
+    for (i = 0; i < num_tunnels; i++) {
+        struct mwan_tunnel *tun = &cfg->tunnels[i];
+
+        ifindices[i] = tun->configured_ifindex;
+        if (tun->configured_ifindex == old_ifindex ||
+            tun->ifindex == old_ifindex) {
+            ifindices[i] = new_ifindex;
+            found = true;
+        }
+    }
+    if (!found)
+        ret = -ENOENT;
+out_unlock:
+    mutex_unlock(&mwan_mac_pending_lock);
+    if (ret)
+        return ret;
+    return mwan_mac_discovery_configure_pending(
+        node_id, generation, ifindices, num_tunnels);
 }
 
 static bool mwan_mac_is_resolved(struct mwan_tunnel *tun)
@@ -234,6 +601,9 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     const struct ethhdr *eth;
     struct mwan_tunnel *tun;
     struct mwan_config *cfg;
+    struct mwan_mac_pending_config *pending_cfg;
+    u32 discovery_node_id;
+    bool pending_tunnel = false;
     u64 nonce;
     bool nonce_matches = true;
     bool peer_changed;
@@ -261,10 +631,21 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     tun = mwan_mac_find_tunnel(cfg, ingress_ifindex);
+    discovery_node_id = cfg ? cfg->node_id : 0;
+    if (!tun) {
+        pending_cfg = rcu_dereference(mwan_mac_pending_cfg);
+        tun = mwan_mac_find_pending_tunnel(pending_cfg, ingress_ifindex);
+        if (tun) {
+            discovery_node_id = pending_cfg->node_id;
+            pending_tunnel = true;
+        }
+    }
     if (!tun || !tun->is_ethernet) {
-        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u\n",
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u active_config=%u pending_config=%u\n",
                             ingress_ifindex,
-                            tun && tun->is_ethernet ? 1 : 0);
+                            tun && tun->is_ethernet ? 1 : 0,
+                            cfg ? 1 : 0,
+                            rcu_access_pointer(mwan_mac_pending_cfg) ? 1 : 0);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -294,7 +675,7 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
     if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST) {
         int response_ret = mwan_mac_send(
             tun, eth->h_source, MWAN_MAC_DISCOVERY_RESPONSE,
-            cfg->node_id, nonce, GFP_ATOMIC);
+            discovery_node_id, nonce, GFP_ATOMIC);
 
         if (response_ret)
             pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_FAILED tunnel=%s ifindex=%d error=%d\n",
@@ -302,9 +683,10 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
                                 tun->dev ? tun->dev->ifindex : 0,
                                 response_ret);
         else if (peer_changed)
-            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED\n",
+            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED source=%s\n",
                     tun->dev ? tun->dev->name : "unknown",
-                    tun->dev ? tun->dev->ifindex : 0);
+                    tun->dev ? tun->dev->ifindex : 0,
+                    pending_tunnel ? "PENDING" : "ACTIVE");
     }
     rcu_read_unlock();
 
@@ -320,6 +702,10 @@ static struct packet_type mwan_mac_discovery_packet_type __read_mostly = {
 static void mwan_mac_discovery_workfn(struct work_struct *work)
 {
     struct mwan_config *cfg;
+    struct mwan_mac_pending_config *pending_cfg;
+    struct mwan_tunnel *tunnels = NULL;
+    u32 node_id = 0;
+    u32 num_tunnels = 0;
     bool unresolved = false;
     u32 i;
 
@@ -329,9 +715,19 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    if (cfg) {
-        for (i = 0; i < cfg->num_tunnels; i++) {
-            struct mwan_tunnel *tun = &cfg->tunnels[i];
+    pending_cfg = rcu_dereference(mwan_mac_pending_cfg);
+    if (cfg && cfg->num_tunnels) {
+        tunnels = cfg->tunnels;
+        num_tunnels = cfg->num_tunnels;
+        node_id = cfg->node_id;
+    } else if (pending_cfg) {
+        tunnels = pending_cfg->tunnels;
+        num_tunnels = pending_cfg->num_tunnels;
+        node_id = pending_cfg->node_id;
+    }
+    if (tunnels) {
+        for (i = 0; i < num_tunnels; i++) {
+            struct mwan_tunnel *tun = &tunnels[i];
             bool tunnel_resolved;
             int send_ret;
 
@@ -342,7 +738,7 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
                 unresolved = true;
             send_ret = mwan_mac_send(tun, tun->dev->broadcast,
                                      MWAN_MAC_DISCOVERY_REQUEST,
-                                     cfg->node_id, 0, GFP_ATOMIC);
+                                     node_id, 0, GFP_ATOMIC);
             if (send_ret)
                 pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=SEND_FAILED tunnel=%s ifindex=%d error=%d resolved=%u\n",
                                     tun->dev->name, tun->dev->ifindex,
@@ -382,4 +778,5 @@ void mwan_mac_discovery_cleanup(void)
     WRITE_ONCE(mwan_mac_discovery_running, false);
     cancel_delayed_work_sync(&mwan_mac_discovery_work);
     dev_remove_pack(&mwan_mac_discovery_packet_type);
+    mwan_mac_discovery_clear_pending(0);
 }

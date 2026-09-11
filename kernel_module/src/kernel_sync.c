@@ -40,6 +40,7 @@ struct pqc_key_state_reply {
 };
 
 static uint32_t active_kernel_config_generation;
+static uint32_t pending_discovery_generation;
 
 /* libnl normally returns its own NLE_* error namespace, while a Generic
  * Netlink error reply contains the real negative kernel errno.  Keep the
@@ -208,6 +209,103 @@ static int kernel_sync_pqc_key_state_valid_cb(struct nl_msg *msg, void *arg)
     return NL_STOP;
 }
 
+static int kernel_sync_register_pending_discovery(const app_context_t *ctx,
+                                                  uint32_t *generation_out)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    struct nlattr *tunnels;
+    uint32_t counter;
+    uint32_t generation;
+    int family_id;
+    int ret = -EIO;
+    size_t i;
+
+    if (!ctx || !generation_out || ctx->cfg.node_id <= 0 ||
+        ctx->cfg.sdwan_tun_count > MAX_SDWAN_TUNS)
+        return -EINVAL;
+
+    counter = __atomic_add_fetch(&pending_discovery_generation, 1,
+                                 __ATOMIC_RELAXED) &
+              ~MWAN_DISCOVERY_GENERATION_FLAG;
+    if (!counter)
+        counter = __atomic_add_fetch(&pending_discovery_generation, 1,
+                                     __ATOMIC_RELAXED) &
+                  ~MWAN_DISCOVERY_GENERATION_FLAG;
+    generation = counter | MWAN_DISCOVERY_GENERATION_FLAG;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    ret = genl_connect(sock);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = kernel_sync_nl_to_errno(family_id);
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_SET_DISCOVERY_CONFIG, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID,
+                    (uint32_t)ctx->cfg.node_id) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
+    if (!tunnels) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    for (i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
+        struct nlattr *tun_node;
+        unsigned int ifindex = if_nametoindex(tun->tunnel_ifname);
+
+        if (!ifindex) {
+            ret = -ENODEV;
+            goto out;
+        }
+        tun_node = nla_nest_start(msg, (int)i + 1);
+        if (!tun_node ||
+            nla_put_u32(msg, MWAN_TUN_IFINDEX, ifindex) < 0) {
+            ret = -EMSGSIZE;
+            goto out;
+        }
+        nla_nest_end(msg, tun_node);
+    }
+    nla_nest_end(msg, tunnels);
+
+    ret = nl_send_auto(sock, msg);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    ret = nl_wait_for_ack(sock);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    *generation_out = generation;
+    log_info("[DISCOVERY-CONFIG] registered pending control-plane node=%d generation=%u tunnels=%zu datapath_active=0",
+             ctx->cfg.node_id, generation, ctx->cfg.sdwan_tun_count);
+    ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
 
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     struct nl_sock *sock;
@@ -241,16 +339,40 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     if (ctx->cfg.encrypt.enabled &&
         ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
         ctx->cfg.encrypt.key_len != 32) {
-        log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu (no Netlink message sent)",
+        uint32_t discovery_generation = 0;
+        int discovery_ret = kernel_sync_register_pending_discovery(
+            ctx, &discovery_generation);
+
+        if (discovery_ret) {
+            log_error("[CFG-TRACE push=%lu] DISCOVERY_REGISTER_FAILED error=%s",
+                      push_id, strerror(-discovery_ret));
+            return KERNEL_SYNC_ERROR;
+        }
+        /* On initial activation there is no datapath to protect, so BFD may
+         * run entirely against pending state. During a re-handshake, keep the
+         * existing active BFD sessions untouched until the new full config is
+         * ready; otherwise a pending generation could disrupt healthy paths. */
+        if (__atomic_load_n(&active_kernel_config_generation,
+                            __ATOMIC_ACQUIRE) == 0) {
+            (void)failover_service_reconcile(ctx, discovery_generation);
+        } else {
+            log_info("[DISCOVERY-CONFIG] active datapath generation=%u preserved while pending generation=%u waits for PQC key",
+                     __atomic_load_n(&active_kernel_config_generation,
+                                     __ATOMIC_ACQUIRE),
+                     discovery_generation);
+        }
+        log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu (active SET_CONFIG not sent)",
                  push_id, ctx->cfg.encrypt.key_len);
         return KERNEL_SYNC_DEFERRED;
     }
 
     generation = __atomic_add_fetch(&config_generation, 1,
-                                    __ATOMIC_RELAXED);
+                                    __ATOMIC_RELAXED) &
+                 ~MWAN_DISCOVERY_GENERATION_FLAG;
     if (generation == 0)
         generation = __atomic_add_fetch(&config_generation, 1,
-                                        __ATOMIC_RELAXED);
+                                        __ATOMIC_RELAXED) &
+                     ~MWAN_DISCOVERY_GENERATION_FLAG;
 
     if (ctx->cfg.encrypt.enabled &&
         ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&

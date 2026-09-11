@@ -17,6 +17,7 @@
 #define MWAN_SALT_LEN        4
 #define MWAN_FAKE_PROTOCOL  99       /* Fake L4 Protocol to hide real protocol (TCP/UDP) */
 #define MWAN_L2_PQC_ETHERTYPE 0x88B5 /* Custom EtherType for L2-PQC packets */
+#define MWAN_DISCOVERY_GENERATION_FLAG (1U << 31)
 
 /* ---- Crypto Type Enum ---- */
 enum mwan_crypt_type {
@@ -62,6 +63,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_ABORT_PQC_KEY,    /* discard an uncommitted NEXT key */
     MWAN_CMD_SET_TUNNEL_WEIGHTS, /* update weights without replacing runtime */
     MWAN_CMD_REBIND_TUNNEL,    /* replace one DOWN tunnel's net_device */
+    MWAN_CMD_SET_DISCOVERY_CONFIG, /* register data tunnels before PQC key */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)

@@ -12,8 +12,9 @@ enum kernel_sync_result {
     KERNEL_SYNC_DEFERRED = 1,
 };
 
-/* APPLIED means the kernel acknowledged the config. DEFERRED is used only
- * while a PQC config waits for its authenticated userspace session key. */
+/* APPLIED means the kernel acknowledged the active datapath config. DEFERRED
+ * means PQC is waiting for its authenticated session key; tunnel discovery
+ * has nevertheless been registered independently with the kernel. */
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx);
 uint32_t kernel_sync_current_config_generation(void);
 int kernel_sync_update_tunnel_weights(const app_context_t *ctx);

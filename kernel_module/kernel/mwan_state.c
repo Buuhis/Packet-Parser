@@ -482,6 +482,11 @@ int mwan_state_update(struct mwan_config *new_cfg)
                 new_cfg->node_id, new_cfg->encrypt_on,
                 new_cfg->encrypt_layer, new_cfg->encrypt_type);
     }
+    /* A PQC profile may already have learned its peer and BFD state through
+     * the control-plane-only discovery registry. Import it before preserving
+     * an existing active config; established active state wins on reload. */
+    mwan_mac_discovery_import_pending(new_cfg);
+
     /* Netlink updates (for example PQC key rotation) replace the whole
      * config. Preserve the independently learned MAC/IP tuple for an
      * unchanged data tunnel so traffic and failover do not rediscover it. */
@@ -502,6 +507,10 @@ int mwan_state_update(struct mwan_config *new_cfg)
             new_cfg->num_tunnels);
     mutex_unlock(&mwan_cfg_update_lock);
 
+    /* Only one profile is active globally. Any pending registry belongs to
+     * the pre-activation phase and must not survive a full config publish,
+     * including a switch to a different node/profile. */
+    mwan_mac_discovery_clear_pending(0);
     mwan_l2_flow_manager_start(new_cfg);
     /* Resolve one independent peer MAC/IP tuple for every bonding tunnel. */
     mwan_mac_discovery_kick();

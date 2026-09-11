@@ -211,6 +211,7 @@ static int mwan_genl_set_tunnel_state(struct sk_buff *skb,
     u32 generation;
     u32 sequence;
     u8 state;
+    int ret;
 
     (void)skb;
     if (!info->attrs[MWAN_ATTR_QUERY_IFINDEX] ||
@@ -226,8 +227,52 @@ static int mwan_genl_set_tunnel_state(struct sk_buff *skb,
     if (state > 1)
         return -EINVAL;
 
-    return mwan_state_set_tunnel_state(ifindex, generation, sequence,
-                                       state != 0);
+    ret = mwan_state_set_tunnel_state(ifindex, generation, sequence,
+                                      state != 0);
+    if ((generation & MWAN_DISCOVERY_GENERATION_FLAG) &&
+        (ret == -ENOENT || ret == -ESTALE))
+        ret = mwan_mac_discovery_set_pending_state(
+            ifindex, generation, sequence, state != 0);
+    return ret;
+}
+
+static int mwan_genl_set_discovery_config(struct sk_buff *skb,
+                                          struct genl_info *info)
+{
+    u32 ifindices[MAX_MWAN_TUNNELS];
+    struct nlattr *nla_tunnels;
+    struct nlattr *tun;
+    u32 count = 0;
+    int rem;
+    int err;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
+        !info->attrs[MWAN_ATTR_TUNNELS])
+        return -EINVAL;
+
+    nla_tunnels = info->attrs[MWAN_ATTR_TUNNELS];
+    nla_for_each_nested(tun, nla_tunnels, rem) {
+        struct nlattr *tb[MWAN_TUN_MAX + 1];
+
+        if (count >= MAX_MWAN_TUNNELS)
+            return -E2BIG;
+        err = nla_parse_nested_deprecated(tb, MWAN_TUN_MAX, tun,
+                                          mwan_tunnel_policy, NULL);
+        if (err < 0)
+            return err;
+        if (!tb[MWAN_TUN_IFINDEX])
+            return -EINVAL;
+        ifindices[count] = nla_get_u32(tb[MWAN_TUN_IFINDEX]);
+        if (!ifindices[count])
+            return -EINVAL;
+        count++;
+    }
+    return mwan_mac_discovery_configure_pending(
+        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
+        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
+        ifindices, count);
 }
 
 static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
@@ -275,6 +320,12 @@ static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
 static int mwan_genl_rebind_tunnel(struct sk_buff *skb,
                                    struct genl_info *info)
 {
+    u32 node_id;
+    u32 generation;
+    u32 old_ifindex;
+    u32 new_ifindex;
+    int ret;
+
     (void)skb;
     if (!info->attrs[MWAN_ATTR_NODE_ID] ||
         !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
@@ -282,11 +333,17 @@ static int mwan_genl_rebind_tunnel(struct sk_buff *skb,
         !info->attrs[MWAN_ATTR_NEW_IFINDEX])
         return -EINVAL;
 
-    return mwan_state_rebind_tunnel(
-        nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
-        nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
-        nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]),
-        nla_get_u32(info->attrs[MWAN_ATTR_NEW_IFINDEX]));
+    node_id = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    generation = nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]);
+    old_ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    new_ifindex = nla_get_u32(info->attrs[MWAN_ATTR_NEW_IFINDEX]);
+    ret = mwan_state_rebind_tunnel(node_id, generation, old_ifindex,
+                                   new_ifindex);
+    if ((generation & MWAN_DISCOVERY_GENERATION_FLAG) &&
+        (ret == -ENOENT || ret == -ESTALE))
+        ret = mwan_mac_discovery_rebind_pending(
+            node_id, generation, old_ifindex, new_ifindex);
+    return ret;
 }
 
 static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
@@ -305,6 +362,9 @@ static int mwan_genl_get_tunnel_state(struct sk_buff *skb,
         return -EINVAL;
     ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
     ret = mwan_state_get_tunnel_state(ifindex, &generation, &sequence, &up);
+    if (ret == -ENOENT)
+        ret = mwan_mac_discovery_get_pending_state(
+            ifindex, &generation, &sequence, &up);
     if (ret)
         return ret;
 
@@ -500,8 +560,13 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
         }
     }
     rcu_read_unlock();
-    if (!tun)
-        return -ENOENT;
+    if (!tun) {
+        ret = mwan_mac_discovery_get_pending_peer(ifindex,
+                                                  &peer_tunnel_ip);
+        if (ret != 0 && ret != -EAGAIN)
+            return ret;
+        resolved = ret == 0;
+    }
 
     reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
     if (!reply)
@@ -601,6 +666,12 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = 0,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_rebind_tunnel,
+    },
+    {
+        .cmd    = MWAN_CMD_SET_DISCOVERY_CONFIG,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_set_discovery_config,
     },
 };
 
