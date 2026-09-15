@@ -116,6 +116,27 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
             return client_send_and_print(socket_path, msg);
         }
 
+        /* ----- -gpi / --get-peer-ip <data_tunnel_interface> --------------- */
+        if (strcmp(argv[i], "-gpi") == 0 ||
+            strcmp(argv[i], "--get-peer-ip") == 0) {
+            size_t ifname_len;
+            char msg[32];
+
+            if (i + 1 >= argc || i + 2 != argc) {
+                fprintf(stderr,
+                        "Error: Usage: -gpi/--get-peer-ip <interface>\n");
+                return 1;
+            }
+            ifname_len = strnlen(argv[i + 1], IFNAMSIZ);
+            if (ifname_len == 0 || ifname_len >= IFNAMSIZ ||
+                strpbrk(argv[i + 1], " \t\r\n")) {
+                fprintf(stderr, "Error: Invalid data tunnel interface\n");
+                return 1;
+            }
+            snprintf(msg, sizeof(msg), "get-peer-ip %s", argv[i + 1]);
+            return client_send_and_print(socket_path, msg);
+        }
+
         /* ----- -a / --add <profile_id> <table.if_name>... ------------------- */
         if ((strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--add") == 0) && i + 2 < argc) {
             int profile_id = atoi(argv[++i]);
@@ -237,6 +258,47 @@ static void handle_get_status(int client_fd, const char *ifname,
         log_warn("[GET-STATUS] Failed to query state for tunnel %s: %s",
                  ifname, strerror(-rc));
         reply_json(client_fd, 500, "Failed to query tunnel status");
+    }
+}
+
+/* Report the peer tunnel IPv4 address learned by discovery for one configured
+ * SD-WAN data tunnel. Physical/WAN interfaces are deliberately rejected. */
+static void handle_get_peer_ip(int client_fd, const char *ifname,
+                               app_context_t *ctx)
+{
+    bool data_tunnel = false;
+    char peer_ip[INET_ADDRSTRLEN] = {0};
+    int rc;
+
+    runtime_config_lock();
+    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
+        if (strcmp(ctx->cfg.sdwan_tuns[i].tunnel_ifname, ifname) == 0) {
+            data_tunnel = true;
+            break;
+        }
+    }
+    runtime_config_unlock();
+
+    if (!data_tunnel) {
+        reply_json(client_fd, 404,
+                   "Data tunnel not found in running configuration");
+        return;
+    }
+
+    rc = kernel_sync_get_tunnel_peer(ifname, peer_ip, sizeof(peer_ip));
+    if (rc == 0) {
+        reply_json(client_fd, 200, peer_ip);
+    } else if (rc == -EAGAIN) {
+        reply_json(client_fd, 503,
+                   "Peer tunnel IP is not resolved yet");
+    } else if (rc == -ENODEV || rc == -ENOENT) {
+        reply_json(client_fd, 503,
+                   "Kernel module or data tunnel interface unavailable");
+    } else {
+        log_warn("[GET-PEER-IP] Failed to query peer IP for tunnel %s: %s",
+                 ifname, strerror(-rc));
+        reply_json(client_fd, 500,
+                   "Failed to query peer tunnel IP");
     }
 }
 
@@ -848,6 +910,21 @@ static int parse_tunnel_command(const char *args, int *profile_id,
 /* ================================================================== */
 void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *running_ctx)
 {
+
+    /* get-peer-ip <data_tunnel_interface> */
+    if (strncmp(buf, "get-peer-ip ", 12) == 0) {
+        const char *ifname = buf + 12;
+        size_t ifname_len = strnlen(ifname, IFNAMSIZ);
+
+        if (ifname_len == 0 || ifname_len >= IFNAMSIZ ||
+            ifname[ifname_len] != '\0' || strpbrk(ifname, " \t\r\n")) {
+            reply_json(client_fd, 400,
+                       "Usage: get-peer-ip <interface>");
+            return;
+        }
+        handle_get_peer_ip(client_fd, ifname, running_ctx);
+        return;
+    }
 
     /* get-status <data_tunnel_interface> */
     if (strncmp(buf, "get-status ", 11) == 0) {

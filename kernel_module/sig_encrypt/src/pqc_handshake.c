@@ -756,8 +756,10 @@ static void handle_handshake_success(policy_key_binding_t *b,
     }
 
     fprintf(stderr,
-            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT.\n",
-            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT]);
+            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
+            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT],
+            derived_master[0], derived_master[1], derived_master[2],
+            derived_master[3]);
 
 }
 
