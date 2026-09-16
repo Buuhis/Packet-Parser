@@ -1349,7 +1349,8 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              const struct mwan_tx_flow_info *info,
                              struct mwan_l2_tx_flow *preselected_flow,
                              enum mwan_packet_class packet_class,
-                             bool closing, u32 *flow_seq, int *owner_cpu)
+                             bool closing, bool allow_tunnel_override,
+                             u32 *flow_seq, int *owner_cpu)
 {
     struct mwan_l2_tx_flow *flow;
     struct mwan_l2_worker *worker;
@@ -1376,11 +1377,11 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         return -ENOSPC;
     }
-    /* POST_ROUTING selected and pinned the data flow before MTU handling.
-     * A mismatch here means a stale caller or a path-state transition raced
-     * this packet. Drop this one packet instead of moving fragments or
-     * already-normalized data onto a different-MTU tunnel. */
-    if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx)) {
+    /* Per-flow mode pins the path before MTU handling. Per-packet mode may
+     * override only the egress tunnel while retaining one sticky flow object
+     * for worker ownership, flow token and L2-PQC sequence ordering. */
+    if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx) &&
+        !allow_tunnel_override) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         mwan_l2_tx_flow_put(flow);
         return -ESTALE;

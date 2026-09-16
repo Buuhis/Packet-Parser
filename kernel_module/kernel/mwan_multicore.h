@@ -38,6 +38,11 @@ struct mwan_tx_flow_context {
     struct mwan_tx_flow_info info;
     struct mwan_l2_tx_flow *flow;
     enum mwan_packet_class packet_class;
+    /* Per-packet mode keeps worker/token/sequence state sticky but may send
+     * this original packet on a tunnel other than flow->tunnel_idx. */
+    bool allow_tunnel_override;
+    /* Optional synchronous aggregate result for GSO/fragment children. */
+    bool *whole_packet_sent;
 };
 
 const char *mwan_multicore_hash_source_name(enum mwan_flow_hash_source source);
@@ -55,6 +60,7 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              const struct mwan_tx_flow_info *info,
                              struct mwan_l2_tx_flow *preselected_flow,
                              enum mwan_packet_class packet_class,
-                             bool closing, u32 *flow_seq, int *owner_cpu);
+                             bool closing, bool allow_tunnel_override,
+                             u32 *flow_seq, int *owner_cpu);
 
 #endif /* MWAN_MULTICORE_H */

@@ -138,6 +138,13 @@ static bool mwan_none_tcp_closing(struct sk_buff *skb)
     return tcp && (tcp->fin || tcp->rst);
 }
 
+static void
+mwan_none_mark_incomplete(const struct mwan_tx_flow_context *tx_ctx)
+{
+    if (tx_ctx && tx_ctx->whole_packet_sent)
+        WRITE_ONCE(*tx_ctx->whole_packet_sent, false);
+}
+
 static unsigned int
 mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
                               u16 tunnel_idx,
@@ -208,6 +215,8 @@ mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
                                 err);
             return NF_DROP;
         }
+        if (err)
+            mwan_none_mark_incomplete(tx_ctx);
         return NF_STOLEN;
     }
     if (mtu_result != MWAN_MTU_FITS)
@@ -228,7 +237,9 @@ mwan_handle_encap_none_single(struct sk_buff *skb, struct mwan_config *cfg,
     }
     err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, info, flow,
                                    packet_class,
-                                   mwan_none_tcp_closing(skb), NULL, NULL);
+                                   mwan_none_tcp_closing(skb),
+                                   tx_ctx && tx_ctx->allow_tunnel_override,
+                                   NULL, NULL);
     return err ? NF_DROP : NF_STOLEN;
 }
 
@@ -241,22 +252,36 @@ unsigned int mwan_handle_encap_none(struct sk_buff *skb,
         struct sk_buff *nskb;
         struct sk_buff *next;
         netdev_features_t features = netif_skb_features(skb);
+        bool all_sent = true;
 
         segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
-        if (IS_ERR(segs) || !segs)
+        if (IS_ERR(segs) || !segs) {
+            mwan_none_mark_incomplete(tx_ctx);
             return NF_DROP;
+        }
         for (nskb = segs; nskb; nskb = next) {
             next = nskb->next;
             nskb->next = NULL;
             nskb->prev = NULL;
             if (mwan_handle_encap_none_single(nskb, cfg, tunnel_idx,
                                               tx_ctx) !=
-                NF_STOLEN)
+                NF_STOLEN) {
+                all_sent = false;
                 kfree_skb(nskb);
+            }
         }
+        if (!all_sent)
+            mwan_none_mark_incomplete(tx_ctx);
         consume_skb(skb);
         return NF_STOLEN;
     }
 
-    return mwan_handle_encap_none_single(skb, cfg, tunnel_idx, tx_ctx);
+    {
+        unsigned int verdict = mwan_handle_encap_none_single(
+            skb, cfg, tunnel_idx, tx_ctx);
+
+        if (verdict != NF_STOLEN)
+            mwan_none_mark_incomplete(tx_ctx);
+        return verdict;
+    }
 }

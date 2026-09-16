@@ -5,6 +5,9 @@ mwan_kmod-objs := mwan_main.o mwan_state.o mwan_key_rotation.o mwan_l2_flow.o mw
                  mwan_tunnel_balance.o \
                  mwan_mtu.o \
                  mwan_mac_discovery.o \
+                 per_packet/mwan_lb_mode.o \
+                 per_packet/mwan_per_packet.o \
+                 per_packet/mwan_per_packet_diag.o \
                  encap/encap_none.o \
                  encap/encap_macsec.o \
                  encap/encap_l3.o \

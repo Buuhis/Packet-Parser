@@ -3,6 +3,7 @@
 #include "../mwan_proto.h"
 #include "../mwan_multicore.h"
 #include "../mwan_mtu.h"
+#include "../per_packet/mwan_per_packet.h"
 
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
@@ -56,6 +57,7 @@ void mwan_l2_diag_reset_all(void)
     mwan_multicore_diag_reset();
     mwan_mtu_stats_reset(MWAN_MTU_PROFILE_BYPASS);
     mwan_mtu_stats_reset(MWAN_MTU_PROFILE_L2_PQC);
+    mwan_per_packet_diag_reset();
 
     spin_lock_bh(&mwan_l2_rx_diag_lock);
     memset(mwan_l2_rx_diag_flows, 0, sizeof(mwan_l2_rx_diag_flows));
@@ -695,6 +697,7 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                READ_ONCE(mwan_l2_diag_enabled),
                min_t(unsigned int, READ_ONCE(mwan_l2_diag_limit),
                      MWAN_L2_DIAG_MAX_FLOWS));
+    mwan_per_packet_diag_show(m);
     seq_printf(m, "tx_flows=%llu tx_zero_packets=%llu\n",
                mwan_l2_tx_diag_flows_get(), mwan_l2_tx_diag_zero_get());
     seq_printf(m, "rx_flows=%lld rx_zero_packets=%lld collisions=%lld\n",
