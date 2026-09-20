@@ -453,6 +453,8 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     __be32 seq_be;
     u8 peer_mac[ETH_ALEN];
     int ip_pkt_len, err;
+    int xmit_ret;
+    u16 tx_queue;
 
     if (unlikely(!target_dev || !worker))
         return -ENODEV;
@@ -560,7 +562,30 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     skb->dev = target_dev;
     skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    dev_queue_xmit(skb);
+    /* dev_queue_xmit() always consumes skb.  Do not propagate an error to
+     * the worker, whose generic error path would otherwise free it twice.
+     * Instead, account the synchronous result here.  NET_XMIT_SUCCESS still
+     * only means that this layer accepted the packet; a qdisc, driver, NIC or
+     * the WAN may lose it later. */
+    tx_queue = skb_get_queue_mapping(skb);
+    xmit_ret = dev_queue_xmit(skb);
+    atomic64_inc(&worker->tx_dev_xmit_calls);
+    if (likely(xmit_ret == NET_XMIT_SUCCESS)) {
+        atomic64_inc(&worker->tx_dev_xmit_accepted);
+    } else if (xmit_ret == NET_XMIT_CN) {
+        /* Congestion notification does not prove that this skb was lost. */
+        atomic64_inc(&worker->tx_dev_xmit_cn);
+    } else {
+        if (xmit_ret > 0)
+            atomic64_inc(&worker->tx_dev_xmit_drop);
+        else
+            atomic64_inc(&worker->tx_dev_xmit_error);
+        atomic64_set(&worker->tx_dev_xmit_last_fail_ns, ktime_get_ns());
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D DEV_XMIT_FAIL token=%016llx seq=%u dev=%s queue=%u worker_cpu=%d ret=%d\n",
+                                flow_token, seq, target_dev->name, tx_queue,
+                                worker->cpu, xmit_ret);
+    }
     return 0;
 }
 

@@ -137,6 +137,9 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
 {
     struct mwan_l2_rx_flow *flow =
         container_of(timer, struct mwan_l2_rx_flow, reorder_timer);
+    u32 first_missing = 0;
+    u32 next_expected;
+    u32 skipped = 0;
     bool restart = false;
     int i;
 
@@ -161,6 +164,9 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
         }
         if (i == MWAN_FLOW_RING_SIZE)
             break;
+        if (!skipped)
+            first_missing = flow->expected_seq;
+        skipped++;
         flow->expected_seq++;
         atomic64_inc(&flow->manager->reorder_timeouts);
     }
@@ -173,7 +179,14 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
     }
     if (restart && !READ_ONCE(flow->stopping))
         mod_timer(&flow->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+    next_expected = flow->expected_seq;
     spin_unlock_bh(&flow->reorder_lock);
+
+    if (skipped && READ_ONCE(mwan_l2_diag_enabled))
+        pr_warn_ratelimited("mwan_kmod: L2D REORDER_TIMEOUT token=%016llx first_missing=%u skipped=%u next_expected=%u timeout_ms=%u\n",
+                            flow->flow_token, first_missing, skipped,
+                            next_expected,
+                            jiffies_to_msecs(MWAN_REORDER_TIMEOUT));
 }
 
 int mwan_l2_flow_manager_init(struct mwan_config *cfg)
@@ -788,6 +801,7 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     delta = (u32)(flow_seq - flow->expected_seq);
     if (unlikely(delta >= MWAN_FLOW_RING_SIZE)) {
         u32 flushed = 0;
+        u32 old_expected = flow->expected_seq;
         int i;
 
         /* This function is reached only after AES-GCM authentication has
@@ -812,6 +826,10 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
             atomic64_add(flushed,
                          &flow->manager->reorder_resync_flushed);
         flow->expected_seq = flow_seq;
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D REORDER_TOO_FAR token=%016llx expected=%u received=%u gap=%u flushed=%u window=%u\n",
+                                flow->flow_token, old_expected, flow_seq,
+                                delta, flushed, MWAN_FLOW_RING_SIZE);
     }
 
     slot = flow_seq & MWAN_FLOW_RING_MASK;

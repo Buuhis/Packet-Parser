@@ -39,6 +39,14 @@ static atomic64_t mwan_l2_rx_diag_nonce_mismatch;
 static atomic64_t mwan_l2_rx_diag_cb_corrupt;
 static atomic64_t mwan_l2_rx_diag_decrypt_fail;
 static atomic64_t mwan_l2_rx_diag_auth_fail;
+static atomic64_t mwan_l2_rx_handler_seen;
+static atomic64_t mwan_l2_rx_handler_accepted;
+static atomic64_t mwan_l2_rx_handler_drop_short;
+static atomic64_t mwan_l2_rx_handler_drop_header;
+static atomic64_t mwan_l2_rx_handler_drop_inactive;
+static atomic64_t mwan_l2_rx_handler_drop_key;
+static atomic64_t mwan_l2_rx_handler_drop_flow;
+static atomic64_t mwan_l2_rx_handler_drop_queue;
 static atomic64_t mwan_l2_rx_diag_cpu_flows[NR_CPUS];
 static atomic64_t mwan_l2_diag_cookie;
 u32 mwan_l2_diag_generation_get(void)
@@ -81,6 +89,14 @@ void mwan_l2_diag_reset_all(void)
     atomic64_set(&mwan_l2_rx_diag_cb_corrupt, 0);
     atomic64_set(&mwan_l2_rx_diag_decrypt_fail, 0);
     atomic64_set(&mwan_l2_rx_diag_auth_fail, 0);
+    atomic64_set(&mwan_l2_rx_handler_seen, 0);
+    atomic64_set(&mwan_l2_rx_handler_accepted, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_short, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_header, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_inactive, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_key, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_flow, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_queue, 0);
     atomic64_set(&mwan_l2_diag_cookie, 0);
     for (cpu = 0; cpu < NR_CPUS; cpu++)
         atomic64_set(&mwan_l2_rx_diag_cpu_flows[cpu], 0);
@@ -88,12 +104,31 @@ void mwan_l2_diag_reset_all(void)
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg) {
+        int i;
+
         atomic64_set(&cfg->flows.tx_worker_deactivated, 0);
         atomic64_set(&cfg->flows.tx_worker_reactivated, 0);
         atomic64_set(&cfg->flows.tx_worker_reselected, 0);
         atomic64_set(&cfg->flows.tx_degraded_admitted, 0);
         atomic64_set(&cfg->flows.tx_recovery_updated, 0);
         atomic64_set(&cfg->flows.tx_recovery_moved, 0);
+        atomic64_set(&cfg->flows.reorder_late, 0);
+        atomic64_set(&cfg->flows.reorder_duplicate, 0);
+        atomic64_set(&cfg->flows.reorder_too_far, 0);
+        atomic64_set(&cfg->flows.reorder_timeouts, 0);
+        atomic64_set(&cfg->flows.reorder_resync, 0);
+        atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
+        atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
+        for (i = 0; cfg->l2_workers && i < cfg->num_workers; i++) {
+            struct mwan_l2_worker *worker = &cfg->l2_workers[i];
+
+            atomic64_set(&worker->tx_dev_xmit_calls, 0);
+            atomic64_set(&worker->tx_dev_xmit_accepted, 0);
+            atomic64_set(&worker->tx_dev_xmit_cn, 0);
+            atomic64_set(&worker->tx_dev_xmit_drop, 0);
+            atomic64_set(&worker->tx_dev_xmit_error, 0);
+            atomic64_set(&worker->tx_dev_xmit_last_fail_ns, 0);
+        }
         mwan_rekey_diag_reset(cfg);
     }
     rcu_read_unlock();
@@ -594,7 +629,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
-    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp\n");
+    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_dqx_calls tx_dqx_ok tx_dqx_cn tx_dqx_drop tx_dqx_err tx_dqx_last_fail_ns tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp\n");
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -621,7 +656,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->work_runs),
                    atomic64_read(&w->schedule_failures),
                    atomic_read(&w->busy));
-        seq_printf(m, "%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d ",
+        seq_printf(m, "%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d ",
                    atomic64_read(&w->tx_queued_packets),
                    atomic64_read(&w->tx_queued_bytes),
                    atomic64_read(&w->tx_max_queued_packets),
@@ -630,6 +665,12 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->tx_processed_packets),
                    atomic64_read(&w->tx_dropped_packets),
                    atomic64_read(&w->tx_xmit_failures),
+                   atomic64_read(&w->tx_dev_xmit_calls),
+                   atomic64_read(&w->tx_dev_xmit_accepted),
+                   atomic64_read(&w->tx_dev_xmit_cn),
+                   atomic64_read(&w->tx_dev_xmit_drop),
+                   atomic64_read(&w->tx_dev_xmit_error),
+                   atomic64_read(&w->tx_dev_xmit_last_fail_ns),
                    atomic64_read(&w->tx_assigned_flows),
                    atomic64_read(&w->tx_processing_ewma_ns),
                    atomic64_read(&w->tx_work_runs),
@@ -685,6 +726,12 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     u64 pending_current = 0;
     u64 pending_previous = 0;
     u64 pending_next = 0;
+    u64 tx_dqx_calls = 0;
+    u64 tx_dqx_accepted = 0;
+    u64 tx_dqx_cn = 0;
+    u64 tx_dqx_drop = 0;
+    u64 tx_dqx_error = 0;
+    u64 tx_dqx_last_fail_ns = 0;
     int phase;
     int reason;
     int cpu;
@@ -709,6 +756,15 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     seq_printf(m, "decrypt_fail=%lld auth_fail=%lld\n",
                atomic64_read(&mwan_l2_rx_diag_decrypt_fail),
                atomic64_read(&mwan_l2_rx_diag_auth_fail));
+    seq_printf(m, "rx_handler seen=%lld accepted=%lld drop_short=%lld drop_header=%lld drop_inactive=%lld drop_key=%lld drop_flow=%lld drop_queue=%lld\n",
+               atomic64_read(&mwan_l2_rx_handler_seen),
+               atomic64_read(&mwan_l2_rx_handler_accepted),
+               atomic64_read(&mwan_l2_rx_handler_drop_short),
+               atomic64_read(&mwan_l2_rx_handler_drop_header),
+               atomic64_read(&mwan_l2_rx_handler_drop_inactive),
+               atomic64_read(&mwan_l2_rx_handler_drop_key),
+               atomic64_read(&mwan_l2_rx_handler_drop_flow),
+               atomic64_read(&mwan_l2_rx_handler_drop_queue));
     mwan_mtu_stats_get(MWAN_MTU_PROFILE_BYPASS, &bypass_mtu);
     mwan_mtu_stats_get(MWAN_MTU_PROFILE_L2_PQC, &l2_mtu);
     seq_printf(m, "mtu_bypass fits=%llu gso=%llu oversize=%llu invalid=%llu icmp_attempted=%llu\n",
@@ -763,6 +819,21 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
             for (i = 0; i < cfg->num_workers; i++) {
                 struct mwan_l2_worker *worker = &cfg->l2_workers[i];
 
+                tx_dqx_calls +=
+                    (u64)atomic64_read(&worker->tx_dev_xmit_calls);
+                tx_dqx_accepted +=
+                    (u64)atomic64_read(&worker->tx_dev_xmit_accepted);
+                tx_dqx_cn +=
+                    (u64)atomic64_read(&worker->tx_dev_xmit_cn);
+                tx_dqx_drop +=
+                    (u64)atomic64_read(&worker->tx_dev_xmit_drop);
+                tx_dqx_error +=
+                    (u64)atomic64_read(&worker->tx_dev_xmit_error);
+                tx_dqx_last_fail_ns = max_t(
+                    u64, tx_dqx_last_fail_ns,
+                    (u64)atomic64_read(
+                        &worker->tx_dev_xmit_last_fail_ns));
+
                 if (cfg->key_id)
                     pending_current += (u64)max_t(
                         int, atomic_read(&worker->crypto_key_pending[
@@ -777,6 +848,9 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                             cfg->next_key_id]), 0);
             }
         }
+        seq_printf(m, "tx_dev_xmit calls=%llu accepted=%llu cn=%llu drop=%llu error=%llu last_fail_ns=%llu\n",
+                   tx_dqx_calls, tx_dqx_accepted, tx_dqx_cn,
+                   tx_dqx_drop, tx_dqx_error, tx_dqx_last_fail_ns);
         phase = atomic_read(&cfg->rekey_diag.phase);
         seq_printf(m, "rekey_diag event_seq=%lld epoch=%llu phase=%s key_state=%u keys=%u/%u/%u valid=%u/%u pending=%llu/%llu/%llu prev_reject_retire=%lld\n",
                    atomic64_read(&cfg->rekey_diag.event_seq),
@@ -866,12 +940,16 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     int ingress_cpu;
     int ret;
 
-    (void)dev;
     (void)pt;
     (void)orig_dev;
     if (!skb)
         return NET_RX_DROP;
+    atomic64_inc(&mwan_l2_rx_handler_seen);
     if (skb->len < MWAN_L2_HDR_LEN + MWAN_GCM_TAG_LEN) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_short);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=short dev=%s len=%u\n",
+                                dev ? dev->name : "none", skb->len);
         kfree_skb(skb);
         return NET_RX_DROP;
     }
@@ -883,6 +961,10 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
      * remains responsible for linearizing the encrypted payload. */
     l2_hdr = skb_header_pointer(skb, 0, sizeof(l2_hdr_buf), &l2_hdr_buf);
     if (unlikely(!l2_hdr)) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_header);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=header dev=%s len=%u\n",
+                                dev ? dev->name : "none", skb->len);
         kfree_skb(skb);
         return NET_RX_DROP;
     }
@@ -900,6 +982,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->encrypt_on || !cfg->l2_workers) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_inactive);
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -909,8 +992,16 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
          packet_key_id != cfg->prev_key_id) &&
         (!cfg->next_key_valid ||
          packet_key_id != cfg->next_key_id)) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_key);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_KEY_REJECT,
                                    packet_key_id);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=key token=%016llx seq=%u key=%u current=%u prev=%u/%u next=%u/%u dev=%s\n",
+                                flow_token, flow_seq, packet_key_id,
+                                cfg->key_id, cfg->prev_key_id,
+                                cfg->prev_key_valid, cfg->next_key_id,
+                                cfg->next_key_valid,
+                                dev ? dev->name : "none");
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -918,8 +1009,13 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
 
     flow = mwan_l2_rx_flow_get(cfg, flow_token, flow_seq);
     if (!flow) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_flow);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_FLOW,
                                    packet_key_id);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=flow token=%016llx seq=%u key=%u dev=%s\n",
+                                flow_token, flow_seq, packet_key_id,
+                                dev ? dev->name : "none");
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -929,10 +1025,16 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                               rx_headlen, rx_nonlinear, ingress_cpu);
     rcu_read_unlock();
     if (unlikely(ret < 0)) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_queue);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=enqueue token=%016llx seq=%u key=%u dev=%s err=%d\n",
+                                flow_token, flow_seq, packet_key_id,
+                                dev ? dev->name : "none", ret);
         mwan_l2_rx_flow_put(flow);
         kfree_skb(skb);
         return NET_RX_DROP;
     }
+    atomic64_inc(&mwan_l2_rx_handler_accepted);
     return NET_RX_SUCCESS;
 }
 

@@ -320,6 +320,15 @@ struct mwan_l2_worker {
     atomic64_t tx_processed_packets;
     atomic64_t tx_dropped_packets;
     atomic64_t tx_xmit_failures;
+    /* dev_queue_xmit() consumes the skb even when it reports a drop/error.
+     * Keep its result separate from pre-xmit crypto/worker failures so a
+     * sequence gap can be placed on the local TX side or farther downstream. */
+    atomic64_t tx_dev_xmit_calls;
+    atomic64_t tx_dev_xmit_accepted;
+    atomic64_t tx_dev_xmit_cn;
+    atomic64_t tx_dev_xmit_drop;
+    atomic64_t tx_dev_xmit_error;
+    atomic64_t tx_dev_xmit_last_fail_ns;
     atomic64_t tx_assigned_flows;
     atomic64_t tx_processing_ewma_ns;
     atomic64_t tx_work_runs;
