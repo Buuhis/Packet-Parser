@@ -119,6 +119,7 @@ void mwan_l2_diag_reset_all(void)
         atomic64_set(&cfg->flows.reorder_resync, 0);
         atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
         atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
+        atomic64_set(&cfg->flows.reorder_resync_preserved, 0);
         for (i = 0; cfg->l2_workers && i < cfg->num_workers; i++) {
             struct mwan_l2_worker *worker = &cfg->l2_workers[i];
 
@@ -813,6 +814,8 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.reorder_resync),
                    atomic64_read(&cfg->flows.reorder_resync_skipped),
                    atomic64_read(&cfg->flows.reorder_resync_flushed));
+        seq_printf(m, "reorder_slide preserved=%lld\n",
+                   atomic64_read(&cfg->flows.reorder_resync_preserved));
         if (cfg->l2_workers) {
             int i;
 

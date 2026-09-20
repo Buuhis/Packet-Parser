@@ -20,7 +20,7 @@
 #define MAX_MWAN_TUNNELS 100
 #define MWAN_LUT_SIZE    256
 #define MWAN_FLOW_HASH_SIZE 1024
-#define MWAN_FLOW_RING_SIZE  256
+#define MWAN_FLOW_RING_SIZE  512
 #define MWAN_FLOW_RING_MASK  (MWAN_FLOW_RING_SIZE - 1)
 #define MWAN_FLOW_MAX_ACTIVE 4096
 #define MWAN_FLOW_IDLE_TIMEOUT msecs_to_jiffies(60000)
@@ -176,11 +176,16 @@ struct mwan_l2_rx_flow {
     unsigned long last_seen;
     bool closing;
     bool stopping;
+    u16 reorder_queued;
     struct mwan_l2_flow_manager *manager;
     spinlock_t reorder_lock;
     struct timer_list reorder_timer;
     struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
-    unsigned long slot_time[MWAN_FLOW_RING_SIZE];
+    /* Only a 30 ms age comparison is required.  Low 32-bit jiffies with
+     * signed-delta comparison remain wrap-safe for intervals below 2^31
+     * ticks and keep a 512-slot RX flow in the same kmalloc-8k class as the
+     * previous 256-slot layout. */
+    u32 slot_time[MWAN_FLOW_RING_SIZE];
 };
 
 /* skb->cb metadata while an encrypted RX frame waits for its sticky worker. */
@@ -257,6 +262,7 @@ struct mwan_l2_flow_manager {
     atomic64_t reorder_resync;
     atomic64_t reorder_resync_skipped;
     atomic64_t reorder_resync_flushed;
+    atomic64_t reorder_resync_preserved;
     struct delayed_work gc_work;
     struct mwan_config *cfg;
     bool stopping;

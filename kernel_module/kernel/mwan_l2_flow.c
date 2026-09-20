@@ -12,6 +12,43 @@
 
 static void mwan_l2_flow_gc_workfn(struct work_struct *work);
 
+static bool mwan_l2_reorder_slot_expired(u32 timestamp)
+{
+    u32 expires = timestamp + (u32)MWAN_REORDER_TIMEOUT;
+
+    return (s32)((u32)jiffies - expires) >= 0;
+}
+
+/* Called with reorder_lock held.  Once a gap has started, newly arriving
+ * packets must not postpone its deadline.  Otherwise a continuous stream can
+ * keep mod_timer(now + timeout) moving forever and fill even a large ring
+ * before the timeout callback gets a chance to advance expected_seq. */
+static void mwan_l2_reorder_arm_locked(struct mwan_l2_rx_flow *flow)
+{
+    u32 delay = (u32)MWAN_REORDER_TIMEOUT;
+    u32 now = (u32)jiffies;
+    int i;
+
+    if (READ_ONCE(flow->stopping) || !flow->reorder_queued ||
+        timer_pending(&flow->reorder_timer))
+        return;
+
+    for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
+        s32 remaining;
+
+        if (!flow->ring[i])
+            continue;
+        remaining = (s32)(flow->slot_time[i] +
+                          (u32)MWAN_REORDER_TIMEOUT - now);
+        if (remaining <= 0) {
+            delay = 1;
+            break;
+        }
+        delay = min_t(u32, delay, (u32)remaining);
+    }
+    mod_timer(&flow->reorder_timer, jiffies + max_t(u32, delay, 1));
+}
+
 static void mwan_l2_timer_delete_sync(struct timer_list *timer)
 {
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 16, 0)
@@ -151,15 +188,15 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
         if (skb) {
             flow->ring[slot] = NULL;
             flow->slot_time[slot] = 0;
+            flow->reorder_queued--;
             flow->expected_seq++;
             netif_rx(skb);
             continue;
         }
 
         for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
-            if (flow->ring[i] && flow->slot_time[i] &&
-                time_after_eq(jiffies, flow->slot_time[i] +
-                                        MWAN_REORDER_TIMEOUT))
+            if (flow->ring[i] &&
+                mwan_l2_reorder_slot_expired(flow->slot_time[i]))
                 break;
         }
         if (i == MWAN_FLOW_RING_SIZE)
@@ -171,14 +208,9 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
         atomic64_inc(&flow->manager->reorder_timeouts);
     }
 
-    for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
-        if (flow->ring[i]) {
-            restart = true;
-            break;
-        }
-    }
-    if (restart && !READ_ONCE(flow->stopping))
-        mod_timer(&flow->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+    restart = flow->reorder_queued != 0;
+    if (restart)
+        mwan_l2_reorder_arm_locked(flow);
     next_expected = flow->expected_seq;
     spin_unlock_bh(&flow->reorder_lock);
 
@@ -195,6 +227,8 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
 
     if (!cfg)
         return -EINVAL;
+    /* Slot selection uses a bit mask throughout the reorder datapath. */
+    BUILD_BUG_ON(MWAN_FLOW_RING_SIZE & (MWAN_FLOW_RING_SIZE - 1));
     cfg->flows.cfg = cfg;
     cfg->flows.stopping = false;
     INIT_DELAYED_WORK(&cfg->flows.gc_work, mwan_l2_flow_gc_workfn);
@@ -218,6 +252,7 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.reorder_resync, 0);
     atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
     atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
+    atomic64_set(&cfg->flows.reorder_resync_preserved, 0);
     for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
         INIT_HLIST_HEAD(&cfg->flows.tx[i].head);
         spin_lock_init(&cfg->flows.tx[i].lock);
@@ -335,8 +370,10 @@ static void mwan_l2_free_rx_ring(struct mwan_l2_rx_flow *flow)
         if (flow->ring[i]) {
             kfree_skb(flow->ring[i]);
             flow->ring[i] = NULL;
+            flow->slot_time[i] = 0;
         }
     }
+    flow->reorder_queued = 0;
     spin_unlock_bh(&flow->reorder_lock);
 }
 
@@ -800,36 +837,62 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     }
     delta = (u32)(flow_seq - flow->expected_seq);
     if (unlikely(delta >= MWAN_FLOW_RING_SIZE)) {
-        u32 flushed = 0;
+        u32 advance = delta - (MWAN_FLOW_RING_SIZE - 1);
+        u32 evicted = 0;
         u32 old_expected = flow->expected_seq;
+        u32 old_expected_slot = old_expected & MWAN_FLOW_RING_MASK;
+        u32 preserved = 0;
         int i;
 
         /* This function is reached only after AES-GCM authentication has
          * succeeded.  A validated packet to the right of the receive window
-         * must advance the window; dropping it while leaving expected_seq
-         * unchanged would permanently black-hole a high-rate UDP flow after
-         * a failover gap larger than MWAN_FLOW_RING_SIZE. */
+         * must advance the window.  Slide only far enough to include the new
+         * packet and retain every buffered packet which overlaps the new
+         * window.  The old flush-all policy amplified a small sequence gap
+         * into loss of all authenticated packets already held in the ring.
+         *
+         * Every occupied slot belongs to the current window, so its offset
+         * from old_expected is recoverable from the masked slot index.  This
+         * avoids per-slot sequence metadata and keeps the normal fast path
+         * and RX-flow memory footprint unchanged apart from the larger ring. */
         atomic64_inc(&flow->manager->reorder_too_far);
         mwan_rekey_diag_count_drop(flow->manager->cfg,
                                    MWAN_REKEY_DROP_REORDER_TOO_FAR, 0);
         atomic64_inc(&flow->manager->reorder_resync);
-        atomic64_add(delta, &flow->manager->reorder_resync_skipped);
+        atomic64_add(advance, &flow->manager->reorder_resync_skipped);
         for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
+            u32 offset;
+
             if (!flow->ring[i])
                 continue;
+            offset = ((u32)i - old_expected_slot) &
+                     MWAN_FLOW_RING_MASK;
+            if (offset >= advance) {
+                preserved++;
+                continue;
+            }
             kfree_skb(flow->ring[i]);
             flow->ring[i] = NULL;
             flow->slot_time[i] = 0;
-            flushed++;
+            flow->reorder_queued--;
+            evicted++;
         }
-        if (flushed)
-            atomic64_add(flushed,
+        if (evicted)
+            atomic64_add(evicted,
                          &flow->manager->reorder_resync_flushed);
-        flow->expected_seq = flow_seq;
-        if (READ_ONCE(mwan_l2_diag_enabled))
+        if (preserved)
+            atomic64_add(preserved,
+                         &flow->manager->reorder_resync_preserved);
+        flow->expected_seq += advance;
+        if (READ_ONCE(mwan_l2_diag_enabled)) {
+            /* Keep the legacy line stable for existing log parsers. */
             pr_warn_ratelimited("mwan_kmod: L2D REORDER_TOO_FAR token=%016llx expected=%u received=%u gap=%u flushed=%u window=%u\n",
                                 flow->flow_token, old_expected, flow_seq,
-                                delta, flushed, MWAN_FLOW_RING_SIZE);
+                                delta, evicted, MWAN_FLOW_RING_SIZE);
+            pr_warn_ratelimited("mwan_kmod: L2D REORDER_SLIDE token=%016llx advanced=%u preserved=%u new_expected=%u\n",
+                                flow->flow_token, advance, preserved,
+                                flow->expected_seq);
+        }
     }
 
     slot = flow_seq & MWAN_FLOW_RING_MASK;
@@ -840,7 +903,8 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         return;
     }
     flow->ring[slot] = skb;
-    flow->slot_time[slot] = jiffies;
+    flow->slot_time[slot] = (u32)jiffies;
+    flow->reorder_queued++;
     while (1) {
         u32 expected_slot = flow->expected_seq & MWAN_FLOW_RING_MASK;
         struct sk_buff *pending = flow->ring[expected_slot];
@@ -849,10 +913,10 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
             break;
         flow->ring[expected_slot] = NULL;
         flow->slot_time[expected_slot] = 0;
+        flow->reorder_queued--;
         flow->expected_seq++;
         netif_rx(pending);
     }
-    if (!READ_ONCE(flow->stopping))
-        mod_timer(&flow->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
+    mwan_l2_reorder_arm_locked(flow);
     spin_unlock_bh(&flow->reorder_lock);
 }
