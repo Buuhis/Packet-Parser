@@ -120,14 +120,24 @@ struct mwan_active_paths {
     u8 tunnel_idx_lut[MWAN_LUT_SIZE];
 };
 
+enum mwan_flow_key_type {
+    MWAN_FLOW_KEY_L3_L4 = 0,
+    MWAN_FLOW_KEY_ESP_SA,
+    MWAN_FLOW_KEY_ESP_NATT_SA,
+    MWAN_FLOW_KEY_IPSEC_FRAGMENT,
+};
+
 struct mwan_l2_flow_key {
     __be32 saddr;
     __be32 daddr;
     __be16 sport;
     __be16 dport;
     u32 fallback_hash;
+    __be32 ipsec_spi;
     u8 protocol;
-    u8 reserved[3];
+    u8 type;
+    u8 direction;
+    u8 reserved;
 };
 
 enum mwan_flow_exec_mode {
@@ -266,6 +276,8 @@ struct mwan_l2_flow_manager {
     atomic64_t tx_degraded_admitted;
     atomic64_t tx_recovery_updated;
     atomic64_t tx_recovery_moved;
+    atomic64_t tx_ipsec_sa_created;
+    atomic64_t tx_ipsec_fragment_created;
     atomic64_t rx_created;
     atomic64_t rx_expired;
     atomic64_t table_full;
@@ -486,9 +498,6 @@ extern unsigned int mwan_l2_idle_unblock_pct;
 extern unsigned int mwan_l2_emergency_pct;
 extern unsigned int mwan_l2_max_shed_pct;
 extern char *mwan_l2_worker_cpus;
-extern bool mwan_l2_pipeline_enabled;
-extern unsigned int mwan_l2_pipeline_high_pct;
-extern char *mwan_l2_pipeline_cpus;
 
 /* API Functions */
 void mwan_state_init(void);

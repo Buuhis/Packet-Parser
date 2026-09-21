@@ -242,6 +242,8 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.tx_degraded_admitted, 0);
     atomic64_set(&cfg->flows.tx_recovery_updated, 0);
     atomic64_set(&cfg->flows.tx_recovery_moved, 0);
+    atomic64_set(&cfg->flows.tx_ipsec_sa_created, 0);
+    atomic64_set(&cfg->flows.tx_ipsec_fragment_created, 0);
     atomic64_set(&cfg->flows.rx_created, 0);
     atomic64_set(&cfg->flows.rx_expired, 0);
     atomic64_set(&cfg->flows.table_full, 0);
@@ -600,6 +602,11 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     hlist_add_head(&candidate->node, &bucket->head);
     atomic_inc(&cfg->flows.tx_count);
     atomic64_inc(&cfg->flows.tx_created);
+    if (candidate->key.type == MWAN_FLOW_KEY_ESP_SA ||
+        candidate->key.type == MWAN_FLOW_KEY_ESP_NATT_SA)
+        atomic64_inc(&cfg->flows.tx_ipsec_sa_created);
+    else if (candidate->key.type == MWAN_FLOW_KEY_IPSEC_FRAGMENT)
+        atomic64_inc(&cfg->flows.tx_ipsec_fragment_created);
     if (candidate->rebalance_on_recovery)
         atomic64_inc(&cfg->flows.tx_degraded_admitted);
     refcount_inc(&candidate->refs); /* caller reference */

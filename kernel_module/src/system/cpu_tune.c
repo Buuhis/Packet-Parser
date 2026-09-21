@@ -200,7 +200,6 @@ static void setup_kernel_overload_policy(void)
     } settings[] = {
         { "SDWAN_L2_EMERGENCY", "l2_emergency" },
         { "SDWAN_L2_MAX_SHED", "l2_max_shed" },
-        { "SDWAN_L2_PIPELINE_HIGH", "l2_pipeline_high" },
     };
 
     for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
@@ -227,22 +226,6 @@ static void setup_kernel_overload_policy(void)
                      settings[i].parameter, path);
     }
 
-    {
-        const char *value = getenv("SDWAN_L2_PIPELINE");
-        const char *path = "/sys/module/mwan_kmod/parameters/l2_pipeline";
-
-        if (value && *value) {
-            if (strcmp(value, "0") != 0 && strcmp(value, "1") != 0) {
-                log_warn("CPU Tuning: ignoring invalid "
-                         "SDWAN_L2_PIPELINE='%s' (expected 0 or 1)", value);
-            } else if (write_sysfs(path, value) == 0) {
-                log_info("  [+] Kernel overload: l2_pipeline=%s",
-                         strcmp(value, "1") == 0 ? "enabled" : "disabled");
-            } else {
-                log_warn("CPU Tuning: cannot set l2_pipeline via %s", path);
-            }
-        }
-    }
 }
 
 /* Linux sysfs cpumasks are comma-separated 32-bit words, most significant

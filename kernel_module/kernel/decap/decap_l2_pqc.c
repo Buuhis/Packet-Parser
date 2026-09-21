@@ -112,6 +112,8 @@ void mwan_l2_diag_reset_all(void)
         atomic64_set(&cfg->flows.tx_degraded_admitted, 0);
         atomic64_set(&cfg->flows.tx_recovery_updated, 0);
         atomic64_set(&cfg->flows.tx_recovery_moved, 0);
+        atomic64_set(&cfg->flows.tx_ipsec_sa_created, 0);
+        atomic64_set(&cfg->flows.tx_ipsec_fragment_created, 0);
         atomic64_set(&cfg->flows.reorder_late, 0);
         atomic64_set(&cfg->flows.reorder_duplicate, 0);
         atomic64_set(&cfg->flows.reorder_too_far, 0);
@@ -732,30 +734,6 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic_read(&w->busy_peak_bp),
                    atomic_read(&w->idle_min_bp));
     }
-    seq_printf(m, "pipeline enabled=%u high_pct=%u tx_promoted=%lld rx_promoted=%lld tx_dropped=%lld rx_dropped=%lld workers=%d\n",
-               READ_ONCE(mwan_l2_pipeline_enabled),
-               clamp_t(unsigned int,
-                       READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U),
-               atomic64_read(&cfg->flows.tx_pipeline_promoted),
-               atomic64_read(&cfg->flows.rx_pipeline_promoted),
-               atomic64_read(&cfg->flows.tx_pipeline_dropped),
-               atomic64_read(&cfg->flows.rx_pipeline_dropped),
-               cfg->num_pipeline_workers);
-    seq_puts(m, "pipeline_cpu tx_q tx_bytes tx_done tx_drop rx_q rx_bytes rx_done rx_drop\n");
-    for (i = 0; cfg->pipeline_workers &&
-                i < cfg->num_pipeline_workers; i++) {
-        struct mwan_pipeline_worker *p = &cfg->pipeline_workers[i];
-
-        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld\n",
-                   p->cpu, atomic64_read(&p->tx_queued),
-                   atomic64_read(&p->tx_queued_bytes),
-                   atomic64_read(&p->tx_completed),
-                   atomic64_read(&p->tx_dropped),
-                   atomic64_read(&p->rx_queued),
-                   atomic64_read(&p->rx_queued_bytes),
-                   atomic64_read(&p->rx_completed),
-                   atomic64_read(&p->rx_dropped));
-    }
     rcu_read_unlock();
     return 0;
 }
@@ -850,26 +828,15 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.tx_degraded_admitted),
                    atomic64_read(&cfg->flows.tx_recovery_updated),
                    atomic64_read(&cfg->flows.tx_recovery_moved));
+        seq_printf(m, "ipsec_sa created=%lld fragment_fallback=%lld\n",
+                   atomic64_read(&cfg->flows.tx_ipsec_sa_created),
+                   atomic64_read(&cfg->flows.tx_ipsec_fragment_created));
         seq_printf(m, "worker_cpus count=%d list=", cfg->num_workers);
         for (worker_idx = 0;
              cfg->l2_workers && worker_idx < cfg->num_workers;
              worker_idx++)
             seq_printf(m, "%s%d", worker_idx ? "," : "",
                        cfg->l2_workers[worker_idx].cpu);
-        seq_putc(m, '\n');
-        seq_printf(m, "pipeline enabled=%u high_pct=%u tx_promoted=%lld rx_promoted=%lld tx_drop=%lld rx_drop=%lld cpus=",
-                   READ_ONCE(mwan_l2_pipeline_enabled),
-                   clamp_t(unsigned int,
-                           READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U),
-                   atomic64_read(&cfg->flows.tx_pipeline_promoted),
-                   atomic64_read(&cfg->flows.rx_pipeline_promoted),
-                   atomic64_read(&cfg->flows.tx_pipeline_dropped),
-                   atomic64_read(&cfg->flows.rx_pipeline_dropped));
-        for (worker_idx = 0;
-             cfg->pipeline_workers &&
-             worker_idx < cfg->num_pipeline_workers; worker_idx++)
-            seq_printf(m, "%s%d", worker_idx ? "," : "",
-                       cfg->pipeline_workers[worker_idx].cpu);
         seq_putc(m, '\n');
         for (u32 i = 0; i < cfg->num_tunnels; i++) {
             const struct mwan_tunnel *tun = &cfg->tunnels[i];

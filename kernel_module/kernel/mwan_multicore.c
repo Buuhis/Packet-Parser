@@ -17,6 +17,18 @@
 #include <net/inet_ecn.h>
 #include <net/ip.h>
 
+/* Datapath feature switches are deliberately compile-time only.  Change a
+ * value here, rebuild mwan_kmod.ko, and reload the module. */
+#define MWAN_ENABLE_ROLE_PIPELINE        0
+#define MWAN_ENABLE_IPSEC_SA_SCHEDULER   1
+/* Reserved for a future ordered multi-lane implementation.  Silently
+ * enabling an unfinished one-SA/multi-core path would break ESP ordering. */
+#define MWAN_ENABLE_HOT_SA_SHARDING      0
+
+#if MWAN_ENABLE_HOT_SA_SHARDING
+#error "MWAN_ENABLE_HOT_SA_SHARDING is not implemented"
+#endif
+
 #define MWAN_CPU_BP_MAX              10000U
 #define MWAN_CPU_COOL_SAMPLES            3U
 #define MWAN_CPU_MIN_SAMPLE_MS           10U
@@ -31,18 +43,32 @@
 #define MWAN_CONTROL_BFD_PORT_1         3784U
 #define MWAN_CONTROL_BFD_PORT_2         3785U
 #define MWAN_CONTROL_BFD_PORT_3         4784U
+#define MWAN_IPSEC_IKE_PORT              500U
+#define MWAN_IPSEC_NATT_PORT            4500U
+#define MWAN_FLOW_DIRECTION_TX              1U
+#if MWAN_ENABLE_ROLE_PIPELINE
 #define MWAN_PIPELINE_HOT_SAMPLES          3U
+#define MWAN_PIPELINE_HIGH_PCT             85U
 #define MWAN_PIPELINE_CB_TX_MAGIC       0x5054U
 #define MWAN_PIPELINE_CB_RX_MAGIC       0x5052U
+#endif
 
 static struct workqueue_struct *mwan_tx_wq;
+#if MWAN_ENABLE_ROLE_PIPELINE
 static struct workqueue_struct *mwan_pipeline_wq;
+#endif
 static DEFINE_SPINLOCK(mwan_admission_lock);
 static atomic64_t mwan_new_flow_admitted;
 static atomic64_t mwan_no_eligible_cpu;
 static void mwan_cpu_sample_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(mwan_cpu_sample_work, mwan_cpu_sample_fn);
 
+struct mwan_esp_wire_header {
+    __be32 spi;
+    __be32 sequence;
+} __packed;
+
+#if MWAN_ENABLE_ROLE_PIPELINE
 struct mwan_pipeline_tx_cb {
     uintptr_t flow_ptr;
     u64 flow_token;
@@ -66,6 +92,7 @@ struct mwan_pipeline_rx_cb {
     ((struct mwan_pipeline_tx_cb *)((skb)->cb))
 #define MWAN_PIPELINE_RX_CB(skb) \
     ((struct mwan_pipeline_rx_cb *)((skb)->cb))
+#endif
 
 static void mwan_atomic64_update_max(atomic64_t *maximum, u64 value)
 {
@@ -100,6 +127,7 @@ static unsigned int mwan_bp_ewma(atomic_t *value, unsigned int sample)
     return next;
 }
 
+#if MWAN_ENABLE_ROLE_PIPELINE
 static void mwan_pipeline_update_hot(unsigned int *samples,
                                      atomic_t *ready, bool hot)
 {
@@ -113,6 +141,7 @@ static void mwan_pipeline_update_hot(unsigned int *samples,
         atomic_set(ready, 0);
     }
 }
+#endif
 
 static void mwan_read_cpu_accounting(int cpu, u64 *total, u64 *system,
                                      u64 *softirq, u64 *idle)
@@ -145,8 +174,10 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     worker->cpu_cool_samples = 0;
     worker->emergency_hot_samples = 0;
     worker->emergency_cool_samples = 0;
+#if MWAN_ENABLE_ROLE_PIPELINE
     worker->tx_pipeline_hot_samples = 0;
     worker->rx_pipeline_hot_samples = 0;
+#endif
     worker->cpu_prev_tx_queued_packets = 0;
     worker->cpu_prev_tx_queued_bytes = 0;
     atomic_set(&worker->system_raw_bp, 0);
@@ -161,8 +192,10 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     atomic_set(&worker->emergency_shed, 0);
     atomic_set(&worker->busy_peak_bp, 0);
     atomic_set(&worker->idle_min_bp, MWAN_CPU_BP_MAX);
+#if MWAN_ENABLE_ROLE_PIPELINE
     atomic_set(&worker->tx_pipeline_ready, 0);
     atomic_set(&worker->rx_pipeline_ready, 0);
+#endif
     atomic64_set(&worker->emergency_enter_count, 0);
     atomic64_set(&worker->emergency_last_enter_ns, 0);
     atomic64_set(&worker->overload_last_drop_ns, 0);
@@ -206,10 +239,12 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
         worker->cpu_cool_samples = 0;
         worker->emergency_hot_samples = 0;
         worker->emergency_cool_samples = 0;
+#if MWAN_ENABLE_ROLE_PIPELINE
         worker->tx_pipeline_hot_samples = 0;
         worker->rx_pipeline_hot_samples = 0;
         atomic_set(&worker->tx_pipeline_ready, 0);
         atomic_set(&worker->rx_pipeline_ready, 0);
+#endif
         return;
     }
 
@@ -334,10 +369,9 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
         }
     }
 
+#if MWAN_ENABLE_ROLE_PIPELINE
     {
-        unsigned int pipeline_bp =
-            clamp_t(unsigned int,
-                    READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U) * 100U;
+        unsigned int pipeline_bp = MWAN_PIPELINE_HIGH_PCT * 100U;
         unsigned int observed = max(raw_busy, ewma_busy);
 
         mwan_pipeline_update_hot(
@@ -352,6 +386,7 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
                 (atomic_read(&worker->busy) ||
                  atomic64_read(&worker->queued_packets)));
     }
+#endif
 }
 
 static void mwan_cpu_sample_fn(struct work_struct *work)
@@ -737,6 +772,7 @@ static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
     return cfg->tunnels[cb->tunnel_idx].encap_type == cb->encap_type;
 }
 
+#if MWAN_ENABLE_ROLE_PIPELINE
 static u32 mwan_pipeline_tx_checksum(const struct mwan_pipeline_tx_cb *cb)
 {
     return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
@@ -923,8 +959,7 @@ static void mwan_pipeline_tx_maybe_promote(
 {
     int target;
 
-    if (!READ_ONCE(mwan_l2_pipeline_enabled) ||
-        encap_type != MWAN_ENCAP_L2_PQC ||
+    if (encap_type != MWAN_ENCAP_L2_PQC ||
         atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
         !atomic_read(&worker->tx_pipeline_ready))
         return;
@@ -946,7 +981,7 @@ void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
 {
     int target;
 
-    if (!READ_ONCE(mwan_l2_pipeline_enabled) || !cfg || !flow || !worker ||
+    if (!cfg || !flow || !worker ||
         atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
         !atomic_read(&worker->rx_pipeline_ready))
         return;
@@ -1047,6 +1082,29 @@ int mwan_pipeline_rx_submit(struct sk_buff *skb,
                             pipeline->cpu);
     return 0;
 }
+#else
+void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
+                                    struct mwan_l2_rx_flow *flow,
+                                    struct mwan_l2_worker *worker,
+                                    u32 flow_id)
+{
+    (void)cfg;
+    (void)flow;
+    (void)worker;
+    (void)flow_id;
+}
+
+int mwan_pipeline_rx_submit(struct sk_buff *skb,
+                            struct mwan_l2_worker *crypto_worker,
+                            struct mwan_l2_rx_flow *flow, u32 flow_seq)
+{
+    (void)skb;
+    (void)crypto_worker;
+    (void)flow;
+    (void)flow_seq;
+    return -EOPNOTSUPP;
+}
+#endif
 
 static bool mwan_l2_rx_cb_valid(const struct sk_buff *skb,
                                 const struct mwan_l2_rx_cb *cb)
@@ -1094,10 +1152,10 @@ static bool mwan_release_tx_queue_ref(struct mwan_l2_worker *worker,
     return mwan_l2_tx_flow_release_queued(worker->cfg, &info.key, owner);
 }
 
+#if MWAN_ENABLE_ROLE_PIPELINE
 static int mwan_pipeline_workers_init(struct mwan_config *cfg)
 {
     cpumask_var_t cpus;
-    const char *requested = READ_ONCE(mwan_l2_pipeline_cpus);
     int cpu;
     int idx = 0;
     int err = 0;
@@ -1106,14 +1164,8 @@ static int mwan_pipeline_workers_init(struct mwan_config *cfg)
     if (!zalloc_cpumask_var(&cpus, GFP_KERNEL))
         return -ENOMEM;
     cpus_read_lock();
-    if (requested && requested[0]) {
-        err = cpulist_parse(requested, cpus);
-        if (err)
-            goto out_unlock;
-    } else {
-        for (i = 0; i < cfg->num_workers; i++)
-            cpumask_set_cpu(cfg->l2_workers[i].cpu, cpus);
-    }
+    for (i = 0; i < cfg->num_workers; i++)
+        cpumask_set_cpu(cfg->l2_workers[i].cpu, cpus);
     cpumask_and(cpus, cpus, cpu_online_mask);
     cpumask_and(cpus, cpus, current->cpus_ptr);
     cfg->num_pipeline_workers = cpumask_weight(cpus);
@@ -1210,6 +1262,18 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
     cfg->pipeline_workers = NULL;
     cfg->num_pipeline_workers = 0;
 }
+#else
+static int mwan_pipeline_workers_init(struct mwan_config *cfg)
+{
+    (void)cfg;
+    return 0;
+}
+
+static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
+{
+    (void)cfg;
+}
+#endif
 
 int mwan_l2_workers_init(struct mwan_config *cfg)
 {
@@ -1228,7 +1292,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     bypass = !cfg->encrypt_on;
     if (!l2_pqc && !bypass)
         return 0;
-    if (!mwan_tx_wq || !mwan_pipeline_wq)
+    if (!mwan_tx_wq)
         return -ENODEV;
     if (!zalloc_cpumask_var(&worker_cpus, GFP_KERNEL))
         return -ENOMEM;
@@ -1650,6 +1714,8 @@ const char *mwan_multicore_hash_source_name(enum mwan_flow_hash_source source)
         return "dissector";
     case MWAN_HASH_FALLBACK:
         return "fallback";
+    case MWAN_HASH_IPSEC_SA:
+        return "ipsec-sa";
     default:
         return "invalid";
     }
@@ -1675,10 +1741,36 @@ static bool mwan_extract_ipv4_tuple(struct sk_buff *skb,
     info->key.saddr = iph->saddr;
     info->key.daddr = iph->daddr;
     info->key.protocol = iph->protocol;
+    info->key.type = MWAN_FLOW_KEY_L3_L4;
+    info->key.direction = MWAN_FLOW_DIRECTION_TX;
     info->tuple_valid = true;
     ip_hlen = iph->ihl * 4;
-    if (!(iph->frag_off & htons(IP_MF | IP_OFFSET)) &&
-        (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP)) {
+    if (iph->frag_off & htons(IP_MF | IP_OFFSET)) {
+#if MWAN_ENABLE_IPSEC_SA_SCHEDULER
+        if (iph->protocol == IPPROTO_ESP)
+            info->key.type = MWAN_FLOW_KEY_IPSEC_FRAGMENT;
+#endif
+        return true;
+    }
+
+#if MWAN_ENABLE_IPSEC_SA_SCHEDULER
+    if (iph->protocol == IPPROTO_ESP) {
+        struct mwan_esp_wire_header esp_buf;
+        const struct mwan_esp_wire_header *esp;
+
+        esp = skb_header_pointer(skb, network_offset + ip_hlen,
+                                 sizeof(esp_buf), &esp_buf);
+        if (esp && esp->spi) {
+            info->key.ipsec_spi = esp->spi;
+            info->key.type = MWAN_FLOW_KEY_ESP_SA;
+            info->ipsec_sequence = esp->sequence;
+            info->ipsec_sa_valid = true;
+        }
+        return true;
+    }
+#endif
+
+    if (iph->protocol == IPPROTO_TCP || iph->protocol == IPPROTO_UDP) {
         ports_ptr = skb_header_pointer(skb, network_offset + ip_hlen,
                                        sizeof(ports_be), &ports_be);
         if (ports_ptr) {
@@ -1690,6 +1782,44 @@ static bool mwan_extract_ipv4_tuple(struct sk_buff *skb,
             *ports = (__force u32)ports_be;
         }
     }
+
+#if MWAN_ENABLE_IPSEC_SA_SCHEDULER
+    if (iph->protocol == IPPROTO_UDP) {
+        bool ike_port = ntohs(info->key.sport) == MWAN_IPSEC_IKE_PORT ||
+                        ntohs(info->key.dport) == MWAN_IPSEC_IKE_PORT;
+        bool natt_port = ntohs(info->key.sport) == MWAN_IPSEC_NATT_PORT ||
+                         ntohs(info->key.dport) == MWAN_IPSEC_NATT_PORT;
+
+        if (ike_port) {
+            info->ipsec_control = true;
+        } else if (natt_port) {
+            struct mwan_esp_wire_header esp_buf;
+            const struct mwan_esp_wire_header *esp;
+            unsigned int ip_len = ntohs(iph->tot_len);
+            int esp_offset = network_offset + ip_hlen +
+                             sizeof(struct udphdr);
+
+            /* UDP/4500 carrying IKE starts with the zero Non-ESP Marker.
+             * Short payloads include NAT keepalives and are control traffic,
+             * not an ESP SA. */
+            if (ip_len < ip_hlen + sizeof(struct udphdr) +
+                         sizeof(esp_buf)) {
+                info->ipsec_control = true;
+            } else {
+                esp = skb_header_pointer(skb, esp_offset, sizeof(esp_buf),
+                                         &esp_buf);
+                if (!esp || !esp->spi) {
+                    info->ipsec_control = true;
+                } else {
+                    info->key.ipsec_spi = esp->spi;
+                    info->key.type = MWAN_FLOW_KEY_ESP_NATT_SA;
+                    info->ipsec_sequence = esp->sequence;
+                    info->ipsec_sa_valid = true;
+                }
+            }
+        }
+    }
+#endif
     return true;
 }
 
@@ -1698,6 +1828,7 @@ u32 mwan_multicore_flow_info(struct sk_buff *skb,
 {
     u32 hash;
     u32 ports = 0;
+    bool tuple_valid;
 
     memset(info, 0, sizeof(*info));
     info->hash_before = skb_get_hash_raw(skb);
@@ -1705,11 +1836,16 @@ u32 mwan_multicore_flow_info(struct sk_buff *skb,
     info->hash_is_l4 = skb->l4_hash;
     info->hash_is_sw = skb->sw_hash;
     hash = skb_get_hash(skb);
-    if (hash) {
+    tuple_valid = mwan_extract_ipv4_tuple(skb, info, &ports);
+    if (info->ipsec_sa_valid) {
+        /* A cached/RSS hash is not guaranteed to contain SPI. Hash the full
+         * canonical SA key so core and tunnel selection stay stable. */
+        hash = jhash(&info->key, sizeof(info->key), 0x69707361U);
+        info->hash_source = MWAN_HASH_IPSEC_SA;
+    } else if (hash) {
         info->hash_source = info->hash_was_cached ? MWAN_HASH_CACHED :
                                                    MWAN_HASH_DISSECTOR;
-        mwan_extract_ipv4_tuple(skb, info, &ports);
-    } else if (mwan_extract_ipv4_tuple(skb, info, &ports)) {
+    } else if (tuple_valid) {
         ports ^= (u32)info->key.protocol << 24;
         hash = jhash_3words((__force u32)info->key.saddr,
                             (__force u32)info->key.daddr, ports,
@@ -1734,6 +1870,43 @@ static bool mwan_is_control_udp_port(__be16 port)
            host == MWAN_CONTROL_BFD_PORT_1 ||
            host == MWAN_CONTROL_BFD_PORT_2 ||
            host == MWAN_CONTROL_BFD_PORT_3;
+}
+
+static bool mwan_is_ipsec_udp_control(struct sk_buff *skb,
+                                      const struct udphdr *udp,
+                                      int network_offset, int ip_hlen,
+                                      int ip_len)
+{
+#if MWAN_ENABLE_IPSEC_SA_SCHEDULER
+    struct mwan_esp_wire_header esp_buf;
+    const struct mwan_esp_wire_header *esp;
+    bool ike_port;
+    bool natt_port;
+
+    if (!udp)
+        return false;
+    ike_port = ntohs(udp->source) == MWAN_IPSEC_IKE_PORT ||
+               ntohs(udp->dest) == MWAN_IPSEC_IKE_PORT;
+    if (ike_port)
+        return true;
+    natt_port = ntohs(udp->source) == MWAN_IPSEC_NATT_PORT ||
+                ntohs(udp->dest) == MWAN_IPSEC_NATT_PORT;
+    if (!natt_port)
+        return false;
+    if (ip_len < ip_hlen + sizeof(*udp) + sizeof(esp_buf))
+        return true;
+    esp = skb_header_pointer(skb,
+                             network_offset + ip_hlen + sizeof(*udp),
+                             sizeof(esp_buf), &esp_buf);
+    return !esp || !esp->spi;
+#else
+    (void)skb;
+    (void)udp;
+    (void)network_offset;
+    (void)ip_hlen;
+    (void)ip_len;
+    return false;
+#endif
 }
 
 enum mwan_packet_class mwan_multicore_packet_classify(struct sk_buff *skb)
@@ -1779,7 +1952,9 @@ enum mwan_packet_class mwan_multicore_packet_classify(struct sk_buff *skb)
         udp = skb_header_pointer(skb, network_offset + ip_hlen,
                                  sizeof(udp_buf), &udp_buf);
         if (!udp || mwan_is_control_udp_port(udp->source) ||
-            mwan_is_control_udp_port(udp->dest))
+            mwan_is_control_udp_port(udp->dest) ||
+            mwan_is_ipsec_udp_control(skb, udp, network_offset, ip_hlen,
+                                      ip_len))
             return MWAN_PACKET_CONTROL;
         return MWAN_PACKET_UDP_DATA;
     }
@@ -1947,8 +2122,10 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     if (owner_cpu)
         *owner_cpu = worker->cpu;
 
+#if MWAN_ENABLE_ROLE_PIPELINE
     mwan_pipeline_tx_maybe_promote(cfg, flow, worker, info->flow_id,
                                    (u8)tun->encap_type);
+#endif
 
     if (mwan_tx_should_drop(worker, skb, packet_class)) {
         spin_unlock_bh(&flow->submit_lock);
@@ -2067,6 +2244,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             if (!cb_ok || tunnel_idx >= cfg->num_tunnels) {
                 err = -EINVAL;
             } else if (encap_type == MWAN_ENCAP_L2_PQC) {
+#if MWAN_ENABLE_ROLE_PIPELINE
                 if (flow && atomic_read(&flow->exec_mode) ==
                                 MWAN_FLOW_EXEC_PIPELINE) {
                     err = mwan_l2_pqc_encrypt_skb(
@@ -2082,10 +2260,13 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                                 &cfg->flows.tx_pipeline_dropped);
                     }
                 } else {
+#endif
                     err = mwan_l2_pqc_encrypt_xmit(
                         skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
                         flow_seq);
+#if MWAN_ENABLE_ROLE_PIPELINE
                 }
+#endif
             } else if (encap_type == MWAN_ENCAP_NONE) {
                 err = mwan_encap_none_xmit(skb, &cfg->tunnels[tunnel_idx]);
             } else {
@@ -2147,6 +2328,7 @@ int mwan_multicore_init(void)
                                  WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
     if (!mwan_tx_wq)
         return -ENOMEM;
+#if MWAN_ENABLE_ROLE_PIPELINE
     mwan_pipeline_wq = alloc_workqueue("mwan_pipeline",
                                        WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
     if (!mwan_pipeline_wq) {
@@ -2154,6 +2336,7 @@ int mwan_multicore_init(void)
         mwan_tx_wq = NULL;
         return -ENOMEM;
     }
+#endif
     sample_ms = clamp_t(unsigned int,
                         READ_ONCE(mwan_l2_softirq_sample_ms),
                         MWAN_CPU_MIN_SAMPLE_MS, MWAN_CPU_MAX_SAMPLE_MS);
@@ -2165,17 +2348,16 @@ int mwan_multicore_init(void)
 void mwan_multicore_cleanup(void)
 {
     cancel_delayed_work_sync(&mwan_cpu_sample_work);
-    /* TX crypto work can enqueue onto the output pipeline.  Drain every
-     * producer before destroying the consumer workqueue.  RX producers have
-     * already been drained by mwan_decap_l2_pqc_cleanup(). */
     if (mwan_tx_wq) {
         destroy_workqueue(mwan_tx_wq);
         mwan_tx_wq = NULL;
     }
+#if MWAN_ENABLE_ROLE_PIPELINE
     if (mwan_pipeline_wq) {
         destroy_workqueue(mwan_pipeline_wq);
         mwan_pipeline_wq = NULL;
     }
+#endif
 }
 
 /* A tunnel rebind changes the net_device referenced by one stable tunnel
@@ -2185,6 +2367,8 @@ void mwan_l2_workers_flush(void)
 {
     if (mwan_tx_wq)
         flush_workqueue(mwan_tx_wq);
+#if MWAN_ENABLE_ROLE_PIPELINE
     if (mwan_pipeline_wq)
         flush_workqueue(mwan_pipeline_wq);
+#endif
 }

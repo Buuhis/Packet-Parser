@@ -28,9 +28,13 @@ struct mwan_l2_tx_diag {
     __be32 daddr;
     __be16 sport;
     __be16 dport;
+    __be32 ipsec_spi;
+    __be32 ipsec_sequence;
     u32 hash_before;
     u8 protocol;
+    u8 key_type;
     bool tuple_valid;
+    bool ipsec_sa_valid;
     bool hash_was_cached;
     bool hash_is_l4;
     bool hash_is_sw;
@@ -42,8 +46,10 @@ struct mwan_l2_tx_diag_key {
     __be32 daddr;
     __be16 sport;
     __be16 dport;
+    __be32 ipsec_spi;
     u32 flow_id;
     u8 protocol;
+    u8 key_type;
     bool tuple_valid;
 };
 
@@ -120,8 +126,10 @@ static bool mwan_l2_tx_diag_first_flow(u32 flow_id,
         .daddr = diag->daddr,
         .sport = diag->sport,
         .dport = diag->dport,
+        .ipsec_spi = diag->ipsec_spi,
         .flow_id = flow_id,
         .protocol = diag->protocol,
+        .key_type = diag->key_type,
         .tuple_valid = diag->tuple_valid,
     };
     unsigned int count;
@@ -142,7 +150,9 @@ static bool mwan_l2_tx_diag_first_flow(u32 flow_id,
         if (key.tuple_valid && seen->tuple_valid &&
             key.saddr == seen->saddr && key.daddr == seen->daddr &&
             key.sport == seen->sport && key.dport == seen->dport &&
-            key.protocol == seen->protocol)
+            key.ipsec_spi == seen->ipsec_spi &&
+            key.protocol == seen->protocol &&
+            key.key_type == seen->key_type)
             goto out;
         if (!key.tuple_valid && !seen->tuple_valid &&
             key.flow_id == seen->flow_id)
@@ -174,10 +184,13 @@ static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
     if (unlikely(flow_id == 0)) {
         atomic64_inc(&mwan_l2_tx_diag_zero);
         if (diag->tuple_valid)
-            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
+            pr_info_ratelimited("mwan_kmod: L2D TX_ZERO g=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u sa=%u spi=%08x esp_seq=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                                 generation, flow_seq, &diag->saddr,
                                 ntohs(diag->sport), &diag->daddr,
                                 ntohs(diag->dport), diag->protocol,
+                                diag->ipsec_sa_valid,
+                                ntohl(diag->ipsec_spi),
+                                ntohl(diag->ipsec_sequence),
                                 diag->hash_source, diag->hash_before,
                                 raw_smp_processor_id(), owner_cpu,
                                 tun->dev ? tun->dev->name : "none");
@@ -194,10 +207,12 @@ static void mwan_l2_tx_diag_log(const struct mwan_l2_tx_diag *diag,
         return;
 
     if (diag->tuple_valid) {
-        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
+        pr_info("mwan_kmod: L2D TX g=%u f=%08x b=%u seq=%llu tuple=%pI4:%u>%pI4:%u p=%u sa=%u spi=%08x esp_seq=%u hs=%s raw=%08x dispatch=%u owner_cpu=%d tun=%s\n",
                 generation, flow_id, flow_idx, flow_seq, &diag->saddr,
                 ntohs(diag->sport), &diag->daddr, ntohs(diag->dport),
-                diag->protocol, diag->hash_source, diag->hash_before,
+                diag->protocol, diag->ipsec_sa_valid,
+                ntohl(diag->ipsec_spi), ntohl(diag->ipsec_sequence),
+                diag->hash_source, diag->hash_before,
                 raw_smp_processor_id(), owner_cpu,
                 tun->dev ? tun->dev->name : "none");
     } else {
@@ -357,9 +372,13 @@ mwan_l2_submit_fragment(struct sk_buff *fragment,
     flow_diag.daddr = info->key.daddr;
     flow_diag.sport = info->key.sport;
     flow_diag.dport = info->key.dport;
+    flow_diag.ipsec_spi = info->key.ipsec_spi;
+    flow_diag.ipsec_sequence = info->ipsec_sequence;
     flow_diag.protocol = info->key.protocol;
+    flow_diag.key_type = info->key.type;
     flow_diag.hash_before = info->hash_before;
     flow_diag.tuple_valid = info->tuple_valid;
+    flow_diag.ipsec_sa_valid = info->ipsec_sa_valid;
     flow_diag.hash_was_cached =
         info->hash_was_cached;
     flow_diag.hash_is_l4 = info->hash_is_l4;
@@ -736,9 +755,13 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
     flow_diag.daddr = info->key.daddr;
     flow_diag.sport = info->key.sport;
     flow_diag.dport = info->key.dport;
+    flow_diag.ipsec_spi = info->key.ipsec_spi;
+    flow_diag.ipsec_sequence = info->ipsec_sequence;
     flow_diag.protocol = info->key.protocol;
+    flow_diag.key_type = info->key.type;
     flow_diag.hash_before = info->hash_before;
     flow_diag.tuple_valid = info->tuple_valid;
+    flow_diag.ipsec_sa_valid = info->ipsec_sa_valid;
     flow_diag.hash_was_cached = info->hash_was_cached;
     flow_diag.hash_is_l4 = info->hash_is_l4;
     flow_diag.hash_is_sw = info->hash_is_sw;

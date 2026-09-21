@@ -10,14 +10,18 @@ enum mwan_flow_hash_source {
     MWAN_HASH_CACHED,
     MWAN_HASH_DISSECTOR,
     MWAN_HASH_FALLBACK,
+    MWAN_HASH_IPSEC_SA,
 };
 
 struct mwan_tx_flow_info {
     struct mwan_l2_flow_key key;
     u32 flow_id;
     u32 hash_before;
+    __be32 ipsec_sequence;
     enum mwan_flow_hash_source hash_source;
     bool tuple_valid;
+    bool ipsec_sa_valid;
+    bool ipsec_control;
     bool hash_was_cached;
     bool hash_is_l4;
     bool hash_is_sw;

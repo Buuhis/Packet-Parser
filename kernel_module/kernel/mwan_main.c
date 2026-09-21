@@ -14,9 +14,6 @@ unsigned int mwan_l2_idle_unblock_pct = 20;
 unsigned int mwan_l2_emergency_pct = 97;
 unsigned int mwan_l2_max_shed_pct = 50;
 char *mwan_l2_worker_cpus = "";
-bool mwan_l2_pipeline_enabled;
-unsigned int mwan_l2_pipeline_high_pct = 85;
-char *mwan_l2_pipeline_cpus = "";
 static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
@@ -49,15 +46,6 @@ MODULE_PARM_DESC(l2_max_shed,
 module_param_named(l2_worker_cpus, mwan_l2_worker_cpus, charp, 0444);
 MODULE_PARM_DESC(l2_worker_cpus,
                  "CPU list for L2 workers (for example 1-3,5); empty uses every online CPU");
-module_param_named(l2_pipeline, mwan_l2_pipeline_enabled, bool, 0644);
-MODULE_PARM_DESC(l2_pipeline,
-                 "Promote hot L2-PQC flows from legacy workers to split crypto/output pipeline");
-module_param_named(l2_pipeline_high, mwan_l2_pipeline_high_pct, uint, 0644);
-MODULE_PARM_DESC(l2_pipeline_high,
-                 "Sustained CPU busy percentage required before flow promotion");
-module_param_named(l2_pipeline_cpus, mwan_l2_pipeline_cpus, charp, 0444);
-MODULE_PARM_DESC(l2_pipeline_cpus,
-                 "CPU list for promoted-flow output workers; empty reuses L2 worker CPUs");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)
