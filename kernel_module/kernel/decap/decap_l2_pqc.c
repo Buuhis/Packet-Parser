@@ -120,6 +120,10 @@ void mwan_l2_diag_reset_all(void)
         atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
         atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
         atomic64_set(&cfg->flows.reorder_resync_preserved, 0);
+        atomic64_set(&cfg->flows.tx_pipeline_promoted, 0);
+        atomic64_set(&cfg->flows.rx_pipeline_promoted, 0);
+        atomic64_set(&cfg->flows.tx_pipeline_dropped, 0);
+        atomic64_set(&cfg->flows.rx_pipeline_dropped, 0);
         for (i = 0; cfg->l2_workers && i < cfg->num_workers; i++) {
             struct mwan_l2_worker *worker = &cfg->l2_workers[i];
 
@@ -129,6 +133,16 @@ void mwan_l2_diag_reset_all(void)
             atomic64_set(&worker->tx_dev_xmit_drop, 0);
             atomic64_set(&worker->tx_dev_xmit_error, 0);
             atomic64_set(&worker->tx_dev_xmit_last_fail_ns, 0);
+        }
+        for (i = 0; cfg->pipeline_workers &&
+                    i < cfg->num_pipeline_workers; i++) {
+            struct mwan_pipeline_worker *worker =
+                &cfg->pipeline_workers[i];
+
+            atomic64_set(&worker->tx_completed, 0);
+            atomic64_set(&worker->rx_completed, 0);
+            atomic64_set(&worker->tx_dropped, 0);
+            atomic64_set(&worker->rx_dropped, 0);
         }
         mwan_rekey_diag_reset(cfg);
     }
@@ -240,6 +254,8 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
 
     worker = &cfg->l2_workers[owner];
     spin_lock(&worker->rx_queue.lock);
+    mwan_pipeline_rx_maybe_promote(cfg, flow, worker,
+                                   lower_32_bits(flow_token));
     if (worker->rx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&worker->queued_bytes) + accounted_bytes >
             MWAN_L2_QUEUE_MAX_BYTES) {
@@ -476,6 +492,7 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
             u32 flow_seq = 0;
             u64 packet_nonce = 0;
             u64 start_ns = ktime_get_ns();
+            bool pipeline_owned = false;
             int ret;
 
             memcpy(&cb, MWAN_L2_RX_CB(skb), sizeof(cb));
@@ -599,10 +616,23 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                 mwan_multicore_rx_congestion_feedback(worker, skb);
                 mwan_l2_rx_flow_touch(flow,
                     mwan_l2_decrypted_tcp_closing(skb));
-                mwan_l2_rx_flow_deliver(flow, skb, flow_seq);
+                if (atomic_read(&flow->exec_mode) ==
+                        MWAN_FLOW_EXEC_PIPELINE) {
+                    ret = mwan_pipeline_rx_submit(skb, worker, flow,
+                                                  flow_seq);
+                    if (!ret) {
+                        pipeline_owned = true;
+                    } else {
+                        atomic64_inc(&worker->dropped_packets);
+                        atomic64_inc(&worker->cfg->flows.rx_pipeline_dropped);
+                        kfree_skb(skb);
+                    }
+                } else {
+                    mwan_l2_rx_flow_deliver(flow, skb, flow_seq);
+                }
             }
 
-            if (flow) {
+            if (flow && !pipeline_owned) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_rx_flow_put(flow);
             }
@@ -701,6 +731,30 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->overload_last_drop_ns),
                    atomic_read(&w->busy_peak_bp),
                    atomic_read(&w->idle_min_bp));
+    }
+    seq_printf(m, "pipeline enabled=%u high_pct=%u tx_promoted=%lld rx_promoted=%lld tx_dropped=%lld rx_dropped=%lld workers=%d\n",
+               READ_ONCE(mwan_l2_pipeline_enabled),
+               clamp_t(unsigned int,
+                       READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U),
+               atomic64_read(&cfg->flows.tx_pipeline_promoted),
+               atomic64_read(&cfg->flows.rx_pipeline_promoted),
+               atomic64_read(&cfg->flows.tx_pipeline_dropped),
+               atomic64_read(&cfg->flows.rx_pipeline_dropped),
+               cfg->num_pipeline_workers);
+    seq_puts(m, "pipeline_cpu tx_q tx_bytes tx_done tx_drop rx_q rx_bytes rx_done rx_drop\n");
+    for (i = 0; cfg->pipeline_workers &&
+                i < cfg->num_pipeline_workers; i++) {
+        struct mwan_pipeline_worker *p = &cfg->pipeline_workers[i];
+
+        seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld\n",
+                   p->cpu, atomic64_read(&p->tx_queued),
+                   atomic64_read(&p->tx_queued_bytes),
+                   atomic64_read(&p->tx_completed),
+                   atomic64_read(&p->tx_dropped),
+                   atomic64_read(&p->rx_queued),
+                   atomic64_read(&p->rx_queued_bytes),
+                   atomic64_read(&p->rx_completed),
+                   atomic64_read(&p->rx_dropped));
     }
     rcu_read_unlock();
     return 0;
@@ -802,6 +856,20 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
              worker_idx++)
             seq_printf(m, "%s%d", worker_idx ? "," : "",
                        cfg->l2_workers[worker_idx].cpu);
+        seq_putc(m, '\n');
+        seq_printf(m, "pipeline enabled=%u high_pct=%u tx_promoted=%lld rx_promoted=%lld tx_drop=%lld rx_drop=%lld cpus=",
+                   READ_ONCE(mwan_l2_pipeline_enabled),
+                   clamp_t(unsigned int,
+                           READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U),
+                   atomic64_read(&cfg->flows.tx_pipeline_promoted),
+                   atomic64_read(&cfg->flows.rx_pipeline_promoted),
+                   atomic64_read(&cfg->flows.tx_pipeline_dropped),
+                   atomic64_read(&cfg->flows.rx_pipeline_dropped));
+        for (worker_idx = 0;
+             cfg->pipeline_workers &&
+             worker_idx < cfg->num_pipeline_workers; worker_idx++)
+            seq_printf(m, "%s%d", worker_idx ? "," : "",
+                       cfg->pipeline_workers[worker_idx].cpu);
         seq_putc(m, '\n');
         for (u32 i = 0; i < cfg->num_tunnels; i++) {
             const struct mwan_tunnel *tun = &cfg->tunnels[i];

@@ -31,6 +31,13 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
                              struct mwan_l2_worker *worker,
                              struct mwan_tunnel *tun, u64 flow_token,
                              u32 seq);
+int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
+                            struct mwan_l2_worker *worker,
+                            struct mwan_tunnel *tun, u64 flow_token,
+                            u32 seq);
+void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
+                                struct mwan_l2_worker *worker,
+                                u64 flow_token, u32 seq);
 int mwan_decap_l2_pqc_init(void);
 void mwan_decap_l2_pqc_cleanup(void);
 

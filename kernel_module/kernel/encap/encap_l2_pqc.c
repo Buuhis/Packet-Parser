@@ -439,10 +439,10 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
     return mwan_handle_encap_l2_pqc_single(skb, cfg, tunnel_idx, tx_ctx);
 }
 
-int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
-                             struct mwan_l2_worker *worker,
-                             struct mwan_tunnel *tun, u64 flow_token,
-                             u32 seq)
+int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
+                            struct mwan_l2_worker *worker,
+                            struct mwan_tunnel *tun, u64 flow_token,
+                            u32 seq)
 {
     struct net_device *target_dev = tun->dev;
     struct aead_request *req = NULL;
@@ -453,8 +453,6 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     __be32 seq_be;
     u8 peer_mac[ETH_ALEN];
     int ip_pkt_len, err;
-    int xmit_ret;
-    u16 tx_queue;
 
     if (unlikely(!target_dev || !worker))
         return -ENODEV;
@@ -553,14 +551,39 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     skb_shinfo(skb)->gso_segs = 0;
     skb->encapsulation = 0;
 
-    if (likely(target_dev->real_num_tx_queues > 1)) {
-        u16 cpu_id = smp_processor_id();
-        u16 q_idx = cpu_id % target_dev->real_num_tx_queues;
-        skb_set_queue_mapping(skb, q_idx);
-    }
-
     skb->dev = target_dev;
     skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
+    return 0;
+}
+
+void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
+                                struct mwan_l2_worker *worker,
+                                u64 flow_token, u32 seq)
+{
+    struct net_device *target_dev;
+    int xmit_ret;
+    u16 tx_queue;
+
+    if (WARN_ON_ONCE(!skb || !worker)) {
+        kfree_skb(skb);
+        return;
+    }
+    target_dev = skb->dev;
+    if (WARN_ON_ONCE(!target_dev)) {
+        atomic64_inc(&worker->tx_dropped_packets);
+        kfree_skb(skb);
+        return;
+    }
+
+    /* Select the hardware queue on the actual output-stage CPU.  Promoted
+     * flows therefore follow XPS for the pipeline CPU instead of retaining
+     * the crypto CPU's queue mapping. */
+    if (likely(target_dev->real_num_tx_queues > 1)) {
+        u16 q_idx = raw_smp_processor_id() %
+                    target_dev->real_num_tx_queues;
+
+        skb_set_queue_mapping(skb, q_idx);
+    }
 
     /* dev_queue_xmit() always consumes skb.  Do not propagate an error to
      * the worker, whose generic error path would otherwise free it twice.
@@ -586,6 +609,19 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
                                 flow_token, seq, target_dev->name, tx_queue,
                                 worker->cpu, xmit_ret);
     }
+}
+
+int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
+                             struct mwan_l2_worker *worker,
+                             struct mwan_tunnel *tun, u64 flow_token,
+                             u32 seq)
+{
+    int err;
+
+    err = mwan_l2_pqc_encrypt_skb(skb, worker, tun, flow_token, seq);
+    if (err)
+        return err;
+    mwan_l2_pqc_xmit_encrypted(skb, worker, flow_token, seq);
     return 0;
 }
 

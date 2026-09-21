@@ -57,4 +57,12 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              enum mwan_packet_class packet_class,
                              bool closing, u32 *flow_seq, int *owner_cpu);
 
+void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
+                                    struct mwan_l2_rx_flow *flow,
+                                    struct mwan_l2_worker *worker,
+                                    u32 flow_id);
+int mwan_pipeline_rx_submit(struct sk_buff *skb,
+                            struct mwan_l2_worker *crypto_worker,
+                            struct mwan_l2_rx_flow *flow, u32 flow_seq);
+
 #endif /* MWAN_MULTICORE_H */

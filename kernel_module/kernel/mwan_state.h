@@ -130,6 +130,11 @@ struct mwan_l2_flow_key {
     u8 reserved[3];
 };
 
+enum mwan_flow_exec_mode {
+    MWAN_FLOW_EXEC_LEGACY = 0,
+    MWAN_FLOW_EXEC_PIPELINE,
+};
+
 struct mwan_l2_tx_flow {
     struct hlist_node node;
     struct mwan_l2_flow_key key;
@@ -146,6 +151,11 @@ struct mwan_l2_tx_flow {
      * an idle mapping must not keep skewing new-flow CPU admission for the
      * full 60-second table timeout. */
     atomic_t worker_counted;
+    /* LEGACY keeps crypto and transmit on owner_worker.  PIPELINE keeps the
+     * same ordered crypto owner but hands the encrypted skb to a separate
+     * egress worker.  Promotion is one-way for the lifetime of the flow. */
+    atomic_t exec_mode;
+    int pipeline_worker;
     /* Serializes admission + sequence allocation + queue insertion for one
      * flow.  A sequence number is consumed only after the packet is certain
      * to enter its sticky owner's FIFO. */
@@ -173,6 +183,10 @@ struct mwan_l2_rx_flow {
     u32 expected_seq;
     atomic_t pending_crypto;
     int owner_worker;
+    /* As on TX, promotion never changes the ordered crypto owner.  It only
+     * moves authenticated reorder/reinjection onto a pipeline egress CPU. */
+    atomic_t exec_mode;
+    int pipeline_worker;
     unsigned long last_seen;
     bool closing;
     bool stopping;
@@ -263,6 +277,10 @@ struct mwan_l2_flow_manager {
     atomic64_t reorder_resync_skipped;
     atomic64_t reorder_resync_flushed;
     atomic64_t reorder_resync_preserved;
+    atomic64_t tx_pipeline_promoted;
+    atomic64_t rx_pipeline_promoted;
+    atomic64_t tx_pipeline_dropped;
+    atomic64_t rx_pipeline_dropped;
     struct delayed_work gc_work;
     struct mwan_config *cfg;
     bool stopping;
@@ -366,6 +384,10 @@ struct mwan_l2_worker {
     atomic_t emergency_shed;
     atomic_t busy_peak_bp;
     atomic_t idle_min_bp;
+    unsigned int tx_pipeline_hot_samples;
+    unsigned int rx_pipeline_hot_samples;
+    atomic_t tx_pipeline_ready;
+    atomic_t rx_pipeline_ready;
     atomic64_t emergency_enter_count;
     atomic64_t emergency_last_enter_ns;
     atomic64_t overload_last_drop_ns;
@@ -379,6 +401,28 @@ struct mwan_l2_worker {
      * these only when a new flow needs a path. */
     atomic64_t *balance_tx_bytes;
     unsigned long *balance_last_data;
+};
+
+/* Final output stage used only by promoted flows.  Crypto remains serialized
+ * on the flow's original mwan_l2_worker; these queues move dev_queue_xmit()
+ * and authenticated RX reinjection to another CPU without copying payload. */
+struct mwan_pipeline_worker {
+    struct mwan_config *cfg;
+    struct sk_buff_head tx_queue;
+    struct sk_buff_head rx_queue;
+    struct work_struct tx_work;
+    struct work_struct rx_work;
+    int cpu;
+    atomic_t tx_scheduled;
+    atomic_t rx_scheduled;
+    atomic64_t tx_queued;
+    atomic64_t rx_queued;
+    atomic64_t tx_queued_bytes;
+    atomic64_t rx_queued_bytes;
+    atomic64_t tx_completed;
+    atomic64_t rx_completed;
+    atomic64_t tx_dropped;
+    atomic64_t rx_dropped;
 };
 
 struct mwan_config {
@@ -424,6 +468,8 @@ struct mwan_config {
     int num_workers;
     int worker_start_cpu;
     struct mwan_l2_worker *l2_workers;
+    int num_pipeline_workers;
+    struct mwan_pipeline_worker *pipeline_workers;
 
 };
 
@@ -440,6 +486,9 @@ extern unsigned int mwan_l2_idle_unblock_pct;
 extern unsigned int mwan_l2_emergency_pct;
 extern unsigned int mwan_l2_max_shed_pct;
 extern char *mwan_l2_worker_cpus;
+extern bool mwan_l2_pipeline_enabled;
+extern unsigned int mwan_l2_pipeline_high_pct;
+extern char *mwan_l2_pipeline_cpus;
 
 /* API Functions */
 void mwan_state_init(void);

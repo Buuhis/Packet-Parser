@@ -253,6 +253,10 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.reorder_resync_skipped, 0);
     atomic64_set(&cfg->flows.reorder_resync_flushed, 0);
     atomic64_set(&cfg->flows.reorder_resync_preserved, 0);
+    atomic64_set(&cfg->flows.tx_pipeline_promoted, 0);
+    atomic64_set(&cfg->flows.rx_pipeline_promoted, 0);
+    atomic64_set(&cfg->flows.tx_pipeline_dropped, 0);
+    atomic64_set(&cfg->flows.rx_pipeline_dropped, 0);
     for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
         INIT_HLIST_HEAD(&cfg->flows.tx[i].head);
         spin_lock_init(&cfg->flows.tx[i].lock);
@@ -567,6 +571,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     atomic_set(&candidate->balance_counted,
                requested_tunnel_idx < 0 ? 1 : 0);
     atomic_set(&candidate->worker_counted, 1);
+    atomic_set(&candidate->exec_mode, MWAN_FLOW_EXEC_LEGACY);
+    candidate->pipeline_worker = -1;
     spin_lock_init(&candidate->submit_lock);
     candidate->owner_worker = owner;
     candidate->home_tunnel_idx = (u16)tunnel_idx;
@@ -746,6 +752,8 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
     candidate->expected_seq = first_seq;
     atomic_set(&candidate->pending_crypto, 0);
     candidate->owner_worker = owner;
+    atomic_set(&candidate->exec_mode, MWAN_FLOW_EXEC_LEGACY);
+    candidate->pipeline_worker = -1;
     candidate->last_seen = jiffies;
     candidate->manager = &cfg->flows;
     spin_lock_init(&candidate->reorder_lock);

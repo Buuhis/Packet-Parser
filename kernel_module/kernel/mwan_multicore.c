@@ -31,13 +31,41 @@
 #define MWAN_CONTROL_BFD_PORT_1         3784U
 #define MWAN_CONTROL_BFD_PORT_2         3785U
 #define MWAN_CONTROL_BFD_PORT_3         4784U
+#define MWAN_PIPELINE_HOT_SAMPLES          3U
+#define MWAN_PIPELINE_CB_TX_MAGIC       0x5054U
+#define MWAN_PIPELINE_CB_RX_MAGIC       0x5052U
 
 static struct workqueue_struct *mwan_tx_wq;
+static struct workqueue_struct *mwan_pipeline_wq;
 static DEFINE_SPINLOCK(mwan_admission_lock);
 static atomic64_t mwan_new_flow_admitted;
 static atomic64_t mwan_no_eligible_cpu;
 static void mwan_cpu_sample_fn(struct work_struct *work);
 static DECLARE_DELAYED_WORK(mwan_cpu_sample_work, mwan_cpu_sample_fn);
+
+struct mwan_pipeline_tx_cb {
+    uintptr_t flow_ptr;
+    u64 flow_token;
+    u32 flow_seq;
+    u32 transmitted_bytes;
+    u32 check;
+    u16 tunnel_idx;
+    u16 crypto_worker;
+    u16 magic;
+};
+
+struct mwan_pipeline_rx_cb {
+    uintptr_t flow_ptr;
+    u32 flow_seq;
+    u32 check;
+    u16 crypto_worker;
+    u16 magic;
+};
+
+#define MWAN_PIPELINE_TX_CB(skb) \
+    ((struct mwan_pipeline_tx_cb *)((skb)->cb))
+#define MWAN_PIPELINE_RX_CB(skb) \
+    ((struct mwan_pipeline_rx_cb *)((skb)->cb))
 
 static void mwan_atomic64_update_max(atomic64_t *maximum, u64 value)
 {
@@ -72,6 +100,20 @@ static unsigned int mwan_bp_ewma(atomic_t *value, unsigned int sample)
     return next;
 }
 
+static void mwan_pipeline_update_hot(unsigned int *samples,
+                                     atomic_t *ready, bool hot)
+{
+    if (hot) {
+        if (*samples < MWAN_PIPELINE_HOT_SAMPLES)
+            (*samples)++;
+        if (*samples >= MWAN_PIPELINE_HOT_SAMPLES)
+            atomic_set(ready, 1);
+    } else {
+        *samples = 0;
+        atomic_set(ready, 0);
+    }
+}
+
 static void mwan_read_cpu_accounting(int cpu, u64 *total, u64 *system,
                                      u64 *softirq, u64 *idle)
 {
@@ -103,6 +145,8 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     worker->cpu_cool_samples = 0;
     worker->emergency_hot_samples = 0;
     worker->emergency_cool_samples = 0;
+    worker->tx_pipeline_hot_samples = 0;
+    worker->rx_pipeline_hot_samples = 0;
     worker->cpu_prev_tx_queued_packets = 0;
     worker->cpu_prev_tx_queued_bytes = 0;
     atomic_set(&worker->system_raw_bp, 0);
@@ -117,6 +161,8 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     atomic_set(&worker->emergency_shed, 0);
     atomic_set(&worker->busy_peak_bp, 0);
     atomic_set(&worker->idle_min_bp, MWAN_CPU_BP_MAX);
+    atomic_set(&worker->tx_pipeline_ready, 0);
+    atomic_set(&worker->rx_pipeline_ready, 0);
     atomic64_set(&worker->emergency_enter_count, 0);
     atomic64_set(&worker->emergency_last_enter_ns, 0);
     atomic64_set(&worker->overload_last_drop_ns, 0);
@@ -160,6 +206,10 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
         worker->cpu_cool_samples = 0;
         worker->emergency_hot_samples = 0;
         worker->emergency_cool_samples = 0;
+        worker->tx_pipeline_hot_samples = 0;
+        worker->rx_pipeline_hot_samples = 0;
+        atomic_set(&worker->tx_pipeline_ready, 0);
+        atomic_set(&worker->rx_pipeline_ready, 0);
         return;
     }
 
@@ -282,6 +332,25 @@ static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
         } else {
             worker->cpu_cool_samples = 0;
         }
+    }
+
+    {
+        unsigned int pipeline_bp =
+            clamp_t(unsigned int,
+                    READ_ONCE(mwan_l2_pipeline_high_pct), 1U, 100U) * 100U;
+        unsigned int observed = max(raw_busy, ewma_busy);
+
+        mwan_pipeline_update_hot(
+            &worker->tx_pipeline_hot_samples,
+            &worker->tx_pipeline_ready,
+            observed >= pipeline_bp &&
+                (atomic_read(&worker->tx_busy) || tx_queued_packets));
+        mwan_pipeline_update_hot(
+            &worker->rx_pipeline_hot_samples,
+            &worker->rx_pipeline_ready,
+            observed >= pipeline_bp &&
+                (atomic_read(&worker->busy) ||
+                 atomic64_read(&worker->queued_packets)));
     }
 }
 
@@ -668,6 +737,317 @@ static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
     return cfg->tunnels[cb->tunnel_idx].encap_type == cb->encap_type;
 }
 
+static u32 mwan_pipeline_tx_checksum(const struct mwan_pipeline_tx_cb *cb)
+{
+    return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
+           lower_32_bits(cb->flow_token) ^ upper_32_bits(cb->flow_token) ^
+           cb->flow_seq ^ cb->transmitted_bytes ^ cb->tunnel_idx ^
+           cb->crypto_worker ^ cb->magic ^ 0x70697074U;
+}
+
+static u32 mwan_pipeline_rx_checksum(const struct mwan_pipeline_rx_cb *cb)
+{
+    return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
+           cb->flow_seq ^ cb->crypto_worker ^ cb->magic ^ 0x70697072U;
+}
+
+static int mwan_pipeline_pick_worker(struct mwan_config *cfg, u32 flow_id,
+                                     int source_cpu, bool tx)
+{
+    u64 best_load = U64_MAX;
+    int start;
+    int best = -1;
+    int pass;
+    int off;
+
+    if (!cfg || !cfg->pipeline_workers || cfg->num_pipeline_workers <= 0)
+        return -1;
+    start = flow_id % cfg->num_pipeline_workers;
+    /* Prefer a different CPU.  If the configured pipeline mask contains only
+     * the crypto CPU, keep a second pass so enabling the feature never makes
+     * an otherwise valid configuration unusable. */
+    for (pass = 0; pass < 2 && best < 0; pass++) {
+        for (off = 0; off < cfg->num_pipeline_workers; off++) {
+            int idx = (start + off) % cfg->num_pipeline_workers;
+            struct mwan_pipeline_worker *worker =
+                &cfg->pipeline_workers[idx];
+            u64 packets;
+            u64 bytes;
+            u64 load;
+
+            if (!cpu_online(worker->cpu) ||
+                (!pass && worker->cpu == source_cpu))
+                continue;
+            packets = (u64)atomic64_read(tx ? &worker->tx_queued :
+                                             &worker->rx_queued);
+            bytes = (u64)atomic64_read(tx ? &worker->tx_queued_bytes :
+                                           &worker->rx_queued_bytes);
+            load = bytes + packets * 2048ULL;
+            if (load < best_load) {
+                best_load = load;
+                best = idx;
+            }
+        }
+    }
+    return best;
+}
+
+static void mwan_pipeline_tx_workfn(struct work_struct *work)
+{
+    struct mwan_pipeline_worker *pipeline =
+        container_of(work, struct mwan_pipeline_worker, tx_work);
+    struct mwan_config *cfg = pipeline->cfg;
+    struct sk_buff *skb;
+    unsigned int batch = 0;
+
+    for (;;) {
+        while ((skb = skb_dequeue(&pipeline->tx_queue)) != NULL) {
+            struct mwan_pipeline_tx_cb cb;
+            struct mwan_l2_tx_flow *flow = NULL;
+            struct mwan_l2_worker *crypto_worker = NULL;
+            bool valid;
+
+            memcpy(&cb, MWAN_PIPELINE_TX_CB(skb), sizeof(cb));
+            valid = cb.magic == MWAN_PIPELINE_CB_TX_MAGIC && cb.flow_ptr &&
+                    cb.check == mwan_pipeline_tx_checksum(&cb) &&
+                    cb.tunnel_idx < cfg->num_tunnels &&
+                    cb.crypto_worker < cfg->num_workers;
+            atomic64_dec(&pipeline->tx_queued);
+            atomic64_sub(skb->truesize, &pipeline->tx_queued_bytes);
+            if (valid) {
+                flow = (struct mwan_l2_tx_flow *)cb.flow_ptr;
+                crypto_worker = &cfg->l2_workers[cb.crypto_worker];
+            }
+            memset(skb->cb, 0, sizeof(skb->cb));
+            if (unlikely(!valid)) {
+                atomic64_inc(&pipeline->tx_dropped);
+                atomic64_inc(&cfg->flows.tx_pipeline_dropped);
+                kfree_skb(skb);
+            } else {
+                mwan_l2_pqc_xmit_encrypted(skb, crypto_worker,
+                                           cb.flow_token, cb.flow_seq);
+                if (atomic_read(&flow->balance_counted))
+                    mwan_tunnel_balance_account_bytes(
+                        cfg, crypto_worker, cb.tunnel_idx,
+                        cb.transmitted_bytes);
+                atomic64_inc(&pipeline->tx_completed);
+            }
+            if (flow) {
+                mwan_l2_tx_flow_complete(cfg, flow);
+                mwan_l2_tx_flow_put(flow);
+            }
+            if (++batch == 64) {
+                batch = 0;
+                cond_resched();
+            }
+        }
+        spin_lock_bh(&pipeline->tx_queue.lock);
+        if (!skb_queue_empty(&pipeline->tx_queue)) {
+            spin_unlock_bh(&pipeline->tx_queue.lock);
+            continue;
+        }
+        atomic_set(&pipeline->tx_scheduled, 0);
+        spin_unlock_bh(&pipeline->tx_queue.lock);
+        break;
+    }
+}
+
+static void mwan_pipeline_rx_workfn(struct work_struct *work)
+{
+    struct mwan_pipeline_worker *pipeline =
+        container_of(work, struct mwan_pipeline_worker, rx_work);
+    struct mwan_config *cfg = pipeline->cfg;
+    struct sk_buff *skb;
+    unsigned int batch = 0;
+
+    for (;;) {
+        while ((skb = skb_dequeue(&pipeline->rx_queue)) != NULL) {
+            struct mwan_pipeline_rx_cb cb;
+            struct mwan_l2_rx_flow *flow = NULL;
+            bool valid;
+
+            memcpy(&cb, MWAN_PIPELINE_RX_CB(skb), sizeof(cb));
+            valid = cb.magic == MWAN_PIPELINE_CB_RX_MAGIC && cb.flow_ptr &&
+                    cb.check == mwan_pipeline_rx_checksum(&cb) &&
+                    cb.crypto_worker < cfg->num_workers;
+            atomic64_dec(&pipeline->rx_queued);
+            atomic64_sub(skb->truesize, &pipeline->rx_queued_bytes);
+            if (valid)
+                flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
+            memset(skb->cb, 0, sizeof(skb->cb));
+            if (unlikely(!valid)) {
+                atomic64_inc(&pipeline->rx_dropped);
+                atomic64_inc(&cfg->flows.rx_pipeline_dropped);
+                kfree_skb(skb);
+            } else {
+                mwan_l2_rx_flow_deliver(flow, skb, cb.flow_seq);
+                atomic64_inc(&pipeline->rx_completed);
+            }
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_rx_flow_put(flow);
+            }
+            if (++batch == 64) {
+                batch = 0;
+                cond_resched();
+            }
+        }
+        spin_lock_bh(&pipeline->rx_queue.lock);
+        if (!skb_queue_empty(&pipeline->rx_queue)) {
+            spin_unlock_bh(&pipeline->rx_queue.lock);
+            continue;
+        }
+        atomic_set(&pipeline->rx_scheduled, 0);
+        spin_unlock_bh(&pipeline->rx_queue.lock);
+        break;
+    }
+}
+
+static bool mwan_pipeline_schedule(struct mwan_pipeline_worker *worker,
+                                   bool tx)
+{
+    struct work_struct *work = tx ? &worker->tx_work : &worker->rx_work;
+
+    if (unlikely(!mwan_pipeline_wq))
+        return false;
+    if (queue_work_on(worker->cpu, mwan_pipeline_wq, work))
+        return true;
+    if (work_busy(work))
+        return true;
+    return queue_work(mwan_pipeline_wq, work);
+}
+
+static void mwan_pipeline_tx_maybe_promote(
+    struct mwan_config *cfg, struct mwan_l2_tx_flow *flow,
+    struct mwan_l2_worker *worker, u32 flow_id, u8 encap_type)
+{
+    int target;
+
+    if (!READ_ONCE(mwan_l2_pipeline_enabled) ||
+        encap_type != MWAN_ENCAP_L2_PQC ||
+        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
+        !atomic_read(&worker->tx_pipeline_ready))
+        return;
+    target = mwan_pipeline_pick_worker(cfg, flow_id, worker->cpu, true);
+    if (target < 0 || cfg->pipeline_workers[target].cpu == worker->cpu)
+        return;
+    WRITE_ONCE(flow->pipeline_worker, target);
+    atomic_set(&flow->exec_mode, MWAN_FLOW_EXEC_PIPELINE);
+    atomic64_inc(&cfg->flows.tx_pipeline_promoted);
+    pr_info_ratelimited("mwan_kmod: promoted TX flow %08x crypto_cpu=%d output_cpu=%d\n",
+                        flow_id, worker->cpu,
+                        cfg->pipeline_workers[target].cpu);
+}
+
+void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
+                                    struct mwan_l2_rx_flow *flow,
+                                    struct mwan_l2_worker *worker,
+                                    u32 flow_id)
+{
+    int target;
+
+    if (!READ_ONCE(mwan_l2_pipeline_enabled) || !cfg || !flow || !worker ||
+        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
+        !atomic_read(&worker->rx_pipeline_ready))
+        return;
+    target = mwan_pipeline_pick_worker(cfg, flow_id, worker->cpu, false);
+    if (target < 0 || cfg->pipeline_workers[target].cpu == worker->cpu)
+        return;
+    WRITE_ONCE(flow->pipeline_worker, target);
+    atomic_set(&flow->exec_mode, MWAN_FLOW_EXEC_PIPELINE);
+    atomic64_inc(&cfg->flows.rx_pipeline_promoted);
+    pr_info_ratelimited("mwan_kmod: promoted RX flow %08x crypto_cpu=%d output_cpu=%d\n",
+                        flow_id, worker->cpu,
+                        cfg->pipeline_workers[target].cpu);
+}
+
+static int mwan_pipeline_tx_submit(struct sk_buff *skb,
+                                   struct mwan_l2_worker *crypto_worker,
+                                   struct mwan_l2_tx_flow *flow,
+                                   u64 flow_token, u32 flow_seq,
+                                   u16 tunnel_idx, u32 transmitted_bytes)
+{
+    struct mwan_config *cfg = crypto_worker->cfg;
+    struct mwan_pipeline_worker *pipeline;
+    struct mwan_pipeline_tx_cb *cb;
+    int idx = READ_ONCE(flow->pipeline_worker);
+    int source = (int)(crypto_worker - cfg->l2_workers);
+    int was_scheduled;
+
+    if (!mwan_pipeline_wq || idx < 0 || idx >= cfg->num_pipeline_workers ||
+        source < 0 || source >= cfg->num_workers)
+        return -ENODEV;
+    pipeline = &cfg->pipeline_workers[idx];
+    spin_lock_bh(&pipeline->tx_queue.lock);
+    if (pipeline->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
+        atomic64_read(&pipeline->tx_queued_bytes) + skb->truesize >
+            MWAN_L2_QUEUE_MAX_BYTES) {
+        spin_unlock_bh(&pipeline->tx_queue.lock);
+        return -ENOSPC;
+    }
+    BUILD_BUG_ON(sizeof(*cb) > sizeof(skb->cb));
+    memset(skb->cb, 0, sizeof(skb->cb));
+    cb = MWAN_PIPELINE_TX_CB(skb);
+    cb->flow_ptr = (uintptr_t)flow;
+    cb->flow_token = flow_token;
+    cb->flow_seq = flow_seq;
+    cb->transmitted_bytes = transmitted_bytes;
+    cb->tunnel_idx = tunnel_idx;
+    cb->crypto_worker = (u16)source;
+    cb->magic = MWAN_PIPELINE_CB_TX_MAGIC;
+    cb->check = mwan_pipeline_tx_checksum(cb);
+    __skb_queue_tail(&pipeline->tx_queue, skb);
+    atomic64_inc(&pipeline->tx_queued);
+    atomic64_add(skb->truesize, &pipeline->tx_queued_bytes);
+    was_scheduled = atomic_cmpxchg(&pipeline->tx_scheduled, 0, 1);
+    spin_unlock_bh(&pipeline->tx_queue.lock);
+    if (!was_scheduled && unlikely(!mwan_pipeline_schedule(pipeline, true)))
+        pr_warn_ratelimited("mwan_kmod: pipeline TX work scheduling deferred on CPU %d\n",
+                            pipeline->cpu);
+    return 0;
+}
+
+int mwan_pipeline_rx_submit(struct sk_buff *skb,
+                            struct mwan_l2_worker *crypto_worker,
+                            struct mwan_l2_rx_flow *flow, u32 flow_seq)
+{
+    struct mwan_config *cfg = crypto_worker->cfg;
+    struct mwan_pipeline_worker *pipeline;
+    struct mwan_pipeline_rx_cb *cb;
+    int idx = READ_ONCE(flow->pipeline_worker);
+    int source = (int)(crypto_worker - cfg->l2_workers);
+    int was_scheduled;
+
+    if (!mwan_pipeline_wq || idx < 0 || idx >= cfg->num_pipeline_workers ||
+        source < 0 || source >= cfg->num_workers)
+        return -ENODEV;
+    pipeline = &cfg->pipeline_workers[idx];
+    spin_lock_bh(&pipeline->rx_queue.lock);
+    if (pipeline->rx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
+        atomic64_read(&pipeline->rx_queued_bytes) + skb->truesize >
+            MWAN_L2_QUEUE_MAX_BYTES) {
+        spin_unlock_bh(&pipeline->rx_queue.lock);
+        return -ENOSPC;
+    }
+    BUILD_BUG_ON(sizeof(*cb) > sizeof(skb->cb));
+    memset(skb->cb, 0, sizeof(skb->cb));
+    cb = MWAN_PIPELINE_RX_CB(skb);
+    cb->flow_ptr = (uintptr_t)flow;
+    cb->flow_seq = flow_seq;
+    cb->crypto_worker = (u16)source;
+    cb->magic = MWAN_PIPELINE_CB_RX_MAGIC;
+    cb->check = mwan_pipeline_rx_checksum(cb);
+    __skb_queue_tail(&pipeline->rx_queue, skb);
+    atomic64_inc(&pipeline->rx_queued);
+    atomic64_add(skb->truesize, &pipeline->rx_queued_bytes);
+    was_scheduled = atomic_cmpxchg(&pipeline->rx_scheduled, 0, 1);
+    spin_unlock_bh(&pipeline->rx_queue.lock);
+    if (!was_scheduled && unlikely(!mwan_pipeline_schedule(pipeline, false)))
+        pr_warn_ratelimited("mwan_kmod: pipeline RX work scheduling deferred on CPU %d\n",
+                            pipeline->cpu);
+    return 0;
+}
+
 static bool mwan_l2_rx_cb_valid(const struct sk_buff *skb,
                                 const struct mwan_l2_rx_cb *cb)
 {
@@ -714,6 +1094,123 @@ static bool mwan_release_tx_queue_ref(struct mwan_l2_worker *worker,
     return mwan_l2_tx_flow_release_queued(worker->cfg, &info.key, owner);
 }
 
+static int mwan_pipeline_workers_init(struct mwan_config *cfg)
+{
+    cpumask_var_t cpus;
+    const char *requested = READ_ONCE(mwan_l2_pipeline_cpus);
+    int cpu;
+    int idx = 0;
+    int err = 0;
+    int i;
+
+    if (!zalloc_cpumask_var(&cpus, GFP_KERNEL))
+        return -ENOMEM;
+    cpus_read_lock();
+    if (requested && requested[0]) {
+        err = cpulist_parse(requested, cpus);
+        if (err)
+            goto out_unlock;
+    } else {
+        for (i = 0; i < cfg->num_workers; i++)
+            cpumask_set_cpu(cfg->l2_workers[i].cpu, cpus);
+    }
+    cpumask_and(cpus, cpus, cpu_online_mask);
+    cpumask_and(cpus, cpus, current->cpus_ptr);
+    cfg->num_pipeline_workers = cpumask_weight(cpus);
+    if (!cfg->num_pipeline_workers) {
+        err = -ENODEV;
+        goto out_unlock;
+    }
+    cfg->pipeline_workers = kcalloc(cfg->num_pipeline_workers,
+                                    sizeof(*cfg->pipeline_workers),
+                                    GFP_KERNEL);
+    if (!cfg->pipeline_workers) {
+        err = -ENOMEM;
+        goto out_unlock;
+    }
+    for_each_cpu(cpu, cpus) {
+        struct mwan_pipeline_worker *worker;
+
+        if (idx >= cfg->num_pipeline_workers)
+            break;
+        worker = &cfg->pipeline_workers[idx++];
+        worker->cfg = cfg;
+        worker->cpu = cpu;
+        skb_queue_head_init(&worker->tx_queue);
+        skb_queue_head_init(&worker->rx_queue);
+        INIT_WORK(&worker->tx_work, mwan_pipeline_tx_workfn);
+        INIT_WORK(&worker->rx_work, mwan_pipeline_rx_workfn);
+        atomic_set(&worker->tx_scheduled, 0);
+        atomic_set(&worker->rx_scheduled, 0);
+    }
+    cfg->num_pipeline_workers = idx;
+out_unlock:
+    cpus_read_unlock();
+    if (err) {
+        kfree(cfg->pipeline_workers);
+        cfg->pipeline_workers = NULL;
+        cfg->num_pipeline_workers = 0;
+    }
+    free_cpumask_var(cpus);
+    return err;
+}
+
+static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
+{
+    int i;
+
+    if (!cfg || !cfg->pipeline_workers)
+        return;
+    for (i = 0; i < cfg->num_pipeline_workers; i++) {
+        cancel_work_sync(&cfg->pipeline_workers[i].tx_work);
+        cancel_work_sync(&cfg->pipeline_workers[i].rx_work);
+    }
+    for (i = 0; i < cfg->num_pipeline_workers; i++) {
+        struct mwan_pipeline_worker *worker = &cfg->pipeline_workers[i];
+        struct sk_buff *skb;
+
+        while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
+            struct mwan_pipeline_tx_cb cb;
+            struct mwan_l2_tx_flow *flow = NULL;
+
+            memcpy(&cb, MWAN_PIPELINE_TX_CB(skb), sizeof(cb));
+            atomic64_dec(&worker->tx_queued);
+            atomic64_sub(skb->truesize, &worker->tx_queued_bytes);
+            if (cb.magic == MWAN_PIPELINE_CB_TX_MAGIC && cb.flow_ptr &&
+                cb.check == mwan_pipeline_tx_checksum(&cb))
+                flow = (struct mwan_l2_tx_flow *)cb.flow_ptr;
+            if (flow) {
+                mwan_l2_tx_flow_complete(cfg, flow);
+                mwan_l2_tx_flow_put(flow);
+            }
+            atomic64_inc(&worker->tx_dropped);
+            atomic64_inc(&cfg->flows.tx_pipeline_dropped);
+            kfree_skb(skb);
+        }
+        while ((skb = skb_dequeue(&worker->rx_queue)) != NULL) {
+            struct mwan_pipeline_rx_cb cb;
+            struct mwan_l2_rx_flow *flow = NULL;
+
+            memcpy(&cb, MWAN_PIPELINE_RX_CB(skb), sizeof(cb));
+            atomic64_dec(&worker->rx_queued);
+            atomic64_sub(skb->truesize, &worker->rx_queued_bytes);
+            if (cb.magic == MWAN_PIPELINE_CB_RX_MAGIC && cb.flow_ptr &&
+                cb.check == mwan_pipeline_rx_checksum(&cb))
+                flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
+            if (flow) {
+                atomic_dec(&flow->pending_crypto);
+                mwan_l2_rx_flow_put(flow);
+            }
+            atomic64_inc(&worker->rx_dropped);
+            atomic64_inc(&cfg->flows.rx_pipeline_dropped);
+            kfree_skb(skb);
+        }
+    }
+    kfree(cfg->pipeline_workers);
+    cfg->pipeline_workers = NULL;
+    cfg->num_pipeline_workers = 0;
+}
+
 int mwan_l2_workers_init(struct mwan_config *cfg)
 {
     cpumask_var_t worker_cpus;
@@ -731,7 +1228,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     bypass = !cfg->encrypt_on;
     if (!l2_pqc && !bypass)
         return 0;
-    if (!mwan_tx_wq)
+    if (!mwan_tx_wq || !mwan_pipeline_wq)
         return -ENODEV;
     if (!zalloc_cpumask_var(&worker_cpus, GFP_KERNEL))
         return -ENOMEM;
@@ -814,6 +1311,14 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         return -ENODEV;
     }
     cfg->worker_start_cpu = cfg->l2_workers[0].cpu;
+    err = mwan_pipeline_workers_init(cfg);
+    if (err) {
+        pr_err("mwan_kmod: failed to initialize pipeline output workers: %d\n",
+               err);
+        free_cpumask_var(worker_cpus);
+        mwan_l2_workers_cleanup(cfg);
+        return err;
+    }
     pr_info("mwan_kmod: initialized %d load-aware %s TX workers\n",
             cfg->num_workers, l2_pqc ? "L2-PQC" : "bypass");
     pr_info("mwan_kmod: L2 worker CPU mask=%*pbl requested=%s\n",
@@ -843,6 +1348,10 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
         cancel_work_sync(&cfg->l2_workers[i].work);
         cancel_work_sync(&cfg->l2_workers[i].tx_work);
     }
+    /* Crypto workers can enqueue final output while they are draining.  Stop
+     * them first, then synchronously drain/free every pipeline-owned skb and
+     * flow reference before crypto contexts or flow tables are destroyed. */
+    mwan_pipeline_workers_cleanup(cfg);
 
     for (i = 0; i < cfg->num_workers; i++) {
         struct mwan_l2_worker *worker = &cfg->l2_workers[i];
@@ -1438,6 +1947,9 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     if (owner_cpu)
         *owner_cpu = worker->cpu;
 
+    mwan_pipeline_tx_maybe_promote(cfg, flow, worker, info->flow_id,
+                                   (u8)tun->encap_type);
+
     if (mwan_tx_should_drop(worker, skb, packet_class)) {
         spin_unlock_bh(&flow->submit_lock);
         mwan_l2_tx_flow_put(flow);
@@ -1533,6 +2045,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             u16 tunnel_idx;
             u8 encap_type;
             u64 start_ns = ktime_get_ns();
+            bool pipeline_owned = false;
             int err;
 
             memcpy(&cb, MWAN_L2_TX_CB(skb), sizeof(cb));
@@ -1554,9 +2067,25 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             if (!cb_ok || tunnel_idx >= cfg->num_tunnels) {
                 err = -EINVAL;
             } else if (encap_type == MWAN_ENCAP_L2_PQC) {
-                err = mwan_l2_pqc_encrypt_xmit(
-                    skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
-                    flow_seq);
+                if (flow && atomic_read(&flow->exec_mode) ==
+                                MWAN_FLOW_EXEC_PIPELINE) {
+                    err = mwan_l2_pqc_encrypt_skb(
+                        skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
+                        flow_seq);
+                    if (!err) {
+                        err = mwan_pipeline_tx_submit(
+                            skb, worker, flow, flow_token, flow_seq,
+                            tunnel_idx, transmitted_bytes);
+                        pipeline_owned = !err;
+                        if (err)
+                            atomic64_inc(
+                                &cfg->flows.tx_pipeline_dropped);
+                    }
+                } else {
+                    err = mwan_l2_pqc_encrypt_xmit(
+                        skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
+                        flow_seq);
+                }
             } else if (encap_type == MWAN_ENCAP_NONE) {
                 err = mwan_encap_none_xmit(skb, &cfg->tunnels[tunnel_idx]);
             } else {
@@ -1582,12 +2111,12 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
-            } else if (flow &&
+            } else if (!pipeline_owned && flow &&
                        atomic_read(&flow->balance_counted)) {
                 mwan_tunnel_balance_account_bytes(
                     cfg, worker, tunnel_idx, transmitted_bytes);
             }
-            if (flow) {
+            if (flow && !pipeline_owned) {
                 mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
             }
@@ -1618,6 +2147,13 @@ int mwan_multicore_init(void)
                                  WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
     if (!mwan_tx_wq)
         return -ENOMEM;
+    mwan_pipeline_wq = alloc_workqueue("mwan_pipeline",
+                                       WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
+    if (!mwan_pipeline_wq) {
+        destroy_workqueue(mwan_tx_wq);
+        mwan_tx_wq = NULL;
+        return -ENOMEM;
+    }
     sample_ms = clamp_t(unsigned int,
                         READ_ONCE(mwan_l2_softirq_sample_ms),
                         MWAN_CPU_MIN_SAMPLE_MS, MWAN_CPU_MAX_SAMPLE_MS);
@@ -1629,9 +2165,16 @@ int mwan_multicore_init(void)
 void mwan_multicore_cleanup(void)
 {
     cancel_delayed_work_sync(&mwan_cpu_sample_work);
+    /* TX crypto work can enqueue onto the output pipeline.  Drain every
+     * producer before destroying the consumer workqueue.  RX producers have
+     * already been drained by mwan_decap_l2_pqc_cleanup(). */
     if (mwan_tx_wq) {
         destroy_workqueue(mwan_tx_wq);
         mwan_tx_wq = NULL;
+    }
+    if (mwan_pipeline_wq) {
+        destroy_workqueue(mwan_pipeline_wq);
+        mwan_pipeline_wq = NULL;
     }
 }
 
@@ -1642,4 +2185,6 @@ void mwan_l2_workers_flush(void)
 {
     if (mwan_tx_wq)
         flush_workqueue(mwan_tx_wq);
+    if (mwan_pipeline_wq)
+        flush_workqueue(mwan_pipeline_wq);
 }
