@@ -48,6 +48,8 @@ static int                  g_mq_count = 0;
 static bool g_irqbalance_was_active = false;
 static bool g_tuning_applied = false;
 
+static int write_sysfs(const char *path, const char *value);
+
 /* ================================================================
  *  Low-level helpers
  * ================================================================ */
@@ -81,17 +83,96 @@ static int get_available_cpu_ids(int *cpu_ids, int max_ids)
     return count;
 }
 
+static bool cpu_id_is_available(int cpu, const int *cpu_ids, int num_cpus)
+{
+    for (int i = 0; i < num_cpus; i++) {
+        if (cpu_ids[i] == cpu)
+            return true;
+    }
+    return false;
+}
+
+/* Parse the same compact CPU-list form accepted by the kernel module, for
+ * example "1-3,5". CPUs outside this process' affinity are ignored so the
+ * userspace IRQ/RPS/XPS mask exactly follows the effective kernel worker set. */
+static int parse_worker_cpu_list(const char *spec, const int *cpu_ids,
+                                 int num_cpus, int *worker_ids,
+                                 int max_workers)
+{
+    const char *cursor = spec;
+    int count = 0;
+
+    if (!spec || !*spec)
+        return -1;
+
+    while (*cursor) {
+        char *end = NULL;
+        long first;
+        long last;
+
+        first = strtol(cursor, &end, 10);
+        if (end == cursor || first < 0 || first >= CPU_SETSIZE)
+            return -1;
+        last = first;
+        cursor = end;
+        if (*cursor == '-') {
+            cursor++;
+            last = strtol(cursor, &end, 10);
+            if (end == cursor || last < first || last >= CPU_SETSIZE)
+                return -1;
+            cursor = end;
+        }
+        if (*cursor != '\0' && *cursor != ',')
+            return -1;
+
+        for (long cpu = first; cpu <= last; cpu++) {
+            bool duplicate = false;
+
+            if (!cpu_id_is_available((int)cpu, cpu_ids, num_cpus))
+                continue;
+            for (int i = 0; i < count; i++) {
+                if (worker_ids[i] == (int)cpu) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate && count < max_workers)
+                worker_ids[count++] = (int)cpu;
+        }
+
+        if (*cursor == ',') {
+            cursor++;
+            if (!*cursor)
+                return -1;
+        }
+    }
+
+    return count > 0 ? count : -1;
+}
+
 /* Use every available CPU by default so independent flows can run in parallel.
- * Deployments that deliberately isolate control-plane CPUs can set
- * SDWAN_RESERVED_CPUS=N in the service environment.  cpu_ids is already
- * ordered, so this also behaves predictably inside a cpuset where CPU 0 may
- * not be available. */
+ * An explicit SDWAN_WORKER_CPUS list is shared with the kernel module.
+ * Deployments using the older configuration can still reserve the first N
+ * available CPUs with SDWAN_RESERVED_CPUS. cpu_ids is already ordered, so
+ * both forms behave predictably inside a cpuset where CPU 0 may be absent. */
 static int select_worker_cpu_ids(const int *cpu_ids, int num_cpus,
                                  int *worker_ids, int max_workers)
 {
     int reserve = 0;
     int count = 0;
+    const char *worker_env = getenv("SDWAN_WORKER_CPUS");
     const char *reserve_env = getenv("SDWAN_RESERVED_CPUS");
+
+    if (worker_env && *worker_env) {
+        count = parse_worker_cpu_list(worker_env, cpu_ids, num_cpus,
+                                      worker_ids, max_workers);
+        if (count > 0)
+            return count;
+
+        log_error("CPU Tuning: invalid SDWAN_WORKER_CPUS='%s'",
+                  worker_env);
+        return 0;
+    }
 
     if (reserve_env && *reserve_env) {
         char *end = NULL;
@@ -109,6 +190,41 @@ static int select_worker_cpu_ids(const int *cpu_ids, int num_cpus,
         worker_ids[count++] = cpu_ids[i];
 
     return count;
+}
+
+static void setup_kernel_overload_policy(void)
+{
+    struct {
+        const char *env_name;
+        const char *parameter;
+    } settings[] = {
+        { "SDWAN_L2_EMERGENCY", "l2_emergency" },
+        { "SDWAN_L2_MAX_SHED", "l2_max_shed" },
+    };
+
+    for (size_t i = 0; i < sizeof(settings) / sizeof(settings[0]); i++) {
+        const char *value = getenv(settings[i].env_name);
+        char path[256];
+        char *end = NULL;
+        long percent;
+
+        if (!value || !*value)
+            continue;
+        percent = strtol(value, &end, 10);
+        if (end == value || *end != '\0' || percent < 1 || percent > 100) {
+            log_warn("CPU Tuning: ignoring invalid %s='%s' (expected 1..100)",
+                     settings[i].env_name, value);
+            continue;
+        }
+        snprintf(path, sizeof(path), "/sys/module/mwan_kmod/parameters/%s",
+                 settings[i].parameter);
+        if (write_sysfs(path, value) == 0)
+            log_info("  [+] Kernel overload: %s=%ld%%",
+                     settings[i].parameter, percent);
+        else
+            log_warn("CPU Tuning: cannot set %s via %s",
+                     settings[i].parameter, path);
+    }
 }
 
 /* Linux sysfs cpumasks are comma-separated 32-bit words, most significant
@@ -524,6 +640,7 @@ int cpu_tune_apply(const app_context_t *ctx)
     write_sysfs("/proc/sys/net/core/netdev_max_backlog", "10000");
     write_sysfs("/proc/sys/net/core/netdev_budget", "600");
     log_info("  [+] Global: rfs=32768, backlog=10000, budget=600");
+    setup_kernel_overload_policy();
 
     /* 2. Tune each logical tunnel and its BE-associated physical WAN NIC. */
     char tuned_nics[MAX_SDWAN_TUNS][IF_NAMESIZE];

@@ -13,6 +13,7 @@ unsigned int mwan_l2_softirq_sample_ms = 50;
 unsigned int mwan_l2_idle_unblock_pct = 20;
 unsigned int mwan_l2_emergency_pct = 97;
 unsigned int mwan_l2_max_shed_pct = 50;
+char *mwan_l2_worker_cpus = "";
 static bool mwan_l2_diag_reset_param;
 module_param_named(l2_diag, mwan_l2_diag_enabled, bool, 0644);
 MODULE_PARM_DESC(l2_diag,
@@ -42,6 +43,9 @@ MODULE_PARM_DESC(l2_emergency,
 module_param_named(l2_max_shed, mwan_l2_max_shed_pct, uint, 0644);
 MODULE_PARM_DESC(l2_max_shed,
                  "Maximum percentage of eligible data packets shed per CPU");
+module_param_named(l2_worker_cpus, mwan_l2_worker_cpus, charp, 0444);
+MODULE_PARM_DESC(l2_worker_cpus,
+                 "CPU list for L2 workers (for example 1-3,5); empty uses every online CPU");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)

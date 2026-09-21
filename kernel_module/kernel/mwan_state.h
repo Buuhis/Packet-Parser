@@ -439,6 +439,7 @@ extern unsigned int mwan_l2_softirq_sample_ms;
 extern unsigned int mwan_l2_idle_unblock_pct;
 extern unsigned int mwan_l2_emergency_pct;
 extern unsigned int mwan_l2_max_shed_pct;
+extern char *mwan_l2_worker_cpus;
 
 /* API Functions */
 void mwan_state_init(void);

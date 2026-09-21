@@ -736,6 +736,7 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     int phase;
     int reason;
     int cpu;
+    int worker_idx;
 
     (void)unused;
     seq_printf(m, "generation=%u enabled=%u limit=%u\n",
@@ -795,6 +796,13 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.tx_degraded_admitted),
                    atomic64_read(&cfg->flows.tx_recovery_updated),
                    atomic64_read(&cfg->flows.tx_recovery_moved));
+        seq_printf(m, "worker_cpus count=%d list=", cfg->num_workers);
+        for (worker_idx = 0;
+             cfg->l2_workers && worker_idx < cfg->num_workers;
+             worker_idx++)
+            seq_printf(m, "%s%d", worker_idx ? "," : "",
+                       cfg->l2_workers[worker_idx].cpu);
+        seq_putc(m, '\n');
         for (u32 i = 0; i < cfg->num_tunnels; i++) {
             const struct mwan_tunnel *tun = &cfg->tunnels[i];
 

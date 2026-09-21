@@ -3,6 +3,7 @@
 #include "mwan_tunnel_balance.h"
 
 #include <linux/cpu.h>
+#include <linux/cpumask.h>
 #include <linux/ip.h>
 #include <linux/jhash.h>
 #include <linux/kernel_stat.h>
@@ -715,6 +716,8 @@ static bool mwan_release_tx_queue_ref(struct mwan_l2_worker *worker,
 
 int mwan_l2_workers_init(struct mwan_config *cfg)
 {
+    cpumask_var_t worker_cpus;
+    const char *requested_cpus;
     bool l2_pqc;
     bool bypass;
     int cpu;
@@ -730,19 +733,41 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         return 0;
     if (!mwan_tx_wq)
         return -ENODEV;
+    if (!zalloc_cpumask_var(&worker_cpus, GFP_KERNEL))
+        return -ENOMEM;
 
     cpus_read_lock();
-    cfg->num_workers = num_online_cpus();
+    requested_cpus = READ_ONCE(mwan_l2_worker_cpus);
+    if (requested_cpus && requested_cpus[0]) {
+        err = cpulist_parse(requested_cpus, worker_cpus);
+        if (err) {
+            pr_err("mwan_kmod: invalid l2_worker_cpus='%s'\n",
+                   requested_cpus);
+            goto err_unlock_invalid_mask;
+        } else {
+            cpumask_and(worker_cpus, worker_cpus, cpu_online_mask);
+            cpumask_and(worker_cpus, worker_cpus, current->cpus_ptr);
+            if (cpumask_empty(worker_cpus)) {
+                pr_err("mwan_kmod: l2_worker_cpus='%s' selects no online/allowed CPU\n",
+                       requested_cpus);
+                goto err_unlock_invalid_mask;
+            }
+        }
+    } else {
+        cpumask_copy(worker_cpus, cpu_online_mask);
+    }
+    cfg->num_workers = cpumask_weight(worker_cpus);
     if (cfg->num_workers <= 0)
         goto err_unlock_no_cpu;
     cfg->l2_workers = kcalloc(cfg->num_workers, sizeof(*cfg->l2_workers),
                               GFP_KERNEL);
     if (!cfg->l2_workers) {
         cpus_read_unlock();
+        free_cpumask_var(worker_cpus);
         return -ENOMEM;
     }
 
-    for_each_online_cpu(cpu) {
+    for_each_cpu(cpu, worker_cpus) {
         struct mwan_l2_worker *worker;
 
         if (idx >= cfg->num_workers)
@@ -762,6 +787,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         if (!worker->balance_tx_bytes || !worker->balance_last_data) {
             cfg->num_workers = idx + 1;
             cpus_read_unlock();
+            free_cpumask_var(worker_cpus);
             mwan_l2_workers_cleanup(cfg);
             return -ENOMEM;
         }
@@ -772,6 +798,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
                    cpu, err);
             cfg->num_workers = idx + 1;
             cpus_read_unlock();
+            free_cpumask_var(worker_cpus);
             mwan_l2_workers_cleanup(cfg);
             return err;
         }
@@ -781,6 +808,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     cfg->num_workers = idx;
     cpus_read_unlock();
     if (!cfg->num_workers) {
+        free_cpumask_var(worker_cpus);
         kfree(cfg->l2_workers);
         cfg->l2_workers = NULL;
         return -ENODEV;
@@ -788,11 +816,21 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     cfg->worker_start_cpu = cfg->l2_workers[0].cpu;
     pr_info("mwan_kmod: initialized %d load-aware %s TX workers\n",
             cfg->num_workers, l2_pqc ? "L2-PQC" : "bypass");
+    pr_info("mwan_kmod: L2 worker CPU mask=%*pbl requested=%s\n",
+            cpumask_pr_args(worker_cpus),
+            requested_cpus && requested_cpus[0] ? requested_cpus : "all");
+    free_cpumask_var(worker_cpus);
     return 0;
 
 err_unlock_no_cpu:
     cpus_read_unlock();
+    free_cpumask_var(worker_cpus);
     return -ENODEV;
+
+err_unlock_invalid_mask:
+    cpus_read_unlock();
+    free_cpumask_var(worker_cpus);
+    return -EINVAL;
 }
 
 void mwan_l2_workers_cleanup(struct mwan_config *cfg)
