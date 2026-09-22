@@ -45,7 +45,7 @@ MODULE_PARM_DESC(l2_max_shed,
                  "Maximum percentage of eligible data packets shed per CPU");
 module_param_named(l2_worker_cpus, mwan_l2_worker_cpus, charp, 0444);
 MODULE_PARM_DESC(l2_worker_cpus,
-                 "CPU list for L2 workers (for example 1-3,5); empty uses every online CPU");
+                 "Ordered L2 CPU list: first=TX role, second=RX role, remaining=Crypto when fixed roles are enabled; empty uses every online/allowed CPU");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)

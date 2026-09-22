@@ -146,6 +146,10 @@ void mwan_l2_diag_reset_all(void)
             atomic64_set(&worker->rx_completed, 0);
             atomic64_set(&worker->tx_dropped, 0);
             atomic64_set(&worker->rx_dropped, 0);
+            atomic64_set(&worker->tx_backpressure_events, 0);
+            atomic64_set(&worker->rx_backpressure_events, 0);
+            atomic64_set(&worker->tx_backpressure_wait_ns, 0);
+            atomic64_set(&worker->rx_backpressure_wait_ns, 0);
         }
         mwan_rekey_diag_reset(cfg);
     }
@@ -621,6 +625,11 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                     mwan_l2_decrypted_tcp_closing(skb));
                 if (atomic_read(&flow->exec_mode) ==
                         MWAN_FLOW_EXEC_PIPELINE) {
+                    mwan_pipeline_wait_for_room(
+                        worker->cfg, READ_ONCE(flow->pipeline_worker),
+                        false, skb->truesize,
+                        mwan_multicore_packet_classify(skb) ==
+                            MWAN_PACKET_CONTROL);
                     ret = mwan_pipeline_rx_submit(skb, worker, flow,
                                                   flow_seq);
                     if (!ret) {
@@ -847,6 +856,39 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
             seq_printf(m, "%s%d", worker_idx ? "," : "",
                        cfg->l2_workers[worker_idx].cpu);
         seq_putc(m, '\n');
+        seq_printf(m, "pipeline workers=%d tx_role_cpu=%d rx_role_cpu=%d tx_promoted=%lld rx_promoted=%lld tx_dropped=%lld rx_dropped=%lld\n",
+                   cfg->num_pipeline_workers, cfg->tx_role_cpu,
+                   cfg->rx_role_cpu,
+                   atomic64_read(&cfg->flows.tx_pipeline_promoted),
+                   atomic64_read(&cfg->flows.rx_pipeline_promoted),
+                   atomic64_read(&cfg->flows.tx_pipeline_dropped),
+                   atomic64_read(&cfg->flows.rx_pipeline_dropped));
+        for (worker_idx = 0;
+             cfg->pipeline_workers &&
+                 worker_idx < cfg->num_pipeline_workers;
+             worker_idx++) {
+            const struct mwan_pipeline_worker *pipeline =
+                &cfg->pipeline_workers[worker_idx];
+
+            seq_printf(m, "pipeline_worker cpu=%d roles=%s%s tx_q=%lld tx_q_bytes=%lld tx_done=%lld tx_drop=%lld tx_bp=%lld tx_bp_wait_ns=%lld rx_q=%lld rx_q_bytes=%lld rx_done=%lld rx_drop=%lld rx_bp=%lld rx_bp_wait_ns=%lld\n",
+                       pipeline->cpu,
+                       pipeline->role_mask & MWAN_PIPELINE_ROLE_TX ?
+                           "TX" : "",
+                       pipeline->role_mask & MWAN_PIPELINE_ROLE_RX ?
+                           "RX" : "",
+                       atomic64_read(&pipeline->tx_queued),
+                       atomic64_read(&pipeline->tx_queued_bytes),
+                       atomic64_read(&pipeline->tx_completed),
+                       atomic64_read(&pipeline->tx_dropped),
+                       atomic64_read(&pipeline->tx_backpressure_events),
+                       atomic64_read(&pipeline->tx_backpressure_wait_ns),
+                       atomic64_read(&pipeline->rx_queued),
+                       atomic64_read(&pipeline->rx_queued_bytes),
+                       atomic64_read(&pipeline->rx_completed),
+                       atomic64_read(&pipeline->rx_dropped),
+                       atomic64_read(&pipeline->rx_backpressure_events),
+                       atomic64_read(&pipeline->rx_backpressure_wait_ns));
+        }
         for (u32 i = 0; i < cfg->num_tunnels; i++) {
             const struct mwan_tunnel *tun = &cfg->tunnels[i];
 

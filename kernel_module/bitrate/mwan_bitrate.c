@@ -13,7 +13,7 @@
  * (10000 == 100%).  It is a CPU headroom guard, not a Mbps limit.
  */
 #define MWAN_BITRATE_ENABLE          1
-#define MWAN_BITRATE_TARGET_BP    7000U
+#define MWAN_BITRATE_TARGET_BP    7800U
 #define MWAN_BITRATE_BP_MAX      10000U
 #define MWAN_BITRATE_BURST_NS    (10ULL * NSEC_PER_MSEC)
 #define MWAN_BITRATE_MAX_SLEEP_NS (5ULL * NSEC_PER_MSEC)

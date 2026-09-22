@@ -19,7 +19,8 @@
 
 /* Datapath feature switches are deliberately compile-time only.  Change a
  * value here, rebuild mwan_kmod.ko, and reload the module. */
-#define MWAN_ENABLE_ROLE_PIPELINE        0
+#define MWAN_ENABLE_ROLE_PIPELINE        1
+#define MWAN_ENABLE_FIXED_ROLE_LAYOUT    MWAN_ENABLE_ROLE_PIPELINE
 #define MWAN_ENABLE_IPSEC_SA_SCHEDULER   1
 /* Reserved for a future ordered multi-lane implementation.  Silently
  * enabling an unfinished one-SA/multi-core path would break ESP ordering. */
@@ -51,6 +52,15 @@
 #define MWAN_PIPELINE_HIGH_PCT             85U
 #define MWAN_PIPELINE_CB_TX_MAGIC       0x5054U
 #define MWAN_PIPELINE_CB_RX_MAGIC       0x5052U
+#define MWAN_PIPELINE_HIGH_PACKETS \
+    (MWAN_L2_QUEUE_MAX_PACKETS / 2U)
+#define MWAN_PIPELINE_LOW_PACKETS \
+    (MWAN_L2_QUEUE_MAX_PACKETS / 4U)
+#define MWAN_PIPELINE_HIGH_BYTES \
+    (MWAN_L2_QUEUE_MAX_BYTES / 2U)
+#define MWAN_PIPELINE_LOW_BYTES \
+    (MWAN_L2_QUEUE_MAX_BYTES / 4U)
+#define MWAN_PIPELINE_WAIT_MS             5U
 #endif
 
 static struct workqueue_struct *mwan_tx_wq;
@@ -794,6 +804,7 @@ static u32 mwan_pipeline_rx_checksum(const struct mwan_pipeline_rx_cb *cb)
 static int mwan_pipeline_pick_worker(struct mwan_config *cfg, u32 flow_id,
                                      int source_cpu, bool tx)
 {
+    u8 required_role = tx ? MWAN_PIPELINE_ROLE_TX : MWAN_PIPELINE_ROLE_RX;
     u64 best_load = U64_MAX;
     int start;
     int best = -1;
@@ -815,7 +826,8 @@ static int mwan_pipeline_pick_worker(struct mwan_config *cfg, u32 flow_id,
             u64 bytes;
             u64 load;
 
-            if (!cpu_online(worker->cpu) ||
+            if (!(worker->role_mask & required_role) ||
+                !cpu_online(worker->cpu) ||
                 (!pass && worker->cpu == source_cpu))
                 continue;
             packets = (u64)atomic64_read(tx ? &worker->tx_queued :
@@ -830,6 +842,73 @@ static int mwan_pipeline_pick_worker(struct mwan_config *cfg, u32 flow_id,
         }
     }
     return best;
+}
+
+static bool mwan_pipeline_has_room(const struct mwan_pipeline_worker *worker,
+                                   bool tx, u64 packet_limit,
+                                   u64 byte_limit, u32 bytes)
+{
+    u64 packets = (u64)atomic64_read(tx ? &worker->tx_queued :
+                                         &worker->rx_queued);
+    u64 queued_bytes = (u64)atomic64_read(tx ? &worker->tx_queued_bytes :
+                                              &worker->rx_queued_bytes);
+
+    if (bytes > byte_limit)
+        return packets == 0 && queued_bytes == 0;
+    return packets < packet_limit && queued_bytes <= byte_limit &&
+           bytes <= byte_limit - queued_bytes;
+}
+
+void mwan_pipeline_wait_for_room(struct mwan_config *cfg, int pipeline_idx,
+                                 bool tx, u32 bytes, bool priority)
+{
+    struct mwan_pipeline_worker *worker;
+    wait_queue_head_t *wait;
+    atomic64_t *events;
+    atomic64_t *wait_ns;
+    u8 required_role = tx ? MWAN_PIPELINE_ROLE_TX : MWAN_PIPELINE_ROLE_RX;
+    u64 started_ns;
+
+    /* Priority traffic consumes the capacity intentionally left between the
+     * high watermark and the hard queue limit. */
+    if (!cfg || priority || READ_ONCE(cfg->role_stopping) ||
+        pipeline_idx < 0 || pipeline_idx >= cfg->num_pipeline_workers)
+        return;
+    worker = &cfg->pipeline_workers[pipeline_idx];
+    if (!(worker->role_mask & required_role))
+        return;
+    if (mwan_pipeline_has_room(worker, tx, MWAN_PIPELINE_HIGH_PACKETS,
+                               MWAN_PIPELINE_HIGH_BYTES, bytes))
+        return;
+
+    wait = tx ? &worker->tx_room_wait : &worker->rx_room_wait;
+    events = tx ? &worker->tx_backpressure_events :
+                  &worker->rx_backpressure_events;
+    wait_ns = tx ? &worker->tx_backpressure_wait_ns :
+                   &worker->rx_backpressure_wait_ns;
+    atomic64_inc(events);
+    started_ns = ktime_get_ns();
+    while (!READ_ONCE(cfg->role_stopping) &&
+           !mwan_pipeline_has_room(worker, tx, MWAN_PIPELINE_LOW_PACKETS,
+                                   MWAN_PIPELINE_LOW_BYTES, bytes))
+        wait_event_timeout(*wait,
+            READ_ONCE(cfg->role_stopping) ||
+            mwan_pipeline_has_room(worker, tx,
+                                   MWAN_PIPELINE_LOW_PACKETS,
+                                   MWAN_PIPELINE_LOW_BYTES, bytes),
+            msecs_to_jiffies(MWAN_PIPELINE_WAIT_MS));
+    atomic64_add(ktime_get_ns() - started_ns, wait_ns);
+}
+
+static void mwan_pipeline_wake_room(struct mwan_pipeline_worker *worker,
+                                    bool tx)
+{
+    wait_queue_head_t *wait = tx ? &worker->tx_room_wait :
+                                   &worker->rx_room_wait;
+
+    if (mwan_pipeline_has_room(worker, tx, MWAN_PIPELINE_LOW_PACKETS,
+                               MWAN_PIPELINE_LOW_BYTES, 0))
+        wake_up_all(wait);
 }
 
 static void mwan_pipeline_tx_workfn(struct work_struct *work)
@@ -854,6 +933,7 @@ static void mwan_pipeline_tx_workfn(struct work_struct *work)
                     cb.crypto_worker < cfg->num_workers;
             atomic64_dec(&pipeline->tx_queued);
             atomic64_sub(skb->truesize, &pipeline->tx_queued_bytes);
+            mwan_pipeline_wake_room(pipeline, true);
             if (valid) {
                 flow = (struct mwan_l2_tx_flow *)cb.flow_ptr;
                 crypto_worker = &cfg->l2_workers[cb.crypto_worker];
@@ -912,6 +992,7 @@ static void mwan_pipeline_rx_workfn(struct work_struct *work)
                     cb.crypto_worker < cfg->num_workers;
             atomic64_dec(&pipeline->rx_queued);
             atomic64_sub(skb->truesize, &pipeline->rx_queued_bytes);
+            mwan_pipeline_wake_room(pipeline, false);
             if (valid)
                 flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
             memset(skb->cb, 0, sizeof(skb->cb));
@@ -964,9 +1045,12 @@ static void mwan_pipeline_tx_maybe_promote(
     int target;
 
     if (encap_type != MWAN_ENCAP_L2_PQC ||
-        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
-        !atomic_read(&worker->tx_pipeline_ready))
+        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY)
         return;
+#if !MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    if (!atomic_read(&worker->tx_pipeline_ready))
+        return;
+#endif
     target = mwan_pipeline_pick_worker(cfg, flow_id, worker->cpu, true);
     if (target < 0 || cfg->pipeline_workers[target].cpu == worker->cpu)
         return;
@@ -986,9 +1070,12 @@ void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
     int target;
 
     if (!cfg || !flow || !worker ||
-        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY ||
-        !atomic_read(&worker->rx_pipeline_ready))
+        atomic_read(&flow->exec_mode) != MWAN_FLOW_EXEC_LEGACY)
         return;
+#if !MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    if (!atomic_read(&worker->rx_pipeline_ready))
+        return;
+#endif
     target = mwan_pipeline_pick_worker(cfg, flow_id, worker->cpu, false);
     if (target < 0 || cfg->pipeline_workers[target].cpu == worker->cpu)
         return;
@@ -1017,6 +1104,8 @@ static int mwan_pipeline_tx_submit(struct sk_buff *skb,
         source < 0 || source >= cfg->num_workers)
         return -ENODEV;
     pipeline = &cfg->pipeline_workers[idx];
+    if (!(pipeline->role_mask & MWAN_PIPELINE_ROLE_TX))
+        return -EINVAL;
     spin_lock_bh(&pipeline->tx_queue.lock);
     if (pipeline->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&pipeline->tx_queued_bytes) + skb->truesize >
@@ -1061,6 +1150,8 @@ int mwan_pipeline_rx_submit(struct sk_buff *skb,
         source < 0 || source >= cfg->num_workers)
         return -ENODEV;
     pipeline = &cfg->pipeline_workers[idx];
+    if (!(pipeline->role_mask & MWAN_PIPELINE_ROLE_RX))
+        return -EINVAL;
     spin_lock_bh(&pipeline->rx_queue.lock);
     if (pipeline->rx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&pipeline->rx_queued_bytes) + skb->truesize >
@@ -1107,6 +1198,16 @@ int mwan_pipeline_rx_submit(struct sk_buff *skb,
     (void)flow;
     (void)flow_seq;
     return -EOPNOTSUPP;
+}
+
+void mwan_pipeline_wait_for_room(struct mwan_config *cfg, int pipeline_idx,
+                                 bool tx, u32 bytes, bool priority)
+{
+    (void)cfg;
+    (void)pipeline_idx;
+    (void)tx;
+    (void)bytes;
+    (void)priority;
 }
 #endif
 
@@ -1157,8 +1258,45 @@ static bool mwan_release_tx_queue_ref(struct mwan_l2_worker *worker,
 }
 
 #if MWAN_ENABLE_ROLE_PIPELINE
+static void mwan_pipeline_worker_init(struct mwan_pipeline_worker *worker,
+                                      struct mwan_config *cfg, int cpu,
+                                      u8 role_mask)
+{
+    worker->cfg = cfg;
+    worker->cpu = cpu;
+    worker->role_mask = role_mask;
+    skb_queue_head_init(&worker->tx_queue);
+    skb_queue_head_init(&worker->rx_queue);
+    INIT_WORK(&worker->tx_work, mwan_pipeline_tx_workfn);
+    INIT_WORK(&worker->rx_work, mwan_pipeline_rx_workfn);
+    init_waitqueue_head(&worker->tx_room_wait);
+    init_waitqueue_head(&worker->rx_room_wait);
+    atomic_set(&worker->tx_scheduled, 0);
+    atomic_set(&worker->rx_scheduled, 0);
+}
+
 static int mwan_pipeline_workers_init(struct mwan_config *cfg)
 {
+#if MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    if (cfg->tx_role_cpu < 0 || cfg->rx_role_cpu < 0 ||
+        cfg->tx_role_cpu == cfg->rx_role_cpu ||
+        !cpu_online(cfg->tx_role_cpu) || !cpu_online(cfg->rx_role_cpu))
+        return -EINVAL;
+
+    cfg->num_pipeline_workers = 2;
+    cfg->pipeline_workers = kcalloc(cfg->num_pipeline_workers,
+                                    sizeof(*cfg->pipeline_workers),
+                                    GFP_KERNEL);
+    if (!cfg->pipeline_workers) {
+        cfg->num_pipeline_workers = 0;
+        return -ENOMEM;
+    }
+    mwan_pipeline_worker_init(&cfg->pipeline_workers[0], cfg,
+                              cfg->tx_role_cpu, MWAN_PIPELINE_ROLE_TX);
+    mwan_pipeline_worker_init(&cfg->pipeline_workers[1], cfg,
+                              cfg->rx_role_cpu, MWAN_PIPELINE_ROLE_RX);
+    return 0;
+#else
     cpumask_var_t cpus;
     int cpu;
     int idx = 0;
@@ -1190,14 +1328,9 @@ static int mwan_pipeline_workers_init(struct mwan_config *cfg)
         if (idx >= cfg->num_pipeline_workers)
             break;
         worker = &cfg->pipeline_workers[idx++];
-        worker->cfg = cfg;
-        worker->cpu = cpu;
-        skb_queue_head_init(&worker->tx_queue);
-        skb_queue_head_init(&worker->rx_queue);
-        INIT_WORK(&worker->tx_work, mwan_pipeline_tx_workfn);
-        INIT_WORK(&worker->rx_work, mwan_pipeline_rx_workfn);
-        atomic_set(&worker->tx_scheduled, 0);
-        atomic_set(&worker->rx_scheduled, 0);
+        mwan_pipeline_worker_init(worker, cfg, cpu,
+                                  MWAN_PIPELINE_ROLE_TX |
+                                  MWAN_PIPELINE_ROLE_RX);
     }
     cfg->num_pipeline_workers = idx;
 out_unlock:
@@ -1209,6 +1342,7 @@ out_unlock:
     }
     free_cpumask_var(cpus);
     return err;
+#endif
 }
 
 static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
@@ -1300,6 +1434,9 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         return -ENODEV;
     if (!zalloc_cpumask_var(&worker_cpus, GFP_KERNEL))
         return -ENOMEM;
+    cfg->tx_role_cpu = -1;
+    cfg->rx_role_cpu = -1;
+    WRITE_ONCE(cfg->role_stopping, false);
 
     cpus_read_lock();
     requested_cpus = READ_ONCE(mwan_l2_worker_cpus);
@@ -1320,7 +1457,20 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         }
     } else {
         cpumask_copy(worker_cpus, cpu_online_mask);
+        cpumask_and(worker_cpus, worker_cpus, current->cpus_ptr);
     }
+#if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    if (l2_pqc) {
+        if (cpumask_weight(worker_cpus) < 3) {
+            pr_err("mwan_kmod: fixed TX/RX/Crypto roles require at least 3 online/allowed CPUs\n");
+            goto err_unlock_invalid_mask;
+        }
+        cfg->tx_role_cpu = cpumask_first(worker_cpus);
+        cfg->rx_role_cpu = cpumask_next(cfg->tx_role_cpu, worker_cpus);
+        cpumask_clear_cpu(cfg->tx_role_cpu, worker_cpus);
+        cpumask_clear_cpu(cfg->rx_role_cpu, worker_cpus);
+    }
+#endif
     cfg->num_workers = cpumask_weight(worker_cpus);
     if (cfg->num_workers <= 0)
         goto err_unlock_no_cpu;
@@ -1379,7 +1529,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         return -ENODEV;
     }
     cfg->worker_start_cpu = cfg->l2_workers[0].cpu;
-    err = mwan_pipeline_workers_init(cfg);
+    err = l2_pqc ? mwan_pipeline_workers_init(cfg) : 0;
     if (err) {
         pr_err("mwan_kmod: failed to initialize pipeline output workers: %d\n",
                err);
@@ -1389,6 +1539,15 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     }
     pr_info("mwan_kmod: initialized %d load-aware %s TX workers\n",
             cfg->num_workers, l2_pqc ? "L2-PQC" : "bypass");
+    if (cfg->num_pipeline_workers)
+        pr_info("mwan_kmod: initialized %d role-pipeline output workers\n",
+                cfg->num_pipeline_workers);
+#if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    if (l2_pqc)
+        pr_info("mwan_kmod: fixed roles TX=CPU%d RX=CPU%d Crypto=%*pbl\n",
+                cfg->tx_role_cpu, cfg->rx_role_cpu,
+                cpumask_pr_args(worker_cpus));
+#endif
     pr_info("mwan_kmod: L2 worker CPU mask=%*pbl requested=%s\n",
             cpumask_pr_args(worker_cpus),
             requested_cpus && requested_cpus[0] ? requested_cpus : "all");
@@ -1412,6 +1571,12 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
 
     if (!cfg || !cfg->l2_workers)
         return;
+    WRITE_ONCE(cfg->role_stopping, true);
+    for (i = 0; cfg->pipeline_workers &&
+                i < cfg->num_pipeline_workers; i++) {
+        wake_up_all(&cfg->pipeline_workers[i].tx_room_wait);
+        wake_up_all(&cfg->pipeline_workers[i].rx_room_wait);
+    }
     for (i = 0; i < cfg->num_workers; i++) {
         cancel_work_sync(&cfg->l2_workers[i].work);
         cancel_work_sync(&cfg->l2_workers[i].tx_work);
@@ -1503,6 +1668,8 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
     kfree(cfg->l2_workers);
     cfg->l2_workers = NULL;
     cfg->num_workers = 0;
+    cfg->tx_role_cpu = -1;
+    cfg->rx_role_cpu = -1;
 }
 
 u64 mwan_multicore_worker_score(const struct mwan_l2_worker *worker)
@@ -2240,6 +2407,15 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             tunnel_idx = cb_ok ? cb.tunnel_idx : 0;
             encap_type = cb_ok ? cb.encap_type : 0;
             packet_class = cb_ok ? cb.packet_class : MWAN_PACKET_OTHER_DATA;
+#if MWAN_ENABLE_ROLE_PIPELINE
+            if (cb_ok && flow && encap_type == MWAN_ENCAP_L2_PQC &&
+                atomic_read(&flow->exec_mode) ==
+                    MWAN_FLOW_EXEC_PIPELINE)
+                mwan_pipeline_wait_for_room(
+                    cfg, READ_ONCE(flow->pipeline_worker), true,
+                    accounted_bytes,
+                    packet_class == MWAN_PACKET_CONTROL);
+#endif
             if (cb_ok && encap_type == MWAN_ENCAP_L2_PQC)
                 mwan_bitrate_wait(&worker->tx_bitrate,
                                   packet_class == MWAN_PACKET_CONTROL);

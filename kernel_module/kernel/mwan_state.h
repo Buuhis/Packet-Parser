@@ -10,6 +10,7 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <linux/workqueue.h>
+#include <linux/wait.h>
 #include <linux/if_ether.h>
 #include <linux/refcount.h>
 #include <linux/list.h>
@@ -418,6 +419,9 @@ struct mwan_l2_worker {
     unsigned long *balance_last_data;
 };
 
+#define MWAN_PIPELINE_ROLE_TX 0x01U
+#define MWAN_PIPELINE_ROLE_RX 0x02U
+
 /* Final output stage used only by promoted flows.  Crypto remains serialized
  * on the flow's original mwan_l2_worker; these queues move dev_queue_xmit()
  * and authenticated RX reinjection to another CPU without copying payload. */
@@ -428,8 +432,11 @@ struct mwan_pipeline_worker {
     struct work_struct tx_work;
     struct work_struct rx_work;
     int cpu;
+    u8 role_mask;
     atomic_t tx_scheduled;
     atomic_t rx_scheduled;
+    wait_queue_head_t tx_room_wait;
+    wait_queue_head_t rx_room_wait;
     atomic64_t tx_queued;
     atomic64_t rx_queued;
     atomic64_t tx_queued_bytes;
@@ -438,6 +445,10 @@ struct mwan_pipeline_worker {
     atomic64_t rx_completed;
     atomic64_t tx_dropped;
     atomic64_t rx_dropped;
+    atomic64_t tx_backpressure_events;
+    atomic64_t rx_backpressure_events;
+    atomic64_t tx_backpressure_wait_ns;
+    atomic64_t rx_backpressure_wait_ns;
 };
 
 struct mwan_config {
@@ -485,6 +496,9 @@ struct mwan_config {
     struct mwan_l2_worker *l2_workers;
     int num_pipeline_workers;
     struct mwan_pipeline_worker *pipeline_workers;
+    int tx_role_cpu;
+    int rx_role_cpu;
+    bool role_stopping;
 
 };
 

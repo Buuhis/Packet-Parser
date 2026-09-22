@@ -68,5 +68,7 @@ void mwan_pipeline_rx_maybe_promote(struct mwan_config *cfg,
 int mwan_pipeline_rx_submit(struct sk_buff *skb,
                             struct mwan_l2_worker *crypto_worker,
                             struct mwan_l2_rx_flow *flow, u32 flow_seq);
+void mwan_pipeline_wait_for_room(struct mwan_config *cfg, int pipeline_idx,
+                                 bool tx, u32 bytes, bool priority);
 
 #endif /* MWAN_MULTICORE_H */
