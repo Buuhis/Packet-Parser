@@ -15,6 +15,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include "mwan_proto.h"
+#include "mwan_bitrate.h"
 
 #define MWAN_REORDER_TIMEOUT       msecs_to_jiffies(30)
 #define MAX_MWAN_TUNNELS 100
@@ -252,7 +253,8 @@ struct mwan_l2_tx_cb {
     u16 tunnel_idx;
     u16 magic;
     u8 encap_type;
-    u8 reserved[3];
+    u8 packet_class;
+    u8 reserved[2];
 };
 
 #define MWAN_L2_TX_CB_MAGIC 0x4d54U
@@ -371,6 +373,7 @@ struct mwan_l2_worker {
     atomic64_t tx_schedule_failures;
     atomic_t tx_scheduled;
     atomic_t tx_busy;
+    struct mwan_bitrate_state tx_bitrate;
 
     /* Per-CPU admission signals from kernel CPU accounting.  Values are
      * basis points (10000 == 100%).  The sampler is the only writer; RX/TX

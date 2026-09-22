@@ -199,6 +199,7 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     atomic64_set(&worker->emergency_enter_count, 0);
     atomic64_set(&worker->emergency_last_enter_ns, 0);
     atomic64_set(&worker->overload_last_drop_ns, 0);
+    mwan_bitrate_init(&worker->tx_bitrate);
 }
 
 static void mwan_cpu_update_worker(struct mwan_l2_worker *worker)
@@ -754,7 +755,8 @@ static u32 mwan_l2_tx_cb_checksum(const struct mwan_l2_tx_cb *cb)
     return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
            lower_32_bits(cb->flow_token) ^ upper_32_bits(cb->flow_token) ^
            cb->flow_seq ^ cb->accounted_bytes ^ cb->tunnel_idx ^
-           cb->magic ^ ((u32)cb->encap_type << 24) ^ 0x74786362U;
+           cb->magic ^ ((u32)cb->encap_type << 24) ^
+           ((u32)cb->packet_class << 16) ^ 0x74786362U;
 }
 
 static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
@@ -768,6 +770,8 @@ static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
         return false;
     if (cb->encap_type != MWAN_ENCAP_NONE &&
         cb->encap_type != MWAN_ENCAP_L2_PQC)
+        return false;
+    if (cb->packet_class > MWAN_PACKET_OTHER_DATA)
         return false;
     return cfg->tunnels[cb->tunnel_idx].encap_type == cb->encap_type;
 }
@@ -2160,6 +2164,7 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     MWAN_L2_TX_CB(skb)->tunnel_idx = (u16)tunnel_idx;
     MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
     MWAN_L2_TX_CB(skb)->encap_type = (u8)tun->encap_type;
+    MWAN_L2_TX_CB(skb)->packet_class = (u8)packet_class;
     MWAN_L2_TX_CB(skb)->check =
         mwan_l2_tx_cb_checksum(MWAN_L2_TX_CB(skb));
     if (tun->encap_type == MWAN_ENCAP_L2_PQC)
@@ -2221,7 +2226,9 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             u32 flow_seq;
             u16 tunnel_idx;
             u8 encap_type;
-            u64 start_ns = ktime_get_ns();
+            u8 packet_class;
+            u64 start_ns;
+            u64 processing_ns;
             bool pipeline_owned = false;
             int err;
 
@@ -2232,6 +2239,11 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             flow_seq = cb_ok ? cb.flow_seq : 0;
             tunnel_idx = cb_ok ? cb.tunnel_idx : 0;
             encap_type = cb_ok ? cb.encap_type : 0;
+            packet_class = cb_ok ? cb.packet_class : MWAN_PACKET_OTHER_DATA;
+            if (cb_ok && encap_type == MWAN_ENCAP_L2_PQC)
+                mwan_bitrate_wait(&worker->tx_bitrate,
+                                  packet_class == MWAN_PACKET_CONTROL);
+            start_ns = ktime_get_ns();
             atomic64_dec(&worker->tx_queued_packets);
             atomic64_sub(accounted_bytes, &worker->tx_queued_bytes);
             if (unlikely(!cb_ok)) {
@@ -2277,8 +2289,12 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic_dec(&worker->crypto_key_pending[
                     (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
 
+            processing_ns = ktime_get_ns() - start_ns;
             mwan_atomic64_update_ewma(&worker->tx_processing_ewma_ns,
-                                      ktime_get_ns() - start_ns);
+                                      processing_ns);
+            if (cb_ok && encap_type == MWAN_ENCAP_L2_PQC)
+                mwan_bitrate_account(&worker->tx_bitrate, processing_ns,
+                                     transmitted_bytes);
             atomic64_inc(&worker->tx_processed_packets);
             if (unlikely(err)) {
                 u8 packet_key_id =

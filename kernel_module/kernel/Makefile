@@ -1,7 +1,10 @@
 obj-m += mwan_kmod.o
 
+ccflags-y += -I$(src)/../bitrate
+
 mwan_kmod-objs := mwan_main.o mwan_state.o mwan_key_rotation.o mwan_l2_flow.o mwan_netlink.o mwan_steer.o \
                  mwan_multicore.o \
+                 ../bitrate/mwan_bitrate.o \
                  mwan_tunnel_balance.o \
                  mwan_mtu.o \
                  mwan_mac_discovery.o \
