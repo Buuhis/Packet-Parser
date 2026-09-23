@@ -22,12 +22,14 @@
  * value here, rebuild mwan_kmod.ko, and reload the module. */
 #define MWAN_ENABLE_ROLE_PIPELINE        1
 #define MWAN_ENABLE_FIXED_ROLE_LAYOUT    MWAN_ENABLE_ROLE_PIPELINE
-/* Diagnostic fixed placement.  With this enabled, TX/RX output work is
- * always queued on these logical CPUs and both CPUs are excluded from the
- * crypto-owner pool.  Change the CPU ids here, rebuild and reload. */
-#define MWAN_ENABLE_HARDCODED_ROLE_CPUS  1
-#define MWAN_FIXED_TX_ROLE_CPU           0
-#define MWAN_FIXED_RX_ROLE_CPU           1
+#define MWAN_ENABLE_SHARED_ROLE_POOL     1
+/* Compile-time output-role pool.  Every CPU in this list can run both TX-out
+ * and RX-out work, while the CPUs are excluded from the crypto-owner pool.
+ * Each flow remains sticky to one selected output worker, and new flows pick
+ * the least-loaded eligible worker.  Change the CPU list here, rebuild and
+ * reload; there is deliberately no runtime/module parameter for this. */
+#define MWAN_ENABLE_HARDCODED_ROLE_POOL  1
+#define MWAN_FIXED_ROLE_POOL_CPUS        "0-1"
 #define MWAN_ENABLE_IPSEC_SA_SCHEDULER   1
 /* Reserved for a future ordered multi-lane implementation.  Silently
  * enabling an unfinished one-SA/multi-core path would break ESP ordering. */
@@ -35,11 +37,6 @@
 
 #if MWAN_ENABLE_HOT_SA_SHARDING
 #error "MWAN_ENABLE_HOT_SA_SHARDING is not implemented"
-#endif
-
-#if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_HARDCODED_ROLE_CPUS && \
-    MWAN_FIXED_TX_ROLE_CPU == MWAN_FIXED_RX_ROLE_CPU
-#error "TX and RX roles must use different CPUs"
 #endif
 
 #define MWAN_CPU_BP_MAX              10000U
@@ -871,10 +868,24 @@ static int mwan_pipeline_pick_worker(struct mwan_config *cfg, u32 flow_id,
                 !cpu_online(worker->cpu) ||
                 (!pass && worker->cpu == source_cpu))
                 continue;
-            packets = (u64)atomic64_read(tx ? &worker->tx_queued :
-                                             &worker->rx_queued);
-            bytes = (u64)atomic64_read(tx ? &worker->tx_queued_bytes :
-                                           &worker->rx_queued_bytes);
+            if ((worker->role_mask & (MWAN_PIPELINE_ROLE_TX |
+                                      MWAN_PIPELINE_ROLE_RX)) ==
+                    (MWAN_PIPELINE_ROLE_TX | MWAN_PIPELINE_ROLE_RX)) {
+                /* A shared role CPU serializes its TX-out and RX-out work on
+                 * the same bound workqueue CPU.  Account both directions so
+                 * a quiet TX queue is not selected on a CPU whose RX queue
+                 * is already congested, and vice versa. */
+                packets = (u64)atomic64_read(&worker->tx_queued) +
+                          (u64)atomic64_read(&worker->rx_queued);
+                bytes = (u64)atomic64_read(&worker->tx_queued_bytes) +
+                        (u64)atomic64_read(&worker->rx_queued_bytes);
+            } else {
+                packets = (u64)atomic64_read(tx ? &worker->tx_queued :
+                                                 &worker->rx_queued);
+                bytes = (u64)atomic64_read(tx ?
+                                               &worker->tx_queued_bytes :
+                                               &worker->rx_queued_bytes);
+            }
             load = bytes + packets * 2048ULL;
             if (load < best_load) {
                 best_load = load;
@@ -1330,15 +1341,19 @@ static void mwan_pipeline_worker_init(struct mwan_pipeline_worker *worker,
     atomic_set(&worker->rx_scheduled, 0);
 }
 
-static int mwan_pipeline_workers_init(struct mwan_config *cfg)
+static int mwan_pipeline_workers_init(struct mwan_config *cfg,
+                                      const struct cpumask *role_cpus)
 {
 #if MWAN_ENABLE_FIXED_ROLE_LAYOUT
-    if (cfg->tx_role_cpu < 0 || cfg->rx_role_cpu < 0 ||
-        cfg->tx_role_cpu == cfg->rx_role_cpu ||
-        !cpu_online(cfg->tx_role_cpu) || !cpu_online(cfg->rx_role_cpu))
+    int cpu;
+    int idx = 0;
+
+    if (!role_cpus || cpumask_empty(role_cpus) ||
+        !cpumask_subset(role_cpus, cpu_online_mask) ||
+        !cpumask_subset(role_cpus, current->cpus_ptr))
         return -EINVAL;
 
-    cfg->num_pipeline_workers = 2;
+    cfg->num_pipeline_workers = cpumask_weight(role_cpus);
     cfg->pipeline_workers = kcalloc(cfg->num_pipeline_workers,
                                     sizeof(*cfg->pipeline_workers),
                                     GFP_KERNEL);
@@ -1346,10 +1361,18 @@ static int mwan_pipeline_workers_init(struct mwan_config *cfg)
         cfg->num_pipeline_workers = 0;
         return -ENOMEM;
     }
-    mwan_pipeline_worker_init(&cfg->pipeline_workers[0], cfg,
-                              cfg->tx_role_cpu, MWAN_PIPELINE_ROLE_TX);
-    mwan_pipeline_worker_init(&cfg->pipeline_workers[1], cfg,
-                              cfg->rx_role_cpu, MWAN_PIPELINE_ROLE_RX);
+    for_each_cpu(cpu, role_cpus) {
+        u8 roles;
+
+#if MWAN_ENABLE_SHARED_ROLE_POOL
+        roles = MWAN_PIPELINE_ROLE_TX | MWAN_PIPELINE_ROLE_RX;
+#else
+        roles = idx == 0 ? MWAN_PIPELINE_ROLE_TX :
+                           MWAN_PIPELINE_ROLE_RX;
+#endif
+        mwan_pipeline_worker_init(&cfg->pipeline_workers[idx++], cfg, cpu,
+                                  roles);
+    }
     return 0;
 #else
     cpumask_var_t cpus;
@@ -1358,6 +1381,7 @@ static int mwan_pipeline_workers_init(struct mwan_config *cfg)
     int err = 0;
     int i;
 
+    (void)role_cpus;
     if (!zalloc_cpumask_var(&cpus, GFP_KERNEL))
         return -ENOMEM;
     cpus_read_lock();
@@ -1474,9 +1498,11 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
     cfg->num_pipeline_workers = 0;
 }
 #else
-static int mwan_pipeline_workers_init(struct mwan_config *cfg)
+static int mwan_pipeline_workers_init(struct mwan_config *cfg,
+                                      const struct cpumask *role_cpus)
 {
     (void)cfg;
+    (void)role_cpus;
     return 0;
 }
 
@@ -1489,6 +1515,7 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
 int mwan_l2_workers_init(struct mwan_config *cfg)
 {
     cpumask_var_t worker_cpus;
+    cpumask_var_t role_cpus;
     const char *requested_cpus;
     bool l2_pqc;
     bool bypass;
@@ -1507,8 +1534,10 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         return -ENODEV;
     if (!zalloc_cpumask_var(&worker_cpus, GFP_KERNEL))
         return -ENOMEM;
-    cfg->tx_role_cpu = -1;
-    cfg->rx_role_cpu = -1;
+    if (!zalloc_cpumask_var(&role_cpus, GFP_KERNEL)) {
+        free_cpumask_var(worker_cpus);
+        return -ENOMEM;
+    }
     WRITE_ONCE(cfg->role_stopping, false);
 
     cpus_read_lock();
@@ -1534,29 +1563,38 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     }
 #if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_FIXED_ROLE_LAYOUT
     if (l2_pqc) {
-        if (cpumask_weight(worker_cpus) < 3) {
-            pr_err("mwan_kmod: fixed TX/RX/Crypto roles require at least 3 online/allowed CPUs\n");
+#if MWAN_ENABLE_HARDCODED_ROLE_POOL
+        err = cpulist_parse(MWAN_FIXED_ROLE_POOL_CPUS, role_cpus);
+        if (err || cpumask_empty(role_cpus)) {
+            pr_err("mwan_kmod: invalid fixed role-pool CPU list '%s'\n",
+                   MWAN_FIXED_ROLE_POOL_CPUS);
             goto err_unlock_invalid_mask;
         }
-#if MWAN_ENABLE_HARDCODED_ROLE_CPUS
-        cfg->tx_role_cpu = MWAN_FIXED_TX_ROLE_CPU;
-        cfg->rx_role_cpu = MWAN_FIXED_RX_ROLE_CPU;
-        if (cfg->tx_role_cpu >= nr_cpu_ids ||
-            cfg->rx_role_cpu >= nr_cpu_ids ||
-            !cpu_online(cfg->tx_role_cpu) ||
-            !cpu_online(cfg->rx_role_cpu) ||
-            !cpumask_test_cpu(cfg->tx_role_cpu, worker_cpus) ||
-            !cpumask_test_cpu(cfg->rx_role_cpu, worker_cpus)) {
-            pr_err("mwan_kmod: hardcoded role CPUs TX=%d RX=%d must be online, allowed and present in l2_worker_cpus\n",
-                   cfg->tx_role_cpu, cfg->rx_role_cpu);
+        if (!cpumask_subset(role_cpus, worker_cpus)) {
+            pr_err("mwan_kmod: fixed role-pool CPUs %s must all be online, allowed and present in l2_worker_cpus\n",
+                   MWAN_FIXED_ROLE_POOL_CPUS);
             goto err_unlock_invalid_mask;
         }
 #else
-        cfg->tx_role_cpu = cpumask_first(worker_cpus);
-        cfg->rx_role_cpu = cpumask_next(cfg->tx_role_cpu, worker_cpus);
+        cpu = cpumask_first(worker_cpus);
+        if (cpu < nr_cpu_ids)
+            cpumask_set_cpu(cpu, role_cpus);
+        cpu = cpumask_next(cpu, worker_cpus);
+        if (cpu < nr_cpu_ids)
+            cpumask_set_cpu(cpu, role_cpus);
 #endif
-        cpumask_clear_cpu(cfg->tx_role_cpu, worker_cpus);
-        cpumask_clear_cpu(cfg->rx_role_cpu, worker_cpus);
+        if (cpumask_weight(role_cpus) < 2 ||
+            cpumask_weight(worker_cpus) <= cpumask_weight(role_cpus)) {
+            pr_err("mwan_kmod: role pool requires at least 2 role CPUs and 1 separate crypto CPU\n");
+            goto err_unlock_invalid_mask;
+        }
+#if !MWAN_ENABLE_SHARED_ROLE_POOL
+        if (cpumask_weight(role_cpus) != 2) {
+            pr_err("mwan_kmod: dedicated TX/RX fallback requires exactly 2 role CPUs\n");
+            goto err_unlock_invalid_mask;
+        }
+#endif
+        cpumask_andnot(worker_cpus, worker_cpus, role_cpus);
     }
 #endif
     cfg->num_workers = cpumask_weight(worker_cpus);
@@ -1567,6 +1605,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     if (!cfg->l2_workers) {
         cpus_read_unlock();
         free_cpumask_var(worker_cpus);
+        free_cpumask_var(role_cpus);
         return -ENOMEM;
     }
 
@@ -1591,6 +1630,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
             cfg->num_workers = idx + 1;
             cpus_read_unlock();
             free_cpumask_var(worker_cpus);
+            free_cpumask_var(role_cpus);
             mwan_l2_workers_cleanup(cfg);
             return -ENOMEM;
         }
@@ -1602,6 +1642,7 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
             cfg->num_workers = idx + 1;
             cpus_read_unlock();
             free_cpumask_var(worker_cpus);
+            free_cpumask_var(role_cpus);
             mwan_l2_workers_cleanup(cfg);
             return err;
         }
@@ -1612,44 +1653,57 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
     cpus_read_unlock();
     if (!cfg->num_workers) {
         free_cpumask_var(worker_cpus);
+        free_cpumask_var(role_cpus);
         kfree(cfg->l2_workers);
         cfg->l2_workers = NULL;
         return -ENODEV;
     }
     cfg->worker_start_cpu = cfg->l2_workers[0].cpu;
-    err = l2_pqc ? mwan_pipeline_workers_init(cfg) : 0;
+    err = l2_pqc ? mwan_pipeline_workers_init(cfg, role_cpus) : 0;
     if (err) {
         pr_err("mwan_kmod: failed to initialize pipeline output workers: %d\n",
                err);
         free_cpumask_var(worker_cpus);
+        free_cpumask_var(role_cpus);
         mwan_l2_workers_cleanup(cfg);
         return err;
     }
-    pr_info("mwan_kmod: initialized %d load-aware %s TX workers\n",
+    pr_info("mwan_kmod: initialized %d load-aware %s crypto workers\n",
             cfg->num_workers, l2_pqc ? "L2-PQC" : "bypass");
     if (cfg->num_pipeline_workers)
         pr_info("mwan_kmod: initialized %d role-pipeline output workers\n",
                 cfg->num_pipeline_workers);
 #if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_FIXED_ROLE_LAYOUT
-    if (l2_pqc)
-        pr_info("mwan_kmod: fixed roles TX=CPU%d RX=CPU%d Crypto=%*pbl\n",
-                cfg->tx_role_cpu, cfg->rx_role_cpu,
+    if (l2_pqc) {
+#if MWAN_ENABLE_SHARED_ROLE_POOL
+        pr_info("mwan_kmod: shared TX/RX output-role pool=%*pbl Crypto=%*pbl\n",
+                cpumask_pr_args(role_cpus),
                 cpumask_pr_args(worker_cpus));
+#else
+        pr_info("mwan_kmod: dedicated output roles TX=CPU%d RX=CPU%d Crypto=%*pbl\n",
+                cpumask_first(role_cpus),
+                cpumask_next(cpumask_first(role_cpus), role_cpus),
+                cpumask_pr_args(worker_cpus));
+#endif
+    }
 #endif
     pr_info("mwan_kmod: L2 worker CPU mask=%*pbl requested=%s\n",
             cpumask_pr_args(worker_cpus),
             requested_cpus && requested_cpus[0] ? requested_cpus : "all");
     free_cpumask_var(worker_cpus);
+    free_cpumask_var(role_cpus);
     return 0;
 
 err_unlock_no_cpu:
     cpus_read_unlock();
     free_cpumask_var(worker_cpus);
+    free_cpumask_var(role_cpus);
     return -ENODEV;
 
 err_unlock_invalid_mask:
     cpus_read_unlock();
     free_cpumask_var(worker_cpus);
+    free_cpumask_var(role_cpus);
     return -EINVAL;
 }
 
@@ -1772,8 +1826,6 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
     kfree(cfg->l2_workers);
     cfg->l2_workers = NULL;
     cfg->num_workers = 0;
-    cfg->tx_role_cpu = -1;
-    cfg->rx_role_cpu = -1;
 }
 
 u64 mwan_multicore_worker_score(const struct mwan_l2_worker *worker)

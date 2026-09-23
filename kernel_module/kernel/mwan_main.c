@@ -45,7 +45,7 @@ MODULE_PARM_DESC(l2_max_shed,
                  "Maximum percentage of eligible data packets shed per CPU");
 module_param_named(l2_worker_cpus, mwan_l2_worker_cpus, charp, 0444);
 MODULE_PARM_DESC(l2_worker_cpus,
-                 "Eligible L2 CPU list; hardcoded TX/RX CPUs must be included and are removed from the Crypto pool; empty uses every online/allowed CPU");
+                 "Eligible L2 CPU list; compile-time output-role pool CPUs must be included and are removed from the Crypto pool; empty uses every online/allowed CPU");
 
 static int mwan_l2_diag_reset_set(const char *val,
                                   const struct kernel_param *kp)

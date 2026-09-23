@@ -423,8 +423,9 @@ struct mwan_l2_worker {
 #define MWAN_PIPELINE_ROLE_RX 0x02U
 
 /* Final output stage used only by promoted flows.  Crypto remains serialized
- * on the flow's original mwan_l2_worker; these queues move dev_queue_xmit()
- * and authenticated RX reinjection to another CPU without copying payload. */
+ * on the flow's original mwan_l2_worker; these per-CPU queues form a role
+ * pool which moves dev_queue_xmit() and authenticated RX reinjection away
+ * from crypto CPUs without copying payload. */
 struct mwan_pipeline_worker {
     struct mwan_config *cfg;
     struct sk_buff_head tx_queue;
@@ -496,8 +497,6 @@ struct mwan_config {
     struct mwan_l2_worker *l2_workers;
     int num_pipeline_workers;
     struct mwan_pipeline_worker *pipeline_workers;
-    int tx_role_cpu;
-    int rx_role_cpu;
     bool role_stopping;
 
 };

@@ -954,9 +954,8 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
             seq_printf(m, "%s%d", worker_idx ? "," : "",
                        cfg->l2_workers[worker_idx].cpu);
         seq_putc(m, '\n');
-        seq_printf(m, "pipeline workers=%d tx_role_cpu=%d rx_role_cpu=%d tx_promoted=%lld rx_promoted=%lld tx_dropped=%lld rx_dropped=%lld\n",
-                   cfg->num_pipeline_workers, cfg->tx_role_cpu,
-                   cfg->rx_role_cpu,
+        seq_printf(m, "pipeline_pool workers=%d tx_promoted=%lld rx_promoted=%lld tx_dropped=%lld rx_dropped=%lld\n",
+                   cfg->num_pipeline_workers,
                    atomic64_read(&cfg->flows.tx_pipeline_promoted),
                    atomic64_read(&cfg->flows.rx_pipeline_promoted),
                    atomic64_read(&cfg->flows.tx_pipeline_dropped),
