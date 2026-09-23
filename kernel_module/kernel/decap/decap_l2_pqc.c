@@ -19,6 +19,9 @@ static struct workqueue_struct *mwan_l2_wq;
 static struct dentry *mwan_debugfs_dir;
 #define MWAN_L2_SOFTIRQ_MIN_SAMPLE_MS       10U
 #define MWAN_L2_SOFTIRQ_MAX_SAMPLE_MS     1000U
+/* Keep the normal live view narrow.  Temporarily set this to 1 only when a
+ * full counter dump is required, then rebuild and reload the module. */
+#define MWAN_L2_STATS_VERBOSE                 0
 
 static DEFINE_SPINLOCK(mwan_l2_rx_diag_lock);
 static u32 mwan_l2_rx_diag_flows[MWAN_L2_DIAG_MAX_FLOWS];
@@ -672,7 +675,11 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
     int i;
 
     (void)unused;
+#if MWAN_L2_STATS_VERBOSE
     seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_dqx_calls tx_dqx_ok tx_dqx_cn tx_dqx_drop tx_dqx_err tx_dqx_last_fail_ns tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp rate_on rate_target_bp rate_burst_ns rate_tokens_ns rate_throttle rate_wait_ns rate_max_wait_ns rate_accounted_ns rate_packets rate_bytes rate_control_bypass rate_max_debt_ns\n");
+#else
+    seq_puts(m, "cpu rx_q rx_q_kib rx_max_q rx_max_kib rx_drop decrypt_fail tx_q tx_q_kib tx_max_q tx_max_kib tx_drop xmit_drop xmit_err overload_drop sys_bp soft_bp idle_bp rate_bp rate_throttle rate_wait_ms\n");
+#endif
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (!cfg || !cfg->l2_workers) {
@@ -687,6 +694,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
 
         mwan_bitrate_snapshot(&w->tx_bitrate, &rate);
 
+#if MWAN_L2_STATS_VERBOSE
         seq_printf(m, "%d %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d ",
                    w->cpu,
                    atomic64_read(&w->queued_packets),
@@ -751,6 +759,29 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    rate.tokens_ns, rate.throttle_events, rate.wait_ns,
                    rate.max_wait_ns, rate.accounted_ns, rate.packets,
                    rate.bytes, rate.control_bypass, rate.max_debt_ns);
+#else
+        seq_printf(m, "%d %lld %llu %lld %llu %lld %lld %lld %llu %lld %llu %lld %lld %lld %lld %d %d %d %u %llu %llu\n",
+                   w->cpu,
+                   atomic64_read(&w->queued_packets),
+                   (u64)atomic64_read(&w->queued_bytes) >> 10,
+                   atomic64_read(&w->max_queued_packets),
+                   (u64)atomic64_read(&w->max_queued_bytes) >> 10,
+                   atomic64_read(&w->dropped_packets),
+                   atomic64_read(&w->decrypt_failures),
+                   atomic64_read(&w->tx_queued_packets),
+                   (u64)atomic64_read(&w->tx_queued_bytes) >> 10,
+                   atomic64_read(&w->tx_max_queued_packets),
+                   (u64)atomic64_read(&w->tx_max_queued_bytes) >> 10,
+                   atomic64_read(&w->tx_dropped_packets),
+                   atomic64_read(&w->tx_dev_xmit_drop),
+                   atomic64_read(&w->tx_dev_xmit_error),
+                   atomic64_read(&w->tx_overload_dropped),
+                   atomic_read(&w->system_raw_bp),
+                   atomic_read(&w->softirq_raw_bp),
+                   atomic_read(&w->idle_raw_bp),
+                   rate.target_bp, rate.throttle_events,
+                   div_u64(rate.wait_ns, NSEC_PER_MSEC));
+#endif
     }
     rcu_read_unlock();
     return 0;

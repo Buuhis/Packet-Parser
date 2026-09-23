@@ -21,6 +21,12 @@
  * value here, rebuild mwan_kmod.ko, and reload the module. */
 #define MWAN_ENABLE_ROLE_PIPELINE        1
 #define MWAN_ENABLE_FIXED_ROLE_LAYOUT    MWAN_ENABLE_ROLE_PIPELINE
+/* Diagnostic fixed placement.  With this enabled, TX/RX output work is
+ * always queued on these logical CPUs and both CPUs are excluded from the
+ * crypto-owner pool.  Change the CPU ids here, rebuild and reload. */
+#define MWAN_ENABLE_HARDCODED_ROLE_CPUS  1
+#define MWAN_FIXED_TX_ROLE_CPU           0
+#define MWAN_FIXED_RX_ROLE_CPU           1
 #define MWAN_ENABLE_IPSEC_SA_SCHEDULER   1
 /* Reserved for a future ordered multi-lane implementation.  Silently
  * enabling an unfinished one-SA/multi-core path would break ESP ordering. */
@@ -28,6 +34,11 @@
 
 #if MWAN_ENABLE_HOT_SA_SHARDING
 #error "MWAN_ENABLE_HOT_SA_SHARDING is not implemented"
+#endif
+
+#if MWAN_ENABLE_ROLE_PIPELINE && MWAN_ENABLE_HARDCODED_ROLE_CPUS && \
+    MWAN_FIXED_TX_ROLE_CPU == MWAN_FIXED_RX_ROLE_CPU
+#error "TX and RX roles must use different CPUs"
 #endif
 
 #define MWAN_CPU_BP_MAX              10000U
@@ -1035,7 +1046,9 @@ static bool mwan_pipeline_schedule(struct mwan_pipeline_worker *worker,
         return true;
     if (work_busy(work))
         return true;
-    return queue_work(mwan_pipeline_wq, work);
+    /* Do not fall back to queue_work(): that could migrate a diagnostic
+     * fixed-role stage to another CPU and make per-CPU observations lie. */
+    return false;
 }
 
 static void mwan_pipeline_tx_maybe_promote(
@@ -1465,8 +1478,23 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
             pr_err("mwan_kmod: fixed TX/RX/Crypto roles require at least 3 online/allowed CPUs\n");
             goto err_unlock_invalid_mask;
         }
+#if MWAN_ENABLE_HARDCODED_ROLE_CPUS
+        cfg->tx_role_cpu = MWAN_FIXED_TX_ROLE_CPU;
+        cfg->rx_role_cpu = MWAN_FIXED_RX_ROLE_CPU;
+        if (cfg->tx_role_cpu >= nr_cpu_ids ||
+            cfg->rx_role_cpu >= nr_cpu_ids ||
+            !cpu_online(cfg->tx_role_cpu) ||
+            !cpu_online(cfg->rx_role_cpu) ||
+            !cpumask_test_cpu(cfg->tx_role_cpu, worker_cpus) ||
+            !cpumask_test_cpu(cfg->rx_role_cpu, worker_cpus)) {
+            pr_err("mwan_kmod: hardcoded role CPUs TX=%d RX=%d must be online, allowed and present in l2_worker_cpus\n",
+                   cfg->tx_role_cpu, cfg->rx_role_cpu);
+            goto err_unlock_invalid_mask;
+        }
+#else
         cfg->tx_role_cpu = cpumask_first(worker_cpus);
         cfg->rx_role_cpu = cpumask_next(cfg->tx_role_cpu, worker_cpus);
+#endif
         cpumask_clear_cpu(cfg->tx_role_cpu, worker_cpus);
         cpumask_clear_cpu(cfg->rx_role_cpu, worker_cpus);
     }
