@@ -2,6 +2,7 @@
 #include "../mwan_mac_discovery.h"
 #include "../mwan_mtu.h"
 #include "../mwan_multicore.h"
+#include "../mwan_drop_trace.h"
 #include <linux/netfilter.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
@@ -22,6 +23,24 @@
 #else
 #include <linux/skbuff.h>
 #endif
+
+static void mwan_l2_encap_drop_trace(
+    enum mwan_drop_reason reason, const struct sk_buff *skb,
+    const struct mwan_tx_flow_context *tx_ctx, int error, u16 tunnel_idx)
+{
+    const struct mwan_drop_trace_ctx ctx = {
+        .reason = reason,
+        .skb = skb,
+        .flow_seq = MWAN_DROP_SEQ_UNKNOWN,
+        .flow_id = tx_ctx ? tx_ctx->info.flow_id : 0,
+        .error = error,
+        .ifindex = skb && skb->dev ? skb->dev->ifindex : 0,
+        .tunnel_idx = tunnel_idx,
+        .tx_queue = MWAN_DROP_TXQ_UNKNOWN,
+    };
+
+    mwan_drop_trace_record(&ctx);
+}
 
 struct mwan_l2_tx_diag {
     __be32 saddr;
@@ -334,29 +353,53 @@ mwan_l2_submit_fragment(struct sk_buff *fragment,
     int err;
 
     if (!fragment || !fragment_context || !fragment_context->cfg ||
-        fragment_context->tunnel_idx >= fragment_context->cfg->num_tunnels)
+        fragment_context->tunnel_idx >= fragment_context->cfg->num_tunnels) {
+        if (fragment)
+            mwan_l2_encap_drop_trace(
+                MWAN_DROP_TX_FRAGMENT_FAILED, fragment,
+                fragment_context ? fragment_context->tx_ctx : NULL,
+                -EINVAL, fragment_context ? fragment_context->tunnel_idx :
+                                             MWAN_DROP_TUNNEL_UNKNOWN);
         return -EINVAL;
+    }
 
     tun = &fragment_context->cfg->tunnels[fragment_context->tunnel_idx];
-    if (!tun->dev)
+    if (!tun->dev) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_NO_DEVICE, fragment,
+                                 fragment_context->tx_ctx, -ENODEV,
+                                 fragment_context->tunnel_idx);
         return -ENODEV;
+    }
 
     /* The kernel fragmenter was given the effective L2-PQC inner MTU.  Do
      * not recurse through the oversize path or recalculate the flow from a
      * fragment that no longer contains the complete UDP 4-tuple. */
     mtu_result = mwan_mtu_classify_ipv4_skb(
         fragment, tun->dev, MWAN_MTU_PROFILE_L2_PQC, &decision);
-    if (mtu_result != MWAN_MTU_FITS)
-        return mtu_result == MWAN_MTU_OVERSIZE ? -EMSGSIZE : -EINVAL;
-    if (!mwan_l2_normalize_ipv4_extent(fragment, &decision))
+    if (mtu_result != MWAN_MTU_FITS) {
+        err = mtu_result == MWAN_MTU_OVERSIZE ? -EMSGSIZE : -EINVAL;
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_MTU_INVALID, fragment,
+                                 fragment_context->tx_ctx, err,
+                                 fragment_context->tunnel_idx);
+        return err;
+    }
+    if (!mwan_l2_normalize_ipv4_extent(fragment, &decision)) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_MTU_INVALID, fragment,
+                                 fragment_context->tx_ctx, -EINVAL,
+                                 fragment_context->tunnel_idx);
         return -EINVAL;
+    }
 
     if (fragment_context->tx_ctx) {
         info = &fragment_context->tx_ctx->info;
         packet_class = fragment_context->tx_ctx->packet_class;
         flow = mwan_l2_tx_flow_hold(fragment_context->tx_ctx->flow);
-        if (!flow)
+        if (!flow) {
+            mwan_l2_encap_drop_trace(MWAN_DROP_TX_FLOW_FAILED, fragment,
+                                     fragment_context->tx_ctx, -ENOENT,
+                                     fragment_context->tunnel_idx);
             return -ENOENT;
+        }
     } else {
         info = &fragment_context->flow_info;
         packet_class = fragment_context->packet_class;
@@ -434,6 +477,9 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
          * This splits 64KB GSO super-packets into MTU-compliant SKBs */
         segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
         if (IS_ERR(segs) || !segs) {
+            mwan_l2_encap_drop_trace(
+                MWAN_DROP_TX_GSO_FAILED, skb, tx_ctx,
+                IS_ERR(segs) ? PTR_ERR(segs) : -ENOMEM, tunnel_idx);
             return NF_DROP;
         }
 
@@ -581,15 +627,43 @@ void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
 {
     struct net_device *target_dev;
     int xmit_ret;
+    u32 packet_len;
     u16 tx_queue;
 
     if (WARN_ON_ONCE(!skb || !worker)) {
+        if (skb) {
+            const struct mwan_drop_trace_ctx ctx = {
+                .reason = MWAN_DROP_TX_WORKER_FAILED,
+                .skb = skb,
+                .flow_token = flow_token,
+                .flow_seq = seq,
+                .flow_id = lower_32_bits(flow_token),
+                .error = -ENODEV,
+                .tunnel_idx = MWAN_DROP_TUNNEL_UNKNOWN,
+                .tx_queue = MWAN_DROP_TXQ_UNKNOWN,
+            };
+
+            mwan_drop_trace_record(&ctx);
+        }
         kfree_skb(skb);
         return;
     }
     target_dev = skb->dev;
     if (WARN_ON_ONCE(!target_dev)) {
+        const struct mwan_drop_trace_ctx ctx = {
+            .reason = MWAN_DROP_TX_NO_DEVICE,
+            .worker = worker,
+            .skb = skb,
+            .flow_token = flow_token,
+            .flow_seq = seq,
+            .flow_id = lower_32_bits(flow_token),
+            .error = -ENODEV,
+            .tunnel_idx = MWAN_DROP_TUNNEL_UNKNOWN,
+            .tx_queue = MWAN_DROP_TXQ_UNKNOWN,
+        };
+
         atomic64_inc(&worker->tx_dropped_packets);
+        mwan_drop_trace_record(&ctx);
         kfree_skb(skb);
         return;
     }
@@ -610,6 +684,7 @@ void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
      * only means that this layer accepted the packet; a qdisc, driver, NIC or
      * the WAN may lose it later. */
     tx_queue = skb_get_queue_mapping(skb);
+    packet_len = skb->len;
     xmit_ret = dev_queue_xmit(skb);
     atomic64_inc(&worker->tx_dev_xmit_calls);
     if (likely(xmit_ret == NET_XMIT_SUCCESS)) {
@@ -618,11 +693,25 @@ void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
         /* Congestion notification does not prove that this skb was lost. */
         atomic64_inc(&worker->tx_dev_xmit_cn);
     } else {
+        const struct mwan_drop_trace_ctx ctx = {
+            .reason = MWAN_DROP_TX_DEV_XMIT,
+            .worker = worker,
+            .flow_token = flow_token,
+            .flow_seq = seq,
+            .flow_id = lower_32_bits(flow_token),
+            .packet_len = packet_len,
+            .error = xmit_ret,
+            .ifindex = target_dev->ifindex,
+            .tunnel_idx = MWAN_DROP_TUNNEL_UNKNOWN,
+            .tx_queue = tx_queue,
+        };
+
         if (xmit_ret > 0)
             atomic64_inc(&worker->tx_dev_xmit_drop);
         else
             atomic64_inc(&worker->tx_dev_xmit_error);
         atomic64_set(&worker->tx_dev_xmit_last_fail_ns, ktime_get_ns());
+        mwan_drop_trace_record(&ctx);
         if (READ_ONCE(mwan_l2_diag_enabled))
             pr_warn_ratelimited("mwan_kmod: L2D DEV_XMIT_FAIL token=%016llx seq=%u dev=%s queue=%u worker_cpu=%d ret=%d\n",
                                 flow_token, seq, target_dev->name, tx_queue,
@@ -683,12 +772,18 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
     int owner_cpu = -1;
     int err;
 
-    if (!cfg || tunnel_idx >= cfg->num_tunnels)
+    if (!cfg || tunnel_idx >= cfg->num_tunnels) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, skb,
+                                 tx_ctx, -EINVAL, tunnel_idx);
         return NF_DROP;
+    }
     tun = &cfg->tunnels[tunnel_idx];
     target_dev = tun->dev;
-    if (unlikely(!target_dev))
+    if (unlikely(!target_dev)) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_NO_DEVICE, skb, tx_ctx,
+                                 -ENODEV, tunnel_idx);
         return NF_DROP;
+    }
 
     mtu_result = mwan_mtu_classify_ipv4_skb(
         skb, target_dev, MWAN_MTU_PROFILE_L2_PQC, &decision);
@@ -703,6 +798,8 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
         if (decision.ipv4_df && !skb->ignore_df) {
             mwan_mtu_send_frag_needed(skb, MWAN_MTU_PROFILE_L2_PQC,
                                       &decision);
+            mwan_l2_encap_drop_trace(MWAN_DROP_TX_MTU_DF, skb, tx_ctx,
+                                     -EMSGSIZE, tunnel_idx);
             return NF_DROP;
         }
 
@@ -725,14 +822,22 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
         if (!consumed) {
             pr_warn_ratelimited("mwan_kmod: L2-PQC MTU fragment setup failed ret=%d\n",
                                 err);
+            mwan_l2_encap_drop_trace(MWAN_DROP_TX_FRAGMENT_FAILED, skb,
+                                     tx_ctx, err, tunnel_idx);
             return NF_DROP;
         }
         return NF_STOLEN;
     }
-    if (mtu_result != MWAN_MTU_FITS)
+    if (mtu_result != MWAN_MTU_FITS) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_MTU_INVALID, skb, tx_ctx,
+                                 -EINVAL, tunnel_idx);
         return NF_DROP;
-    if (!mwan_l2_normalize_ipv4_extent(skb, &decision))
+    }
+    if (!mwan_l2_normalize_ipv4_extent(skb, &decision)) {
+        mwan_l2_encap_drop_trace(MWAN_DROP_TX_MTU_INVALID, skb, tx_ctx,
+                                 -EINVAL, tunnel_idx);
         return NF_DROP;
+    }
 
     /* The SYN must be adjusted while the normalized inner packet is still
      * plaintext. */
@@ -742,8 +847,11 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
         info = &tx_ctx->info;
         packet_class = tx_ctx->packet_class;
         flow = mwan_l2_tx_flow_hold(tx_ctx->flow);
-        if (!flow)
+        if (!flow) {
+            mwan_l2_encap_drop_trace(MWAN_DROP_TX_FLOW_FAILED, skb,
+                                     tx_ctx, -ENOENT, tunnel_idx);
             return NF_DROP;
+        }
         flow_id = info->flow_id;
     } else {
         flow_id = mwan_multicore_flow_info(skb, &local_info);

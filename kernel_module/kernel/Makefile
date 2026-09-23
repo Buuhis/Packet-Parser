@@ -5,7 +5,7 @@ ccflags-y += -I$(src)/../bitrate
 BITRATE_BUILD_ARTIFACTS := $(CURDIR)/../bitrate/mwan_bitrate.o \
                            $(CURDIR)/../bitrate/.mwan_bitrate.o.cmd
 
-mwan_kmod-objs := mwan_main.o mwan_state.o mwan_key_rotation.o mwan_l2_flow.o mwan_netlink.o mwan_steer.o \
+mwan_kmod-objs := mwan_main.o mwan_state.o mwan_key_rotation.o mwan_l2_flow.o mwan_drop_trace.o mwan_netlink.o mwan_steer.o \
                  mwan_multicore.o \
                  ../bitrate/mwan_bitrate.o \
                  mwan_tunnel_balance.o \

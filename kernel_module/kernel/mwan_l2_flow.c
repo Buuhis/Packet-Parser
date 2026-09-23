@@ -1,4 +1,5 @@
 #include "mwan_state.h"
+#include "mwan_drop_trace.h"
 #include "mwan_tunnel_balance.h"
 
 #include <linux/cpu.h>
@@ -11,6 +12,44 @@
 #include <linux/version.h>
 
 static void mwan_l2_flow_gc_workfn(struct work_struct *work);
+
+static const struct mwan_l2_worker *
+mwan_reorder_owner(const struct mwan_l2_rx_flow *flow)
+{
+    const struct mwan_config *cfg;
+
+    if (!flow || !flow->manager)
+        return NULL;
+    cfg = flow->manager->cfg;
+    if (!cfg || !cfg->l2_workers || flow->owner_worker < 0 ||
+        flow->owner_worker >= cfg->num_workers)
+        return NULL;
+    return &cfg->l2_workers[flow->owner_worker];
+}
+
+static void mwan_reorder_drop_trace(enum mwan_drop_reason reason,
+                                    const struct mwan_l2_rx_flow *flow,
+                                    const struct sk_buff *skb, u32 flow_seq,
+                                    u32 packet_len, int ifindex, int error)
+{
+    const struct mwan_drop_trace_ctx ctx = {
+        .reason = reason,
+        .worker = mwan_reorder_owner(flow),
+        .skb = skb,
+        .flow_token = flow ? flow->flow_token : 0,
+        .flow_seq = flow_seq,
+        .flow_id = flow ? lower_32_bits(flow->flow_token) : 0,
+        .packet_len = packet_len,
+        .queue_packets = flow ? flow->reorder_queued : 0,
+        .error = error,
+        .ifindex = ifindex ? ifindex :
+                   skb && skb->dev ? skb->dev->ifindex : 0,
+        .tunnel_idx = MWAN_DROP_TUNNEL_UNKNOWN,
+        .tx_queue = MWAN_DROP_TXQ_UNKNOWN,
+    };
+
+    mwan_drop_trace_record(&ctx);
+}
 
 static bool mwan_l2_reorder_slot_expired(u32 timestamp)
 {
@@ -186,11 +225,20 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
         struct sk_buff *skb = flow->ring[slot];
 
         if (skb) {
+            u32 delivered_seq = flow->expected_seq;
+            u32 packet_len = skb->len;
+            int ifindex = skb->dev ? skb->dev->ifindex : 0;
+            int rx_ret;
+
             flow->ring[slot] = NULL;
             flow->slot_time[slot] = 0;
             flow->reorder_queued--;
             flow->expected_seq++;
-            netif_rx(skb);
+            rx_ret = netif_rx(skb);
+            if (unlikely(rx_ret == NET_RX_DROP))
+                mwan_reorder_drop_trace(MWAN_DROP_NETIF_RX, flow, NULL,
+                                        delivered_seq, packet_len, ifindex,
+                                        rx_ret);
             continue;
         }
 
@@ -203,6 +251,8 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
             break;
         if (!skipped)
             first_missing = flow->expected_seq;
+        mwan_reorder_drop_trace(MWAN_DROP_REORDER_GAP_TIMEOUT, flow, NULL,
+                                flow->expected_seq, 0, 0, -ETIMEDOUT);
         skipped++;
         flow->expected_seq++;
         atomic64_inc(&flow->manager->reorder_timeouts);
@@ -369,11 +419,20 @@ void mwan_l2_flow_manager_start(struct mwan_config *cfg)
 
 static void mwan_l2_free_rx_ring(struct mwan_l2_rx_flow *flow)
 {
+    u32 expected_slot;
     int i;
 
     spin_lock_bh(&flow->reorder_lock);
+    expected_slot = flow->expected_seq & MWAN_FLOW_RING_MASK;
     for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
         if (flow->ring[i]) {
+            u32 offset = ((u32)i - expected_slot) &
+                         MWAN_FLOW_RING_MASK;
+
+            mwan_reorder_drop_trace(MWAN_DROP_RX_REORDER_CLEANUP, flow,
+                                    flow->ring[i],
+                                    flow->expected_seq + offset,
+                                    0, 0, -ESHUTDOWN);
             kfree_skb(flow->ring[i]);
             flow->ring[i] = NULL;
             flow->slot_time[i] = 0;
@@ -837,6 +896,9 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     u32 slot;
 
     if (!flow || !skb) {
+        if (skb)
+            mwan_reorder_drop_trace(MWAN_DROP_RX_FLOW_FAILED, flow, skb,
+                                    flow_seq, 0, 0, -EINVAL);
         kfree_skb(skb);
         return;
     }
@@ -847,6 +909,8 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         mwan_rekey_diag_count_drop(flow->manager->cfg,
                                    MWAN_REKEY_DROP_REORDER_LATE, 0);
         spin_unlock_bh(&flow->reorder_lock);
+        mwan_reorder_drop_trace(MWAN_DROP_REORDER_LATE, flow, skb,
+                                flow_seq, 0, 0, -ERANGE);
         kfree_skb(skb);
         return;
     }
@@ -886,6 +950,9 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                 preserved++;
                 continue;
             }
+            mwan_reorder_drop_trace(MWAN_DROP_REORDER_EVICT, flow,
+                                    flow->ring[i], old_expected + offset,
+                                    0, 0, -ENOBUFS);
             kfree_skb(flow->ring[i]);
             flow->ring[i] = NULL;
             flow->slot_time[i] = 0;
@@ -914,6 +981,8 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     if (unlikely(flow->ring[slot])) {
         atomic64_inc(&flow->manager->reorder_duplicate);
         spin_unlock_bh(&flow->reorder_lock);
+        mwan_reorder_drop_trace(MWAN_DROP_REORDER_DUPLICATE, flow, skb,
+                                flow_seq, 0, 0, -EEXIST);
         kfree_skb(skb);
         return;
     }
@@ -923,14 +992,25 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     while (1) {
         u32 expected_slot = flow->expected_seq & MWAN_FLOW_RING_MASK;
         struct sk_buff *pending = flow->ring[expected_slot];
+        u32 delivered_seq;
+        u32 packet_len;
+        int ifindex;
+        int rx_ret;
 
         if (!pending)
             break;
+        delivered_seq = flow->expected_seq;
+        packet_len = pending->len;
+        ifindex = pending->dev ? pending->dev->ifindex : 0;
         flow->ring[expected_slot] = NULL;
         flow->slot_time[expected_slot] = 0;
         flow->reorder_queued--;
         flow->expected_seq++;
-        netif_rx(pending);
+        rx_ret = netif_rx(pending);
+        if (unlikely(rx_ret == NET_RX_DROP))
+            mwan_reorder_drop_trace(MWAN_DROP_NETIF_RX, flow, NULL,
+                                    delivered_seq, packet_len, ifindex,
+                                    rx_ret);
     }
     mwan_l2_reorder_arm_locked(flow);
     spin_unlock_bh(&flow->reorder_lock);

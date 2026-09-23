@@ -1,4 +1,5 @@
 #include "mwan_multicore.h"
+#include "mwan_drop_trace.h"
 #include "mwan_steer.h"
 #include "mwan_tunnel_balance.h"
 
@@ -137,6 +138,35 @@ static void mwan_atomic64_update_ewma(atomic64_t *ewma, u64 sample)
         old = atomic64_read(ewma);
         next = old ? old - (old >> 3) + ((s64)sample >> 3) : sample;
     } while (atomic64_cmpxchg(ewma, old, next) != old);
+}
+
+static void mwan_worker_drop_trace(enum mwan_drop_reason reason,
+                                   const struct mwan_l2_worker *worker,
+                                   const struct sk_buff *skb, u64 flow_token,
+                                   u32 flow_seq, u32 flow_id, int error,
+                                   u64 queue_packets, u64 queue_bytes,
+                                   u32 pressure_bp, u32 drop_probability_bp,
+                                   u16 tunnel_idx)
+{
+    const struct mwan_drop_trace_ctx ctx = {
+        .reason = reason,
+        .worker = worker,
+        .skb = skb,
+        .flow_token = flow_token,
+        .flow_seq = flow_seq,
+        .flow_id = flow_id,
+        .queue_packets = queue_packets,
+        .queue_bytes = queue_bytes,
+        .pressure_bp = pressure_bp,
+        .drop_probability_bp = drop_probability_bp,
+        .error = error,
+        .ifindex = skb && skb->dev ? skb->dev->ifindex : 0,
+        .tunnel_idx = tunnel_idx,
+        .tx_queue = skb && skb->dev ? skb_get_queue_mapping(skb) :
+                                      MWAN_DROP_TXQ_UNKNOWN,
+    };
+
+    mwan_drop_trace_record(&ctx);
 }
 
 static unsigned int mwan_bp_ewma(atomic_t *value, unsigned int sample)
@@ -953,6 +983,12 @@ static void mwan_pipeline_tx_workfn(struct work_struct *work)
             if (unlikely(!valid)) {
                 atomic64_inc(&pipeline->tx_dropped);
                 atomic64_inc(&cfg->flows.tx_pipeline_dropped);
+                mwan_worker_drop_trace(
+                    MWAN_DROP_TX_PIPELINE_METADATA, crypto_worker, skb,
+                    cb.flow_token, cb.flow_seq, lower_32_bits(cb.flow_token),
+                    -EINVAL, atomic64_read(&pipeline->tx_queued),
+                    atomic64_read(&pipeline->tx_queued_bytes), 0, 0,
+                    cb.tunnel_idx);
                 kfree_skb(skb);
             } else {
                 mwan_l2_pqc_xmit_encrypted(skb, crypto_worker,
@@ -1010,6 +1046,12 @@ static void mwan_pipeline_rx_workfn(struct work_struct *work)
             if (unlikely(!valid)) {
                 atomic64_inc(&pipeline->rx_dropped);
                 atomic64_inc(&cfg->flows.rx_pipeline_dropped);
+                mwan_worker_drop_trace(
+                    MWAN_DROP_RX_PIPELINE_METADATA, NULL, skb, 0,
+                    cb.flow_seq, 0, -EINVAL,
+                    atomic64_read(&pipeline->rx_queued),
+                    atomic64_read(&pipeline->rx_queued_bytes), 0, 0,
+                    MWAN_DROP_TUNNEL_UNKNOWN);
                 kfree_skb(skb);
             } else {
                 mwan_l2_rx_flow_deliver(flow, skb, cb.flow_seq);
@@ -1375,6 +1417,7 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
         while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
             struct mwan_pipeline_tx_cb cb;
             struct mwan_l2_tx_flow *flow = NULL;
+            struct mwan_l2_worker *crypto_worker = NULL;
 
             memcpy(&cb, MWAN_PIPELINE_TX_CB(skb), sizeof(cb));
             atomic64_dec(&worker->tx_queued);
@@ -1382,6 +1425,14 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
             if (cb.magic == MWAN_PIPELINE_CB_TX_MAGIC && cb.flow_ptr &&
                 cb.check == mwan_pipeline_tx_checksum(&cb))
                 flow = (struct mwan_l2_tx_flow *)cb.flow_ptr;
+            if (cb.crypto_worker < cfg->num_workers)
+                crypto_worker = &cfg->l2_workers[cb.crypto_worker];
+            mwan_worker_drop_trace(
+                MWAN_DROP_TX_PIPELINE_CLEANUP, crypto_worker, skb,
+                cb.flow_token, cb.flow_seq, lower_32_bits(cb.flow_token),
+                -ESHUTDOWN, atomic64_read(&worker->tx_queued),
+                atomic64_read(&worker->tx_queued_bytes), 0, 0,
+                cb.tunnel_idx);
             if (flow) {
                 mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
@@ -1400,6 +1451,15 @@ static void mwan_pipeline_workers_cleanup(struct mwan_config *cfg)
             if (cb.magic == MWAN_PIPELINE_CB_RX_MAGIC && cb.flow_ptr &&
                 cb.check == mwan_pipeline_rx_checksum(&cb))
                 flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
+            mwan_worker_drop_trace(
+                MWAN_DROP_RX_PIPELINE_CLEANUP,
+                cb.crypto_worker < cfg->num_workers ?
+                    &cfg->l2_workers[cb.crypto_worker] : NULL,
+                skb, flow ? flow->flow_token : 0, cb.flow_seq,
+                flow ? lower_32_bits(flow->flow_token) : 0,
+                -ESHUTDOWN, atomic64_read(&worker->rx_queued),
+                atomic64_read(&worker->rx_queued_bytes), 0, 0,
+                MWAN_DROP_TUNNEL_UNKNOWN);
             if (flow) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_rx_flow_put(flow);
@@ -1640,6 +1700,14 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             } else if (!mwan_release_rx_queue_ref(worker, skb))
                 pr_warn_ratelimited("mwan_kmod: unable to recover corrupt RX queue reference during cleanup on CPU %d\n",
                                     worker->cpu);
+            mwan_worker_drop_trace(
+                MWAN_DROP_RX_CLEANUP, worker, skb,
+                cb_ok ? cb.dispatch_flow_token : 0,
+                cb_ok ? cb.dispatch_flow_seq : MWAN_DROP_SEQ_UNKNOWN,
+                cb_ok ? lower_32_bits(cb.dispatch_flow_token) : 0,
+                -ESHUTDOWN, atomic64_read(&worker->queued_packets),
+                atomic64_read(&worker->queued_bytes), 0, 0,
+                MWAN_DROP_TUNNEL_UNKNOWN);
             kfree_skb(skb);
         }
         while ((skb = skb_dequeue(&worker->tx_queue)) != NULL) {
@@ -1663,6 +1731,14 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             } else if (!mwan_release_tx_queue_ref(worker, skb))
                 pr_warn_ratelimited("mwan_kmod: unable to recover corrupt TX queue reference during cleanup on CPU %d\n",
                                     worker->cpu);
+            mwan_worker_drop_trace(
+                MWAN_DROP_TX_CLEANUP, worker, skb,
+                cb_ok ? cb.flow_token : 0,
+                cb_ok ? cb.flow_seq : MWAN_DROP_SEQ_UNKNOWN,
+                cb_ok ? lower_32_bits(cb.flow_token) : 0,
+                -ESHUTDOWN, atomic64_read(&worker->tx_queued_packets),
+                atomic64_read(&worker->tx_queued_bytes), 0, 0,
+                cb_ok ? cb.tunnel_idx : MWAN_DROP_TUNNEL_UNKNOWN);
             kfree_skb(skb);
         }
 
@@ -2221,6 +2297,8 @@ static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
                                 struct sk_buff *skb,
                                 enum mwan_packet_class packet_class)
 {
+    unsigned int drop_probability_bp;
+
     if (packet_class == MWAN_PACKET_CONTROL) {
         if (atomic_read(&worker->admission_blocked))
             atomic64_inc(&worker->tx_control_preserved);
@@ -2236,8 +2314,8 @@ static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
 
     if (!atomic_read(&worker->emergency_shed))
         return false;
-    if (get_random_u32() % MWAN_CPU_BP_MAX >=
-        mwan_drop_probability_bp(worker))
+    drop_probability_bp = mwan_drop_probability_bp(worker);
+    if (get_random_u32() % MWAN_CPU_BP_MAX >= drop_probability_bp)
         return false;
 
     atomic64_inc(&worker->tx_overload_dropped);
@@ -2245,6 +2323,13 @@ static bool mwan_tx_should_drop(struct mwan_l2_worker *worker,
     atomic64_inc(&worker->tx_dropped_packets);
     mwan_rekey_diag_count_drop(worker->cfg, MWAN_REKEY_DROP_TX_OVERLOAD,
                                0);
+    mwan_worker_drop_trace(
+        MWAN_DROP_TX_OVERLOAD_SHED, worker, skb, 0,
+        MWAN_DROP_SEQ_UNKNOWN, skb_get_hash(skb), -EAGAIN,
+        atomic64_read(&worker->tx_queued_packets),
+        atomic64_read(&worker->tx_queued_bytes),
+        mwan_worker_pressure(worker), drop_probability_bp,
+        MWAN_DROP_TUNNEL_UNKNOWN);
     return true;
 }
 
@@ -2282,10 +2367,18 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
 
     flow = preselected_flow;
     if (!skb || !cfg || !info || tunnel_idx >= cfg->num_tunnels) {
+        if (skb)
+            mwan_worker_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, NULL,
+                                   skb, 0, MWAN_DROP_SEQ_UNKNOWN,
+                                   info ? info->flow_id : 0, -EINVAL,
+                                   0, 0, 0, 0, tunnel_idx);
         mwan_l2_tx_flow_put(flow);
         return -EINVAL;
     }
     if (!cfg->l2_workers || cfg->num_workers <= 0) {
+        mwan_worker_drop_trace(MWAN_DROP_TX_OWNER_INVALID, NULL, skb, 0,
+                               MWAN_DROP_SEQ_UNKNOWN, info->flow_id,
+                               -ENODEV, 0, 0, 0, 0, tunnel_idx);
         mwan_l2_tx_flow_put(flow);
         return -ENODEV;
     }
@@ -2295,6 +2388,9 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                                    (int)tunnel_idx, false);
     if (!flow) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
+        mwan_worker_drop_trace(MWAN_DROP_TX_FLOW_FAILED, NULL, skb, 0,
+                               MWAN_DROP_SEQ_UNKNOWN, info->flow_id,
+                               -ENOSPC, 0, 0, 0, 0, tunnel_idx);
         return -ENOSPC;
     }
     /* POST_ROUTING selected and pinned the data flow before MTU handling.
@@ -2303,6 +2399,10 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
      * already-normalized data onto a different-MTU tunnel. */
     if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx)) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
+        mwan_worker_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, NULL, skb,
+                               flow->flow_token, MWAN_DROP_SEQ_UNKNOWN,
+                               info->flow_id, -ESTALE, 0, 0, 0, 0,
+                               tunnel_idx);
         mwan_l2_tx_flow_put(flow);
         return -ESTALE;
     }
@@ -2314,6 +2414,10 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         !cpu_online(cfg->l2_workers[owner].cpu)) {
         spin_unlock_bh(&flow->submit_lock);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
+        mwan_worker_drop_trace(MWAN_DROP_TX_OWNER_INVALID, NULL, skb,
+                               flow->flow_token, MWAN_DROP_SEQ_UNKNOWN,
+                               info->flow_id, -ENODEV, 0, 0, 0, 0,
+                               tunnel_idx);
         mwan_l2_tx_flow_put(flow);
         return -ENODEV;
     }
@@ -2338,10 +2442,18 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     if (worker->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&worker->tx_queued_bytes) + accounted_bytes >
             MWAN_L2_QUEUE_MAX_BYTES) {
+        u64 queue_packets = worker->tx_queue.qlen;
+        u64 queue_bytes = atomic64_read(&worker->tx_queued_bytes);
+
         spin_unlock(&worker->tx_queue.lock);
         spin_unlock_bh(&flow->submit_lock);
         atomic64_inc(&worker->tx_dropped_packets);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
+        mwan_worker_drop_trace(MWAN_DROP_TX_QUEUE_FULL, worker, skb,
+                               flow->flow_token, MWAN_DROP_SEQ_UNKNOWN,
+                               info->flow_id, -ENOSPC, queue_packets,
+                               queue_bytes, mwan_worker_pressure(worker),
+                               0, tunnel_idx);
         mwan_l2_tx_flow_put(flow);
         return -ENOSPC;
     }
@@ -2425,6 +2537,8 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             u64 start_ns;
             u64 processing_ns;
             bool pipeline_owned = false;
+            bool pipeline_selected = false;
+            bool pipeline_submit_attempted = false;
             int err;
 
             memcpy(&cb, MWAN_L2_TX_CB(skb), sizeof(cb));
@@ -2463,10 +2577,12 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
 #if MWAN_ENABLE_ROLE_PIPELINE
                 if (flow && atomic_read(&flow->exec_mode) ==
                                 MWAN_FLOW_EXEC_PIPELINE) {
+                    pipeline_selected = true;
                     err = mwan_l2_pqc_encrypt_skb(
                         skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
                         flow_seq);
                     if (!err) {
+                        pipeline_submit_attempted = true;
                         err = mwan_pipeline_tx_submit(
                             skb, worker, flow, flow_token, flow_seq,
                             tunnel_idx, transmitted_bytes);
@@ -2503,6 +2619,39 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             if (unlikely(err)) {
                 u8 packet_key_id =
                     (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
+                enum mwan_drop_reason drop_reason;
+                u64 drop_queue_packets =
+                    atomic64_read(&worker->tx_queued_packets);
+                u64 drop_queue_bytes =
+                    atomic64_read(&worker->tx_queued_bytes);
+
+                if (!cb_ok)
+                    drop_reason = MWAN_DROP_TX_WORKER_METADATA;
+                else if (err == -ENOKEY)
+                    drop_reason = MWAN_DROP_TX_CRYPTO_NO_KEY;
+                else if (pipeline_submit_attempted)
+                    drop_reason = err == -ENOSPC ?
+                        MWAN_DROP_TX_PIPELINE_FULL :
+                        MWAN_DROP_TX_PIPELINE_METADATA;
+                else if (encap_type == MWAN_ENCAP_L2_PQC)
+                    drop_reason = MWAN_DROP_TX_CRYPTO_FAILED;
+                else
+                    drop_reason = MWAN_DROP_TX_WORKER_FAILED;
+
+                if (pipeline_selected && flow) {
+                    int pipeline_idx = READ_ONCE(flow->pipeline_worker);
+
+                    if (pipeline_idx >= 0 &&
+                        pipeline_idx < cfg->num_pipeline_workers) {
+                        struct mwan_pipeline_worker *pipeline =
+                            &cfg->pipeline_workers[pipeline_idx];
+
+                        drop_queue_packets =
+                            atomic64_read(&pipeline->tx_queued);
+                        drop_queue_bytes =
+                            atomic64_read(&pipeline->tx_queued_bytes);
+                    }
+                }
 
                 mwan_rekey_diag_count_drop(
                     cfg, err == -ENOKEY ?
@@ -2511,6 +2660,11 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                     packet_key_id);
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
+                mwan_worker_drop_trace(
+                    drop_reason, worker, skb, flow_token, flow_seq,
+                    lower_32_bits(flow_token), err, drop_queue_packets,
+                    drop_queue_bytes, mwan_worker_pressure(worker), 0,
+                    tunnel_idx);
                 kfree_skb(skb);
             } else if (!pipeline_owned && flow &&
                        atomic_read(&flow->balance_counted)) {

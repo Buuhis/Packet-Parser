@@ -3,6 +3,7 @@
 #include "mwan_proto.h"
 #include "mwan_mac_discovery.h"
 #include "mwan_multicore.h"
+#include "mwan_drop_trace.h"
 
 #include <linux/module.h>
 #include <linux/netfilter.h>
@@ -20,6 +21,24 @@
 #include <net/netfilter/nf_conntrack_core.h>
 
 extern struct net init_net;
+
+static void mwan_steer_drop_trace(enum mwan_drop_reason reason,
+                                  const struct sk_buff *skb, u32 flow_id,
+                                  int error, int ifindex, u16 tunnel_idx)
+{
+    const struct mwan_drop_trace_ctx ctx = {
+        .reason = reason,
+        .skb = skb,
+        .flow_seq = MWAN_DROP_SEQ_UNKNOWN,
+        .flow_id = flow_id,
+        .error = error,
+        .ifindex = ifindex,
+        .tunnel_idx = tunnel_idx,
+        .tx_queue = MWAN_DROP_TXQ_UNKNOWN,
+    };
+
+    mwan_drop_trace_record(&ctx);
+}
 
 static struct mwan_tunnel *find_mwan_tunnel(struct mwan_config *cfg, u32 ifindex)
 {
@@ -218,12 +237,20 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         unsigned int ret;
 
         if (!tun) {
+            mwan_steer_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, skb, 0,
+                                  -ENODEV,
+                                  state->out ? state->out->ifindex : 0,
+                                  MWAN_DROP_TUNNEL_UNKNOWN);
             rcu_read_unlock();
             return NF_DROP;
         }
         tun_idx = (u8)(tun - cfg->tunnels);
         confirm_ret = nf_conntrack_confirm(skb);
         if (unlikely(confirm_ret != NF_ACCEPT)) {
+            mwan_steer_drop_trace(MWAN_DROP_TX_CONNTRACK_REJECT, skb, 0,
+                                  confirm_ret,
+                                  state->out ? state->out->ifindex : 0,
+                                  tun_idx);
             rcu_read_unlock();
             return (unsigned int)confirm_ret;
         }
@@ -273,6 +300,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         if (!active || active->active_count == 0 ||
             active->total_weight == 0) {
             mwan_state_count_no_active_drop();
+            mwan_steer_drop_trace(MWAN_DROP_TX_NO_ACTIVE_TUNNEL, skb,
+                                  hash, -ENETDOWN,
+                                  state->out ? state->out->ifindex : 0,
+                                  MWAN_DROP_TUNNEL_UNKNOWN);
             rcu_read_unlock();
             return NF_DROP;
         }
@@ -281,6 +312,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
          * final tie-breaker used by the flow-aware selector. */
         tun_idx = active->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
         if (unlikely(tun_idx >= cfg->num_tunnels)) {
+            mwan_steer_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, skb,
+                                  hash, -EINVAL,
+                                  state->out ? state->out->ifindex : 0,
+                                  tun_idx);
             rcu_read_unlock();
             return NF_DROP;
         }
@@ -298,6 +333,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                              tun->dev ? tun->dev->name : NULL);
             pr_warn_ratelimited("mwan_kmod: conntrack confirm rejected TX packet ret=%d\n",
                                 confirm_ret);
+            mwan_steer_drop_trace(MWAN_DROP_TX_CONNTRACK_REJECT, skb,
+                                  hash, confirm_ret,
+                                  state->out ? state->out->ifindex : 0,
+                                  tun_idx);
             rcu_read_unlock();
             return (unsigned int)confirm_ret;
         }
@@ -315,10 +354,18 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                 tx_ctx.packet_class == MWAN_PACKET_CONTROL,
                 &selected_tun_idx, &tx_ctx.flow);
             if (unlikely(select_ret)) {
+                mwan_steer_drop_trace(MWAN_DROP_TX_FLOW_FAILED, skb,
+                                      hash, select_ret,
+                                      state->out ? state->out->ifindex : 0,
+                                      MWAN_DROP_TUNNEL_UNKNOWN);
                 rcu_read_unlock();
                 return NF_DROP;
             }
             if (unlikely(selected_tun_idx >= cfg->num_tunnels)) {
+                mwan_steer_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, skb,
+                                      hash, -EINVAL,
+                                      state->out ? state->out->ifindex : 0,
+                                      selected_tun_idx);
                 mwan_l2_tx_flow_put(tx_ctx.flow);
                 rcu_read_unlock();
                 return NF_DROP;
