@@ -1,5 +1,9 @@
 #include "db_client.h"
+#include "config_semantics.h"
 #include "utils/logger.h"
+#include "../kernel/mwan_proto.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -113,7 +117,8 @@ static int copy_pg_field(PGresult *res, int row, int col, char *dst,
 static int parse_tunnel_row(PGresult *res, int row, bool weight_enabled,
                             sdwan_tun_cfg_t *tun)
 {
-    int configured_weight;
+    long configured_weight = 0;
+    char *end = NULL;
 
     memset(tun, 0, sizeof(*tun));
     if (copy_pg_field(res, row, 0, tun->tunnel_ifname,
@@ -135,14 +140,24 @@ static int parse_tunnel_row(PGresult *res, int row, bool weight_enabled,
 
     tun->segment_id = PQgetisnull(res, row, 3) ? 0 :
                       atoi(PQgetvalue(res, row, 3));
-    configured_weight = PQgetisnull(res, row, 4) ? 1 :
-                        atoi(PQgetvalue(res, row, 4));
-    if (weight_enabled && configured_weight <= 0) {
-        log_error("Tunnel %s has invalid weight %d",
-                  tun->tunnel_ifname, configured_weight);
-        return -1;
+    if (weight_enabled) {
+        if (PQgetisnull(res, row, 4)) {
+            log_error("Tunnel %s has NULL weight while weighting is enabled",
+                      tun->tunnel_ifname);
+            return -1;
+        }
+        errno = 0;
+        configured_weight = strtol(PQgetvalue(res, row, 4), &end, 10);
+        if (errno || !end || *end != '\0' || configured_weight < 0 ||
+            configured_weight > (long)MWAN_WEIGHT_MAX ||
+            configured_weight > INT_MAX) {
+            log_error("Tunnel %s has invalid weight '%s' (expected 0..%u)",
+                      tun->tunnel_ifname, PQgetvalue(res, row, 4),
+                      MWAN_WEIGHT_MAX);
+            return -1;
+        }
     }
-    tun->weight = weight_enabled ? configured_weight : 1;
+    tun->weight = weight_enabled ? (int)configured_weight : 1;
     tun->latency = PQgetisnull(res, row, 6) ? 0 :
                    atoi(PQgetvalue(res, row, 6));
     tun->latency_enabled = pg_bool(res, row, 7);
@@ -290,6 +305,14 @@ int db_client_load_config(int profile_id, app_config_t *cfg)
             pthread_mutex_unlock(&g_db_mutex);
             return -1;
         }
+    }
+    if (!config_weights_valid(cfg)) {
+        log_error("Profile %d has an invalid weight snapshot: enabled=%d, tunnels=%zu (enabled weights must be 0..%u and sum to %u)",
+                  profile_id, cfg->weight_enabled ? 1 : 0,
+                  cfg->sdwan_tun_count, MWAN_WEIGHT_MAX, MWAN_WEIGHT_MAX);
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -1;
     }
     PQclear(res);
     

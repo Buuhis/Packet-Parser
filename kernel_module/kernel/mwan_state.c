@@ -42,7 +42,7 @@ mwan_active_paths_build_weights(const struct mwan_config *cfg,
         const struct mwan_tunnel *tun = &cfg->tunnels[i];
         u32 weight = weights ? weights[i] : tun->weight;
 
-        if (!tun->published_up)
+        if (!tun->published_up || !weight)
             continue;
         paths->active_count++;
         paths->total_weight += weight;
@@ -58,7 +58,7 @@ mwan_active_paths_build_weights(const struct mwan_config *cfg,
         u32 count;
         u32 j;
 
-        if (!tun->published_up)
+        if (!tun->published_up || !weight)
             continue;
         count = (u32)(((u64)weight * MWAN_LUT_SIZE) /
                       paths->total_weight);
@@ -81,6 +81,7 @@ static void mwan_legacy_weight_lut_build(struct mwan_config *cfg,
                                          const u32 *weights,
                                          u32 total_weight)
 {
+    int last_selectable = -1;
     u32 current_slot = 0;
     u32 i;
 
@@ -89,16 +90,19 @@ static void mwan_legacy_weight_lut_build(struct mwan_config *cfg,
         return;
 
     for (i = 0; i < cfg->num_tunnels; i++) {
-        u32 count = (u32)(((u64)weights[i] * MWAN_LUT_SIZE) /
-                          total_weight);
+        u32 count;
         u32 j;
 
+        if (!weights[i])
+            continue;
+        last_selectable = (int)i;
+        count = (u32)(((u64)weights[i] * MWAN_LUT_SIZE) /
+                      total_weight);
         for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++)
             cfg->tunnel_idx_lut[current_slot++] = (u8)i;
     }
-    while (current_slot < MWAN_LUT_SIZE)
-        cfg->tunnel_idx_lut[current_slot++] =
-            (u8)(cfg->num_tunnels - 1);
+    while (current_slot < MWAN_LUT_SIZE && last_selectable >= 0)
+        cfg->tunnel_idx_lut[current_slot++] = (u8)last_selectable;
 }
 
 static void mwan_config_release_devices(struct mwan_config *cfg)
@@ -290,6 +294,12 @@ int mwan_state_update(struct mwan_config *new_cfg)
         tun->discovery_nonce = 0;
         tun->peer_ip_resolved = false;
         tun->discovery_unresolved_reported = false;
+        if (tun->weight > MWAN_WEIGHT_MAX) {
+            pr_err("mwan_kmod: Tunnel weight %u exceeds maximum %u\n",
+                   tun->weight, MWAN_WEIGHT_MAX);
+            err = -ERANGE;
+            goto err_release_devices;
+        }
         if (U32_MAX - new_cfg->total_weight < tun->weight) {
             pr_err("mwan_kmod: Tunnel weight sum overflow\n");
             err = -EOVERFLOW;
@@ -367,20 +377,20 @@ int mwan_state_update(struct mwan_config *new_cfg)
         }
     }
 
+    if (new_cfg->num_tunnels && !new_cfg->total_weight) {
+        pr_err("mwan_kmod: At least one tunnel weight must be non-zero\n");
+        err = -EINVAL;
+        goto err_release_devices;
+    }
+
     /* Phase 1.5: Populate weight-proportional LUT for O(1) steering */
     if (new_cfg->total_weight > 0 && new_cfg->num_tunnels > 0) {
-        int current_slot = 0;
-        for (i = 0; i < new_cfg->num_tunnels; i++) {
-            int count = (new_cfg->tunnels[i].weight * MWAN_LUT_SIZE) / new_cfg->total_weight;
-            int j;
-            for (j = 0; j < count && current_slot < MWAN_LUT_SIZE; j++) {
-                new_cfg->tunnel_idx_lut[current_slot++] = i;
-            }
-        }
-        /* Handle rounding: ensure remaining slots are filled */
-        while (current_slot < MWAN_LUT_SIZE) {
-            new_cfg->tunnel_idx_lut[current_slot++] = new_cfg->num_tunnels - 1;
-        }
+        u32 initial_weights[MAX_MWAN_TUNNELS] = {0};
+
+        for (i = 0; i < new_cfg->num_tunnels; i++)
+            initial_weights[i] = new_cfg->tunnels[i].weight;
+        mwan_legacy_weight_lut_build(new_cfg, initial_weights,
+                                     new_cfg->total_weight);
 
         pr_info("mwan_kmod: Config updated - num_tunnels: %u, total_weight: %u\n", 
                 new_cfg->num_tunnels, new_cfg->total_weight);
@@ -571,7 +581,7 @@ int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
     for (i = 0; i < count; i++) {
         bool matched = false;
 
-        if (!ifindices[i] || !weights[i]) {
+        if (!ifindices[i] || weights[i] > MWAN_WEIGHT_MAX) {
             ret = -EINVAL;
             goto out_unlock;
         }
@@ -603,6 +613,10 @@ int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
             ret = -EINVAL;
             goto out_unlock;
         }
+    }
+    if (!total_weight) {
+        ret = -EINVAL;
+        goto out_unlock;
     }
 
     new_paths = mwan_active_paths_build_weights(cfg, new_weights);

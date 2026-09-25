@@ -75,6 +75,9 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
     if (nla_tunnels) {
         nla_for_each_nested(tun, nla_tunnels, rem) {
             struct nlattr *tb[MWAN_TUN_MAX + 1];
+            u32 ifindex;
+            u32 weight;
+            u32 i;
 
             err = nla_parse_nested_deprecated(tb, MWAN_TUN_MAX, tun,
                                               mwan_tunnel_policy, NULL);
@@ -84,19 +87,30 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
             }
 
             if (!tb[MWAN_TUN_IFINDEX] || !tb[MWAN_TUN_WEIGHT] ||
-                nla_get_u32(tb[MWAN_TUN_IFINDEX]) == 0 ||
-                nla_get_u32(tb[MWAN_TUN_WEIGHT]) == 0 ||
                 new_cfg->num_tunnels >= MAX_MWAN_TUNNELS) {
                 ret = -EINVAL;
                 goto err_free_config;
             }
 
+            ifindex = nla_get_u32(tb[MWAN_TUN_IFINDEX]);
+            weight = nla_get_u32(tb[MWAN_TUN_WEIGHT]);
+            if (!ifindex || weight > MWAN_WEIGHT_MAX) {
+                ret = -EINVAL;
+                goto err_free_config;
+            }
+            for (i = 0; i < new_cfg->num_tunnels; i++) {
+                if (new_cfg->tunnels[i].configured_ifindex == ifindex) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+            }
+
             new_cfg->tunnels[new_cfg->num_tunnels].ifindex =
-                nla_get_u32(tb[MWAN_TUN_IFINDEX]);
+                ifindex;
             new_cfg->tunnels[new_cfg->num_tunnels].configured_ifindex =
                 new_cfg->tunnels[new_cfg->num_tunnels].ifindex;
             new_cfg->tunnels[new_cfg->num_tunnels].weight =
-                nla_get_u32(tb[MWAN_TUN_WEIGHT]);
+                weight;
 
             pr_info("mwan_kmod: CFG-TRACE nlseq=%u TUNNEL slot=%u ifindex=%u weight=%u\n",
                     info->snd_seq, new_cfg->num_tunnels,
@@ -306,7 +320,7 @@ static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
             return -EINVAL;
         ifindices[count] = nla_get_u32(tb[MWAN_TUN_IFINDEX]);
         weights[count] = nla_get_u32(tb[MWAN_TUN_WEIGHT]);
-        if (!ifindices[count] || !weights[count])
+        if (!ifindices[count] || weights[count] > MWAN_WEIGHT_MAX)
             return -EINVAL;
         count++;
     }

@@ -296,9 +296,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         int select_ret;
         u16 selected_tun_idx;
         u8 tun_idx;
+        bool has_selectable_path = active && active->active_count &&
+                                   active->total_weight;
 
-        if (!active || active->active_count == 0 ||
-            active->total_weight == 0) {
+        if (!has_selectable_path && !cfg->num_tunnels) {
             mwan_state_count_no_active_drop();
             mwan_steer_drop_trace(MWAN_DROP_TX_NO_ACTIVE_TUNNEL, skb,
                                   hash, -ENETDOWN,
@@ -308,9 +309,14 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             return NF_DROP;
         }
 
-        /* Keep the weighted active LUT as the fallback and as the stable
-         * final tie-breaker used by the flow-aware selector. */
-        tun_idx = active->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)];
+        /* A flow-aware datapath must still reach its sticky-flow lookup when
+         * there is no path eligible for new admission: an established flow
+         * may legally remain on an UP tunnel whose weight was drained to
+         * zero. Tunnel zero is used only to discover the profile-wide encap
+         * mode in this exceptional case; it is never selected for a new
+         * flow. */
+        tun_idx = has_selectable_path ?
+            active->tunnel_idx_lut[hash & (MWAN_LUT_SIZE - 1)] : 0;
         if (unlikely(tun_idx >= cfg->num_tunnels)) {
             mwan_steer_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, skb,
                                   hash, -EINVAL,
@@ -320,6 +326,20 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             return NF_DROP;
         }
         tun = &cfg->tunnels[tun_idx];
+
+        /* Legacy datapaths have no sticky flow table to recover an existing
+         * zero-weight assignment, so without a selectable path they must
+         * retain the original fail-closed behaviour. */
+        if (!has_selectable_path && tun->encap_type != MWAN_ENCAP_NONE &&
+            tun->encap_type != MWAN_ENCAP_L2_PQC) {
+            mwan_state_count_no_active_drop();
+            mwan_steer_drop_trace(MWAN_DROP_TX_NO_ACTIVE_TUNNEL, skb,
+                                  hash, -ENETDOWN,
+                                  state->out ? state->out->ifindex : 0,
+                                  MWAN_DROP_TUNNEL_UNKNOWN);
+            rcu_read_unlock();
+            return NF_DROP;
+        }
 
         /* Every asynchronous encap handler below takes ownership of skb and
          * normally returns NF_STOLEN.  Confirm a NEW conntrack entry first,
@@ -354,10 +374,19 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                 tx_ctx.packet_class == MWAN_PACKET_CONTROL,
                 &selected_tun_idx, &tx_ctx.flow);
             if (unlikely(select_ret)) {
-                mwan_steer_drop_trace(MWAN_DROP_TX_FLOW_FAILED, skb,
-                                      hash, select_ret,
-                                      state->out ? state->out->ifindex : 0,
-                                      MWAN_DROP_TUNNEL_UNKNOWN);
+                if (!has_selectable_path) {
+                    mwan_state_count_no_active_drop();
+                    mwan_steer_drop_trace(
+                        MWAN_DROP_TX_NO_ACTIVE_TUNNEL, skb, hash,
+                        select_ret,
+                        state->out ? state->out->ifindex : 0,
+                        MWAN_DROP_TUNNEL_UNKNOWN);
+                } else {
+                    mwan_steer_drop_trace(
+                        MWAN_DROP_TX_FLOW_FAILED, skb, hash, select_ret,
+                        state->out ? state->out->ifindex : 0,
+                        MWAN_DROP_TUNNEL_UNKNOWN);
+                }
                 rcu_read_unlock();
                 return NF_DROP;
             }

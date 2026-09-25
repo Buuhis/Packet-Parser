@@ -18,6 +18,7 @@
 #define MWAN_FAKE_PROTOCOL  99       /* Fake L4 Protocol to hide real protocol (TCP/UDP) */
 #define MWAN_L2_PQC_ETHERTYPE 0x88B5 /* Custom EtherType for L2-PQC packets */
 #define MWAN_DISCOVERY_GENERATION_FLAG (1U << 31)
+#define MWAN_WEIGHT_MAX      100U     /* BE/UI configured-weight contract */
 
 /* ---- Crypto Type Enum ---- */
 enum mwan_crypt_type {

@@ -536,6 +536,31 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         candidate.cfg.sdwan_tuns[candidate.cfg.sdwan_tun_count++] = new_tun;
     }
 
+    /* Adding a tunnel changes the complete percentage snapshot. Refresh the
+     * weights (and associated tunnel fields) of every active member so an
+     * old 100% runtime snapshot is never combined with only the new row. */
+    for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
+        sdwan_tun_cfg_t refreshed;
+
+        if (db_client_load_tunnel(
+                profile_id, candidate.cfg.sdwan_tuns[i].tunnel_ifname,
+                candidate.cfg.weight_enabled, &refreshed) != 0) {
+            runtime_config_unlock();
+            log_error("[ADD] Failed to refresh complete tunnel snapshot");
+            reply_json(client_fd, 500,
+                       "Failed to reload tunnel configuration");
+            return;
+        }
+        candidate.cfg.sdwan_tuns[i] = refreshed;
+    }
+    if (!config_weights_valid(&candidate.cfg)) {
+        runtime_config_unlock();
+        log_error("[ADD] Refusing invalid weight snapshot for profile %d",
+                  profile_id);
+        reply_json(client_fd, 400, "Invalid tunnel weight snapshot");
+        return;
+    }
+
     /* Sync to kernel */
     if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
         *ctx = candidate;
@@ -594,6 +619,30 @@ static void handle_del_tunnels(int client_fd, int profile_id,
         candidate.cfg.sdwan_tun_count--;
         memset(&candidate.cfg.sdwan_tuns[candidate.cfg.sdwan_tun_count], 0,
                sizeof(sdwan_tun_cfg_t));
+    }
+
+    /* The UI/BE stores percentages for the post-delete tunnel set. Reload
+     * every remaining row before validating the new complete snapshot. */
+    for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
+        sdwan_tun_cfg_t refreshed;
+
+        if (db_client_load_tunnel(
+                profile_id, candidate.cfg.sdwan_tuns[i].tunnel_ifname,
+                candidate.cfg.weight_enabled, &refreshed) != 0) {
+            runtime_config_unlock();
+            log_error("[DEL] Failed to refresh complete tunnel snapshot");
+            reply_json(client_fd, 500,
+                       "Failed to reload tunnel configuration");
+            return;
+        }
+        candidate.cfg.sdwan_tuns[i] = refreshed;
+    }
+    if (!config_weights_valid(&candidate.cfg)) {
+        runtime_config_unlock();
+        log_error("[DEL] Refusing invalid weight snapshot for profile %d",
+                  profile_id);
+        reply_json(client_fd, 400, "Invalid tunnel weight snapshot");
+        return;
     }
 
     /* Sync to kernel */

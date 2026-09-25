@@ -5,6 +5,11 @@
 
 #include <stdbool.h>
 
+/* Validate the complete userspace weight snapshot. Enabled profiles use
+ * integer percentages (0..100) whose sum is exactly 100. Disabled profiles
+ * are normalized by the DB loader to equal runtime weights of one. */
+bool config_weights_valid(const app_config_t *cfg);
+
 /* Compare only values consumed by the running userspace/kernel datapath.
  * Database metadata and structure padding are deliberately excluded. */
 bool config_runtime_equal(const app_config_t *left,

@@ -492,6 +492,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     int owner;
     int tunnel_idx;
     u16 admission_active_count = 0;
+    u16 admission_configured_count = 0;
 
     if (!cfg || !key || READ_ONCE(cfg->flows.stopping))
         return NULL;
@@ -516,7 +517,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                 return NULL;
             }
             if (allow_tunnel_remap &&
-                !mwan_tunnel_balance_is_active(cfg, flow->tunnel_idx)) {
+                !mwan_tunnel_balance_is_usable(cfg, flow->tunnel_idx)) {
                 bool old_counted =
                     atomic_read(&flow->balance_counted) != 0;
 
@@ -557,20 +558,21 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                        refcount_read(&flow->refs) == 1) {
                 u16 old_tunnel_idx = READ_ONCE(flow->tunnel_idx);
                 u16 active_count = 0;
+                u16 configured_count = 0;
                 bool old_counted =
                     atomic_read(&flow->balance_counted) != 0;
 
                 tunnel_idx = mwan_tunnel_balance_recover_flow(
                     cfg, old_tunnel_idx, flow_hash, old_counted,
                     READ_ONCE(flow->admission_active_count),
-                    &active_count);
+                    &active_count, &configured_count);
                 if (tunnel_idx >= 0) {
                     WRITE_ONCE(flow->tunnel_idx, (u16)tunnel_idx);
                     WRITE_ONCE(flow->home_tunnel_idx, (u16)tunnel_idx);
                     WRITE_ONCE(flow->admission_active_count,
                                active_count);
                     WRITE_ONCE(flow->rebalance_on_recovery,
-                               active_count < cfg->num_tunnels);
+                               active_count < configured_count);
                     atomic_set(&flow->balance_counted, 1);
                     atomic64_inc(&cfg->flows.tx_recovery_updated);
                     if (tunnel_idx != old_tunnel_idx)
@@ -617,7 +619,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
         tunnel_idx = requested_tunnel_idx;
     } else {
         tunnel_idx = mwan_tunnel_balance_assign_flow(
-            cfg, flow_hash, &admission_active_count);
+            cfg, flow_hash, &admission_active_count,
+            &admission_configured_count);
     }
     if (tunnel_idx < 0) {
         atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
@@ -641,7 +644,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     candidate->admission_active_count = admission_active_count;
     candidate->rebalance_on_recovery =
         requested_tunnel_idx < 0 &&
-        admission_active_count < cfg->num_tunnels;
+        admission_active_count < admission_configured_count;
     candidate->last_seen = jiffies;
     INIT_HLIST_NODE(&candidate->node);
 
@@ -690,7 +693,7 @@ int mwan_l2_tx_flow_select_tunnel(struct mwan_config *cfg,
     if (!flow)
         return -ENOSPC;
     selected = READ_ONCE(flow->tunnel_idx);
-    if (!mwan_tunnel_balance_is_active(cfg, selected)) {
+    if (!mwan_tunnel_balance_is_usable(cfg, selected)) {
         mwan_l2_tx_flow_put(flow);
         return -ENETDOWN;
     }

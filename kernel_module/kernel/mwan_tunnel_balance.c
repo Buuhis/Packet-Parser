@@ -122,12 +122,18 @@ static void mwan_tunnel_balance_refresh_locked(struct mwan_config *cfg,
     cfg->tunnel_balance_sample_ns = now_ns;
 }
 
-bool mwan_tunnel_balance_is_active(const struct mwan_config *cfg,
+bool mwan_tunnel_balance_is_usable(const struct mwan_config *cfg,
                                    u16 tunnel_idx)
 {
     if (!cfg || tunnel_idx >= cfg->num_tunnels)
         return false;
-    return READ_ONCE(cfg->tunnels[tunnel_idx].published_up) &&
+    return READ_ONCE(cfg->tunnels[tunnel_idx].published_up);
+}
+
+bool mwan_tunnel_balance_is_active(const struct mwan_config *cfg,
+                                   u16 tunnel_idx)
+{
+    return mwan_tunnel_balance_is_usable(cfg, tunnel_idx) &&
            READ_ONCE(cfg->tunnels[tunnel_idx].weight) != 0;
 }
 
@@ -140,7 +146,8 @@ bool mwan_tunnel_balance_is_active(const struct mwan_config *cfg,
  */
 static int mwan_tunnel_balance_select_locked(struct mwan_config *cfg,
                                              u32 flow_hash,
-                                             u16 *active_count)
+                                             u16 *active_count,
+                                             u16 *configured_count)
 {
     const struct mwan_active_paths *active;
     u64 best_load = U64_MAX;
@@ -150,6 +157,7 @@ static int mwan_tunnel_balance_select_locked(struct mwan_config *cfg,
     u64 total_flows = 0;
     u32 best_rank = U32_MAX;
     u16 published_active_count = 0;
+    u16 configured_selectable_count = 0;
     u16 eligible_active_count = 0;
     u16 selectable_active_count = 0;
     int preferred = -1;
@@ -176,6 +184,9 @@ static int mwan_tunnel_balance_select_locked(struct mwan_config *cfg,
     for (i = 0; i < cfg->num_tunnels; i++) {
         const struct mwan_tunnel *tun = &cfg->tunnels[i];
 
+        if (!READ_ONCE(tun->weight))
+            continue;
+        configured_selectable_count++;
         if (!mwan_tunnel_balance_is_active(cfg, (u16)i))
             continue;
         eligible_active_count++;
@@ -228,6 +239,8 @@ static int mwan_tunnel_balance_select_locked(struct mwan_config *cfg,
         *active_count = min(published_active_count,
                             min(eligible_active_count,
                                 selectable_active_count));
+    if (configured_count)
+        *configured_count = configured_selectable_count;
     return best;
 }
 
@@ -249,7 +262,8 @@ void mwan_tunnel_balance_init(struct mwan_config *cfg)
 }
 
 int mwan_tunnel_balance_assign_flow(struct mwan_config *cfg, u32 flow_hash,
-                                    u16 *active_count)
+                                    u16 *active_count,
+                                    u16 *configured_count)
 {
     int selected;
 
@@ -258,7 +272,8 @@ int mwan_tunnel_balance_assign_flow(struct mwan_config *cfg, u32 flow_hash,
     spin_lock_bh(&cfg->tunnel_balance_lock);
     mwan_tunnel_balance_refresh_locked(cfg, ktime_get_ns());
     selected = mwan_tunnel_balance_select_locked(cfg, flow_hash,
-                                                  active_count);
+                                                  active_count,
+                                                  configured_count);
     if (selected >= 0) {
         atomic_inc(&cfg->tunnels[selected].balance_active_flows);
         atomic_inc(&cfg->tunnels[selected].balance_admitted_flows);
@@ -288,7 +303,7 @@ int mwan_tunnel_balance_reassign_flow(struct mwan_config *cfg,
         return -EINVAL;
     spin_lock_bh(&cfg->tunnel_balance_lock);
     mwan_tunnel_balance_refresh_locked(cfg, ktime_get_ns());
-    selected = mwan_tunnel_balance_select_locked(cfg, flow_hash, NULL);
+    selected = mwan_tunnel_balance_select_locked(cfg, flow_hash, NULL, NULL);
     if (selected >= 0) {
         if (selected != old_tunnel_idx) {
             atomic_inc(&cfg->tunnels[selected].balance_active_flows);
@@ -349,17 +364,20 @@ int mwan_tunnel_balance_recover_flow(struct mwan_config *cfg,
                                      u16 old_tunnel_idx, u32 flow_hash,
                                      bool old_counted,
                                      u16 admission_active_count,
-                                     u16 *active_count)
+                                     u16 *active_count,
+                                     u16 *configured_count)
 {
     const struct mwan_active_paths *active;
     u64 best_count = 0;
     u64 best_weight = 1;
     u32 best_rank = U32_MAX;
     u16 current_active_count = 0;
+    u16 current_configured_count = 0;
     int selected = -EAGAIN;
     u32 i;
 
-    if (!cfg || old_tunnel_idx >= cfg->num_tunnels || !active_count)
+    if (!cfg || old_tunnel_idx >= cfg->num_tunnels || !active_count ||
+        !configured_count)
         return -EINVAL;
 
     /* Avoid a tunnel-array scan on packets sent while the path set remains
@@ -379,6 +397,9 @@ int mwan_tunnel_balance_recover_flow(struct mwan_config *cfg,
         u64 weight;
         u32 rank;
 
+        if (!READ_ONCE(tun->weight))
+            continue;
+        current_configured_count++;
         if (!mwan_tunnel_balance_is_active(cfg, (u16)i))
             continue;
         current_active_count++;
@@ -431,6 +452,7 @@ int mwan_tunnel_balance_recover_flow(struct mwan_config *cfg,
         atomic_inc(&cfg->tunnels[selected].balance_admitted_flows);
     }
     *active_count = current_active_count;
+    *configured_count = current_configured_count;
 out_unlock:
     spin_unlock_bh(&cfg->tunnel_balance_lock);
     return selected;

@@ -4,6 +4,31 @@
 
 #include <string.h>
 
+bool config_weights_valid(const app_config_t *cfg)
+{
+    unsigned int total = 0;
+    size_t i;
+
+    if (!cfg || cfg->sdwan_tun_count == 0 ||
+        cfg->sdwan_tun_count > MAX_SDWAN_TUNS)
+        return false;
+
+    for (i = 0; i < cfg->sdwan_tun_count; i++) {
+        int weight = cfg->sdwan_tuns[i].weight;
+
+        if (!cfg->weight_enabled) {
+            if (weight != 1)
+                return false;
+            continue;
+        }
+        if (weight < 0 || weight > (int)MWAN_WEIGHT_MAX)
+            return false;
+        total += (unsigned int)weight;
+    }
+
+    return !cfg->weight_enabled || total == MWAN_WEIGHT_MAX;
+}
+
 static bool encrypt_equal(const encrypt_cfg_t *left,
                           const encrypt_cfg_t *right)
 {

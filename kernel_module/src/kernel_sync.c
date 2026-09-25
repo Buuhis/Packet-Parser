@@ -1,4 +1,5 @@
 #include "kernel_sync.h"
+#include "config/config_semantics.h"
 #include "failover.h"
 #include "utils/logger.h"
 #include <stdio.h>
@@ -324,7 +325,13 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
     bool have_pqc_slots = false;
 
-    if (!ctx) return KERNEL_SYNC_ERROR;
+    if (!ctx)
+        return KERNEL_SYNC_ERROR;
+    if (ctx->cfg.node_id > 0 && !config_weights_valid(&ctx->cfg)) {
+        log_error("Refusing to push invalid weight snapshot for profile %d",
+                  ctx->cfg.node_id);
+        return KERNEL_SYNC_ERROR;
+    }
 
     push_id = __atomic_add_fetch(&push_generation, 1, __ATOMIC_RELAXED);
     log_info("[CFG-TRACE push=%lu] PREPARE node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
@@ -522,7 +529,8 @@ int kernel_sync_update_tunnel_weights(const app_context_t *ctx)
     size_t i;
 
     if (!ctx || ctx->cfg.node_id <= 0 || !generation ||
-        ctx->cfg.sdwan_tun_count == 0)
+        ctx->cfg.sdwan_tun_count == 0 ||
+        !config_weights_valid(&ctx->cfg))
         return -EINVAL;
 
     sock = nl_socket_alloc();
@@ -560,7 +568,8 @@ int kernel_sync_update_tunnel_weights(const app_context_t *ctx)
         unsigned int ifindex;
 
         ifindex = if_nametoindex(tun->tunnel_ifname);
-        if (!ifindex || tun->weight <= 0) {
+        if (!ifindex || tun->weight < 0 ||
+            tun->weight > (int)MWAN_WEIGHT_MAX) {
             ret = ifindex ? -EINVAL : -ENODEV;
             goto out;
         }
