@@ -259,16 +259,31 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         return ret;
     }
 
-    /* Bypass PQC handshake traffic (UDP port 7090) */
+    /* The PQC handshake uses its separately bound exchange tunnel.  That
+     * interface is not a managed data tunnel and returned above.  UDP/7090
+     * routed onto an L2-PQC data tunnel is therefore ordinary payload and
+     * must enter the encryption pipeline instead of escaping in plaintext.
+     * Preserve the legacy bypass for the other encapsulation modes until
+     * their control-plane paths are audited separately. */
     if (is_pqc_handshake_packet(skb, iph)) {
-        /* Keep control traffic on the route/interface selected by the
-         * normal IPv4 stack.  In particular, do not steal the skb and call
-         * dev_queue_xmit() here: doing that bypasses the remaining output
-         * path, including its normal MTU/fragmentation handling. */
-        mwan_fw_diag_log("TX_POST", skb, state, -1,
-                         "ACCEPT_PQC_HANDSHAKE", state->out->name);
-        rcu_read_unlock();
-        return NF_ACCEPT;
+        struct mwan_tunnel *routed_tun =
+            find_mwan_tunnel(cfg, state->out->ifindex);
+
+        if (!routed_tun ||
+            routed_tun->encap_type != MWAN_ENCAP_L2_PQC) {
+            /* Keep legacy control traffic on the route/interface selected by
+             * the normal IPv4 stack.  In particular, do not steal the skb and
+             * call dev_queue_xmit() here: doing that bypasses the remaining
+             * output path, including normal MTU/fragmentation handling. */
+            mwan_fw_diag_log("TX_POST", skb, state, -1,
+                             "ACCEPT_PQC_HANDSHAKE", state->out->name);
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
+
+        mwan_fw_diag_log("TX_POST", skb, state,
+                         routed_tun->encap_type,
+                         "ENCRYPT_UDP7090_DATA", state->out->name);
     }
 
     // pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
