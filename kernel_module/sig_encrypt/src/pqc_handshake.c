@@ -27,7 +27,11 @@
 #define PQC_HS_GIVEUP_TIMEOUT_MS 15000
 #define PQC_WORKER_STOP_TIMEOUT_MS 3000
 #define PQC_HS_REQUEST_RETRY_MS 1000
-#define PQC_HS_REQUEST_DATA_SZ ((uint16_t)sizeof(uint64_t))
+#define PQC_HS_REQUEST_WIRE_VERSION 2
+#define PQC_HS_RECOVERY_COOLDOWN_MS 5000
+#define PQC_HS_RX_RATE_WINDOW_MS 1000
+#define PQC_HS_RX_RATE_LIMIT 16
+#define PQC_HS_DROP_LOG_INTERVAL_MS 60000
 #define PQC_HS_KEEPALIVE_INTERVAL_MS 15000
 #define PQC_HS_KEEPALIVE_MISSED_LIMIT 1
 #define PQC_HS_KEEPALIVE_TIMEOUT_MS \
@@ -38,7 +42,7 @@
 #define PQC_HS_STATE_READY 1
 #define PQC_HS_STATE_FAILED 2
 #define PQC_HS_STATE_HANDSHAKING 3
-#define PQC_HS_INIT_WIRE_VERSION 1
+#define PQC_HS_INIT_WIRE_VERSION 2
 #define PQC_HS_INIT_HAS_CURRENT 0x01
 #define PQC_HS_INIT_HAS_PREVIOUS 0x02
 
@@ -52,6 +56,16 @@ enum pqc_hs_hello_diag_status {
     PQC_HS_HELLO_DIAG_ENCAPSULATE,
     PQC_HS_HELLO_DIAG_SIGN_RESPONSE,
     PQC_HS_HELLO_DIAG_SEND_RESPONSE,
+    PQC_HS_HELLO_DIAG_REPLAY,
+    PQC_HS_HELLO_DIAG_CHALLENGE,
+};
+
+enum pqc_hs_drop_reason {
+    PQC_HS_DROP_BAD_SIGNATURE = 0,
+    PQC_HS_DROP_REPLAY,
+    PQC_HS_DROP_RATE_LIMIT,
+    PQC_HS_DROP_BAD_FRESHNESS,
+    PQC_HS_DROP_MALFORMED,
 };
 
 typedef struct {
@@ -75,9 +89,17 @@ typedef struct {
 #pragma pack(push, 1)
 typedef struct {
     uint8_t version;
+    uint8_t reserved[7];
+    uint8_t request_id_be[sizeof(uint64_t)];
+} pqc_hs_request_wire_t;
+
+typedef struct {
+    uint8_t version;
     uint8_t flags;
     uint8_t current_key_id;
     uint8_t previous_key_id;
+    uint8_t sender_epoch_be[sizeof(uint64_t)];
+    uint8_t responder_challenge_be[sizeof(uint64_t)];
 } pqc_hs_init_hello_wire_t;
 
 typedef struct {
@@ -89,10 +111,13 @@ typedef struct {
 
 #define PQC_HS_KEEPALIVE_DATA_SZ \
     ((uint16_t)sizeof(pqc_hs_keepalive_wire_t))
+#define PQC_HS_REQUEST_DATA_SZ \
+    ((uint16_t)sizeof(pqc_hs_request_wire_t))
 
-/* TEST ONLY: allow the two peers to use different local profile IDs.
- * Set this back to 0 after the profile-mismatch test. */
-#define PQC_TEST_ALLOW_PROFILE_MISMATCH 1
+/* Each appliance owns its local profile ID.  The authenticated peer is bound
+ * by the exchange tuple and its Vault public key, so the remote numeric ID is
+ * informational and is not required to equal the local ID. */
+#define PQC_REMOTE_PROFILE_ID_COMPAT 1
 
 extern void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
                                  uint64_t config_generation);
@@ -130,9 +155,13 @@ static pqc_runtime_state_t g_dispatcher_state = PQC_RUNTIME_STOPPED;
 static int g_dispatcher_last_error;
 static pthread_cond_t g_dispatcher_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_worker_state_cond = PTHREAD_COND_INITIALIZER;
+static uint64_t g_rx_tuple_drop_count;
+static uint64_t g_rx_tuple_drop_suppressed;
+static uint64_t g_rx_tuple_drop_last_log;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
 static void *pqc_udp_dispatcher_thread(void *arg);
+static uint64_t get_time_ms_hs(void);
 
 static bool pqc_dispatcher_is_running(void) {
     return atomic_load_explicit(&g_dispatcher_running,
@@ -156,13 +185,95 @@ static const char *pqc_runtime_state_name(pqc_runtime_state_t state) {
 
 static bool pqc_hs_profile_matches(uint32_t wire_profile_id,
                                    int local_profile_id) {
-#if PQC_TEST_ALLOW_PROFILE_MISMATCH
+#if PQC_REMOTE_PROFILE_ID_COMPAT
     (void)wire_profile_id;
     (void)local_profile_id;
     return true;
 #else
     return wire_profile_id == (uint32_t)local_profile_id;
 #endif
+}
+
+static const char *pqc_hs_drop_reason_name(enum pqc_hs_drop_reason reason) {
+    switch (reason) {
+    case PQC_HS_DROP_BAD_SIGNATURE: return "bad-signature";
+    case PQC_HS_DROP_REPLAY: return "replay";
+    case PQC_HS_DROP_RATE_LIMIT: return "rate-limit";
+    case PQC_HS_DROP_BAD_FRESHNESS: return "bad-freshness";
+    case PQC_HS_DROP_MALFORMED: return "malformed";
+    default: return "unknown";
+    }
+}
+
+/* g_key_mutex must be held.  Count every drop, but print at most one line per
+ * reason/profile/minute.  The next line includes the number suppressed. */
+static bool pqc_hs_record_drop_locked(policy_key_binding_t *b,
+                                      enum pqc_hs_drop_reason reason,
+                                      uint8_t msg_type) {
+    uint64_t now;
+
+    if (!b || reason < 0 || reason >= PQC_HS_DROP_REASON_COUNT)
+        return false;
+    now = get_time_ms_hs();
+    b->rx_drop_count[reason]++;
+    if (b->rx_drop_last_log[reason] != 0 &&
+        now >= b->rx_drop_last_log[reason] &&
+        now - b->rx_drop_last_log[reason] <
+            PQC_HS_DROP_LOG_INTERVAL_MS) {
+        b->rx_drop_suppressed[reason]++;
+        return false;
+    }
+    fprintf(stderr,
+            "[PQC-HS] Profile %d dropped type=%u reason=%s"
+            " total=%llu suppressed=%llu.\n",
+            b->profile_id, msg_type, pqc_hs_drop_reason_name(reason),
+            (unsigned long long)b->rx_drop_count[reason],
+            (unsigned long long)b->rx_drop_suppressed[reason]);
+    b->rx_drop_suppressed[reason] = 0;
+    b->rx_drop_last_log[reason] = now;
+    return true;
+}
+
+/* g_key_mutex must be held.  This is intentionally before signature/KEM work. */
+static bool pqc_hs_rate_limit_locked(policy_key_binding_t *b,
+                                     uint8_t msg_type) {
+    uint64_t now;
+
+    if (!b) return false;
+    now = get_time_ms_hs();
+    if (b->rx_rate_window_start == 0 ||
+        now < b->rx_rate_window_start ||
+        now - b->rx_rate_window_start >= PQC_HS_RX_RATE_WINDOW_MS) {
+        b->rx_rate_window_start = now;
+        b->rx_rate_window_count = 0;
+    }
+    if (b->rx_rate_window_count >= PQC_HS_RX_RATE_LIMIT) {
+        pqc_hs_record_drop_locked(b, PQC_HS_DROP_RATE_LIMIT, msg_type);
+        return false;
+    }
+    b->rx_rate_window_count++;
+    return true;
+}
+
+/* g_key_mutex must be held. */
+static void pqc_hs_record_tuple_drop_locked(bool ambiguous) {
+    uint64_t now = get_time_ms_hs();
+
+    g_rx_tuple_drop_count++;
+    if (g_rx_tuple_drop_last_log != 0 &&
+        now >= g_rx_tuple_drop_last_log &&
+        now - g_rx_tuple_drop_last_log < PQC_HS_DROP_LOG_INTERVAL_MS) {
+        g_rx_tuple_drop_suppressed++;
+        return;
+    }
+    fprintf(stderr,
+            "[PQC-HS] Dropped handshake packet: %s exchange tuple"
+            " total=%llu suppressed=%llu.\n",
+            ambiguous ? "ambiguous" : "unbound",
+            (unsigned long long)g_rx_tuple_drop_count,
+            (unsigned long long)g_rx_tuple_drop_suppressed);
+    g_rx_tuple_drop_suppressed = 0;
+    g_rx_tuple_drop_last_log = now;
 }
 
 /* These diagnostic slots are owned by one profile.  Returning true only on
@@ -195,27 +306,108 @@ static bool pqc_hs_keepalive_log_allowed(uint64_t now,
     return true;
 }
 
-/* g_key_mutex must be held. Exact profile matches always win. In test mode,
- * mismatched IDs may fall back only when exactly one active PQC binding exists;
- * multiple bindings would make routing the packet ambiguous. */
-static int pqc_hs_find_rx_binding_locked(uint32_t wire_profile_id) {
-    int fallback = -1;
+/* g_key_mutex must be held.  The network tuple only selects the candidate
+ * binding; the signature under that binding's peer key proves identity. */
+static int pqc_hs_find_rx_binding_locked(uint32_t wire_profile_id,
+                                         const pqc_rx_pkt_info_t *info) {
+    int candidate = -1;
+
+    (void)wire_profile_id;
+    if (!info || info->src_addr.sin_family != AF_INET ||
+        info->ingress_ifindex == 0)
+        return -1;
 
     for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (g_policy_bindings_active[i] &&
-            g_policy_bindings[i].profile_id == (int)wire_profile_id)
-            return i;
-    }
+        policy_key_binding_t *b = &g_policy_bindings[i];
+        struct in_addr local_addr;
+        struct in_addr peer_addr;
+        unsigned int expected_ifindex;
 
-#if PQC_TEST_ALLOW_PROFILE_MISMATCH
-    for (int i = 0; i < g_policy_bindings_count; i++) {
-        if (!g_policy_bindings_active[i]) continue;
-        if (fallback >= 0) return -1;
-        fallback = i;
+        if (!g_policy_bindings_active[i] ||
+            inet_pton(AF_INET, b->local_ip, &local_addr) != 1 ||
+            inet_pton(AF_INET, b->peer_ip, &peer_addr) != 1)
+            continue;
+        expected_ifindex = if_nametoindex(b->wan_ifname);
+        if (expected_ifindex == 0 ||
+            info->src_addr.sin_addr.s_addr != peer_addr.s_addr ||
+            info->dst_addr.s_addr != local_addr.s_addr ||
+            info->ingress_ifindex != expected_ifindex)
+            continue;
+        if (candidate >= 0)
+            return -2; /* Ambiguous tuple: fail closed. */
+        candidate = i;
     }
-#endif
+    return candidate;
+}
 
-    return fallback;
+/* g_key_mutex must be held. */
+static bool pqc_hs_request_seen_locked(const policy_key_binding_t *b,
+                                       uint64_t request_id) {
+    for (int i = 0; b && i < PQC_HS_REPLAY_SLOTS; i++) {
+        if (b->request_replay[i].valid &&
+            b->request_replay[i].request_id == request_id)
+            return true;
+    }
+    return false;
+}
+
+/* g_key_mutex must be held. */
+static void pqc_hs_remember_request_locked(policy_key_binding_t *b,
+                                           uint64_t request_id,
+                                           uint64_t now) {
+    int slot;
+
+    if (!b || !request_id) return;
+    slot = b->request_replay_next;
+    b->request_replay_next = (slot + 1) % PQC_HS_REPLAY_SLOTS;
+    b->request_replay[slot].request_id = request_id;
+    b->request_replay[slot].seen_ms = now;
+    b->request_replay[slot].valid = true;
+}
+
+/* g_key_mutex must be held.  Match the session as well as the signed packet
+ * hash so a cache eviction cannot make an already-completed HELLO fresh. */
+static bool pqc_hs_completed_hello_seen_locked(
+    const policy_key_binding_t *b, uint32_t session_id,
+    const uint8_t hello_hash[32]) {
+    for (int i = 0; b && i < PQC_HS_COMPLETED_HELLO_SLOTS; i++) {
+        const pqc_hs_completed_hello_entry_t *entry =
+            &b->completed_hello[i];
+        if (entry->valid && entry->session_id == session_id &&
+            memcmp(entry->hello_hash, hello_hash, 32) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* g_key_mutex must be held. */
+static void pqc_hs_remember_completed_hello_locked(
+    policy_key_binding_t *b, uint32_t session_id,
+    const uint8_t hello_hash[32], uint64_t peer_epoch) {
+    int slot;
+
+    if (!b || !session_id || !hello_hash) return;
+    if (pqc_hs_completed_hello_seen_locked(b, session_id, hello_hash))
+        return;
+    slot = b->completed_hello_next;
+    b->completed_hello_next =
+        (slot + 1) % PQC_HS_COMPLETED_HELLO_SLOTS;
+    b->completed_hello[slot].session_id = session_id;
+    memcpy(b->completed_hello[slot].hello_hash, hello_hash, 32);
+    b->completed_hello[slot].peer_epoch = peer_epoch;
+    b->completed_hello[slot].seen_ms = get_time_ms_hs();
+    b->completed_hello[slot].valid = true;
+}
+
+/* g_key_mutex must be held. */
+static bool pqc_hs_peer_epoch_seen_locked(const policy_key_binding_t *b,
+                                          uint64_t peer_epoch) {
+    for (int i = 0; b && i < PQC_HS_COMPLETED_HELLO_SLOTS; i++) {
+        if (b->completed_hello[i].valid &&
+            b->completed_hello[i].peer_epoch == peer_epoch)
+            return true;
+    }
+    return false;
 }
 
 static int pqc_generate_session_id(uint32_t *session_id) {
@@ -327,6 +519,7 @@ static int pqc_hs_verify_message(const uint8_t *pub_key, size_t pub_key_len,
 static int pqc_hs_verify_request_locked(policy_key_binding_t *b,
                                         const struct pqc_hs_msg *msg,
                                         uint64_t *request_id) {
+    const pqc_hs_request_wire_t *wire;
     uint8_t raw_pub[8192];
     uint64_t request_id_be;
     size_t raw_pub_sz = 0;
@@ -344,7 +537,14 @@ static int pqc_hs_verify_request_locked(policy_key_binding_t *b,
         pqc_hs_verify_message(raw_pub, raw_pub_sz, msg) != TRF_PQC_OK)
         return -EKEYREJECTED;
 
-    memcpy(&request_id_be, msg->payload, sizeof(request_id_be));
+    wire = (const pqc_hs_request_wire_t *)msg->payload;
+    if (wire->version != PQC_HS_REQUEST_WIRE_VERSION)
+        return -EPROTO;
+    for (size_t i = 0; i < sizeof(wire->reserved); i++) {
+        if (wire->reserved[i] != 0)
+            return -EPROTO;
+    }
+    memcpy(&request_id_be, wire->request_id_be, sizeof(request_id_be));
     *request_id = be64toh(request_id_be);
     return *request_id ? 0 : -EINVAL;
 }
@@ -356,6 +556,7 @@ static int pqc_hs_send_handshake_request(policy_key_binding_t *b,
     uint8_t request_buf[PQC_HS_MSG_MAX_SZ];
     uint8_t raw_priv[8192];
     struct pqc_hs_msg *request = (struct pqc_hs_msg *)request_buf;
+    pqc_hs_request_wire_t *wire;
     uint64_t request_id;
     uint64_t request_id_be;
     size_t raw_priv_sz = 0;
@@ -388,7 +589,9 @@ static int pqc_hs_send_handshake_request(policy_key_binding_t *b,
         return errno ? -errno : -EIO;
 
     request_id_be = htobe64(request_id);
-    memcpy(request->payload, &request_id_be, sizeof(request_id_be));
+    wire = (pqc_hs_request_wire_t *)request->payload;
+    wire->version = PQC_HS_REQUEST_WIRE_VERSION;
+    memcpy(wire->request_id_be, &request_id_be, sizeof(request_id_be));
     trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
     if (raw_priv_sz == 0 ||
         pqc_hs_sign_message(raw_priv, raw_priv_sz, request,
@@ -635,6 +838,12 @@ static void pqc_hs_begin_profile_recovery_locked(policy_key_binding_t *b,
     b->handshake_start_time = 0;
     b->local_request_id = 0;
     b->local_keepalive_seq = 0;
+    if (b->is_initiator) {
+        b->peer_request_id = 0;
+        b->peer_keepalive_epoch = 0;
+        b->peer_keepalive_seq = 0;
+    }
+    b->pending_peer_epoch = 0;
     b->send_poke = !b->is_initiator;
     b->keepalive_enabled = b->is_tunnel;
     b->last_keepalive_rx_time = 0;
@@ -756,10 +965,8 @@ static void handle_handshake_success(policy_key_binding_t *b,
     }
 
     fprintf(stderr,
-            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT. Key prefix: %02X%02X%02X%02X...\n",
-            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT],
-            derived_master[0], derived_master[1], derived_master[2],
-            derived_master[3]);
+            "[PQC-HS] %s Handshake SUCCESS for Profile %d. Promoted new key ID: %d to CURRENT.\n",
+            role, b->profile_id, b->key_ids[KEY_SLOT_CURRENT]);
 
 }
 
@@ -824,6 +1031,10 @@ static int pqc_hs_send_cached_response(policy_key_binding_t *b, int cache_slot,
             b->hs_cache[cache_slot].key_promoted = true;
             handle_handshake_success(b, master_key, agreed_key_id,
                                      "Responder");
+            pqc_hs_remember_completed_hello_locked(
+                b, session_id, hello_hash,
+                b->hs_cache[cache_slot].peer_epoch);
+            b->pending_peer_epoch = 0;
             memset(b->hs_cache[cache_slot].master_key, 0,
                    sizeof(b->hs_cache[cache_slot].master_key));
             callback_generation = b->config_generation;
@@ -877,6 +1088,8 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     uint8_t init_agreed_key_id = 0;
     uint8_t rekey_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ] = {0};
     uint8_t rekey_id = 0;
+    uint64_t sender_epoch = 0;
+    uint64_t responder_challenge = 0;
     size_t response_prefix = 0;
     char *new_my_priv = NULL;
     char *new_peer_pub = NULL;
@@ -907,7 +1120,18 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
             return -EPROTO;
         }
         memcpy(&peer_init_state, msg->payload, sizeof(peer_init_state));
+        {
+            uint64_t value_be;
+
+            memcpy(&value_be, peer_init_state.sender_epoch_be,
+                   sizeof(value_be));
+            sender_epoch = be64toh(value_be);
+            memcpy(&value_be, peer_init_state.responder_challenge_be,
+                   sizeof(value_be));
+            responder_challenge = be64toh(value_be);
+        }
         if (peer_init_state.version != PQC_HS_INIT_WIRE_VERSION ||
+            sender_epoch == 0 || responder_challenge == 0 ||
             (peer_init_state.flags &
              ~(PQC_HS_INIT_HAS_CURRENT | PQC_HS_INIT_HAS_PREVIOUS)) ||
             ((peer_init_state.flags & PQC_HS_INIT_HAS_CURRENT) != 0) !=
@@ -950,6 +1174,24 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         }
         break;
     }
+    if (!is_rekey && cached_slot < 0 && !session_conflict) {
+        for (int i = 0; i < PQC_HS_COMPLETED_HELLO_SLOTS; i++) {
+            const pqc_hs_completed_hello_entry_t *entry =
+                &b->completed_hello[i];
+
+            if (!entry->valid || entry->session_id != msg->session_id)
+                continue;
+            if (memcmp(entry->hello_hash, hello_hash,
+                       sizeof(hello_hash)) == 0) {
+                pqc_hs_record_drop_locked(
+                    b, PQC_HS_DROP_REPLAY, msg->msg_type);
+                pthread_mutex_unlock(&g_key_mutex);
+                return -EALREADY;
+            }
+            session_conflict = true;
+            break;
+        }
+    }
     pthread_mutex_unlock(&g_key_mutex);
 
     if (session_conflict) {
@@ -988,8 +1230,14 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
 
     trf_base64_decode(*peer_pub, raw_pub, &raw_pub_sz);
     if (pqc_hs_verify_message(raw_pub, raw_pub_sz, msg) != TRF_PQC_OK) {
-        if (pqc_hs_diag_changed(&b->hello_rx_last_status,
-                                PQC_HS_HELLO_DIAG_BAD_SIGNATURE)) {
+        bool log_detail;
+
+        pthread_mutex_lock(&g_key_mutex);
+        log_detail = pqc_hs_record_drop_locked(
+            b, PQC_HS_DROP_BAD_SIGNATURE, msg->msg_type);
+        pthread_mutex_unlock(&g_key_mutex);
+        b->hello_rx_last_status = PQC_HS_HELLO_DIAG_BAD_SIGNATURE;
+        if (log_detail) {
             fprintf(stderr,
                     "[PQC-HS-L3] HELLO signature verification failed for Profile %d, session %u.\n",
                     b->profile_id, msg->session_id);
@@ -999,6 +1247,30 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
                               "Handshake signature verification failed. Mismatched authentication keys.");
         }
         return -1;
+    }
+
+    if (!is_rekey) {
+        bool challenge_valid;
+        bool log_detail = false;
+
+        pthread_mutex_lock(&g_key_mutex);
+        challenge_valid = b->local_request_id != 0 &&
+                          responder_challenge == b->local_request_id &&
+                          (b->pending_peer_epoch == 0 ||
+                           sender_epoch == b->pending_peer_epoch);
+        if (!challenge_valid)
+            log_detail = pqc_hs_record_drop_locked(
+                b, PQC_HS_DROP_BAD_FRESHNESS, msg->msg_type);
+        pthread_mutex_unlock(&g_key_mutex);
+        if (!challenge_valid) {
+            b->hello_rx_last_status = PQC_HS_HELLO_DIAG_CHALLENGE;
+            if (log_detail) {
+                fprintf(stderr,
+                        "[PQC-HS-L3] Rejected HELLO with stale challenge for Profile %d.\n",
+                        b->profile_id);
+            }
+            return -ESTALE;
+        }
     }
 
     if (trf_kem_encapsulate(kem_public_key, (int)kem_public_key_len,
@@ -1118,8 +1390,13 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         memcpy(b->hs_cache[cached_slot].master_key, derived_master,
                sizeof(derived_master));
     b->hs_cache[cached_slot].agreed_key_id = init_agreed_key_id;
+    b->hs_cache[cached_slot].peer_epoch = sender_epoch;
     b->hs_cache[cached_slot].valid = true;
     b->hs_cache[cached_slot].is_rekey = is_rekey;
+    if (!is_rekey) {
+        b->peer_keepalive_epoch = sender_epoch;
+        b->peer_keepalive_seq = 0;
+    }
     pthread_mutex_unlock(&g_key_mutex);
 
     return pqc_hs_send_cached_response(b, cached_slot, msg->session_id,
@@ -1481,7 +1758,11 @@ failed:
     return -ETIMEDOUT;
 }
 
-static void pqc_feed_packet_to_binding_queue(policy_key_binding_t *b, const uint8_t *data, int len) {
+static bool pqc_feed_packet_to_binding_queue(policy_key_binding_t *b,
+                                             const uint8_t *data, int len,
+                                             const pqc_rx_pkt_info_t *info) {
+    bool queued = false;
+
     pthread_mutex_lock(&b->rx_mutex);
     int next = (b->rx_head + 1) % PQC_RX_QUEUE_SIZE;
     if (next != b->rx_tail) {
@@ -1492,17 +1773,24 @@ static void pqc_feed_packet_to_binding_queue(policy_key_binding_t *b, const uint
         if (b->rx_queue[b->rx_head]) {
             memcpy(b->rx_queue[b->rx_head], data, len);
             b->rx_len[b->rx_head] = len;
+            if (info)
+                b->rx_info[b->rx_head] = *info;
+            else
+                memset(&b->rx_info[b->rx_head], 0,
+                       sizeof(b->rx_info[b->rx_head]));
             b->rx_head = next;
             pthread_cond_signal(&b->rx_cond);
+            queued = true;
         }
     }
     pthread_mutex_unlock(&b->rx_mutex);
+    return queued;
 }
 
-void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_mac) {
+void sig_pqc_feed_rx_packet(const uint8_t *payload, int len,
+                            const pqc_rx_pkt_info_t *info) {
     const struct pqc_hs_msg *validated_msg = NULL;
 
-    (void)src_mac;
     if (pqc_hs_validate_message(payload, len, &validated_msg) != 0)
         return;
     const struct pqc_hs_msg *msg = validated_msg;
@@ -1510,16 +1798,21 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
 
     uint32_t profile_id = msg->profile_id;
     pthread_mutex_lock(&g_key_mutex);
-    int binding_idx = pqc_hs_find_rx_binding_locked(profile_id);
+    int binding_idx = pqc_hs_find_rx_binding_locked(profile_id, info);
     if (binding_idx >= 0) {
         policy_key_binding_t *b = &g_policy_bindings[binding_idx];
-#if PQC_TEST_ALLOW_PROFILE_MISMATCH
-        if (b->profile_id != (int)profile_id) {
-            // fprintf(stderr,
-            //         "[PQC-HS-TEST] Accepting wire profile %u on local profile %d.\n",
-            //         profile_id, b->profile_id);
+
+        if (msg->msg_type < PQC_HS_MSG_HELLO ||
+            msg->msg_type > PQC_HS_MSG_REKEY_ABORT) {
+            pqc_hs_record_drop_locked(
+                b, PQC_HS_DROP_MALFORMED, msg->msg_type);
+            pthread_mutex_unlock(&g_key_mutex);
+            return;
         }
-#endif
+        if (!pqc_hs_rate_limit_locked(b, msg->msg_type)) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return;
+        }
         if (msg->msg_type == PQC_HS_MSG_KEEPALIVE && b->is_tunnel) {
             pqc_hs_keepalive_status_t peer_status;
             uint8_t local_state;
@@ -1534,12 +1827,11 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
             verify_rc = pqc_hs_verify_l3_keepalive_locked(
                 b, msg, &peer_status);
             if (verify_rc != 0) {
-                if (pqc_hs_diag_changed(&b->keepalive_rx_last_error,
-                                        verify_rc)) {
-                    fprintf(stderr,
-                            "[PQC-HS-L3] Rejected unauthenticated/invalid KEM key keepalive for Profile %d: %s.\n",
-                            b->profile_id, strerror(-verify_rc));
-                }
+                pqc_hs_record_drop_locked(
+                    b, verify_rc == -EKEYREJECTED ?
+                        PQC_HS_DROP_BAD_SIGNATURE : PQC_HS_DROP_MALFORMED,
+                    msg->msg_type);
+                b->keepalive_rx_last_error = verify_rc;
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             }
@@ -1550,12 +1842,44 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 b->keepalive_rx_last_error = 0;
             }
 
-            if (peer_status.epoch == b->peer_keepalive_epoch &&
-                peer_status.sequence <= b->peer_keepalive_seq) {
+            if (b->peer_keepalive_epoch == 0 ||
+                peer_status.epoch != b->peer_keepalive_epoch) {
+                uint64_t now = get_time_ms_hs();
+
+                /* An authenticated new responder-side view of the peer can
+                 * indicate that the initiator rebooted.  Do not discard
+                 * CURRENT: issue a new challenge and require a matching
+                 * signed HELLO.  Epochs from completed sessions are replay. */
+                if (!b->is_initiator &&
+                    !pqc_hs_peer_epoch_seen_locked(
+                        b, peer_status.epoch) &&
+                    b->pending_peer_epoch != peer_status.epoch &&
+                    (b->last_recovery_request_time == 0 ||
+                     now < b->last_recovery_request_time ||
+                     now - b->last_recovery_request_time >=
+                        PQC_HS_RECOVERY_COOLDOWN_MS)) {
+                    uint64_t challenge = 0;
+
+                    if (pqc_generate_request_id(&challenge) == 0) {
+                        b->local_request_id = challenge;
+                        b->local_keepalive_seq = 0;
+                        b->pending_peer_epoch = peer_status.epoch;
+                        b->last_recovery_request_time = now;
+                        atomic_store_explicit(
+                            &b->send_poke, true, memory_order_release);
+                    }
+                }
+                pqc_hs_record_drop_locked(
+                    b, PQC_HS_DROP_BAD_FRESHNESS, msg->msg_type);
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             }
-            b->peer_keepalive_epoch = peer_status.epoch;
+            if (peer_status.sequence <= b->peer_keepalive_seq) {
+                pqc_hs_record_drop_locked(
+                    b, PQC_HS_DROP_REPLAY, msg->msg_type);
+                pthread_mutex_unlock(&g_key_mutex);
+                return;
+            }
             b->peer_keepalive_seq = peer_status.sequence;
             b->last_keepalive_rx_time = get_time_ms_hs();
             b->keepalive_monitor_start_time =
@@ -1636,30 +1960,54 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                                                          &request_id);
 
             if (verify_rc != 0) {
-                if (pqc_hs_diag_changed(&b->request_rx_last_error,
-                                        verify_rc)) {
-                    fprintf(stderr,
-                            "[PQC-HS] Rejected unauthenticated/invalid handshake request for Profile %d: %s.\n",
-                            b->profile_id, strerror(-verify_rc));
-                }
+                pqc_hs_record_drop_locked(
+                    b, verify_rc == -EKEYREJECTED ?
+                        PQC_HS_DROP_BAD_SIGNATURE : PQC_HS_DROP_MALFORMED,
+                    msg->msg_type);
+                b->request_rx_last_error = verify_rc;
                 pthread_mutex_unlock(&g_key_mutex);
                 return;
             }
             b->request_rx_last_error = 0;
-            if (request_id == b->peer_request_id) {
-                /* The responder retries the same authenticated request until
-                 * the state changes.  Duplicates are expected and must not
-                 * flood the service journal. */
-                pthread_mutex_unlock(&g_key_mutex);
-                return;
-            }
+            {
+                uint64_t now = get_time_ms_hs();
+                uint64_t sender_epoch = b->local_request_id;
 
-            b->peer_request_id = request_id;
-            pqc_hs_begin_profile_recovery_locked(b, get_time_ms_hs());
+                /* The responder retransmits the current POKE until HELLO is
+                 * observed.  This is normal reliability traffic, not a
+                 * security event and must stay log-silent. */
+                if (request_id == b->peer_request_id) {
+                    pthread_mutex_unlock(&g_key_mutex);
+                    return;
+                }
+                if (pqc_hs_request_seen_locked(b, request_id)) {
+                    pqc_hs_record_drop_locked(
+                        b, PQC_HS_DROP_REPLAY, msg->msg_type);
+                    pthread_mutex_unlock(&g_key_mutex);
+                    return;
+                }
+                if (b->last_recovery_request_time != 0 &&
+                    now >= b->last_recovery_request_time &&
+                    now - b->last_recovery_request_time <
+                        PQC_HS_RECOVERY_COOLDOWN_MS) {
+                    pqc_hs_record_drop_locked(
+                        b, PQC_HS_DROP_RATE_LIMIT, msg->msg_type);
+                    pthread_mutex_unlock(&g_key_mutex);
+                    return;
+                }
+                pqc_hs_remember_request_locked(b, request_id, now);
+                b->last_recovery_request_time = now;
+                pqc_hs_begin_profile_recovery_locked(b, now);
+                b->local_request_id = sender_epoch;
+                b->local_keepalive_seq = 0;
+                b->peer_request_id = request_id;
+                b->peer_keepalive_epoch = request_id;
+                b->peer_keepalive_seq = 0;
+            }
             pqc_flush_rx_queue(b);
             fprintf(stderr,
-                    "[PQC-HS] Accepted authenticated responder request %016llx. Restarting initiator handshake for Profile %d.\n",
-                    (unsigned long long)request_id, b->profile_id);
+                    "[PQC-HS] Accepted fresh authenticated responder request; restarting initiator handshake for Profile %d.\n",
+                    b->profile_id);
             pthread_mutex_unlock(&g_key_mutex);
             return;
         } else if (msg->msg_type == PQC_HS_MSG_HELLO) {
@@ -1670,10 +2018,13 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_
                 fprintf(stderr, "[PQC-HS] Received HELLO message while asleep. Waking up Responder and flushing rx queue for Profile %d.\n", profile_id);
             }
         }
-        pqc_feed_packet_to_binding_queue(b, payload, len);
+        if (!pqc_feed_packet_to_binding_queue(b, payload, len, info))
+            pqc_hs_record_drop_locked(
+                b, PQC_HS_DROP_RATE_LIMIT, msg->msg_type);
         pthread_mutex_unlock(&g_key_mutex);
         return;
     }
+    pqc_hs_record_tuple_drop_locked(binding_idx == -2);
     pthread_mutex_unlock(&g_key_mutex);
 }
 
@@ -1695,8 +2046,7 @@ static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz,
     if (len > buf_sz) len = buf_sz;
     memcpy(buf, b->rx_queue[b->rx_tail], len);
     if (info) {
-        info->src_addr = b->rx_info[b->rx_tail].src_addr;
-        memcpy(info->src_mac, b->rx_info[b->rx_tail].src_mac, 6);
+        *info = b->rx_info[b->rx_tail];
     }
     free(b->rx_queue[b->rx_tail]);
     b->rx_queue[b->rx_tail] = NULL;
@@ -1830,6 +2180,17 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
 
     int optval = 1;
     setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if (setsockopt(sockfd, IPPROTO_IP, IP_PKTINFO,
+                   &optval, sizeof(optval)) < 0) {
+        int saved_errno = errno;
+
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Cannot enable IP_PKTINFO: %s\n",
+                strerror(saved_errno));
+        close(sockfd);
+        pqc_dispatcher_publish_failure(saved_errno);
+        return NULL;
+    }
 
     struct sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
@@ -1855,20 +2216,56 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
 
     uint8_t buffer[PQC_HS_MSG_MAX_SZ];
     struct sockaddr_in clientaddr;
-    socklen_t addr_len = sizeof(clientaddr);
 
     fprintf(stderr, "[PQC-DISPATCHER] UDP Listener running on port %d\n", PQC_HS_PORT);
 
     while (pqc_dispatcher_is_running()) {
-        int n = recvfrom(sockfd, buffer, sizeof(buffer), MSG_DONTWAIT, (struct sockaddr *)&clientaddr, &addr_len);
+        struct iovec iov = {
+            .iov_base = buffer,
+            .iov_len = sizeof(buffer),
+        };
+        char control[CMSG_SPACE(sizeof(struct in_pktinfo))];
+        struct msghdr msgh;
+        struct cmsghdr *cmsg;
+        pqc_rx_pkt_info_t info;
+        int n;
+
+        memset(&clientaddr, 0, sizeof(clientaddr));
+        memset(&info, 0, sizeof(info));
+        memset(&msgh, 0, sizeof(msgh));
+        memset(control, 0, sizeof(control));
+        msgh.msg_name = &clientaddr;
+        msgh.msg_namelen = sizeof(clientaddr);
+        msgh.msg_iov = &iov;
+        msgh.msg_iovlen = 1;
+        msgh.msg_control = control;
+        msgh.msg_controllen = sizeof(control);
+        n = recvmsg(sockfd, &msgh, MSG_DONTWAIT);
         if (n > 0) {
-            sig_pqc_feed_rx_packet(buffer, n, NULL);
+            info.src_addr = clientaddr;
+            for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg;
+                 cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+                if (cmsg->cmsg_level == IPPROTO_IP &&
+                    cmsg->cmsg_type == IP_PKTINFO &&
+                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+                    const struct in_pktinfo *pktinfo =
+                        (const struct in_pktinfo *)CMSG_DATA(cmsg);
+
+                    info.dst_addr = pktinfo->ipi_addr;
+                    info.ingress_ifindex =
+                        (unsigned int)pktinfo->ipi_ifindex;
+                    break;
+                }
+            }
+            if (!(msgh.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) &&
+                info.ingress_ifindex != 0)
+                sig_pqc_feed_rx_packet(buffer, n, &info);
             continue;
         }
         if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
             errno != EINTR) {
             runtime_error = errno;
-            fprintf(stderr, "[PQC-DISPATCHER] recvfrom failed: %s\n",
+            fprintf(stderr, "[PQC-DISPATCHER] recvmsg failed: %s\n",
                     strerror(runtime_error));
             break;
         }
@@ -2192,6 +2589,35 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             }
 
             if (is_initiator) {
+                uint64_t responder_challenge;
+                uint64_t sender_epoch;
+
+                pthread_mutex_lock(&g_key_mutex);
+                responder_challenge = b->peer_request_id;
+                sender_epoch = b->local_request_id;
+                pthread_mutex_unlock(&g_key_mutex);
+
+                /* A HELLO is accepted only as a response to the responder's
+                 * fresh, signed POKE challenge. */
+                if (!responder_challenge) {
+                    usleep(200000);
+                    continue;
+                }
+                if (!sender_epoch) {
+                    uint64_t generated_epoch = 0;
+
+                    if (pqc_generate_request_id(&generated_epoch) != 0) {
+                        usleep(200000);
+                        continue;
+                    }
+                    pthread_mutex_lock(&g_key_mutex);
+                    if (!b->local_request_id) {
+                        b->local_request_id = generated_epoch;
+                        b->local_keepalive_seq = 0;
+                    }
+                    sender_epoch = b->local_request_id;
+                    pthread_mutex_unlock(&g_key_mutex);
+                }
                 if (b->handshake_start_time == 0) {
                     b->handshake_start_time = get_time_ms_hs();
                 }
@@ -2223,6 +2649,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                        (size_t)pk_sz);
 
                 pthread_mutex_lock(&g_key_mutex);
+                {
+                    uint64_t value_be = htobe64(sender_epoch);
+
+                    memcpy(init_wire->sender_epoch_be, &value_be,
+                           sizeof(value_be));
+                    value_be = htobe64(responder_challenge);
+                    memcpy(init_wire->responder_challenge_be, &value_be,
+                           sizeof(value_be));
+                }
                 if (b->key_slots_valid[KEY_SLOT_CURRENT]) {
                     init_wire->flags |= PQC_HS_INIT_HAS_CURRENT;
                     init_wire->current_key_id =
@@ -2482,6 +2917,34 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
             } else {
                 uint8_t rx_buf[PQC_HS_MSG_MAX_SZ];
                 pqc_rx_pkt_info_t info;
+                uint64_t now = get_time_ms_hs();
+                bool poke_pending;
+                bool request_now;
+
+                pthread_mutex_lock(&g_key_mutex);
+                poke_pending = b->pending_peer_epoch != 0;
+                pthread_mutex_unlock(&g_key_mutex);
+                request_now = atomic_exchange_explicit(
+                                  &b->send_poke, false,
+                                  memory_order_acq_rel) ||
+                              (poke_pending &&
+                               (next_request_time == 0 ||
+                                now >= next_request_time));
+                if (request_now) {
+                    int request_rc = pqc_hs_send_handshake_request(
+                        b, sockfd, &peeraddr, my_priv);
+
+                    next_request_time =
+                        now + PQC_HS_REQUEST_RETRY_MS;
+                    if (request_rc != last_request_send_status) {
+                        fprintf(stderr,
+                                request_rc == 0 ?
+                                "[PQC-HS-L3] Responder Profile %d is challenging an authenticated peer restart.\n" :
+                                "[PQC-HS-L3] Responder Profile %d could not send peer-restart challenge.\n",
+                                profile_id);
+                        last_request_send_status = request_rc;
+                    }
+                }
                 int rx_len = pqc_policy_rx_recv(b, rx_buf, sizeof(rx_buf), &info, 200);
                 if (rx_len > 0) {
                     const struct pqc_hs_msg *msg = NULL;
@@ -2865,6 +3328,7 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->local_keepalive_seq = 0;
         b->peer_keepalive_epoch = 0;
         b->peer_keepalive_seq = 0;
+        b->pending_peer_epoch = 0;
         b->keepalive_monitor_start_time = 0;
         b->last_keepalive_rx_time = 0;
         b->next_auto_retry_time = 0;
@@ -2946,6 +3410,18 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->local_keepalive_seq = 0;
         b->peer_keepalive_epoch = 0;
         b->peer_keepalive_seq = 0;
+        b->pending_peer_epoch = 0;
+        b->last_recovery_request_time = 0;
+        b->request_replay_next = 0;
+        b->completed_hello_next = 0;
+        memset(b->request_replay, 0, sizeof(b->request_replay));
+        memset(b->completed_hello, 0, sizeof(b->completed_hello));
+        b->rx_rate_window_start = 0;
+        b->rx_rate_window_count = 0;
+        memset(b->rx_drop_count, 0, sizeof(b->rx_drop_count));
+        memset(b->rx_drop_suppressed, 0,
+               sizeof(b->rx_drop_suppressed));
+        memset(b->rx_drop_last_log, 0, sizeof(b->rx_drop_last_log));
         b->send_poke = role_mode != PQC_ROLE_INITIATOR;
         strncpy(b->local_ip, local_ip ? local_ip : "", sizeof(b->local_ip) - 1);
         b->local_ip[sizeof(b->local_ip) - 1] = '\0';
@@ -3099,6 +3575,12 @@ void sig_pqc_finalize_reload(void) {
             b->local_keepalive_seq = 0;
             b->peer_keepalive_epoch = 0;
             b->peer_keepalive_seq = 0;
+            b->pending_peer_epoch = 0;
+            b->last_recovery_request_time = 0;
+            b->request_replay_next = 0;
+            b->completed_hello_next = 0;
+            memset(b->request_replay, 0, sizeof(b->request_replay));
+            memset(b->completed_hello, 0, sizeof(b->completed_hello));
             b->keepalive_monitor_start_time = 0;
             b->last_keepalive_rx_time = 0;
             b->next_auto_retry_time = 0;
@@ -3237,7 +3719,11 @@ int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_m
             b->handshake_start_time = 0;
             b->key_ready = false;
             b->local_request_id = new_request_id;
+            b->peer_request_id = 0;
             b->local_keepalive_seq = 0;
+            b->peer_keepalive_epoch = 0;
+            b->peer_keepalive_seq = 0;
+            b->pending_peer_epoch = 0;
             b->send_poke = !b->is_initiator;
             b->keepalive_enabled = b->is_tunnel;
             b->keepalive_monitor_start_time = get_time_ms_hs();

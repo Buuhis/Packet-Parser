@@ -41,6 +41,9 @@
 
 #define PQC_RX_QUEUE_SIZE  16
 #define PQC_HS_CACHE_SLOTS 4
+#define PQC_HS_REPLAY_SLOTS 32
+#define PQC_HS_COMPLETED_HELLO_SLOTS 16
+#define PQC_HS_DROP_REASON_COUNT 5
 #define MAX_IDENTITY_REGISTRY 100
 #define MAX_POLICY_BINDINGS 128
 #define MAX_L2_DISPATCHERS 16
@@ -66,8 +69,24 @@ typedef struct {
 
 typedef struct {
     struct sockaddr_in src_addr;
+    struct in_addr dst_addr;
+    unsigned int ingress_ifindex;
     uint8_t src_mac[6];
 } pqc_rx_pkt_info_t;
+
+typedef struct {
+    uint64_t request_id;
+    uint64_t seen_ms;
+    bool valid;
+} pqc_hs_request_replay_entry_t;
+
+typedef struct {
+    uint32_t session_id;
+    uint8_t hello_hash[32];
+    uint64_t peer_epoch;
+    uint64_t seen_ms;
+    bool valid;
+} pqc_hs_completed_hello_entry_t;
 
 typedef struct {
     uint8_t *response;
@@ -75,6 +94,7 @@ typedef struct {
     int response_len;
     uint8_t hello_hash[32];
     uint8_t master_key[PQC_TRAFFIC_KEY_SZ];
+    uint64_t peer_epoch;
     uint8_t agreed_key_id;
     bool valid;
     bool key_promoted;
@@ -93,6 +113,7 @@ typedef struct {
     uint64_t local_keepalive_seq;
     uint64_t peer_keepalive_epoch;
     uint64_t peer_keepalive_seq;
+    uint64_t pending_peer_epoch;
     /* Per-profile liveness state.  Keepalive transmission remains on its
      * own 15-second schedule; these timestamps only decide when this one
      * profile has missed three consecutive peer keepalives. */
@@ -102,14 +123,24 @@ typedef struct {
     /* Logging-only coalescing; liveness/failover never consult these fields. */
     uint64_t keepalive_unreachable_log_time;
     uint64_t keepalive_restored_log_time;
+    uint64_t last_recovery_request_time;
+    uint64_t rx_rate_window_start;
+    uint64_t rx_drop_count[PQC_HS_DROP_REASON_COUNT];
+    uint64_t rx_drop_suppressed[PQC_HS_DROP_REASON_COUNT];
+    uint64_t rx_drop_last_log[PQC_HS_DROP_REASON_COUNT];
     uint32_t keepalive_unreachable_suppressed;
     uint32_t keepalive_restored_suppressed;
+    uint32_t rx_rate_window_count;
 
     char *local_priv;
     char *local_pub;
     char *peer_pub;
 
     pqc_hs_cache_entry_t hs_cache[PQC_HS_CACHE_SLOTS];
+    pqc_hs_request_replay_entry_t
+        request_replay[PQC_HS_REPLAY_SLOTS];
+    pqc_hs_completed_hello_entry_t
+        completed_hello[PQC_HS_COMPLETED_HELLO_SLOTS];
 
     pthread_t thread_id;
     uint8_t *rx_queue[PQC_RX_QUEUE_SIZE];
@@ -123,6 +154,8 @@ typedef struct {
     int rx_head;
     int rx_tail;
     int hs_cache_next;
+    int request_replay_next;
+    int completed_hello_next;
     int rx_len[PQC_RX_QUEUE_SIZE];
     pqc_rx_pkt_info_t rx_info[PQC_RX_QUEUE_SIZE];
     pqc_runtime_state_t worker_state;
@@ -244,11 +277,14 @@ char* sig_pqc_deobfuscate_peer_pub(const char *obf_pub_str, const char *peer_fin
 
 /**
  * Feed a received PQC handshake packet (UDP payload only) into the handshake module.
- * Called by the forwarder WAN RX thread when it detects a UDP packet to port PQC_HS_PORT.
- * @param udp_payload Pointer to the UDP payload (after UDP header).
- * @param payload_len Length of the UDP payload.
+ * The dispatcher must provide kernel-observed source/destination/interface
+ * metadata; it is used to select one binding before signature verification.
+ * @param payload Pointer to the UDP payload.
+ * @param len Length of the UDP payload.
+ * @param info Source, destination and ingress-interface metadata from recvmsg.
  */
-void sig_pqc_feed_rx_packet(const uint8_t *payload, int len, const uint8_t *src_mac);
+void sig_pqc_feed_rx_packet(const uint8_t *payload, int len,
+                            const pqc_rx_pkt_info_t *info);
 
 void sig_pqc_record_sent(int profile_id);
 void sig_pqc_record_recv(int profile_id);
