@@ -295,6 +295,11 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
         
         // Push configuration to kernel datapath via Netlink
         sync_result = kernel_sync_push_config(&candidate);
+        log_info("[PQC-HS-DIAG] event=KEY_SYNC profile=%d generation=%llu "
+                 "result=%s",
+                 profile_id, (unsigned long long)config_generation,
+                 sync_result == KERNEL_SYNC_APPLIED ? "APPLIED" :
+                 sync_result == KERNEL_SYNC_DEFERRED ? "DEFERRED" : "ERROR");
         if (sync_result == KERNEL_SYNC_APPLIED) {
             running_ctx = candidate;
             log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
@@ -302,6 +307,9 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
         }
     } else {
+        log_warn("[PQC-HS-DIAG] event=KEY_SYNC profile=%d generation=%llu "
+                 "result=STALE_OR_INACTIVE",
+                 profile_id, (unsigned long long)config_generation);
         log_warn("[CFG-TRACE pqc-callback] STALE_OR_INACTIVE config_generation=%llu callback_node=%d active_node=%d active_enabled=%d active_layer=%u active_type=%u",
                  (unsigned long long)config_generation, profile_id,
                  running_ctx.cfg.node_id,

@@ -89,7 +89,12 @@ static void mwan_fw_diag_log(const char *stage, struct sk_buff *skb,
     enum ip_conntrack_info ctinfo = IP_CT_UNTRACKED;
     struct iphdr iph_buf;
     const struct iphdr *iph;
+    struct udphdr udph_buf;
+    const struct udphdr *udph = NULL;
     struct nf_conn *ct;
+    u16 sport = 0;
+    u16 dport = 0;
+    u16 frag;
 
     if (!READ_ONCE(mwan_fw_diag_enabled) || !skb)
         return;
@@ -99,16 +104,30 @@ static void mwan_fw_diag_log(const char *stage, struct sk_buff *skb,
     if (!iph || iph->version != 4)
         return;
 
+    frag = ntohs(iph->frag_off);
+    if (iph->protocol == IPPROTO_UDP && iph->ihl >= 5 &&
+        !(iph->frag_off & htons(IP_OFFSET))) {
+        udph = skb_header_pointer(skb,
+                                  skb_network_offset(skb) + iph->ihl * 4,
+                                  sizeof(udph_buf), &udph_buf);
+        if (udph) {
+            sport = ntohs(udph->source);
+            dport = ntohs(udph->dest);
+        }
+    }
+
     ct = nf_ct_get(skb, &ctinfo);
     pr_info_ratelimited("mwan_kmod: FWDIAG stage=%s in=%s out=%s iif=%d mark=%#x "
-                        "src=%pI4 dst=%pI4 proto=%u len=%u "
+                        "src=%pI4 dst=%pI4 proto=%u sport=%u dport=%u "
+                        "len=%u frag_off=%u mf=%u "
                         "ct=%s/%d tracked=%u confirmed=%u encap=%d "
                         "action=%s selected=%s\n",
                         stage,
                         state && state->in ? state->in->name : "-",
                         state && state->out ? state->out->name : "-",
                         skb->skb_iif, skb->mark, &iph->saddr, &iph->daddr,
-                        iph->protocol, skb->len,
+                        iph->protocol, sport, dport, skb->len,
+                        frag & IP_OFFSET, !!(frag & IP_MF),
                         mwan_ct_info_name(ct, ctinfo),
                         ct ? (int)ctinfo : -1, !!ct,
                         ct ? !!nf_ct_is_confirmed(ct) : 0,
@@ -219,6 +238,13 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     // pr_info_ratelimited("mwan_kmod: POST_ROUTING hit: dest %pI4, out_dev: %s (ifindex: %d)\n",
     //                     &iph->daddr, state->out ? state->out->name : "NULL",
     //                     state->out ? state->out->ifindex : -1);
+
+    /* Observe the socket mark before consulting MWAN configuration.  This is
+     * important during reboot recovery, where the POKE may be emitted while
+     * the datapath configuration is still being restored. */
+    if (state->out && is_pqc_handshake_packet(skb, iph))
+        mwan_fw_diag_log("TX_POST_7090_ORIGIN", skb, state, -1,
+                         "MARKED_LOCAL_OUT", state->out->name);
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
