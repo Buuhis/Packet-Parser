@@ -773,13 +773,11 @@ u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow)
 }
 
 struct mwan_l2_rx_flow *
-mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
+mwan_l2_rx_flow_lookup(struct mwan_config *cfg, u64 flow_token)
 {
     struct mwan_l2_rx_flow *flow;
-    struct mwan_l2_rx_flow *candidate;
     struct mwan_l2_flow_bucket *bucket;
     u32 index;
-    int owner;
 
     flow_token &= MWAN_FLOW_COOKIE_MASK;
     if (!cfg || !flow_token || READ_ONCE(cfg->flows.stopping))
@@ -789,27 +787,56 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
         if (flow->flow_token == flow_token) {
+            /* Reserve in-flight lifetime under the same lock used by GC.
+             * This is not activity: last_seen remains unchanged until AEAD
+             * succeeds in the worker. */
+            atomic_inc(&flow->pending_crypto);
             refcount_inc(&flow->refs);
-            WRITE_ONCE(flow->last_seen, jiffies);
             spin_unlock_bh(&bucket->lock);
             return flow;
         }
     }
     spin_unlock_bh(&bucket->lock);
 
-    if (atomic_read(&cfg->flows.rx_count) >= MWAN_FLOW_MAX_ACTIVE) {
-        atomic64_inc(&cfg->flows.table_full);
+    return NULL;
+}
+
+/* This is the only RX flow-creation entry point.  Callers must invoke it only
+ * after the packet header and ciphertext have passed AEAD authentication.
+ * Worker admission also happens here, after authentication.  The temporary
+ * candidate worker is only responsible for verifying unknown tokens; normal
+ * packets retain the existing load-aware sticky-owner model. */
+struct mwan_l2_rx_flow *
+mwan_l2_rx_flow_get_authenticated(struct mwan_config *cfg, u64 flow_token,
+                                  u32 first_seq)
+{
+    struct mwan_l2_rx_flow *flow;
+    struct mwan_l2_rx_flow *candidate;
+    struct mwan_l2_flow_bucket *bucket;
+    u32 index;
+    int owner;
+
+    flow_token &= MWAN_FLOW_COOKIE_MASK;
+    if (!cfg || !flow_token || READ_ONCE(cfg->flows.stopping) ||
+        !cfg->l2_workers)
         return NULL;
+    index = mwan_l2_rx_bucket(flow_token);
+    bucket = &cfg->flows.rx[index];
+
+    spin_lock_bh(&bucket->lock);
+    hlist_for_each_entry(flow, &bucket->head, node) {
+        if (flow->flow_token == flow_token) {
+            atomic_inc(&flow->pending_crypto);
+            refcount_inc(&flow->refs);
+            spin_unlock_bh(&bucket->lock);
+            return flow;
+        }
     }
-    candidate = kzalloc(sizeof(*candidate), GFP_ATOMIC);
+    spin_unlock_bh(&bucket->lock);
+
+    candidate = kzalloc(sizeof(*candidate), GFP_KERNEL);
     if (!candidate)
         return NULL;
-    /* The encrypted RX prefix does not expose the inner protocol.  If every
-     * CPU is admission-blocked, admit the first authenticated-flow candidate
-     * on the CPU with the most remaining idle time.  TX can distinguish and
-     * reserve this fallback for control packets; RX cannot do so safely before
-     * decryption, and dropping the first ciphertext would also black-hole TCP
-     * SYN/FIN/RST and pure ACK traffic. */
     owner = mwan_l2_select_rx_worker(cfg, lower_32_bits(flow_token), -1,
                                      true);
     if (owner < 0) {
@@ -817,9 +844,9 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
         return NULL;
     }
     candidate->flow_token = flow_token;
-    refcount_set(&candidate->refs, 1);
+    refcount_set(&candidate->refs, 1); /* table reference */
     candidate->expected_seq = first_seq;
-    atomic_set(&candidate->pending_crypto, 0);
+    atomic_set(&candidate->pending_crypto, 1);
     candidate->owner_worker = owner;
     atomic_set(&candidate->exec_mode, MWAN_FLOW_EXEC_LEGACY);
     candidate->pipeline_worker = -1;
@@ -832,6 +859,7 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
         if (flow->flow_token == flow_token) {
+            atomic_inc(&flow->pending_crypto);
             refcount_inc(&flow->refs);
             spin_unlock_bh(&bucket->lock);
             atomic64_dec(&cfg->l2_workers[owner].assigned_flows);
@@ -839,10 +867,17 @@ mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq)
             return flow;
         }
     }
+    if (!atomic_add_unless(&cfg->flows.rx_count, 1,
+                           MWAN_FLOW_MAX_ACTIVE)) {
+        spin_unlock_bh(&bucket->lock);
+        atomic64_inc(&cfg->flows.table_full);
+        atomic64_dec(&cfg->l2_workers[owner].assigned_flows);
+        kfree(candidate);
+        return NULL;
+    }
     hlist_add_head(&candidate->node, &bucket->head);
-    atomic_inc(&cfg->flows.rx_count);
     atomic64_inc(&cfg->flows.rx_created);
-    refcount_inc(&candidate->refs);
+    refcount_inc(&candidate->refs); /* caller reference */
     spin_unlock_bh(&bucket->lock);
     return candidate;
 }

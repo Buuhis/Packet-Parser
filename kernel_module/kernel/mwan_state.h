@@ -31,6 +31,12 @@
 #define MWAN_FLOW_BALANCE_IDLE_TIMEOUT msecs_to_jiffies(2000)
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
+/* Unknown RX flow tokens have not passed AEAD authentication yet.  Keep
+ * their exposure substantially below the normal authenticated-flow queue so
+ * forged tokens cannot replace the flow-table exhaustion with queue-memory
+ * exhaustion. */
+#define MWAN_L2_CANDIDATE_MAX_PACKETS 256
+#define MWAN_L2_CANDIDATE_MAX_BYTES   (1U * 1024U * 1024U)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
 #define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
 #define MWAN_FLOW_KEY_ID_SHIFT 56
@@ -229,6 +235,9 @@ struct mwan_l2_rx_cb {
 };
 
 #define MWAN_L2_RX_CB_NONLINEAR BIT(0)
+#define MWAN_L2_RX_CB_CANDIDATE BIT(1)
+#define MWAN_L2_RX_CB_FLAGS_MASK \
+    (MWAN_L2_RX_CB_NONLINEAR | MWAN_L2_RX_CB_CANDIDATE)
 #define MWAN_L2_RX_CB_MAGIC     0x4cU
 #define MWAN_L2_RX_CB(skb) ((struct mwan_l2_rx_cb *)((skb)->cb))
 
@@ -332,6 +341,8 @@ struct mwan_l2_worker {
 
     atomic64_t queued_packets;
     atomic64_t queued_bytes;
+    atomic64_t candidate_queued_packets;
+    atomic64_t candidate_queued_bytes;
     atomic64_t max_queued_packets;
     atomic64_t max_queued_bytes;
     atomic64_t enqueued_packets;
@@ -611,7 +622,10 @@ bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
                                    const struct mwan_l2_flow_key *key,
                                    int owner_worker);
 struct mwan_l2_rx_flow *
-mwan_l2_rx_flow_get(struct mwan_config *cfg, u64 flow_token, u32 first_seq);
+mwan_l2_rx_flow_lookup(struct mwan_config *cfg, u64 flow_token);
+struct mwan_l2_rx_flow *
+mwan_l2_rx_flow_get_authenticated(struct mwan_config *cfg, u64 flow_token,
+                                  u32 first_seq);
 void mwan_l2_rx_flow_put(struct mwan_l2_rx_flow *flow);
 void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing);
 bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,

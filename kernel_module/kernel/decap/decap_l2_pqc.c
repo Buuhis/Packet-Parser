@@ -48,9 +48,14 @@ static atomic64_t mwan_l2_rx_handler_accepted;
 static atomic64_t mwan_l2_rx_handler_drop_short;
 static atomic64_t mwan_l2_rx_handler_drop_header;
 static atomic64_t mwan_l2_rx_handler_drop_inactive;
+static atomic64_t mwan_l2_rx_handler_drop_ingress;
 static atomic64_t mwan_l2_rx_handler_drop_key;
 static atomic64_t mwan_l2_rx_handler_drop_flow;
 static atomic64_t mwan_l2_rx_handler_drop_queue;
+static atomic64_t mwan_l2_rx_candidate_enqueued;
+static atomic64_t mwan_l2_rx_candidate_authenticated;
+static atomic64_t mwan_l2_rx_candidate_rejected;
+static atomic64_t mwan_l2_rx_candidate_full;
 static atomic64_t mwan_l2_rx_diag_cpu_flows[NR_CPUS];
 static atomic64_t mwan_l2_diag_cookie;
 
@@ -124,9 +129,14 @@ void mwan_l2_diag_reset_all(void)
     atomic64_set(&mwan_l2_rx_handler_drop_short, 0);
     atomic64_set(&mwan_l2_rx_handler_drop_header, 0);
     atomic64_set(&mwan_l2_rx_handler_drop_inactive, 0);
+    atomic64_set(&mwan_l2_rx_handler_drop_ingress, 0);
     atomic64_set(&mwan_l2_rx_handler_drop_key, 0);
     atomic64_set(&mwan_l2_rx_handler_drop_flow, 0);
     atomic64_set(&mwan_l2_rx_handler_drop_queue, 0);
+    atomic64_set(&mwan_l2_rx_candidate_enqueued, 0);
+    atomic64_set(&mwan_l2_rx_candidate_authenticated, 0);
+    atomic64_set(&mwan_l2_rx_candidate_rejected, 0);
+    atomic64_set(&mwan_l2_rx_candidate_full, 0);
     atomic64_set(&mwan_l2_diag_cookie, 0);
     for (cpu = 0; cpu < NR_CPUS; cpu++)
         atomic64_set(&mwan_l2_rx_diag_cpu_flows[cpu], 0);
@@ -254,17 +264,71 @@ static bool mwan_l2_schedule_rx_worker(struct mwan_l2_worker *worker)
     return queue_work(mwan_l2_wq, &worker->work);
 }
 
+/* The packet_type hook is global for the EtherType, so explicitly restrict
+ * admission to a configured L2-PQC data path.  All configured paths are
+ * accepted: a flow is deliberately not pinned to one ingress because
+ * steering and failover may move it between sd_N devices. */
+static bool mwan_l2_ingress_allowed(const struct mwan_config *cfg,
+                                    const struct sk_buff *skb,
+                                    const struct net_device *dev,
+                                    const struct net_device *orig_dev)
+{
+    int ingress_ifindex;
+    u32 i;
+
+    if (!cfg)
+        return false;
+    /* Match the receive-device precedence already used by MAC discovery. */
+    ingress_ifindex = skb && skb->dev ? skb->dev->ifindex :
+                      (dev ? dev->ifindex :
+                       (orig_dev ? orig_dev->ifindex : 0));
+    if (ingress_ifindex <= 0)
+        return false;
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        const struct mwan_tunnel *tun = &cfg->tunnels[i];
+
+        if (tun->encap_type != MWAN_ENCAP_L2_PQC)
+            continue;
+        if (ingress_ifindex == tun->ifindex ||
+            ingress_ifindex == tun->configured_ifindex)
+            return true;
+    }
+    return false;
+}
+
+/* Unknown tokens have no flow object yet.  Hash them deterministically onto
+ * an online crypto worker so their first packets remain serialized without
+ * reserving an assigned-flow slot before authentication. */
+static int mwan_l2_candidate_worker(const struct mwan_config *cfg,
+                                    u64 flow_token)
+{
+    u32 start;
+    int offset;
+
+    if (!cfg || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -ENODEV;
+    start = lower_32_bits(flow_token & MWAN_FLOW_COOKIE_MASK) %
+            cfg->num_workers;
+    for (offset = 0; offset < cfg->num_workers; offset++) {
+        int idx = (start + offset) % cfg->num_workers;
+
+        if (cpu_online(cfg->l2_workers[idx].cpu))
+            return idx;
+    }
+    return -ENODEV;
+}
+
 static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
-                               struct mwan_l2_rx_flow *flow, u64 flow_token,
-                               u32 flow_seq, u64 packet_nonce,
+                               struct mwan_l2_rx_flow *flow, int owner,
+                               u64 flow_token, u32 flow_seq, u64 packet_nonce,
                                u32 rx_headlen, bool rx_nonlinear,
                                int ingress_cpu)
 {
     struct mwan_l2_worker *worker;
     unsigned int accounted_bytes = skb->truesize;
     u32 diag_id = lower_32_bits(flow_token);
-    int owner = flow->owner_worker;
     int was_scheduled;
+    bool candidate = !flow;
     bool new_diag_flow;
     u32 generation = mwan_l2_diag_generation_get();
     u64 diag_cookie = 0;
@@ -291,8 +355,9 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
 
     worker = &cfg->l2_workers[owner];
     spin_lock(&worker->rx_queue.lock);
-    mwan_pipeline_rx_maybe_promote(cfg, flow, worker,
-                                   lower_32_bits(flow_token));
+    if (flow)
+        mwan_pipeline_rx_maybe_promote(cfg, flow, worker,
+                                       lower_32_bits(flow_token));
     if (worker->rx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
         atomic64_read(&worker->queued_bytes) + accounted_bytes >
             MWAN_L2_QUEUE_MAX_BYTES) {
@@ -307,6 +372,24 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
                               queue_packets, queue_bytes);
         return -ENOSPC;
     }
+    if (candidate &&
+        (atomic64_read(&worker->candidate_queued_packets) >=
+             MWAN_L2_CANDIDATE_MAX_PACKETS ||
+         atomic64_read(&worker->candidate_queued_bytes) + accounted_bytes >
+             MWAN_L2_CANDIDATE_MAX_BYTES)) {
+        u64 queue_packets =
+            atomic64_read(&worker->candidate_queued_packets);
+        u64 queue_bytes = atomic64_read(&worker->candidate_queued_bytes);
+
+        spin_unlock(&worker->rx_queue.lock);
+        atomic64_inc(&worker->dropped_packets);
+        atomic64_inc(&mwan_l2_rx_candidate_full);
+        mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_QUEUE, 0);
+        mwan_l2_rx_drop_trace(MWAN_DROP_RX_CANDIDATE_FULL, worker, skb,
+                              flow_token, flow_seq, -ENOSPC,
+                              queue_packets, queue_bytes);
+        return -EAGAIN;
+    }
 
     BUILD_BUG_ON(sizeof(struct mwan_l2_rx_cb) > sizeof(skb->cb));
     MWAN_L2_RX_CB(skb)->flow_ptr = (uintptr_t)flow;
@@ -318,7 +401,8 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     MWAN_L2_RX_CB(skb)->dispatch_headlen =
         min_t(u32, rx_headlen, U16_MAX);
     MWAN_L2_RX_CB(skb)->dispatch_flags =
-        rx_nonlinear ? MWAN_L2_RX_CB_NONLINEAR : 0;
+        (rx_nonlinear ? MWAN_L2_RX_CB_NONLINEAR : 0) |
+        (candidate ? MWAN_L2_RX_CB_CANDIDATE : 0);
     MWAN_L2_RX_CB(skb)->diag_magic = MWAN_L2_RX_CB_MAGIC;
     MWAN_L2_RX_CB(skb)->diag_check =
         mwan_l2_rx_cb_checksum(MWAN_L2_RX_CB(skb));
@@ -329,7 +413,11 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     atomic64_inc(&worker->queued_packets);
     atomic64_add(accounted_bytes, &worker->queued_bytes);
     atomic64_inc(&worker->enqueued_packets);
-    atomic_inc(&flow->pending_crypto);
+    if (candidate) {
+        atomic64_inc(&worker->candidate_queued_packets);
+        atomic64_add(accounted_bytes, &worker->candidate_queued_bytes);
+        atomic64_inc(&mwan_l2_rx_candidate_enqueued);
+    }
     /* Change 0 -> 1 while holding the same queue lock used by the worker's
      * empty-queue handoff.  This makes queue ownership and scheduled state a
      * single transition instead of two independently visible operations. */
@@ -530,25 +618,35 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
             u64 diag_cookie;
             u32 dispatch_headlen;
             bool dispatch_nonlinear;
+            bool candidate;
             bool cb_ok;
             u64 flow_token = 0;
             u32 flow_seq = 0;
             u64 packet_nonce = 0;
             u64 start_ns = ktime_get_ns();
             bool pipeline_owned = false;
+            int decrypt_ret;
             int ret;
 
             memcpy(&cb, MWAN_L2_RX_CB(skb), sizeof(cb));
+            candidate = cb.dispatch_flags & MWAN_L2_RX_CB_CANDIDATE;
             cb_ok = cb.diag_magic == MWAN_L2_RX_CB_MAGIC &&
                     cb.diag_check == mwan_l2_rx_cb_checksum(&cb) &&
-                    cb.flow_ptr && cb.accounted_bytes == accounted_bytes &&
-                    !(cb.dispatch_flags & ~MWAN_L2_RX_CB_NONLINEAR);
+                    cb.accounted_bytes == accounted_bytes &&
+                    !(cb.dispatch_flags & ~MWAN_L2_RX_CB_FLAGS_MASK) &&
+                    ((candidate && !cb.flow_ptr) ||
+                     (!candidate && cb.flow_ptr));
 
             /* skb->truesize is the value charged at enqueue and is outside
              * skb->cb.  It therefore remains safe accounting input even when
              * every byte of cb must be treated as untrusted. */
             atomic64_dec(&worker->queued_packets);
             atomic64_sub(accounted_bytes, &worker->queued_bytes);
+            if (cb_ok && candidate) {
+                atomic64_dec(&worker->candidate_queued_packets);
+                atomic64_sub(accounted_bytes,
+                             &worker->candidate_queued_bytes);
+            }
             if (unlikely(!cb_ok)) {
                 bool flow_released;
                 u8 accounted_key_id = 0;
@@ -579,7 +677,8 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                 continue;
             }
 
-            flow = (struct mwan_l2_rx_flow *)cb.flow_ptr;
+            flow = candidate ? NULL :
+                   (struct mwan_l2_rx_flow *)cb.flow_ptr;
             dispatch_flow_token = cb.dispatch_flow_token;
             dispatch_flow_seq = cb.dispatch_flow_seq;
             dispatch_nonce = cb.dispatch_nonce;
@@ -589,10 +688,35 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                 cb.dispatch_flags & MWAN_L2_RX_CB_NONLINEAR;
             ret = l2_pqc_decrypt_skb(skb, worker, &flow_token, &flow_seq,
                                      &packet_nonce);
+            decrypt_ret = ret;
             atomic_dec(&worker->crypto_key_pending[
                 (u8)(dispatch_flow_token >> MWAN_FLOW_KEY_ID_SHIFT)]);
             mwan_l2_update_ewma(worker, ktime_get_ns() - start_ns);
             atomic64_inc(&worker->processed_packets);
+
+            /* skb->cb is internal metadata, while these header fields are
+             * covered by the AEAD associated data.  Never create or use flow
+             * state if the authenticated header differs from dispatch. */
+            if (!ret && unlikely(dispatch_flow_token != flow_token ||
+                                 dispatch_flow_seq != flow_seq ||
+                                 dispatch_nonce != packet_nonce))
+                ret = -EINVAL;
+
+            if (!ret && candidate) {
+                flow = mwan_l2_rx_flow_get_authenticated(
+                    worker->cfg, flow_token, flow_seq);
+                if (unlikely(!flow)) {
+                    atomic64_inc(&mwan_l2_rx_handler_drop_flow);
+                    mwan_rekey_diag_count_drop(
+                        worker->cfg, MWAN_REKEY_DROP_RX_FLOW,
+                        (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT));
+                    ret = -ENOSPC;
+                } else {
+                    atomic64_inc(&mwan_l2_rx_candidate_authenticated);
+                }
+            }
+            if (candidate && ret)
+                atomic64_inc(&mwan_l2_rx_candidate_rejected);
 
             if (READ_ONCE(mwan_l2_diag_enabled)) {
                 bool fid_ok = dispatch_flow_token == flow_token;
@@ -607,9 +731,9 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                     atomic64_inc(&mwan_l2_rx_diag_seq_mismatch);
                 if (!nonce_ok)
                     atomic64_inc(&mwan_l2_rx_diag_nonce_mismatch);
-                if (ret) {
+                if (decrypt_ret) {
                     atomic64_inc(&mwan_l2_rx_diag_decrypt_fail);
-                    if (ret == -EBADMSG)
+                    if (decrypt_ret == -EBADMSG)
                         atomic64_inc(&mwan_l2_rx_diag_auth_fail);
                 }
 
@@ -628,9 +752,9 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                                         dispatch_nonlinear,
                                         worker->cpu, raw_smp_processor_id(),
                                         fid_ok, seq_ok, nonce_ok,
-                                        ret ? "fail" : "ok",
-                                        ret == -EBADMSG ? "fail" :
-                                        (ret ? "na" : "ok"), ret);
+                                        decrypt_ret ? "fail" : "ok",
+                                        decrypt_ret == -EBADMSG ? "fail" :
+                                        (decrypt_ret ? "na" : "ok"), ret);
                 else if (first_work)
                     pr_info("mwan_kmod: L2D WORK g=%u c=%llu hdr=%016llx/%u/%016llx cpu=%d/%u token_ok=1 seq_ok=1 auth=ok\n",
                             generation, diag_cookie, flow_token, flow_seq,
@@ -643,7 +767,19 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                 u8 packet_key_id =
                     (u8)(dispatch_flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
 
-                if (ret == -ENOKEY)
+                if (!decrypt_ret && ret == -ENOSPC) {
+                    mwan_l2_rx_drop_trace(
+                        MWAN_DROP_RX_FLOW_FAILED, worker, skb,
+                        dispatch_flow_token, dispatch_flow_seq, ret,
+                        atomic64_read(&worker->queued_packets),
+                        atomic64_read(&worker->queued_bytes));
+                } else if (!decrypt_ret) {
+                    mwan_l2_rx_drop_trace(
+                        MWAN_DROP_RX_WORKER_METADATA, worker, skb,
+                        dispatch_flow_token, dispatch_flow_seq, ret,
+                        atomic64_read(&worker->queued_packets),
+                        atomic64_read(&worker->queued_bytes));
+                } else if (ret == -ENOKEY)
                     mwan_rekey_diag_count_drop(
                         worker->cfg, MWAN_REKEY_DROP_RX_CRYPTO_NO_KEY,
                         packet_key_id);
@@ -655,14 +791,17 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                     mwan_rekey_diag_count_drop(
                         worker->cfg, MWAN_REKEY_DROP_RX_CRYPTO_OTHER,
                         packet_key_id);
-                atomic64_inc(&worker->decrypt_failures);
-                mwan_l2_rx_drop_trace(
-                    ret == -ENOKEY ? MWAN_DROP_RX_CRYPTO_NO_KEY :
-                    ret == -EBADMSG ? MWAN_DROP_RX_AUTH_FAILED :
-                                      MWAN_DROP_RX_CRYPTO_FAILED,
-                    worker, skb, dispatch_flow_token, dispatch_flow_seq,
-                    ret, atomic64_read(&worker->queued_packets),
-                    atomic64_read(&worker->queued_bytes));
+                if (decrypt_ret) {
+                    atomic64_inc(&worker->decrypt_failures);
+                    mwan_l2_rx_drop_trace(
+                        ret == -ENOKEY ? MWAN_DROP_RX_CRYPTO_NO_KEY :
+                        ret == -EBADMSG ? MWAN_DROP_RX_AUTH_FAILED :
+                                          MWAN_DROP_RX_CRYPTO_FAILED,
+                        worker, skb, dispatch_flow_token,
+                        dispatch_flow_seq, ret,
+                        atomic64_read(&worker->queued_packets),
+                        atomic64_read(&worker->queued_bytes));
+                }
                 kfree_skb(skb);
             } else {
                 /* At an RX bottleneck the inner TCP header is visible only
@@ -906,15 +1045,21 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     seq_printf(m, "decrypt_fail=%lld auth_fail=%lld\n",
                atomic64_read(&mwan_l2_rx_diag_decrypt_fail),
                atomic64_read(&mwan_l2_rx_diag_auth_fail));
-    seq_printf(m, "rx_handler seen=%lld accepted=%lld drop_short=%lld drop_header=%lld drop_inactive=%lld drop_key=%lld drop_flow=%lld drop_queue=%lld\n",
+    seq_printf(m, "rx_handler seen=%lld accepted=%lld drop_short=%lld drop_header=%lld drop_inactive=%lld drop_ingress=%lld drop_key=%lld drop_flow=%lld drop_queue=%lld\n",
                atomic64_read(&mwan_l2_rx_handler_seen),
                atomic64_read(&mwan_l2_rx_handler_accepted),
                atomic64_read(&mwan_l2_rx_handler_drop_short),
                atomic64_read(&mwan_l2_rx_handler_drop_header),
                atomic64_read(&mwan_l2_rx_handler_drop_inactive),
+               atomic64_read(&mwan_l2_rx_handler_drop_ingress),
                atomic64_read(&mwan_l2_rx_handler_drop_key),
                atomic64_read(&mwan_l2_rx_handler_drop_flow),
                atomic64_read(&mwan_l2_rx_handler_drop_queue));
+    seq_printf(m, "rx_candidate enqueued=%lld authenticated=%lld rejected=%lld full=%lld\n",
+               atomic64_read(&mwan_l2_rx_candidate_enqueued),
+               atomic64_read(&mwan_l2_rx_candidate_authenticated),
+               atomic64_read(&mwan_l2_rx_candidate_rejected),
+               atomic64_read(&mwan_l2_rx_candidate_full));
     mwan_mtu_stats_get(MWAN_MTU_PROFILE_BYPASS, &bypass_mtu);
     mwan_mtu_stats_get(MWAN_MTU_PROFILE_L2_PQC, &l2_mtu);
     seq_printf(m, "mtu_bypass fits=%llu gso=%llu oversize=%llu invalid=%llu icmp_attempted=%llu\n",
@@ -1132,10 +1277,10 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
     u32 rx_headlen;
     bool rx_nonlinear;
     int ingress_cpu;
+    int owner;
     int ret;
 
     (void)pt;
-    (void)orig_dev;
     if (!skb)
         return NET_RX_DROP;
     atomic64_inc(&mwan_l2_rx_handler_seen);
@@ -1179,10 +1324,24 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    if (!cfg || !cfg->encrypt_on || !cfg->l2_workers) {
+    if (!cfg || !cfg->encrypt_on || cfg->encrypt_layer != 2 ||
+        cfg->encrypt_type != MWAN_CRYPT_PQC_GCM || !cfg->l2_workers) {
         atomic64_inc(&mwan_l2_rx_handler_drop_inactive);
         mwan_l2_rx_drop_trace(MWAN_DROP_RX_INACTIVE, NULL, skb,
                               flow_token, flow_seq, -ENODEV, 0, 0);
+        rcu_read_unlock();
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+    if (!mwan_l2_ingress_allowed(cfg, skb, dev, orig_dev)) {
+        atomic64_inc(&mwan_l2_rx_handler_drop_ingress);
+        mwan_l2_rx_drop_trace(MWAN_DROP_RX_INGRESS_REJECT, NULL, skb,
+                              flow_token, flow_seq, -EPERM, 0, 0);
+        if (READ_ONCE(mwan_l2_diag_enabled))
+            pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=ingress token=%016llx seq=%u dev=%s orig=%s\n",
+                                flow_token, flow_seq,
+                                dev ? dev->name : "none",
+                                orig_dev ? orig_dev->name : "none");
         rcu_read_unlock();
         kfree_skb(skb);
         return NET_RX_DROP;
@@ -1209,11 +1368,13 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         return NET_RX_DROP;
     }
 
-    flow = mwan_l2_rx_flow_get(cfg, flow_token, flow_seq);
-    if (!flow) {
+    flow = mwan_l2_rx_flow_lookup(cfg, flow_token);
+    owner = flow ? flow->owner_worker :
+                   mwan_l2_candidate_worker(cfg, flow_token);
+    if (owner < 0) {
         atomic64_inc(&mwan_l2_rx_handler_drop_flow);
         mwan_l2_rx_drop_trace(MWAN_DROP_RX_FLOW_FAILED, NULL, skb,
-                              flow_token, flow_seq, -ENOSPC, 0, 0);
+                              flow_token, flow_seq, -ENODEV, 0, 0);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_RX_FLOW,
                                    packet_key_id);
         if (READ_ONCE(mwan_l2_diag_enabled))
@@ -1221,10 +1382,14 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
                                 flow_token, flow_seq, packet_key_id,
                                 dev ? dev->name : "none");
         rcu_read_unlock();
+        if (flow) {
+            atomic_dec(&flow->pending_crypto);
+            mwan_l2_rx_flow_put(flow);
+        }
         kfree_skb(skb);
         return NET_RX_DROP;
     }
-    ret = mwan_l2_enqueue_skb(cfg, skb, flow, flow_token, flow_seq,
+    ret = mwan_l2_enqueue_skb(cfg, skb, flow, owner, flow_token, flow_seq,
                               packet_nonce,
                               rx_headlen, rx_nonlinear, ingress_cpu);
     rcu_read_unlock();
@@ -1232,7 +1397,7 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
         atomic64_inc(&mwan_l2_rx_handler_drop_queue);
         /* The enqueue helper already records queue-full with its owner CPU.
          * Record other enqueue failures here without duplicating ENOSPC. */
-        if (ret != -ENOSPC)
+        if (ret != -ENOSPC && ret != -EAGAIN)
             mwan_l2_rx_drop_trace(
                                   ret == -ENODEV ?
                                       MWAN_DROP_RX_OWNER_INVALID :
@@ -1243,7 +1408,10 @@ static int l2_pqc_rx_handler(struct sk_buff *skb, struct net_device *dev,
             pr_warn_ratelimited("mwan_kmod: L2D RX_HANDLER_DROP reason=enqueue token=%016llx seq=%u key=%u dev=%s err=%d\n",
                                 flow_token, flow_seq, packet_key_id,
                                 dev ? dev->name : "none", ret);
-        mwan_l2_rx_flow_put(flow);
+        if (flow) {
+            atomic_dec(&flow->pending_crypto);
+            mwan_l2_rx_flow_put(flow);
+        }
         kfree_skb(skb);
         return NET_RX_DROP;
     }

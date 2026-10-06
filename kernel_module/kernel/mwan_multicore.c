@@ -1280,9 +1280,16 @@ void mwan_pipeline_wait_for_room(struct mwan_config *cfg, int pipeline_idx,
 static bool mwan_l2_rx_cb_valid(const struct sk_buff *skb,
                                 const struct mwan_l2_rx_cb *cb)
 {
+    bool candidate;
+
+    if (!skb || !cb)
+        return false;
+    candidate = cb->dispatch_flags & MWAN_L2_RX_CB_CANDIDATE;
     return skb && cb && cb->diag_magic == MWAN_L2_RX_CB_MAGIC &&
-           cb->flow_ptr && cb->accounted_bytes == skb->truesize &&
-           !(cb->dispatch_flags & ~MWAN_L2_RX_CB_NONLINEAR) &&
+           cb->accounted_bytes == skb->truesize &&
+           !(cb->dispatch_flags & ~MWAN_L2_RX_CB_FLAGS_MASK) &&
+           ((candidate && !cb->flow_ptr) ||
+            (!candidate && cb->flow_ptr)) &&
            cb->diag_check == mwan_l2_rx_cb_checksum(cb);
 }
 
@@ -1748,10 +1755,16 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
                 atomic_dec(&worker->crypto_key_pending[
                     (u8)(cb.dispatch_flow_token >>
                          MWAN_FLOW_KEY_ID_SHIFT)]);
+            if (cb_ok &&
+                (cb.dispatch_flags & MWAN_L2_RX_CB_CANDIDATE)) {
+                atomic64_dec(&worker->candidate_queued_packets);
+                atomic64_sub(skb->truesize,
+                             &worker->candidate_queued_bytes);
+            }
             if (flow) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_rx_flow_put(flow);
-            } else if (!mwan_release_rx_queue_ref(worker, skb))
+            } else if (!cb_ok && !mwan_release_rx_queue_ref(worker, skb))
                 pr_warn_ratelimited("mwan_kmod: unable to recover corrupt RX queue reference during cleanup on CPU %d\n",
                                     worker->cpu);
             mwan_worker_drop_trace(
