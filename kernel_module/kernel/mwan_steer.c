@@ -4,6 +4,7 @@
 #include "mwan_mac_discovery.h"
 #include "mwan_multicore.h"
 #include "mwan_drop_trace.h"
+#include "mwan_control_plane.h"
 
 #include <linux/module.h>
 #include <linux/netfilter.h>
@@ -99,14 +100,14 @@ static void mwan_fw_diag_log(const char *stage, struct sk_buff *skb,
         return;
 
     ct = nf_ct_get(skb, &ctinfo);
-    pr_info_ratelimited("mwan_kmod: FWDIAG stage=%s in=%s out=%s iif=%d "
+    pr_info_ratelimited("mwan_kmod: FWDIAG stage=%s in=%s out=%s iif=%d mark=%#x "
                         "src=%pI4 dst=%pI4 proto=%u len=%u "
                         "ct=%s/%d tracked=%u confirmed=%u encap=%d "
                         "action=%s selected=%s\n",
                         stage,
                         state && state->in ? state->in->name : "-",
                         state && state->out ? state->out->name : "-",
-                        skb->skb_iif, &iph->saddr, &iph->daddr,
+                        skb->skb_iif, skb->mark, &iph->saddr, &iph->daddr,
                         iph->protocol, skb->len,
                         mwan_ct_info_name(ct, ctinfo),
                         ct ? (int)ctinfo : -1, !!ct,
@@ -115,8 +116,10 @@ static void mwan_fw_diag_log(const char *stage, struct sk_buff *skb,
                         selected_dev ? selected_dev : "-");
 }
 
-/* Helper function to check if packet is PQC handshake traffic (UDP port 7090) */
-static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *iph)
+/* Port 7090 is shared by the PQC control plane and ordinary applications.
+ * The port alone must therefore never grant the L2-PQC encryption bypass. */
+static inline bool is_pqc_udp_7090_packet(struct sk_buff *skb,
+                                          struct iphdr *iph)
 {
     struct udphdr udph_buf;
     const struct udphdr *udph;
@@ -142,6 +145,16 @@ static inline bool is_pqc_handshake_packet(struct sk_buff *skb, struct iphdr *ip
         return false;
 
     return udph->dest == htons(7090) || udph->source == htons(7090);
+}
+
+static inline bool is_pqc_handshake_packet(struct sk_buff *skb,
+                                           struct iphdr *iph)
+{
+    if (!is_pqc_udp_7090_packet(skb, iph))
+        return false;
+
+    return (skb->mark & MWAN_PQC_HS_SOCKET_MARK_MASK) ==
+           MWAN_PQC_HS_SOCKET_MARK;
 }
 
 /* Single-hop BFD probes belong to the tunnel selected by their bound
@@ -265,7 +278,7 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
      * must enter the encryption pipeline instead of escaping in plaintext.
      * Preserve the legacy bypass for the other encapsulation modes until
      * their control-plane paths are audited separately. */
-    if (is_pqc_handshake_packet(skb, iph)) {
+    if (is_pqc_udp_7090_packet(skb, iph)) {
         struct mwan_tunnel *routed_tun =
             find_mwan_tunnel(cfg, state->out->ifindex);
 
@@ -277,6 +290,19 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
              * output path, including normal MTU/fragmentation handling. */
             mwan_fw_diag_log("TX_POST", skb, state, -1,
                              "ACCEPT_PQC_HANDSHAKE", state->out->name);
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
+
+        /* A real handshake packet is marked by the userspace socket and bound
+         * to the configured exchange IP/interface.  It must remain usable
+         * while either peer has no traffic key, including after rmmod/reboot.
+         * skb marks are local metadata and are never exposed on the wire. */
+        if (is_pqc_handshake_packet(skb, iph)) {
+            mwan_fw_diag_log("TX_POST", skb, state,
+                             routed_tun->encap_type,
+                             "ACCEPT_MARKED_PQC_HANDSHAKE",
+                             state->out->name);
             rcu_read_unlock();
             return NF_ACCEPT;
         }
@@ -477,7 +503,7 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
         }
 
         /* Bypass decryption for PQC handshake packets */
-        if (is_pqc_handshake_packet(skb, iph)) {
+        if (is_pqc_udp_7090_packet(skb, iph)) {
             rcu_read_unlock();
             return NF_ACCEPT;
         }

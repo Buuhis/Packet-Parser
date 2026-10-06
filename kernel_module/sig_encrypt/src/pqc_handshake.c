@@ -158,6 +158,13 @@ static pthread_cond_t g_worker_state_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t g_rx_tuple_drop_count;
 static uint64_t g_rx_tuple_drop_suppressed;
 static uint64_t g_rx_tuple_drop_last_log;
+static char g_dispatcher_ifname[IFNAMSIZ];
+static char g_dispatcher_local_ip[INET_ADDRSTRLEN];
+
+typedef struct {
+    char ifname[IFNAMSIZ];
+    char local_ip[INET_ADDRSTRLEN];
+} pqc_dispatcher_endpoint_t;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
 static void *pqc_udp_dispatcher_thread(void *arg);
@@ -166,6 +173,16 @@ static uint64_t get_time_ms_hs(void);
 static bool pqc_dispatcher_is_running(void) {
     return atomic_load_explicit(&g_dispatcher_running,
                                 memory_order_acquire);
+}
+
+static int pqc_hs_mark_tx_socket(int sockfd) {
+    int mark = (int)MWAN_PQC_HS_SOCKET_MARK;
+
+    if (sockfd < 0)
+        return -EINVAL;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) < 0)
+        return -errno;
+    return 0;
 }
 
 static const char *pqc_runtime_state_name(pqc_runtime_state_t state) {
@@ -2062,16 +2079,36 @@ static void pqc_dispatcher_publish_failure(int error_code) {
                           memory_order_release);
     g_dispatcher_state = PQC_RUNTIME_FAILED;
     g_dispatcher_last_error = error_code ? error_code : EIO;
+    g_dispatcher_ifname[0] = '\0';
+    g_dispatcher_local_ip[0] = '\0';
     pthread_cond_broadcast(&g_dispatcher_cond);
     pthread_mutex_unlock(&g_key_mutex);
 }
 
-static int pqc_dispatcher_ensure_running(void) {
+static int pqc_dispatcher_ensure_running(const char *ifname,
+                                         const char *local_ip) {
     struct timespec deadline;
     pthread_t udp_tid;
     int rc;
 
+    if (!ifname || !ifname[0] || strlen(ifname) >= IFNAMSIZ ||
+        !local_ip || !local_ip[0] || strlen(local_ip) >= INET_ADDRSTRLEN)
+        return -EINVAL;
+
     pthread_mutex_lock(&g_key_mutex);
+    if ((g_dispatcher_state == PQC_RUNTIME_RUNNING &&
+         pqc_dispatcher_is_running()) ||
+        g_dispatcher_state == PQC_RUNTIME_STARTING) {
+        if (strcmp(g_dispatcher_ifname, ifname) != 0 ||
+            strcmp(g_dispatcher_local_ip, local_ip) != 0) {
+            pthread_mutex_unlock(&g_key_mutex);
+            fprintf(stderr,
+                    "[PQC-HS] UDP dispatcher already owns %s/%s; cannot also bind %s/%s.\n",
+                    g_dispatcher_ifname, g_dispatcher_local_ip,
+                    ifname, local_ip);
+            return -EADDRINUSE;
+        }
+    }
     if (g_dispatcher_state == PQC_RUNTIME_RUNNING &&
         pqc_dispatcher_is_running()) {
         pthread_mutex_unlock(&g_key_mutex);
@@ -2079,14 +2116,31 @@ static int pqc_dispatcher_ensure_running(void) {
     }
 
     if (g_dispatcher_state != PQC_RUNTIME_STARTING) {
+        pqc_dispatcher_endpoint_t *endpoint = calloc(1, sizeof(*endpoint));
+
+        if (!endpoint) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return -ENOMEM;
+        }
+        snprintf(endpoint->ifname, sizeof(endpoint->ifname), "%s", ifname);
+        snprintf(endpoint->local_ip, sizeof(endpoint->local_ip), "%s",
+                 local_ip);
+        snprintf(g_dispatcher_ifname, sizeof(g_dispatcher_ifname), "%s",
+                 ifname);
+        snprintf(g_dispatcher_local_ip, sizeof(g_dispatcher_local_ip), "%s",
+                 local_ip);
         g_dispatcher_state = PQC_RUNTIME_STARTING;
         g_dispatcher_last_error = 0;
         atomic_store_explicit(&g_dispatcher_running, false,
                               memory_order_release);
-        rc = pthread_create(&udp_tid, NULL, pqc_udp_dispatcher_thread, NULL);
+        rc = pthread_create(&udp_tid, NULL, pqc_udp_dispatcher_thread,
+                            endpoint);
         if (rc != 0) {
+            free(endpoint);
             g_dispatcher_state = PQC_RUNTIME_FAILED;
             g_dispatcher_last_error = rc;
+            g_dispatcher_ifname[0] = '\0';
+            g_dispatcher_local_ip[0] = '\0';
             pthread_cond_broadcast(&g_dispatcher_cond);
             pthread_mutex_unlock(&g_key_mutex);
             fprintf(stderr,
@@ -2168,8 +2222,16 @@ static int pqc_interface_ipv4_ready(const char *ifname,
 }
 
 static void* pqc_udp_dispatcher_thread(void* arg) {
-    (void)arg;
+    pqc_dispatcher_endpoint_t endpoint;
     int runtime_error = 0;
+
+    if (!arg) {
+        pqc_dispatcher_publish_failure(EINVAL);
+        return NULL;
+    }
+    endpoint = *(const pqc_dispatcher_endpoint_t *)arg;
+    free(arg);
+
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         int saved_errno = errno;
@@ -2179,7 +2241,16 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     }
 
     int optval = 1;
-    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR,
+                   &optval, sizeof(optval)) < 0) {
+        int saved_errno = errno;
+
+        fprintf(stderr, "[PQC-DISPATCHER] Cannot enable SO_REUSEADDR: %s\n",
+                strerror(saved_errno));
+        close(sockfd);
+        pqc_dispatcher_publish_failure(saved_errno);
+        return NULL;
+    }
     if (setsockopt(sockfd, IPPROTO_IP, IP_PKTINFO,
                    &optval, sizeof(optval)) < 0) {
         int saved_errno = errno;
@@ -2191,16 +2262,36 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
         pqc_dispatcher_publish_failure(saved_errno);
         return NULL;
     }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_BINDTODEVICE, endpoint.ifname,
+                   strlen(endpoint.ifname) + 1) < 0) {
+        int saved_errno = errno;
+
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Cannot bind listener to interface %s: %s\n",
+                endpoint.ifname, strerror(saved_errno));
+        close(sockfd);
+        pqc_dispatcher_publish_failure(saved_errno);
+        return NULL;
+    }
 
     struct sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
     servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, endpoint.local_ip, &servaddr.sin_addr) != 1) {
+        fprintf(stderr, "[PQC-DISPATCHER] Invalid local IP %s.\n",
+                endpoint.local_ip);
+        close(sockfd);
+        pqc_dispatcher_publish_failure(EINVAL);
+        return NULL;
+    }
     servaddr.sin_port = htons(PQC_HS_PORT);
 
     if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0) {
         int saved_errno = errno;
-        perror("[PQC-DISPATCHER] Bind failed (Port 7090)");
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Bind failed on %s/%s:%d: %s\n",
+                endpoint.ifname, endpoint.local_ip, PQC_HS_PORT,
+                strerror(saved_errno));
         close(sockfd);
         pqc_dispatcher_publish_failure(saved_errno);
         return NULL;
@@ -2217,7 +2308,9 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     uint8_t buffer[PQC_HS_MSG_MAX_SZ];
     struct sockaddr_in clientaddr;
 
-    fprintf(stderr, "[PQC-DISPATCHER] UDP Listener running on port %d\n", PQC_HS_PORT);
+    fprintf(stderr,
+            "[PQC-DISPATCHER] UDP listener running on %s/%s:%d\n",
+            endpoint.ifname, endpoint.local_ip, PQC_HS_PORT);
 
     while (pqc_dispatcher_is_running()) {
         struct iovec iov = {
@@ -2280,6 +2373,8 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
         g_dispatcher_state = PQC_RUNTIME_FAILED;
         g_dispatcher_last_error = runtime_error ? runtime_error : ECONNRESET;
     }
+    g_dispatcher_ifname[0] = '\0';
+    g_dispatcher_local_ip[0] = '\0';
     pthread_cond_broadcast(&g_dispatcher_cond);
     pthread_mutex_unlock(&g_key_mutex);
     return NULL;
@@ -2383,6 +2478,20 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
         free(my_priv); free(my_pub); free(peer_pub);
         pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, saved_errno, false);
         return NULL;
+    }
+
+    {
+        int mark_rc = pqc_hs_mark_tx_socket(sockfd);
+
+        if (mark_rc != 0) {
+            fprintf(stderr,
+                    "[PQC-WORKER] Cannot mark handshake socket for Profile %d: %s\n",
+                    profile_id, strerror(-mark_rc));
+            close(sockfd);
+            free(my_priv); free(my_pub); free(peer_pub);
+            pqc_worker_publish_state(b, PQC_RUNTIME_FAILED, -mark_rc, false);
+            return NULL;
+        }
     }
 
     if (wan_ifname[0] == '\0' ||
@@ -3097,7 +3206,8 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
         return rc;
     }
 
-    rc = pqc_dispatcher_ensure_running();
+    rc = pqc_dispatcher_ensure_running(configured_ifname,
+                                       configured_local_ip);
     if (rc != 0) {
         pthread_mutex_lock(&g_key_mutex);
         if (binding_idx < g_policy_bindings_count &&

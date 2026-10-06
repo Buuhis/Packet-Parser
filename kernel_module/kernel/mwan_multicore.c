@@ -2,6 +2,7 @@
 #include "mwan_drop_trace.h"
 #include "mwan_steer.h"
 #include "mwan_tunnel_balance.h"
+#include "mwan_control_plane.h"
 
 #include <linux/cpu.h>
 #include <linux/cpumask.h>
@@ -2202,14 +2203,25 @@ u32 mwan_multicore_flow_info(struct sk_buff *skb,
     return hash;
 }
 
-static bool mwan_is_control_udp_port(__be16 port)
+static bool mwan_is_bfd_control_udp_port(__be16 port)
 {
     u16 host = ntohs(port);
 
-    return host == MWAN_CONTROL_PQC_PORT ||
-           host == MWAN_CONTROL_BFD_PORT_1 ||
+    return host == MWAN_CONTROL_BFD_PORT_1 ||
            host == MWAN_CONTROL_BFD_PORT_2 ||
            host == MWAN_CONTROL_BFD_PORT_3;
+}
+
+static bool mwan_is_marked_pqc_control(const struct sk_buff *skb,
+                                       const struct udphdr *udp)
+{
+    if (!skb || !udp ||
+        (skb->mark & MWAN_PQC_HS_SOCKET_MARK_MASK) !=
+            MWAN_PQC_HS_SOCKET_MARK)
+        return false;
+
+    return ntohs(udp->source) == MWAN_CONTROL_PQC_PORT ||
+           ntohs(udp->dest) == MWAN_CONTROL_PQC_PORT;
 }
 
 static bool mwan_is_ipsec_udp_control(struct sk_buff *skb,
@@ -2291,8 +2303,9 @@ enum mwan_packet_class mwan_multicore_packet_classify(struct sk_buff *skb)
 
         udp = skb_header_pointer(skb, network_offset + ip_hlen,
                                  sizeof(udp_buf), &udp_buf);
-        if (!udp || mwan_is_control_udp_port(udp->source) ||
-            mwan_is_control_udp_port(udp->dest) ||
+        if (!udp || mwan_is_marked_pqc_control(skb, udp) ||
+            mwan_is_bfd_control_udp_port(udp->source) ||
+            mwan_is_bfd_control_udp_port(udp->dest) ||
             mwan_is_ipsec_udp_control(skb, udp, network_offset, ip_hlen,
                                       ip_len))
             return MWAN_PACKET_CONTROL;

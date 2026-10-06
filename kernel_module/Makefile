@@ -1,5 +1,5 @@
 CC      := gcc-12
-CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Isrc -Isig_encrypt/inc -Ifailover/inc -I/usr/include/postgresql -I/usr/include/libnl3
+CFLAGS  := -O2 -Wall -Wextra -std=gnu11 -Iinclude -Isrc -Isig_encrypt/inc -Ifailover/inc -I/usr/include/postgresql -I/usr/include/libnl3
 # Resolve libscrypt.so relative to the installed daemon instead of a development
 # path.  The package installs it in /usr/lib/sd-wan.
 LDFLAGS := -pthread -lpq -lnl-3 -lnl-genl-3 -Lsig_encrypt/lib -Wl,--disable-new-dtags,-rpath,'$$ORIGIN/../lib/sd-wan' -lscrypt -lcrypto

@@ -1,6 +1,6 @@
 obj-m += mwan_kmod.o
 
-ccflags-y += -I$(src)/../bitrate
+ccflags-y += -I$(src)/../bitrate -I$(src)/../include
 
 BITRATE_BUILD_ARTIFACTS := $(CURDIR)/../bitrate/mwan_bitrate.o \
                            $(CURDIR)/../bitrate/.mwan_bitrate.o.cmd

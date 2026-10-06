@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "mwan_control_plane.h"
 #include "pqc_key_rotation.h"
 
 #define PQC_HS_PORT        7090
