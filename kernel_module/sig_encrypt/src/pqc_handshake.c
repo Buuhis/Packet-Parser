@@ -650,7 +650,13 @@ static int pqc_hs_send_handshake_request(policy_key_binding_t *b,
 
         if (rc != 0) return rc;
         pthread_mutex_lock(&g_key_mutex);
-        if (!b->local_request_id) b->local_request_id = request_id;
+        if (!b->local_request_id) {
+            b->local_request_id = request_id;
+            /* This ID is now the active responder challenge.  Timestamp its
+             * creation so an overlapping signed keepalive cannot immediately
+             * replace it with a second challenge while HELLO is in flight. */
+            b->last_recovery_request_time = get_time_ms_hs();
+        }
         request_id = b->local_request_id;
         pthread_mutex_unlock(&g_key_mutex);
     }
@@ -1951,14 +1957,19 @@ void sig_pqc_feed_rx_packet(const uint8_t *payload, int len,
                 peer_status.epoch != b->peer_keepalive_epoch) {
                 uint64_t now = get_time_ms_hs();
 
+                local_state = pqc_hs_l3_state_locked(b);
+
                 /* An authenticated new responder-side view of the peer can
                  * indicate that the initiator rebooted.  Do not discard
                  * CURRENT: issue a new challenge and require a matching
-                 * signed HELLO.  Epochs from completed sessions are replay. */
+                 * signed HELLO.  An in-progress handshake already owns one
+                 * challenge; keep it stable until success or timeout instead
+                 * of replacing it because a keepalive crossed the POKE. */
                 if (!b->is_initiator &&
+                    local_state != PQC_HS_STATE_HANDSHAKING &&
+                    b->pending_peer_epoch == 0 &&
                     !pqc_hs_peer_epoch_seen_locked(
                         b, peer_status.epoch) &&
-                    b->pending_peer_epoch != peer_status.epoch &&
                     (b->last_recovery_request_time == 0 ||
                      now < b->last_recovery_request_time ||
                      now - b->last_recovery_request_time >=
@@ -2959,6 +2970,25 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                 last_prepare_error = 0;
 
                 while (pqc_dispatcher_is_running() && !b->key_ready && !b->thread_exit_sig) {
+                    uint64_t active_challenge;
+
+                    pthread_mutex_lock(&g_key_mutex);
+                    active_challenge = b->peer_request_id;
+                    pthread_mutex_unlock(&g_key_mutex);
+                    if (active_challenge != responder_challenge) {
+                        PQC_HS_DIAG("event=HELLO_REBUILD profile=%d "
+                                    "old_session=%u old_challenge=%llu "
+                                    "new_challenge=%llu",
+                                    profile_id, session_id,
+                                    (unsigned long long)responder_challenge,
+                                    (unsigned long long)active_challenge);
+                        /* The dispatcher authenticated a new POKE while this
+                         * HELLO was in flight.  The KEM keypair, session ID,
+                         * signed payload and challenge are one transaction;
+                         * leave this retry loop so the outer loop rebuilds all
+                         * of them from the new challenge. */
+                        break;
+                    }
                     if (b->handshake_start_time == 0) {
                         b->handshake_start_time = get_time_ms_hs();
                     }
