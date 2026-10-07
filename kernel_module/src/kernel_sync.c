@@ -1,6 +1,7 @@
 #include "kernel_sync.h"
 #include "config/config_semantics.h"
 #include "failover.h"
+#include "config/provision_reconcile.h"
 #include "utils/logger.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -324,6 +325,10 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     uint8_t pqc_key_ids[KEY_SLOT_COUNT] = {0};
     bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
     bool have_pqc_slots = false;
+    app_context_t present_ctx;
+    const app_context_t *push_ctx = ctx;
+    size_t missing_tunnels = 0;
+    int present_ret = 0;
 
     if (!ctx)
         return KERNEL_SYNC_ERROR;
@@ -331,6 +336,18 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         log_error("Refusing to push invalid weight snapshot for profile %d",
                   ctx->cfg.node_id);
         return KERNEL_SYNC_ERROR;
+    }
+
+    /* A PQC profile is desired state.  Missing net_devices do not invalidate
+     * the profile: only the interfaces acknowledged by -id/-a are serialized
+     * into the current kernel snapshot.  The complete userspace snapshot is
+     * retained so a later -a can add one tunnel without reconstructing or
+     * restarting the other tunnels. */
+    if (ctx->cfg.encrypt.enabled &&
+        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        present_ret = provision_reconcile_build_present(
+            ctx, &present_ctx, &missing_tunnels);
+        push_ctx = &present_ctx;
     }
 
     push_id = __atomic_add_fetch(&push_generation, 1, __ATOMIC_RELAXED);
@@ -348,28 +365,32 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         ctx->cfg.encrypt.key_len != 32) {
         uint32_t discovery_generation = 0;
         int discovery_ret = kernel_sync_register_pending_discovery(
-            ctx, &discovery_generation);
+            push_ctx, &discovery_generation);
 
         if (discovery_ret) {
             log_error("[CFG-TRACE push=%lu] DISCOVERY_REGISTER_FAILED error=%s",
                       push_id, strerror(-discovery_ret));
             return KERNEL_SYNC_ERROR;
         }
-        /* On initial activation there is no datapath to protect, so BFD may
-         * run entirely against pending state. During a re-handshake, keep the
-         * existing active BFD sessions untouched until the new full config is
-         * ready; otherwise a pending generation could disrupt healthy paths. */
+        /* Pending state is fail-closed registration only.  Discovery and BFD
+         * start after the authenticated key is installed, so neither control
+         * protocol can leak plaintext before activation. */
         if (__atomic_load_n(&active_kernel_config_generation,
-                            __ATOMIC_ACQUIRE) == 0) {
-            (void)failover_service_reconcile(ctx, discovery_generation);
-        } else {
+                            __ATOMIC_ACQUIRE) != 0) {
             log_info("[DISCOVERY-CONFIG] active datapath generation=%u preserved while pending generation=%u waits for PQC key",
                      __atomic_load_n(&active_kernel_config_generation,
                                      __ATOMIC_ACQUIRE),
                      discovery_generation);
         }
-        log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu (active SET_CONFIG not sent)",
-                 push_id, ctx->cfg.encrypt.key_len);
+        log_info("[CFG-TRACE push=%lu] DEFERRED reason=PQC_KEY_NOT_READY key_len=%zu present=%zu missing=%zu (active SET_CONFIG not sent)",
+                 push_id, ctx->cfg.encrypt.key_len,
+                 push_ctx->cfg.sdwan_tun_count, missing_tunnels);
+        return KERNEL_SYNC_DEFERRED;
+    }
+
+    if (present_ret == -EAGAIN && missing_tunnels != 0) {
+        log_info("[CFG-TRACE push=%lu] DEFERRED reason=WAIT_TUNNEL present=0 missing=%zu",
+                 push_id, missing_tunnels);
         return KERNEL_SYNC_DEFERRED;
     }
 
@@ -381,13 +402,13 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
                                         __ATOMIC_RELAXED) &
                      ~MWAN_DISCOVERY_GENERATION_FLAG;
 
-    if (ctx->cfg.encrypt.enabled &&
-        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
-        sig_pqc_snapshot_keys(ctx->cfg.node_id, pqc_keys, pqc_key_ids,
+    if (push_ctx->cfg.encrypt.enabled &&
+        push_ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+        sig_pqc_snapshot_keys(push_ctx->cfg.node_id, pqc_keys, pqc_key_ids,
                               pqc_slots_valid) == 0 &&
         pqc_slots_valid[KEY_SLOT_CURRENT] &&
         pqc_key_ids[KEY_SLOT_CURRENT] != 0 &&
-        memcmp(pqc_keys[KEY_SLOT_CURRENT], ctx->cfg.encrypt.key,
+        memcmp(pqc_keys[KEY_SLOT_CURRENT], push_ctx->cfg.encrypt.key,
                PQC_TRAFFIC_KEY_SZ) == 0) {
         have_pqc_slots = true;
     }
@@ -418,12 +439,12 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
 
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MWAN_CMD_SET_CONFIG, MWAN_GENL_VERSION);
 
-    nla_put_u32(msg, MWAN_ATTR_NODE_ID, ctx->cfg.node_id);
+    nla_put_u32(msg, MWAN_ATTR_NODE_ID, push_ctx->cfg.node_id);
     nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation);
     
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
-    for (size_t i = 0; i < ctx->cfg.sdwan_tun_count; i++) {
-        const sdwan_tun_cfg_t *tun = &ctx->cfg.sdwan_tuns[i];
+    for (size_t i = 0; i < push_ctx->cfg.sdwan_tun_count; i++) {
+        const sdwan_tun_cfg_t *tun = &push_ctx->cfg.sdwan_tuns[i];
         unsigned int idx = if_nametoindex(tun->tunnel_ifname);
         if (idx == 0) {
             log_error("Tunnel interface '%s' does not exist",
@@ -444,12 +465,12 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     nla_nest_end(msg, tunnels);
 
     /* Sync Encryption Config */
-    if (ctx->cfg.encrypt.enabled) {
+    if (push_ctx->cfg.encrypt.enabled) {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   1);
-        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_LAYER, ctx->cfg.encrypt.layer);
-        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  ctx->cfg.encrypt.type);
-        nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   ctx->cfg.encrypt.key_len, ctx->cfg.encrypt.key);
-        nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     ctx->cfg.encrypt.salt);
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_LAYER, push_ctx->cfg.encrypt.layer);
+        nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  push_ctx->cfg.encrypt.type);
+        nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   push_ctx->cfg.encrypt.key_len, push_ctx->cfg.encrypt.key);
+        nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     push_ctx->cfg.encrypt.salt);
         if (have_pqc_slots) {
             nla_put_u8(msg, MWAN_ATTR_KEY_ID,
                        pqc_key_ids[KEY_SLOT_CURRENT]);
@@ -467,13 +488,13 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         }
         
         const char *type_str = "AES-GCM-128";
-        if (ctx->cfg.encrypt.type == 1) type_str = "AES-GCM-256";
-        else if (ctx->cfg.encrypt.type == 2) type_str = "PQC-GCM";
+        if (push_ctx->cfg.encrypt.type == 1) type_str = "AES-GCM-256";
+        else if (push_ctx->cfg.encrypt.type == 2) type_str = "PQC-GCM";
 
         log_info("  [+] Sync Encryption: ON (layer: %u, type: %s, key_len: %zu)",
-                 ctx->cfg.encrypt.layer,
+                 push_ctx->cfg.encrypt.layer,
                  type_str,
-                 ctx->cfg.encrypt.key_len);
+                 push_ctx->cfg.encrypt.key_len);
     } else {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_ON,   0);
         log_info("  [+] Sync Encryption: OFF");
@@ -500,11 +521,13 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
                      __ATOMIC_RELEASE);
 
     log_info("[CFG-TRACE push=%lu nlseq=%u] KERNEL_ACK_OK node=%d enabled=%d layer=%u type=%u key_len=%zu tunnels=%zu",
-             push_id, nl_seq, ctx->cfg.node_id, ctx->cfg.encrypt.enabled,
-             ctx->cfg.encrypt.layer, ctx->cfg.encrypt.type,
-             ctx->cfg.encrypt.key_len, ctx->cfg.sdwan_tun_count);
+             push_id, nl_seq, push_ctx->cfg.node_id,
+             push_ctx->cfg.encrypt.enabled,
+             push_ctx->cfg.encrypt.layer, push_ctx->cfg.encrypt.type,
+             push_ctx->cfg.encrypt.key_len,
+             push_ctx->cfg.sdwan_tun_count);
     ret = KERNEL_SYNC_APPLIED;
-    (void)failover_service_reconcile(ctx, generation);
+    (void)failover_service_reconcile(push_ctx, generation);
 
 out:
     nlmsg_free(msg);

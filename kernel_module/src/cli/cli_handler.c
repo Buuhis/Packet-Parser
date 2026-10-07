@@ -3,6 +3,7 @@
 #include "config/db_client.h"
 #include "failover.h"
 #include "kernel_sync.h"
+#include "config/provision_reconcile.h"
 #include "runtime_config.h"
 #include "system/cpu_tune.h"
 #include "utils/logger.h"
@@ -459,6 +460,7 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     log_info("[CFG-TRACE user=%lu] CTX_REPLACED node=%d mode=%s key_len=%zu",
              generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg),
              ctx->cfg.encrypt.key_len);
+    provision_reconcile_accept(ctx);
 
     log_info("[CFG-TRACE user=%lu] KERNEL_SYNC_RETURNED_SUCCESS node=%d mode=%s",
              generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
@@ -492,13 +494,38 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
 }
 
 /* ---------- handle: add <profile_id> <table.if_name>... ----------- */
+static void rollback_add_acknowledgements(
+    int profile_id, const char tunnel_names[][IFNAMSIZ], size_t tunnel_count,
+    const bool changed[], const bool added[])
+{
+    while (tunnel_count > 0) {
+        size_t n = --tunnel_count;
+
+        if (changed[n])
+            provision_reconcile_rollback_tunnel(
+                profile_id, tunnel_names[n], added[n]);
+    }
+}
+
 static void handle_add_tunnels(int client_fd, int profile_id,
                                const char tunnel_names[][IFNAMSIZ],
                                size_t tunnel_count, app_context_t *ctx)
 {
     app_context_t candidate;
+    bool ack_changed[MAX_SDWAN_TUNS] = { false };
+    bool ack_added[MAX_SDWAN_TUNS] = { false };
+    bool reconcile_needed = false;
 
     runtime_config_lock();
+    if (ctx->cfg.node_id <= 0 || ctx->cfg.node_id != profile_id ||
+        provision_reconcile_validate_profile(profile_id) != 0) {
+        runtime_config_unlock();
+        log_warn("[ADD] Rejected profile=%d active_profile=%d: profile is not provisioned",
+                 profile_id, ctx->cfg.node_id);
+        reply_json(client_fd, 409,
+                   "Profile is not provisioned or is not active");
+        return;
+    }
     candidate = *ctx;
 
     for (size_t n = 0; n < tunnel_count; n++) {
@@ -508,24 +535,54 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         log_info(">>> [ADD] Profile %d: adding tunnel '%s'", profile_id,
                  tunnel_name);
 
+        bool already_desired = false;
+
+        for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
+            if (strcmp(candidate.cfg.sdwan_tuns[i].tunnel_ifname,
+                       tunnel_name) == 0) {
+                already_desired = true;
+                break;
+            }
+        }
+
+        /* -id may have accepted this DB tunnel before its net_device was
+         * created.  In that case -a is the explicit BE event that retries
+         * only the desired snapshot; it is not a duplicate configuration. */
+        if (already_desired) {
+            bool was_acknowledged =
+                provision_reconcile_tunnel_acknowledged(profile_id,
+                                                         tunnel_name);
+
+            if (provision_reconcile_ack_tunnel(profile_id,
+                                               tunnel_name) != 0) {
+                rollback_add_acknowledgements(profile_id, tunnel_names,
+                                              n, ack_changed, ack_added);
+                runtime_config_unlock();
+                reply_json(client_fd, 503,
+                           "Tunnel interface is not available yet");
+                return;
+            }
+            ack_changed[n] = !was_acknowledged;
+            reconcile_needed |= ack_changed[n];
+            if (ack_changed[n])
+                log_info("[ADD] Tunnel '%s' was waiting for its interface; reconciling it without restarting peer tunnels",
+                         tunnel_name);
+            continue;
+        }
+
         if (candidate.cfg.sdwan_tun_count >= MAX_SDWAN_TUNS) {
+            rollback_add_acknowledgements(profile_id, tunnel_names, n,
+                                          ack_changed, ack_added);
             runtime_config_unlock();
             reply_json(client_fd, 400, "Maximum tunnel count reached");
             return;
         }
 
-        for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
-            if (strcmp(candidate.cfg.sdwan_tuns[i].tunnel_ifname,
-                       tunnel_name) == 0) {
-                runtime_config_unlock();
-                reply_json(client_fd, 400, "Tunnel is already active");
-                return;
-            }
-        }
-
         if (db_client_load_tunnel(profile_id, tunnel_name,
                                   candidate.cfg.weight_enabled,
                                   &new_tun) != 0) {
+            rollback_add_acknowledgements(profile_id, tunnel_names, n,
+                                          ack_changed, ack_added);
             runtime_config_unlock();
             log_error("[ADD] Tunnel '%s' not found in DB for profile %d",
                       tunnel_name, profile_id);
@@ -533,7 +590,26 @@ static void handle_add_tunnels(int client_fd, int profile_id,
             return;
         }
 
+        if (provision_reconcile_ack_tunnel(profile_id,
+                                           tunnel_name) != 0) {
+            rollback_add_acknowledgements(profile_id, tunnel_names, n,
+                                          ack_changed, ack_added);
+            runtime_config_unlock();
+            reply_json(client_fd, 503,
+                       "Tunnel interface is not available yet");
+            return;
+        }
+        ack_changed[n] = true;
+        ack_added[n] = true;
+        reconcile_needed = true;
+
         candidate.cfg.sdwan_tuns[candidate.cfg.sdwan_tun_count++] = new_tun;
+    }
+
+    if (!reconcile_needed) {
+        runtime_config_unlock();
+        reply_json(client_fd, 200, "Tunnel is already active");
+        return;
     }
 
     /* Adding a tunnel changes the complete percentage snapshot. Refresh the
@@ -545,6 +621,9 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         if (db_client_load_tunnel(
                 profile_id, candidate.cfg.sdwan_tuns[i].tunnel_ifname,
                 candidate.cfg.weight_enabled, &refreshed) != 0) {
+            rollback_add_acknowledgements(profile_id, tunnel_names,
+                                          tunnel_count, ack_changed,
+                                          ack_added);
             runtime_config_unlock();
             log_error("[ADD] Failed to refresh complete tunnel snapshot");
             reply_json(client_fd, 500,
@@ -554,6 +633,8 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         candidate.cfg.sdwan_tuns[i] = refreshed;
     }
     if (!config_weights_valid(&candidate.cfg)) {
+        rollback_add_acknowledgements(profile_id, tunnel_names,
+                                      tunnel_count, ack_changed, ack_added);
         runtime_config_unlock();
         log_error("[ADD] Refusing invalid weight snapshot for profile %d",
                   profile_id);
@@ -564,6 +645,7 @@ static void handle_add_tunnels(int client_fd, int profile_id,
     /* Sync to kernel */
     if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
         *ctx = candidate;
+        provision_reconcile_accept(ctx);
         runtime_config_unlock();
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)",
@@ -571,6 +653,8 @@ static void handle_add_tunnels(int client_fd, int profile_id,
         }
         reply_json(client_fd, 200, "Tunnel added successfully");
     } else {
+        rollback_add_acknowledgements(profile_id, tunnel_names,
+                                      tunnel_count, ack_changed, ack_added);
         runtime_config_unlock();
         log_error("[ADD] Netlink push failed after adding tunnel '%s'",
                   tunnel_names[0]);
@@ -648,6 +732,7 @@ static void handle_del_tunnels(int client_fd, int profile_id,
     /* Sync to kernel */
     if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
         *ctx = candidate;
+        provision_reconcile_accept(ctx);
         runtime_config_unlock();
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)",
@@ -682,6 +767,7 @@ static void handle_del_profile(int client_fd, int profile_id,
 
     sig_pqc_prepare_reload();
     sig_pqc_finalize_reload();
+    provision_reconcile_clear();
     cpu_tune_restore();
     clear_node_id();
     reply_json(client_fd, 200, "Success");

@@ -251,6 +251,12 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     
     if (!cfg || cfg->num_tunnels == 0) {
         rcu_read_unlock();
+        if (state->out &&
+            mwan_mac_discovery_is_pending_tunnel(state->out->ifindex)) {
+            pr_warn_ratelimited("mwan_kmod: PREKEY-TX-DROP ifindex=%d reason=NO_ACTIVE_KEY\n",
+                                state->out->ifindex);
+            return NF_DROP;
+        }
         return NF_ACCEPT;
     }
 
@@ -510,6 +516,12 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
 
     if (!cfg) {
         rcu_read_unlock();
+        if (skb->dev &&
+            mwan_mac_discovery_is_pending_tunnel(skb->dev->ifindex)) {
+            pr_warn_ratelimited("mwan_kmod: PREKEY-RX-DROP ifindex=%d reason=NO_ACTIVE_KEY\n",
+                                skb->dev->ifindex);
+            return NF_DROP;
+        }
         return NF_ACCEPT;
     }
 
@@ -518,12 +530,21 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     if (tun) {
         mwan_fw_diag_log("RX_PRE", skb, state, tun->encap_type,
                          tun->encap_type == MWAN_ENCAP_L2_PQC ?
-                         "L2_PLAINTEXT_REINJECT" : "ENTER_TUNNEL",
+                         "L2_AUTHENTICATED_REINJECT" : "ENTER_TUNNEL",
                          tun->dev ? tun->dev->name : NULL);
         /* If this tunnel is configured for L2 PQC encapsulation,
-         * we bypass L3 decryption completely because the packet
-         * was already decrypted at the L2 layer handler. */
+         * accept only packets tagged by the authenticated L2 receive path.
+         * A native IPv4 frame arriving directly on the data interface has
+         * no tag and must never bypass encryption as plaintext. */
         if (tun->encap_type == MWAN_ENCAP_L2_PQC) {
+            if (!(skb->mark & MWAN_L2_DECRYPTED_MARK)) {
+                pr_warn_ratelimited("mwan_kmod: L2-PLAINTEXT-RX-DROP tunnel=%s ifindex=%d\n",
+                                    tun->dev ? tun->dev->name : "unknown",
+                                    skb->dev ? skb->dev->ifindex : 0);
+                rcu_read_unlock();
+                return NF_DROP;
+            }
+            skb->mark &= ~MWAN_L2_DECRYPTED_MARK;
             rcu_read_unlock();
             return NF_ACCEPT;
         }

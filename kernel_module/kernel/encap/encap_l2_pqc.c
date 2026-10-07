@@ -621,6 +621,112 @@ int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
     return 0;
 }
 
+/* Encrypt a small non-IP control payload on one exact data tunnel.  MAC
+ * discovery uses a broadcast destination until the authenticated response
+ * supplies the peer MAC.  The reserved flow cookie lets RX dispatch the
+ * authenticated plaintext to discovery instead of the IPv4 reinjection
+ * path. */
+int mwan_l2_pqc_encrypt_control_xmit(struct mwan_config *cfg,
+                                    struct mwan_tunnel *tun,
+                                    const u8 dest[ETH_ALEN],
+                                    const void *payload,
+                                    size_t payload_len)
+{
+    struct mwan_l2_worker *worker = NULL;
+    struct crypto_aead *tfm = NULL;
+    struct aead_request *req = NULL;
+    struct mwan_l2_pqc_hdr *l2_hdr;
+    struct net_device *target_dev;
+    struct sk_buff *skb;
+    struct ethhdr *eth;
+    struct scatterlist sg[3];
+    __be64 token_be;
+    __be64 nonce_be;
+    __be32 seq_be;
+    u64 flow_token;
+    u64 packet_nonce;
+    u32 flow_seq;
+    u8 iv[MWAN_RFC4106_IV_LEN];
+    int nents;
+    int err;
+    int i;
+
+    if (!cfg || !tun || !dest || !payload || !payload_len ||
+        !cfg->encrypt_on || cfg->encrypt_layer != 2 ||
+        cfg->encrypt_type != MWAN_CRYPT_PQC_GCM || !cfg->key_id ||
+        !cfg->l2_workers || cfg->num_workers <= 0)
+        return -EINVAL;
+    target_dev = tun->dev;
+    if (!target_dev || !tun->is_ethernet || !netif_running(target_dev))
+        return -ENETDOWN;
+    for (i = 0; i < cfg->num_workers; i++) {
+        if (cpu_online(cfg->l2_workers[i].cpu)) {
+            worker = &cfg->l2_workers[i];
+            break;
+        }
+    }
+    if (!worker)
+        return -ENODEV;
+
+    packet_nonce = mwan_next_packet_nonce();
+    if (!packet_nonce)
+        return -EOVERFLOW;
+    flow_token = ((u64)cfg->key_id << MWAN_FLOW_KEY_ID_SHIFT) |
+                 MWAN_L2_DISCOVERY_COOKIE;
+    flow_seq = lower_32_bits(packet_nonce);
+    token_be = cpu_to_be64(flow_token);
+    seq_be = cpu_to_be32(flow_seq);
+    nonce_be = cpu_to_be64(packet_nonce);
+    memcpy(iv, &nonce_be, sizeof(nonce_be));
+
+    skb = alloc_skb(LL_RESERVED_SPACE(target_dev) + ETH_HLEN +
+                    MWAN_L2_HDR_LEN + payload_len + MWAN_GCM_TAG_LEN,
+                    GFP_KERNEL);
+    if (!skb)
+        return -ENOMEM;
+    skb_reserve(skb, LL_RESERVED_SPACE(target_dev));
+    memcpy(skb_put(skb, payload_len), payload, payload_len);
+    skb_push(skb, ETH_HLEN + MWAN_L2_HDR_LEN);
+    skb_reset_mac_header(skb);
+    eth = eth_hdr(skb);
+    ether_addr_copy(eth->h_dest, dest);
+    ether_addr_copy(eth->h_source, target_dev->dev_addr);
+    eth->h_proto = htons(MWAN_L2_PQC_ETHERTYPE);
+    l2_hdr = (struct mwan_l2_pqc_hdr *)(skb->data + ETH_HLEN);
+    memcpy(&l2_hdr->flow_token, &token_be, sizeof(token_be));
+    memcpy(&l2_hdr->flow_seq, &seq_be, sizeof(seq_be));
+    memcpy(&l2_hdr->packet_nonce, &nonce_be, sizeof(nonce_be));
+    skb_put(skb, MWAN_GCM_TAG_LEN);
+
+    sg_init_table(sg, ARRAY_SIZE(sg));
+    sg_set_buf(&sg[0], l2_hdr, MWAN_L2_HDR_LEN);
+    nents = skb_to_sgvec(skb, &sg[1], ETH_HLEN + MWAN_L2_HDR_LEN,
+                         payload_len + MWAN_GCM_TAG_LEN);
+    if (nents < 0) {
+        err = nents;
+        goto out_free;
+    }
+    err = mwan_l2_worker_tx_crypto_lock(worker, cfg->key_id, &tfm, &req);
+    if (err)
+        goto out_free;
+    aead_request_set_crypt(req, sg, sg, payload_len, iv);
+    aead_request_set_ad(req, MWAN_L2_HDR_LEN);
+    err = crypto_aead_encrypt(req);
+    mwan_l2_worker_crypto_unlock(worker);
+    if (err)
+        goto out_free;
+
+    skb->dev = target_dev;
+    skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
+    skb->ip_summed = CHECKSUM_NONE;
+    err = dev_queue_xmit(skb);
+    return net_xmit_eval(err) ? -EIO : 0;
+
+out_free:
+    kfree_skb(skb);
+    return err;
+}
+
 void mwan_l2_pqc_xmit_encrypted(struct sk_buff *skb,
                                 struct mwan_l2_worker *worker,
                                 u64 flow_token, u32 seq)

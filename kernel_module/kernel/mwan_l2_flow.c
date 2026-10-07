@@ -121,7 +121,7 @@ static u64 mwan_l2_new_flow_token(void)
 
     do {
         cookie = get_random_u64() & MWAN_FLOW_COOKIE_MASK;
-    } while (!cookie);
+    } while (!cookie || cookie == MWAN_L2_DISCOVERY_COOKIE);
     return cookie;
 }
 

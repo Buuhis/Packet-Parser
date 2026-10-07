@@ -9,6 +9,7 @@ BIN := sd-wan
 SRC := \
     src/main.c \
     src/kernel_sync.c \
+    src/config/provision_reconcile.c \
     src/app_context.c \
     src/runtime_config.c \
     failover/src/bfd.c \

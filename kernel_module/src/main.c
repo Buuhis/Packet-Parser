@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "app_context.h"
 #include "kernel_sync.h"
+#include "config/provision_reconcile.h"
 #include "runtime_config.h"
 #include "failover.h"
 #include "system/cpu_tune.h"
@@ -300,9 +301,13 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
                  profile_id, (unsigned long long)config_generation,
                  sync_result == KERNEL_SYNC_APPLIED ? "APPLIED" :
                  sync_result == KERNEL_SYNC_DEFERRED ? "DEFERRED" : "ERROR");
-        if (sync_result == KERNEL_SYNC_APPLIED) {
+        if (sync_result != KERNEL_SYNC_ERROR) {
             running_ctx = candidate;
-            log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
+            provision_reconcile_note_key(profile_id, true);
+            if (sync_result == KERNEL_SYNC_APPLIED)
+                log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
+            else
+                log_info("[PQC] Dynamic key retained for Node %d while waiting for a tunnel -a event", profile_id);
         } else {
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
         }

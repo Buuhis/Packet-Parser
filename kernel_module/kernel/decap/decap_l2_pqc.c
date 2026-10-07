@@ -4,6 +4,7 @@
 #include "../mwan_multicore.h"
 #include "../mwan_mtu.h"
 #include "../mwan_drop_trace.h"
+#include "../mwan_mac_discovery.h"
 
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
@@ -452,6 +453,7 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb,
     u64 packet_nonce;
     u64 flow_token;
     u32 flow_seq;
+    bool discovery;
     __be64 flow_token_be, nonce_be;
     __be32 flow_seq_be;
     struct aead_request *req;
@@ -473,6 +475,8 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb,
     flow_token = be64_to_cpu(flow_token_be);
     flow_seq = be32_to_cpu(flow_seq_be);
     packet_nonce = be64_to_cpu(nonce_be);
+    discovery = (flow_token & MWAN_L2_CONTROL_COOKIE_MASK) ==
+                MWAN_L2_DISCOVERY_COOKIE;
     if (unlikely(packet_nonce == 0))
         return -EINVAL;
 
@@ -523,16 +527,20 @@ static int l2_pqc_decrypt_skb(struct sk_buff *skb,
     skb_trim(skb, skb->len - MWAN_GCM_TAG_LEN);
 
     skb_set_mac_header(skb, -ETH_HLEN);
-    eth_hdr(skb)->h_proto = htons(ETH_P_IP);
-    skb->protocol = htons(ETH_P_IP);
+    eth_hdr(skb)->h_proto = htons(discovery ?
+                                   MWAN_MAC_DISCOVERY_ETHERTYPE : ETH_P_IP);
+    skb->protocol = eth_hdr(skb)->h_proto;
     skb_reset_network_header(skb);
     skb->ip_summed = CHECKSUM_NONE;
     skb->encapsulation = 0;
+    if (!discovery)
+        skb->mark |= MWAN_L2_DECRYPTED_MARK;
 
     /* The old hash describes the encrypted/outer frame.  Recompute it from
      * the restored inner tuple before reinjection. */
     skb_clear_hash(skb);
-    skb_get_hash(skb);
+    if (!discovery)
+        skb_get_hash(skb);
     return 0;
 }
 
@@ -701,6 +709,33 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                                  dispatch_flow_seq != flow_seq ||
                                  dispatch_nonce != packet_nonce))
                 ret = -EINVAL;
+
+            /* The reserved cookie is authenticated with the same traffic
+             * key as data but is not an IPv4 flow.  Handle it per ingress
+             * tunnel before creating flow/reorder state. */
+            if (!ret &&
+                (flow_token & MWAN_L2_CONTROL_COOKIE_MASK) ==
+                    MWAN_L2_DISCOVERY_COOKIE) {
+                ret = mwan_mac_discovery_receive_encrypted(worker->cfg,
+                                                            skb);
+                memset(skb->cb, 0, sizeof(skb->cb));
+                if (ret) {
+                    atomic64_inc(&worker->dropped_packets);
+                    pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=ENCRYPTED_REJECT error=%d ifindex=%d\n",
+                                        ret,
+                                        skb->dev ? skb->dev->ifindex : 0);
+                }
+                kfree_skb(skb);
+                if (flow) {
+                    atomic_dec(&flow->pending_crypto);
+                    mwan_l2_rx_flow_put(flow);
+                }
+                if (++batch == 64) {
+                    batch = 0;
+                    cond_resched();
+                }
+                continue;
+            }
 
             if (!ret && candidate) {
                 flow = mwan_l2_rx_flow_get_authenticated(

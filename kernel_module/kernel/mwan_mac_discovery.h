@@ -5,6 +5,7 @@
 
 struct mwan_tunnel;
 struct mwan_config;
+struct sk_buff;
 
 int mwan_mac_discovery_init(void);
 void mwan_mac_discovery_cleanup(void);
@@ -25,5 +26,8 @@ int mwan_mac_discovery_rebind_pending(u32 node_id, u32 generation,
 bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[6]);
 bool mwan_mac_get_peer_tunnel_ip(struct mwan_tunnel *tun,
                                  __be32 *peer_tunnel_ip);
+bool mwan_mac_discovery_is_pending_tunnel(u32 ifindex);
+int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
+                                         struct sk_buff *skb);
 
 #endif /* MWAN_MAC_DISCOVERY_H */

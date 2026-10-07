@@ -1,5 +1,7 @@
 #include "mwan_mac_discovery.h"
+#include "mwan_proto.h"
 #include "mwan_state.h"
+#include "mwan_steer.h"
 
 #include <linux/etherdevice.h>
 #include <linux/if_arp.h>
@@ -14,13 +16,11 @@
 #include <linux/workqueue.h>
 #include <net/rtnetlink.h>
 
-#define MWAN_MAC_DISCOVERY_ETHERTYPE 0x88B6
 #define MWAN_MAC_DISCOVERY_MAGIC     0x4d574d44U /* "MWMD" */
-#define MWAN_MAC_DISCOVERY_VERSION   2
+#define MWAN_MAC_DISCOVERY_VERSION   3
 #define MWAN_MAC_DISCOVERY_REQUEST   1
 #define MWAN_MAC_DISCOVERY_RESPONSE  2
 #define MWAN_MAC_RETRY_MS            1000
-#define MWAN_MAC_REFRESH_MS          30000
 
 struct mwan_mac_discovery_hdr {
     __be32 magic;
@@ -30,6 +30,7 @@ struct mwan_mac_discovery_hdr {
     __be32 node_id;
     __be32 tunnel_ip;
     __be64 nonce;
+    u8 sender_mac[ETH_ALEN];
 } __packed;
 
 static void mwan_mac_discovery_workfn(struct work_struct *work);
@@ -37,9 +38,9 @@ static DECLARE_DELAYED_WORK(mwan_mac_discovery_work,
                             mwan_mac_discovery_workfn);
 static bool mwan_mac_discovery_running;
 
-/* Discovery must be able to identify data tunnels before an authenticated
- * PQC traffic key exists.  This pending registry is control-plane only: it is
- * never visible to packet steering, crypto workers or active_paths. */
+/* Pending registration identifies fail-closed data interfaces while the PQC
+ * traffic key is absent.  It never sends discovery and is not visible to
+ * crypto workers or active_paths. */
 struct mwan_mac_pending_config {
     u32 node_id;
     u32 generation;
@@ -235,7 +236,6 @@ int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
 
     pr_info("mwan_kmod: MAC-DISCOVERY-CONFIG state=PENDING node=%u generation=%u tunnels=%u datapath_active=0\n",
             node_id, generation, num_tunnels);
-    mwan_mac_discovery_kick();
     return 0;
 
 err_destroy:
@@ -305,6 +305,20 @@ int mwan_mac_discovery_get_pending_peer(u32 ifindex,
               0 : -EAGAIN;
     rcu_read_unlock();
     return ret;
+}
+
+bool mwan_mac_discovery_is_pending_tunnel(u32 ifindex)
+{
+    struct mwan_mac_pending_config *cfg;
+    bool found;
+
+    if (!ifindex)
+        return false;
+    rcu_read_lock();
+    cfg = rcu_dereference(mwan_mac_pending_cfg);
+    found = mwan_mac_find_pending_tunnel(cfg, ifindex) != NULL;
+    rcu_read_unlock();
+    return found;
 }
 
 int mwan_mac_discovery_set_pending_state(u32 ifindex, u32 generation,
@@ -530,25 +544,23 @@ static __be32 mwan_mac_local_ipv4(struct net_device *dev)
     return 0;
 }
 
-static int mwan_mac_send(struct mwan_tunnel *tun, const u8 *dest,
-                         u8 type, u32 node_id, u64 response_nonce,
-                         gfp_t gfp)
+static int mwan_mac_send(struct mwan_config *cfg, struct mwan_tunnel *tun,
+                         const u8 *dest, u8 type, u32 node_id,
+                         u64 response_nonce)
 {
-    struct mwan_mac_discovery_hdr *hdr;
-    struct sk_buff *skb;
-    struct ethhdr *eth;
+    struct mwan_mac_discovery_hdr hdr = { 0 };
     struct net_device *dev;
     __be32 local_ip;
     u64 nonce;
-    unsigned int headroom;
-    int ret;
 
-    if (!tun)
+    if (!cfg || !tun)
         return -EINVAL;
     dev = tun->dev;
     if (!dev || dev->type != ARPHRD_ETHER || !netif_running(dev))
         return -ENETDOWN;
+    rcu_read_lock();
     local_ip = mwan_mac_local_ipv4(dev);
+    rcu_read_unlock();
     if (local_ip == 0)
         return -EADDRNOTAVAIL;
 
@@ -564,91 +576,50 @@ static int mwan_mac_send(struct mwan_tunnel *tun, const u8 *dest,
         return -EINVAL;
     }
 
-    headroom = LL_RESERVED_SPACE(dev);
-    skb = alloc_skb(headroom + ETH_HLEN + sizeof(*hdr), gfp);
-    if (!skb)
-        return -ENOMEM;
+    hdr.magic = cpu_to_be32(MWAN_MAC_DISCOVERY_MAGIC);
+    hdr.version = MWAN_MAC_DISCOVERY_VERSION;
+    hdr.type = type;
+    hdr.node_id = cpu_to_be32(node_id);
+    hdr.tunnel_ip = local_ip;
+    hdr.nonce = cpu_to_be64(nonce);
+    ether_addr_copy(hdr.sender_mac, dev->dev_addr);
 
-    skb_reserve(skb, headroom);
-    hdr = skb_put_zero(skb, sizeof(*hdr));
-    hdr->magic = cpu_to_be32(MWAN_MAC_DISCOVERY_MAGIC);
-    hdr->version = MWAN_MAC_DISCOVERY_VERSION;
-    hdr->type = type;
-    hdr->node_id = cpu_to_be32(node_id);
-    hdr->tunnel_ip = local_ip;
-    hdr->nonce = cpu_to_be64(nonce);
-
-    eth = skb_push(skb, ETH_HLEN);
-    skb_reset_mac_header(skb);
-    ether_addr_copy(eth->h_dest, dest);
-    ether_addr_copy(eth->h_source, dev->dev_addr);
-    eth->h_proto = htons(MWAN_MAC_DISCOVERY_ETHERTYPE);
-
-    skb->dev = dev;
-    skb->protocol = eth->h_proto;
-    skb_reset_network_header(skb);
-    skb->ip_summed = CHECKSUM_NONE;
-    ret = dev_queue_xmit(skb);
-    return net_xmit_eval(ret) ? -EIO : 0;
+    return mwan_l2_pqc_encrypt_control_xmit(cfg, tun, dest, &hdr,
+                                             sizeof(hdr));
 }
 
-static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
-                                 struct packet_type *pt,
-                                 struct net_device *orig_dev)
+int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
+                                         struct sk_buff *skb)
 {
     struct mwan_mac_discovery_hdr hdr_buf;
     const struct mwan_mac_discovery_hdr *hdr;
-    const struct ethhdr *eth;
     struct mwan_tunnel *tun;
-    struct mwan_config *cfg;
-    struct mwan_mac_pending_config *pending_cfg;
-    u32 discovery_node_id;
-    bool pending_tunnel = false;
     u64 nonce;
     bool nonce_matches = true;
     bool peer_changed;
     int ingress_ifindex;
 
-    (void)pt;
-    if (!skb)
-        return NET_RX_DROP;
+    if (!cfg || !skb)
+        return -EINVAL;
 
-    ingress_ifindex = skb->dev ? skb->dev->ifindex :
-                      (dev ? dev->ifindex :
-                       (orig_dev ? orig_dev->ifindex : 0));
-    eth = eth_hdr(skb);
+    ingress_ifindex = skb->dev ? skb->dev->ifindex : 0;
     hdr = skb_header_pointer(skb, 0, sizeof(hdr_buf), &hdr_buf);
-    if (!eth || !hdr ||
+    if (!hdr ||
         be32_to_cpu(hdr->magic) != MWAN_MAC_DISCOVERY_MAGIC ||
         hdr->version != MWAN_MAC_DISCOVERY_VERSION ||
         (hdr->type != MWAN_MAC_DISCOVERY_REQUEST &&
          hdr->type != MWAN_MAC_DISCOVERY_RESPONSE) ||
-        hdr->tunnel_ip == 0 || hdr->nonce == 0) {
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        hdr->tunnel_ip == 0 || hdr->nonce == 0 ||
+        !is_valid_ether_addr(hdr->sender_mac)) {
+        return -EBADMSG;
     }
 
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
     tun = mwan_mac_find_tunnel(cfg, ingress_ifindex);
-    discovery_node_id = cfg ? cfg->node_id : 0;
-    if (!tun) {
-        pending_cfg = rcu_dereference(mwan_mac_pending_cfg);
-        tun = mwan_mac_find_pending_tunnel(pending_cfg, ingress_ifindex);
-        if (tun) {
-            discovery_node_id = pending_cfg->node_id;
-            pending_tunnel = true;
-        }
-    }
     if (!tun || !tun->is_ethernet) {
-        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u active_config=%u pending_config=%u\n",
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u active_config=1 encrypted=1\n",
                             ingress_ifindex,
-                            tun && tun->is_ethernet ? 1 : 0,
-                            cfg ? 1 : 0,
-                            rcu_access_pointer(mwan_mac_pending_cfg) ? 1 : 0);
-        rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+                            tun && tun->is_ethernet ? 1 : 0);
+        return -ENODEV;
     }
 
     nonce = be64_to_cpu(hdr->nonce);
@@ -662,20 +633,18 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
                             tun->dev ? tun->dev->name : "unknown",
                             ingress_ifindex,
                             (unsigned long long)nonce);
-        rcu_read_unlock();
-        kfree_skb(skb);
-        return NET_RX_DROP;
+        return -ESTALE;
     }
 
-    /* The ingress ifindex identifies the point-to-point data tunnel. The
-     * source MAC comes from Ethernet; peer tunnel IP is explicitly carried
-     * in the discovery payload and is never inferred from a subnet. */
-    peer_changed = mwan_mac_learn_peer(tun, eth->h_source,
+    /* The ingress ifindex identifies the point-to-point data tunnel.  Peer
+     * MAC and tunnel IP both come from the authenticated payload; neither is
+     * trusted from the mutable outer Ethernet header or inferred by subnet. */
+    peer_changed = mwan_mac_learn_peer(tun, hdr->sender_mac,
                                        hdr->tunnel_ip);
     if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST) {
         int response_ret = mwan_mac_send(
-            tun, eth->h_source, MWAN_MAC_DISCOVERY_RESPONSE,
-            discovery_node_id, nonce, GFP_ATOMIC);
+            cfg, tun, hdr->sender_mac, MWAN_MAC_DISCOVERY_RESPONSE,
+            cfg->node_id, nonce);
 
         if (response_ret)
             pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_FAILED tunnel=%s ifindex=%d error=%d\n",
@@ -683,29 +652,16 @@ static int mwan_mac_discovery_rx(struct sk_buff *skb, struct net_device *dev,
                                 tun->dev ? tun->dev->ifindex : 0,
                                 response_ret);
         else if (peer_changed)
-            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED source=%s\n",
+            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED encrypted=1\n",
                     tun->dev ? tun->dev->name : "unknown",
-                    tun->dev ? tun->dev->ifindex : 0,
-                    pending_tunnel ? "PENDING" : "ACTIVE");
+                    tun->dev ? tun->dev->ifindex : 0);
     }
-    rcu_read_unlock();
-
-    kfree_skb(skb);
-    return NET_RX_SUCCESS;
+    return 0;
 }
-
-static struct packet_type mwan_mac_discovery_packet_type __read_mostly = {
-    .type = cpu_to_be16(MWAN_MAC_DISCOVERY_ETHERTYPE),
-    .func = mwan_mac_discovery_rx,
-};
 
 static void mwan_mac_discovery_workfn(struct work_struct *work)
 {
     struct mwan_config *cfg;
-    struct mwan_mac_pending_config *pending_cfg;
-    struct mwan_tunnel *tunnels = NULL;
-    u32 node_id = 0;
-    u32 num_tunnels = 0;
     bool unresolved = false;
     u32 i;
 
@@ -713,32 +669,29 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
     if (!READ_ONCE(mwan_mac_discovery_running))
         return;
 
-    rcu_read_lock();
-    cfg = rcu_dereference(g_mwan_cfg);
-    pending_cfg = rcu_dereference(mwan_mac_pending_cfg);
-    if (cfg && cfg->num_tunnels) {
-        tunnels = cfg->tunnels;
-        num_tunnels = cfg->num_tunnels;
-        node_id = cfg->node_id;
-    } else if (pending_cfg) {
-        tunnels = pending_cfg->tunnels;
-        num_tunnels = pending_cfg->num_tunnels;
-        node_id = pending_cfg->node_id;
-    }
-    if (tunnels) {
-        for (i = 0; i < num_tunnels; i++) {
-            struct mwan_tunnel *tun = &tunnels[i];
+    /* Encryption can sleep, so keep the active config stable with the update
+     * mutex rather than holding an RCU read lock across crypto.  Pending
+     * profiles have no traffic key and deliberately send nothing. */
+    mutex_lock(&mwan_cfg_update_lock);
+    cfg = rcu_dereference_protected(
+        g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
+    if (cfg && cfg->num_tunnels && cfg->encrypt_on &&
+        cfg->encrypt_layer == 2 &&
+        cfg->encrypt_type == MWAN_CRYPT_PQC_GCM && cfg->key_id) {
+        for (i = 0; i < cfg->num_tunnels; i++) {
+            struct mwan_tunnel *tun = &cfg->tunnels[i];
             bool tunnel_resolved;
             int send_ret;
 
             if (!tun->is_ethernet || !tun->dev)
                 continue;
             tunnel_resolved = mwan_mac_is_resolved(tun);
-            if (!tunnel_resolved)
-                unresolved = true;
-            send_ret = mwan_mac_send(tun, tun->dev->broadcast,
+            if (tunnel_resolved)
+                continue;
+            unresolved = true;
+            send_ret = mwan_mac_send(cfg, tun, tun->dev->broadcast,
                                      MWAN_MAC_DISCOVERY_REQUEST,
-                                     node_id, 0, GFP_ATOMIC);
+                                     cfg->node_id, 0);
             if (send_ret)
                 pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=SEND_FAILED tunnel=%s ifindex=%d error=%d resolved=%u\n",
                                     tun->dev->name, tun->dev->ifindex,
@@ -750,13 +703,11 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
                         tun->dev->name, tun->dev->ifindex);
         }
     }
-    rcu_read_unlock();
+    mutex_unlock(&mwan_cfg_update_lock);
 
-    if (READ_ONCE(mwan_mac_discovery_running))
+    if (READ_ONCE(mwan_mac_discovery_running) && unresolved)
         schedule_delayed_work(&mwan_mac_discovery_work,
-                              msecs_to_jiffies(unresolved ?
-                                              MWAN_MAC_RETRY_MS :
-                                              MWAN_MAC_REFRESH_MS));
+                              msecs_to_jiffies(MWAN_MAC_RETRY_MS));
 }
 
 void mwan_mac_discovery_kick(void)
@@ -767,9 +718,8 @@ void mwan_mac_discovery_kick(void)
 
 int mwan_mac_discovery_init(void)
 {
-    BUILD_BUG_ON(sizeof(struct mwan_mac_discovery_hdr) != 24);
+    BUILD_BUG_ON(sizeof(struct mwan_mac_discovery_hdr) != 30);
     WRITE_ONCE(mwan_mac_discovery_running, true);
-    dev_add_pack(&mwan_mac_discovery_packet_type);
     return 0;
 }
 
@@ -777,6 +727,5 @@ void mwan_mac_discovery_cleanup(void)
 {
     WRITE_ONCE(mwan_mac_discovery_running, false);
     cancel_delayed_work_sync(&mwan_mac_discovery_work);
-    dev_remove_pack(&mwan_mac_discovery_packet_type);
     mwan_mac_discovery_clear_pending(0);
 }
