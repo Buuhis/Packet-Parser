@@ -118,15 +118,22 @@ int pqc_bind_node(int node_id, uint64_t config_generation) {
     char key_id[256] = {0};
     char local_fg_db[32] = {0};
     char peer_pub_name[256] = {0};
+    app_context_t pqc_context = {0};
     bool l2_rekey_enabled = false;
 
-    runtime_config_lock();
-    if (running_ctx.cfg.node_id == node_id &&
-        running_ctx.cfg.encrypt.enabled &&
-        running_ctx.cfg.encrypt.layer == 2 &&
-        running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM)
+    /* A deferred full apply is not ACTIVE yet, so its PQC mode must be read
+     * from the pending candidate instead of the older running_ctx. */
+    if (!provision_transaction_snapshot(node_id, &pqc_context, NULL,
+                                        NULL, NULL)) {
+        runtime_config_lock();
+        pqc_context = running_ctx;
+        runtime_config_unlock();
+    }
+    if (pqc_context.cfg.node_id == node_id &&
+        pqc_context.cfg.encrypt.enabled &&
+        pqc_context.cfg.encrypt.layer == 2 &&
+        pqc_context.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM)
         l2_rekey_enabled = true;
-    runtime_config_unlock();
 
     // Load PQC identity config from DB
     if (db_client_load_pqc_identity(node_id,
@@ -162,13 +169,18 @@ int pqc_bind_node(int node_id, uint64_t config_generation) {
     uint32_t peer_ip_num;
     int role_mode;
 
-    if (db_client_load_pqc_exchange_tunnel(
-            node_id, hs_tun_name, sizeof(hs_tun_name), hs_tun_ip,
-            sizeof(hs_tun_ip), hs_peer_tun_ip,
-            sizeof(hs_peer_tun_ip)) != 0) {
-        log_error("[PQC-TUNNEL] Missing PQC exchange tunnel for profile %d",
-                  node_id);
-        return -ENOENT;
+    int tunnel_rc = db_client_load_pqc_exchange_tunnel(
+        node_id, hs_tun_name, sizeof(hs_tun_name), hs_tun_ip,
+        sizeof(hs_tun_ip), hs_peer_tun_ip,
+        sizeof(hs_peer_tun_ip));
+    if (tunnel_rc != 0) {
+        if (tunnel_rc == -EEXIST)
+            log_error("[PQC-TUNNEL] Refusing ambiguous exchange tunnel configuration for profile %d",
+                      node_id);
+        else
+            log_error("[PQC-TUNNEL] Missing PQC exchange tunnel for profile %d",
+                      node_id);
+        return tunnel_rc;
     }
     if (hs_tun_name[0] == '\0' || strlen(hs_tun_name) >= IFNAMSIZ) {
         log_error("[PQC-TUNNEL] Interface name '%s' is empty or exceeds IFNAMSIZ",

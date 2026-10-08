@@ -946,7 +946,12 @@ static void handle_del_profile(int client_fd, int profile_id,
 static void handle_edit_config_multi(int client_fd, int profile_id, const char *fields_str, app_context_t *ctx)
 {
     app_context_t candidate = {0};
+    app_context_t baseline = {0};
+    app_context_t pending_candidate = {0};
     app_config_t refreshed = {0};
+    enum provision_transaction_kind pending_kind = PROVISION_TX_NONE;
+    uint64_t pending_generation = 0;
+    uint64_t pending_previous_generation = 0;
     uint64_t previous_config_generation = 0;
     uint64_t config_generation = 0;
 
@@ -1017,10 +1022,22 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     bool reload_pqc_lifecycle = false;
     bool trigger_pqc_handshake = false;
     bool stage_security_transition = false;
+    bool replace_pending_full_apply = false;
+    bool pqc_edit_requested = refresh_pqc_keys || refresh_pqc_tunnels ||
+                              refresh_pqc_binding;
 
-    if (provision_transaction_any()) {
+    if (provision_transaction_snapshot(profile_id, &pending_candidate,
+                                       &pending_kind, &pending_generation,
+                                       &pending_previous_generation)) {
+        if (pending_kind != PROVISION_TX_FULL_APPLY || !pqc_edit_requested) {
+            reply_json(client_fd, 409,
+                       "Another apply/security transition is still pending");
+            return;
+        }
+        replace_pending_full_apply = true;
+    } else if (provision_transaction_any()) {
         reply_json(client_fd, 409,
-                   "Another apply/security transition is still pending");
+                   "Another profile transition is still pending");
         return;
     }
 
@@ -1034,32 +1051,33 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     runtime_config_lock();
-    candidate = *ctx;
+    candidate = replace_pending_full_apply ? pending_candidate : *ctx;
+    baseline = candidate;
 
     if (refresh_profiles || refresh_tunnels) {
 
         /* Keep an already-derived PQC session key until the requested
          * handshake refresh below replaces it. The DB intentionally does
          * not contain this ephemeral traffic key. */
-        if (ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
-            ctx->cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
+        if (baseline.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
+            baseline.cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
             refreshed.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-            memcpy(refreshed.encrypt.key, ctx->cfg.encrypt.key,
+            memcpy(refreshed.encrypt.key, baseline.cfg.encrypt.key,
                    PQC_TRAFFIC_KEY_SZ);
             refreshed.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
         }
         candidate.cfg = refreshed;
-        runtime_update_needed = !config_runtime_equal(&ctx->cfg,
+        runtime_update_needed = !config_runtime_equal(&baseline.cfg,
                                                       &candidate.cfg);
-        sync_needed = !config_kernel_equal(&ctx->cfg, &candidate.cfg);
+        sync_needed = !config_kernel_equal(&baseline.cfg, &candidate.cfg);
         weight_only_update = sync_needed &&
-            config_kernel_weight_only_changed(&ctx->cfg,
+            config_kernel_weight_only_changed(&baseline.cfg,
                                               &candidate.cfg);
         failover_reconcile_needed = !config_failover_equal(
-            &ctx->cfg, &candidate.cfg);
+            &baseline.cfg, &candidate.cfg);
         if (runtime_update_needed)
             reload_pqc_lifecycle = config_pqc_policy_changed(
-                &ctx->cfg, &candidate.cfg);
+                &baseline.cfg, &candidate.cfg);
     }
 
     if (refresh_pqc_keys || refresh_pqc_tunnels || refresh_pqc_binding)
@@ -1069,6 +1087,12 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM;
     runtime_config_unlock();
 
+    if (replace_pending_full_apply && !stage_security_transition) {
+        reply_json(client_fd, 409,
+                   "Pending PQC full apply cannot be replaced by a non-PQC edit");
+        return;
+    }
+
     if (!runtime_update_needed && !reload_pqc_lifecycle) {
         log_info("[EDIT] NOOP profile=%d metadata=%d; runtime datapath unchanged",
                  profile_id, metadata_seen ? 1 : 0);
@@ -1077,9 +1101,18 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         return;
     }
 
-    if (reload_pqc_lifecycle)
+    if (reload_pqc_lifecycle) {
         config_generation = runtime_config_begin_reload(
             &previous_config_generation);
+        if (replace_pending_full_apply &&
+            previous_config_generation != pending_generation) {
+            runtime_config_cancel_reload(config_generation,
+                                         previous_config_generation);
+            reply_json(client_fd, 409,
+                       "Full apply transaction changed; retry edit");
+            return;
+        }
+    }
 
     runtime_config_lock();
 
@@ -1146,11 +1179,27 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     runtime_config_unlock();
 
     if (stage_security_transition) {
-        provision_transaction_stage(PROVISION_TX_SECURITY_EDIT, &candidate,
-                                    config_generation,
-                                    previous_config_generation);
-        log_info("[EDIT] Security candidate staged for profile %d; ACTIVE datapath/key remains in use",
-                 profile_id);
+        if (replace_pending_full_apply) {
+            if (provision_transaction_replace_full_apply(
+                    &candidate, pending_generation, config_generation) != 0) {
+                runtime_config_cancel_reload(config_generation,
+                                             previous_config_generation);
+                reply_json(client_fd, 409,
+                           "Full apply transaction changed; retry edit");
+                return;
+            }
+            provision_reconcile_accept(&candidate);
+            log_info("[EDIT] Pending full apply replaced for profile %d generation=%llu old_generation=%llu base_generation=%llu",
+                     profile_id, (unsigned long long)config_generation,
+                     (unsigned long long)pending_generation,
+                     (unsigned long long)pending_previous_generation);
+        } else {
+            provision_transaction_stage(PROVISION_TX_SECURITY_EDIT,
+                                        &candidate, config_generation,
+                                        previous_config_generation);
+            log_info("[EDIT] Security candidate staged for profile %d; ACTIVE datapath/key remains in use",
+                     profile_id);
+        }
     }
 
     if (!stage_security_transition && failover_reconcile_needed &&
@@ -1165,7 +1214,8 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
                      profile_id, strerror(-failover_rc));
     }
 
-    if (reload_pqc_lifecycle && !stage_security_transition) {
+    if (replace_pending_full_apply ||
+        (reload_pqc_lifecycle && !stage_security_transition)) {
         sig_pqc_prepare_reload();
         sig_pqc_finalize_reload();
     }
@@ -1183,6 +1233,8 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     reply_json(client_fd, 200,
+               replace_pending_full_apply ?
+                   "Pending full apply updated; PQC handshake restarted" :
                stage_security_transition ?
                    "Security update accepted; old config remains active until handshake commit" :
                    "Config updated and synced successfully");

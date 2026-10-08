@@ -106,6 +106,32 @@ int provision_transaction_update(const app_context_t *candidate,
     return ret;
 }
 
+int provision_transaction_replace_full_apply(const app_context_t *candidate,
+                                             uint64_t expected_generation,
+                                             uint64_t new_generation)
+{
+    int ret = 0;
+
+    if (!candidate || !expected_generation || !new_generation)
+        return -EINVAL;
+
+    pthread_mutex_lock(&provision.lock);
+    if (!provision.transaction_valid ||
+        provision.transaction_kind != PROVISION_TX_FULL_APPLY ||
+        provision.transaction_generation != expected_generation ||
+        provision.transaction_candidate.cfg.node_id !=
+            candidate->cfg.node_id) {
+        ret = -ESTALE;
+    } else {
+        /* Keep transaction_previous_generation unchanged. It identifies the
+         * ACTIVE generation that predates the whole full-apply sequence. */
+        provision.transaction_candidate = *candidate;
+        provision.transaction_generation = new_generation;
+    }
+    pthread_mutex_unlock(&provision.lock);
+    return ret;
+}
+
 static void transaction_clear_locked(void)
 {
     provision.transaction_valid = false;

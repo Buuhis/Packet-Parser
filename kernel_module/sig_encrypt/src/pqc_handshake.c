@@ -156,6 +156,7 @@ static bool g_policy_bindings_active[MAX_POLICY_BINDINGS] = {false};
 static atomic_bool g_dispatcher_running = ATOMIC_VAR_INIT(false);
 static pqc_runtime_state_t g_dispatcher_state = PQC_RUNTIME_STOPPED;
 static int g_dispatcher_last_error;
+static bool g_dispatcher_reconfiguring;
 static pthread_cond_t g_dispatcher_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_worker_state_cond = PTHREAD_COND_INITIALIZER;
 static uint64_t g_rx_tuple_drop_count;
@@ -2226,6 +2227,7 @@ static void pqc_dispatcher_publish_failure(int error_code) {
                           memory_order_release);
     g_dispatcher_state = PQC_RUNTIME_FAILED;
     g_dispatcher_last_error = error_code ? error_code : EIO;
+    g_dispatcher_reconfiguring = false;
     g_dispatcher_ifname[0] = '\0';
     g_dispatcher_local_ip[0] = '\0';
     pthread_cond_broadcast(&g_dispatcher_cond);
@@ -2243,17 +2245,45 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
         return -EINVAL;
 
     pthread_mutex_lock(&g_key_mutex);
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    while (g_dispatcher_reconfiguring) {
+        rc = pthread_cond_timedwait(&g_dispatcher_cond, &g_key_mutex,
+                                    &deadline);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_key_mutex);
+            return -ETIMEDOUT;
+        }
+    }
     if ((g_dispatcher_state == PQC_RUNTIME_RUNNING &&
          pqc_dispatcher_is_running()) ||
         g_dispatcher_state == PQC_RUNTIME_STARTING) {
         if (strcmp(g_dispatcher_ifname, ifname) != 0 ||
             strcmp(g_dispatcher_local_ip, local_ip) != 0) {
-            pthread_mutex_unlock(&g_key_mutex);
             fprintf(stderr,
-                    "[PQC-HS] UDP dispatcher already owns %s/%s; cannot also bind %s/%s.\n",
+                    "[PQC-HS] Rebinding UDP dispatcher from %s/%s to %s/%s.\n",
                     g_dispatcher_ifname, g_dispatcher_local_ip,
                     ifname, local_ip);
-            return -EADDRINUSE;
+            if (g_dispatcher_state == PQC_RUNTIME_STARTING) {
+                pthread_mutex_unlock(&g_key_mutex);
+                return -EAGAIN;
+            }
+
+            g_dispatcher_reconfiguring = true;
+            atomic_store_explicit(&g_dispatcher_running, false,
+                                  memory_order_release);
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            deadline.tv_sec += 2;
+            while (g_dispatcher_reconfiguring) {
+                rc = pthread_cond_timedwait(&g_dispatcher_cond,
+                                            &g_key_mutex, &deadline);
+                if (rc == ETIMEDOUT) {
+                    pthread_mutex_unlock(&g_key_mutex);
+                    fprintf(stderr,
+                            "[PQC-HS] Timed out stopping the old UDP dispatcher.\n");
+                    return -ETIMEDOUT;
+                }
+            }
         }
     }
     if (g_dispatcher_state == PQC_RUNTIME_RUNNING &&
@@ -2516,7 +2546,11 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     pthread_mutex_lock(&g_key_mutex);
     atomic_store_explicit(&g_dispatcher_running, false,
                           memory_order_release);
-    if (g_dispatcher_state == PQC_RUNTIME_RUNNING) {
+    if (g_dispatcher_reconfiguring) {
+        g_dispatcher_state = PQC_RUNTIME_STOPPED;
+        g_dispatcher_last_error = 0;
+        g_dispatcher_reconfiguring = false;
+    } else if (g_dispatcher_state == PQC_RUNTIME_RUNNING) {
         g_dispatcher_state = PQC_RUNTIME_FAILED;
         g_dispatcher_last_error = runtime_error ? runtime_error : ECONNRESET;
     }

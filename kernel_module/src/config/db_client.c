@@ -440,10 +440,19 @@ int db_client_load_pqc_exchange_tunnel(int profile_id, char *tunnel_name, size_t
         return -1;
     }
 
-    if (PQntuples(res) == 0) {
+    int row_count = PQntuples(res);
+    if (row_count == 0) {
         PQclear(res);
         pthread_mutex_unlock(&g_db_mutex);
-        return -2; /* Not found */
+        return -ENOENT;
+    }
+
+    if (row_count != 1) {
+        log_error("[PQC-TUNNEL] Profile %d has %d exchange tunnel mappings; exactly one is required",
+                  profile_id, row_count);
+        PQclear(res);
+        pthread_mutex_unlock(&g_db_mutex);
+        return -EEXIST;
     }
 
     if (tunnel_name && tn_len > 0) {

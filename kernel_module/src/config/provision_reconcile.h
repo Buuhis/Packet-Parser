@@ -36,6 +36,9 @@ bool provision_transaction_snapshot(int profile_id,
 bool provision_transaction_any(void);
 int provision_transaction_update(const app_context_t *candidate,
                                  uint64_t generation);
+int provision_transaction_replace_full_apply(const app_context_t *candidate,
+                                             uint64_t expected_generation,
+                                             uint64_t new_generation);
 void provision_transaction_finish(uint64_t generation);
 void provision_transaction_cancel(uint64_t generation);
 
