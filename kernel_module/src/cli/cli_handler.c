@@ -768,17 +768,35 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                                size_t tunnel_count, app_context_t *ctx)
 {
     app_context_t candidate;
+    enum provision_transaction_kind transaction_kind = PROVISION_TX_NONE;
     enum kernel_sync_result sync_result;
+    uint64_t transaction_generation = 0;
+    bool transaction_pending;
+    bool committed_full_apply = false;
     size_t already_absent = 0;
 
-    if (provision_transaction_any()) {
-        reply_json(client_fd, 409,
-                   "Cannot delete tunnels while an apply/security transition is pending");
-        return;
-    }
-
     runtime_config_lock();
-    candidate = *ctx;
+    transaction_pending = provision_transaction_snapshot(
+        profile_id, &candidate, &transaction_kind,
+        &transaction_generation, NULL);
+    if (transaction_pending) {
+        if (transaction_kind != PROVISION_TX_FULL_APPLY) {
+            runtime_config_unlock();
+            reply_json(client_fd, 409,
+                       "Security transition is still pending");
+            return;
+        }
+    } else {
+        /* A transaction for another profile must not be bypassed by deleting
+         * from the active snapshot. */
+        if (provision_transaction_any()) {
+            runtime_config_unlock();
+            reply_json(client_fd, 409,
+                       "Another apply/security transition is still pending");
+            return;
+        }
+        candidate = *ctx;
+    }
 
     for (size_t n = 0; n < tunnel_count; n++) {
         const char *tunnel_name = tunnel_names[n];
@@ -845,9 +863,23 @@ static void handle_del_tunnels(int client_fd, int profile_id,
      * means the active kernel config was acknowledged, not merely deferred. */
     sync_result = kernel_sync_push_config(&candidate);
     if (sync_result == KERNEL_SYNC_APPLIED) {
+        if (transaction_pending &&
+            provision_transaction_update(
+                &candidate, transaction_generation) != 0) {
+            runtime_config_unlock();
+            reply_json(client_fd, 409,
+                       "Full apply transaction changed; retry delete");
+            return;
+        }
         *ctx = candidate;
         provision_reconcile_accept(ctx);
+        if (transaction_pending) {
+            provision_transaction_finish(transaction_generation);
+            committed_full_apply = true;
+        }
         runtime_config_unlock();
+        if (committed_full_apply)
+            cpu_tune_apply(&candidate);
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[DEL] Tunnel '%s' absent and kernel snapshot reconciled (remaining: %zu)",
                      tunnel_names[n], candidate.cfg.sdwan_tun_count);
@@ -856,6 +888,20 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                    already_absent == tunnel_count ?
                        "Tunnel already absent; stale kernel binding removed" :
                        "Tunnel deleted successfully");
+    } else if (sync_result == KERNEL_SYNC_DEFERRED) {
+        if (transaction_pending &&
+            provision_transaction_update(
+                &candidate, transaction_generation) != 0) {
+            runtime_config_unlock();
+            reply_json(client_fd, 409,
+                       "Full apply transaction changed; retry delete");
+            return;
+        }
+        runtime_config_unlock();
+        log_warn("[DEL] Tunnel '%s' removed from pending full apply, but kernel cleanup is not applied yet",
+                 tunnel_names[0]);
+        reply_json(client_fd, 503,
+                   "Tunnel cleanup pending; retry delete after kernel apply");
     } else {
         runtime_config_unlock();
         log_error("[DEL] Kernel cleanup not applied for tunnel '%s' (result=%d)",
