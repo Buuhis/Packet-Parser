@@ -248,16 +248,32 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
 
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
-    
+
+    /* A pending-only tunnel must never become an unmanaged plaintext escape
+     * merely because another profile/config is still active.  An interface
+     * shared with the active config remains usable only for make-before-break
+     * edits; full -id additionally closes the global datapath gate. */
+    if (state->out &&
+        mwan_mac_discovery_is_pending_tunnel(state->out->ifindex) &&
+        (!cfg || mwan_state_datapath_blocked() ||
+         !is_mwan_tunnel(cfg, state->out->ifindex))) {
+        rcu_read_unlock();
+        pr_warn_ratelimited("mwan_kmod: PREKEY-TX-DROP ifindex=%d reason=PENDING_NOT_ACTIVE\n",
+                            state->out->ifindex);
+        return NF_DROP;
+    }
+
     if (!cfg || cfg->num_tunnels == 0) {
         rcu_read_unlock();
-        if (state->out &&
-            mwan_mac_discovery_is_pending_tunnel(state->out->ifindex)) {
-            pr_warn_ratelimited("mwan_kmod: PREKEY-TX-DROP ifindex=%d reason=NO_ACTIVE_KEY\n",
-                                state->out->ifindex);
-            return NF_DROP;
-        }
         return NF_ACCEPT;
+    }
+
+    if (mwan_state_datapath_blocked() && state->out &&
+        is_mwan_tunnel(cfg, state->out->ifindex)) {
+        pr_warn_ratelimited("mwan_kmod: DATAPATH-GATE-TX-DROP ifindex=%d reason=FULL_APPLY\n",
+                            state->out->ifindex);
+        rcu_read_unlock();
+        return NF_DROP;
     }
 
     /* 1. Filter: Check if Outbound Interface is managed by MWAN */
@@ -514,15 +530,27 @@ static unsigned int mwan_hook_pre_routing(void *priv, struct sk_buff *skb, const
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
 
+    if (skb->dev &&
+        mwan_mac_discovery_is_pending_tunnel(skb->dev->ifindex) &&
+        (!cfg || mwan_state_datapath_blocked() ||
+         !is_mwan_tunnel(cfg, skb->dev->ifindex))) {
+        rcu_read_unlock();
+        pr_warn_ratelimited("mwan_kmod: PREKEY-RX-DROP ifindex=%d reason=PENDING_NOT_ACTIVE\n",
+                            skb->dev->ifindex);
+        return NF_DROP;
+    }
+
     if (!cfg) {
         rcu_read_unlock();
-        if (skb->dev &&
-            mwan_mac_discovery_is_pending_tunnel(skb->dev->ifindex)) {
-            pr_warn_ratelimited("mwan_kmod: PREKEY-RX-DROP ifindex=%d reason=NO_ACTIVE_KEY\n",
-                                skb->dev->ifindex);
-            return NF_DROP;
-        }
         return NF_ACCEPT;
+    }
+
+    if (mwan_state_datapath_blocked() && skb->dev &&
+        is_mwan_tunnel(cfg, skb->dev->ifindex)) {
+        pr_warn_ratelimited("mwan_kmod: DATAPATH-GATE-RX-DROP ifindex=%d reason=FULL_APPLY\n",
+                            skb->dev->ifindex);
+        rcu_read_unlock();
+        return NF_DROP;
     }
 
     /* 1. Check if packet is coming from one of our WAN tunnels */

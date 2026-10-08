@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 4
+#define MWAN_GENL_VERSION 5
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
@@ -69,6 +69,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_SET_TUNNEL_WEIGHTS, /* update weights without replacing runtime */
     MWAN_CMD_REBIND_TUNNEL,    /* replace one DOWN tunnel's net_device */
     MWAN_CMD_SET_DISCOVERY_CONFIG, /* register data tunnels before PQC key */
+    MWAN_CMD_SET_DATAPATH_GATE, /* full -id: block/unblock active data paths */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -97,6 +98,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_NEXT_KEY_ID,       /* u8: staged traffic-key generation */
     MWAN_ATTR_KEY_STATE,         /* u8: enum mwan_pqc_key_state */
     MWAN_ATTR_NEW_IFINDEX,       /* u32: replacement data-tunnel ifindex */
+    MWAN_ATTR_DATAPATH_BLOCKED,  /* u8: 1=fail closed, 0=allow active cfg */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

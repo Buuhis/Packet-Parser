@@ -377,7 +377,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
          * protocol can leak plaintext before activation. */
         if (__atomic_load_n(&active_kernel_config_generation,
                             __ATOMIC_ACQUIRE) != 0) {
-            log_info("[DISCOVERY-CONFIG] active datapath generation=%u preserved while pending generation=%u waits for PQC key",
+            log_info("[DISCOVERY-CONFIG] previous datapath generation=%u remains installed while pending generation=%u waits for PQC key; full -id gate controls forwarding",
                      __atomic_load_n(&active_kernel_config_generation,
                                      __ATOMIC_ACQUIRE),
                      discovery_generation);
@@ -539,6 +539,53 @@ uint32_t kernel_sync_current_config_generation(void)
 {
     return __atomic_load_n(&active_kernel_config_generation,
                            __ATOMIC_ACQUIRE);
+}
+
+int kernel_sync_set_datapath_blocked(bool blocked)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    int family_id;
+    int ret = -EIO;
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    ret = genl_connect(sock);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = kernel_sync_nl_to_errno(family_id);
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_SET_DATAPATH_GATE, MWAN_GENL_VERSION) ||
+        nla_put_u8(msg, MWAN_ATTR_DATAPATH_BLOCKED,
+                   blocked ? 1 : 0) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret < 0)
+        ret = kernel_sync_nl_to_errno(ret);
+    else
+        ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
 }
 
 int kernel_sync_update_tunnel_weights(const app_context_t *ctx)

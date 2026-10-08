@@ -266,7 +266,12 @@ int pqc_bind_node(int node_id, uint64_t config_generation) {
 void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
                           uint64_t config_generation) {
     app_context_t candidate;
+    enum provision_transaction_kind transaction_kind = PROVISION_TX_NONE;
+    uint64_t previous_generation = 0;
     enum kernel_sync_result sync_result;
+    bool transaction_pending;
+    bool apply_cpu_tuning = false;
+    bool cancel_security_generation = false;
 
     log_info("[PQC] Handshake successful for Node %d! Syncing new dynamic session key to kernel...", profile_id);
     runtime_config_lock();
@@ -279,13 +284,23 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
              running_ctx.cfg.encrypt.key_len,
              key_bytes ? "valid" : "null");
     
-    // Check if this matches the currently running Node configuration
+    transaction_pending = provision_transaction_snapshot(
+        profile_id, &candidate, &transaction_kind, NULL,
+        &previous_generation);
+
+    // A full apply or security edit commits its PENDING snapshot here. A
+    // retry without a transaction updates the existing ACTIVE snapshot.
     if (key_bytes &&
         runtime_config_generation_is_current_locked(config_generation) &&
-        running_ctx.cfg.node_id == profile_id &&
-        running_ctx.cfg.encrypt.enabled &&
-        running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
-        candidate = running_ctx;
+        ((transaction_pending &&
+          candidate.cfg.encrypt.enabled &&
+          candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) ||
+         (!transaction_pending &&
+          running_ctx.cfg.node_id == profile_id &&
+          running_ctx.cfg.encrypt.enabled &&
+          running_ctx.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM))) {
+        if (!transaction_pending)
+            candidate = running_ctx;
         memcpy(candidate.cfg.encrypt.key, key_bytes, PQC_TRAFFIC_KEY_SZ);
         candidate.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
         log_info("[CFG-TRACE pqc-callback] KEY_INSTALLED callback_node=%d active_node=%d active_layer=%u active_type=%u key_len=%zu",
@@ -302,14 +317,37 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
                  sync_result == KERNEL_SYNC_APPLIED ? "APPLIED" :
                  sync_result == KERNEL_SYNC_DEFERRED ? "DEFERRED" : "ERROR");
         if (sync_result != KERNEL_SYNC_ERROR) {
-            running_ctx = candidate;
-            provision_reconcile_note_key(profile_id, true);
-            if (sync_result == KERNEL_SYNC_APPLIED)
+            if (transaction_pending)
+                (void)provision_transaction_update(
+                    &candidate, config_generation);
+            if (sync_result == KERNEL_SYNC_APPLIED) {
+                running_ctx = candidate;
+                provision_reconcile_accept(&running_ctx);
+                if (transaction_pending)
+                    provision_transaction_finish(config_generation);
+                else
+                    provision_reconcile_note_key(profile_id, true);
+                apply_cpu_tuning =
+                    transaction_kind == PROVISION_TX_FULL_APPLY;
                 log_info("[PQC] Dynamic key synchronized with kernel datapath for Node %d", profile_id);
-            else
+            } else {
+                if (transaction_kind == PROVISION_TX_FULL_APPLY)
+                    provision_reconcile_note_key(profile_id, true);
                 log_info("[PQC] Dynamic key retained for Node %d while waiting for a tunnel -a event", profile_id);
+            }
         } else {
             log_error("[PQC] Failed to sync dynamic key to kernel for Node %d", profile_id);
+            if (transaction_kind == PROVISION_TX_SECURITY_EDIT) {
+                provision_transaction_cancel(config_generation);
+                cancel_security_generation = true;
+                log_warn("[EDIT] Candidate rejected; ACTIVE config/key was never replaced for profile %d",
+                         profile_id);
+            } else if (transaction_kind == PROVISION_TX_FULL_APPLY) {
+                (void)provision_transaction_update(
+                    &candidate, config_generation);
+                log_warn("[CFG-TRACE] Full apply remains fail-closed after kernel key install failure for profile %d",
+                         profile_id);
+            }
         }
     } else {
         log_warn("[PQC-HS-DIAG] event=KEY_SYNC profile=%d generation=%llu "
@@ -324,6 +362,11 @@ void sig_pqc_on_key_ready(int profile_id, const uint8_t *key_bytes,
         log_warn("[PQC] Handshake key ready for Node %d but no active tunnel/encryption is configured for it.", profile_id);
     }
     runtime_config_unlock();
+    if (apply_cpu_tuning)
+        cpu_tune_apply(&candidate);
+    if (cancel_security_generation)
+        runtime_config_cancel_reload(config_generation,
+                                     previous_generation);
 }
 
 /* A rotation has already been committed through the key-only Netlink API.

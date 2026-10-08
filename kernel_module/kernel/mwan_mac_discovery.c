@@ -601,6 +601,8 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
 
     if (!cfg || !skb)
         return -EINVAL;
+    if (mwan_state_datapath_blocked())
+        return -EACCES;
 
     ingress_ifindex = skb->dev ? skb->dev->ifindex : 0;
     hdr = skb_header_pointer(skb, 0, sizeof(hdr_buf), &hdr_buf);
@@ -675,7 +677,8 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
     mutex_lock(&mwan_cfg_update_lock);
     cfg = rcu_dereference_protected(
         g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
-    if (cfg && cfg->num_tunnels && cfg->encrypt_on &&
+    if (!mwan_state_datapath_blocked() &&
+        cfg && cfg->num_tunnels && cfg->encrypt_on &&
         cfg->encrypt_layer == 2 &&
         cfg->encrypt_type == MWAN_CRYPT_PQC_GCM && cfg->key_id) {
         for (i = 0; i < cfg->num_tunnels; i++) {

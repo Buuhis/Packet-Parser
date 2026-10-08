@@ -32,6 +32,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NEXT_KEY_ID] = { .type = NLA_U8 },
     [MWAN_ATTR_KEY_STATE] = { .type = NLA_U8 },
     [MWAN_ATTR_NEW_IFINDEX] = { .type = NLA_U32 },
+    [MWAN_ATTR_DATAPATH_BLOCKED] = { .type = NLA_U8 },
 };
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
@@ -287,6 +288,21 @@ static int mwan_genl_set_discovery_config(struct sk_buff *skb,
         nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
         nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
         ifindices, count);
+}
+
+static int mwan_genl_set_datapath_gate(struct sk_buff *skb,
+                                        struct genl_info *info)
+{
+    u8 blocked;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_DATAPATH_BLOCKED])
+        return -EINVAL;
+    blocked = nla_get_u8(info->attrs[MWAN_ATTR_DATAPATH_BLOCKED]);
+    if (blocked > 1)
+        return -EINVAL;
+    mwan_state_set_datapath_blocked(blocked != 0);
+    return 0;
 }
 
 static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
@@ -686,6 +702,12 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = GENL_ADMIN_PERM,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_set_discovery_config,
+    },
+    {
+        .cmd    = MWAN_CMD_SET_DATAPATH_GATE,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_set_datapath_gate,
     },
 };
 

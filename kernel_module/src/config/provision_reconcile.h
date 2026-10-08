@@ -16,6 +16,29 @@ enum provision_state {
     PROVISION_READY,
 };
 
+enum provision_transaction_kind {
+    PROVISION_TX_NONE = 0,
+    PROVISION_TX_FULL_APPLY,
+    PROVISION_TX_SECURITY_EDIT,
+};
+
+/* ACTIVE remains in running_ctx.  This transaction owns the candidate until
+ * handshake + kernel ACK make it safe to commit. */
+void provision_transaction_stage(enum provision_transaction_kind kind,
+                                 const app_context_t *candidate,
+                                 uint64_t generation,
+                                 uint64_t previous_generation);
+bool provision_transaction_snapshot(int profile_id,
+                                    app_context_t *candidate,
+                                    enum provision_transaction_kind *kind,
+                                    uint64_t *generation,
+                                    uint64_t *previous_generation);
+bool provision_transaction_any(void);
+int provision_transaction_update(const app_context_t *candidate,
+                                 uint64_t generation);
+void provision_transaction_finish(uint64_t generation);
+void provision_transaction_cancel(uint64_t generation);
+
 void provision_reconcile_accept(const app_context_t *desired);
 void provision_reconcile_clear(void);
 void provision_reconcile_note_key(int profile_id, bool ready);

@@ -366,6 +366,8 @@ static void handle_retry(int client_fd, int req_id, app_context_t *ctx)
 {
     char retry_info[320] = {0};
     app_context_t active;
+    app_context_t pending;
+    enum provision_transaction_kind pending_kind;
     uint64_t config_generation;
     int retry_rc;
 
@@ -374,6 +376,25 @@ static void handle_retry(int client_fd, int req_id, app_context_t *ctx)
     runtime_config_lock();
     active = *ctx;
     runtime_config_unlock();
+    if (provision_transaction_snapshot(req_id, &pending, &pending_kind,
+                                       &config_generation, NULL) &&
+        pending.cfg.encrypt.enabled &&
+        pending.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+        retry_rc = pqc_bind_node(req_id, config_generation);
+        if (retry_rc == 0) {
+            log_info("[PQC-HS] Pending %s for profile %d restarted",
+                     pending_kind == PROVISION_TX_FULL_APPLY ?
+                         "full apply" : "security edit",
+                     req_id);
+            reply_json(client_fd, 200, "Pending handshake retry triggered");
+            return;
+        }
+        snprintf(retry_info, sizeof(retry_info),
+                 "Profile %d pending retry failed: %s", req_id,
+                 strerror(-retry_rc));
+        reply_json(client_fd, 503, retry_info);
+        return;
+    }
     if (active.cfg.node_id != req_id || !active.cfg.encrypt.enabled ||
         active.cfg.encrypt.type != MWAN_CRYPT_PQC_GCM) {
         snprintf(retry_info, sizeof(retry_info),
@@ -446,8 +467,29 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     log_info("[CFG-AUDIT req=%lu] CONFIG_GENERATION=%llu previous=%llu",
              generation, (unsigned long long)config_generation,
              (unsigned long long)previous_config_generation);
-    sync_result = apply_candidate(ctx, &candidate);
+    if (kernel_sync_set_datapath_blocked(true) != 0) {
+        runtime_config_cancel_reload(config_generation,
+                                     previous_config_generation);
+        log_error("[CFG-TRACE user=%lu] DATAPATH_GATE_FAILED node=%d",
+                  generation, req_id);
+        reply_json(client_fd, 500, "Failed to close datapath for full apply");
+        return;
+    }
+
+    /* Full -id is fail-closed.  Keep running_ctx as ACTIVE and retain the DB
+     * snapshot separately as PENDING until handshake + kernel ACK commit it. */
+    provision_reconcile_accept(&candidate);
+    provision_transaction_stage(PROVISION_TX_FULL_APPLY, &candidate,
+                                config_generation,
+                                previous_config_generation);
+    sync_result = kernel_sync_push_config(&candidate);
     if (sync_result == KERNEL_SYNC_ERROR) {
+        provision_transaction_cancel(config_generation);
+        if (active_snapshot.cfg.node_id > 0)
+            provision_reconcile_accept(&active_snapshot);
+        else
+            provision_reconcile_clear();
+        (void)kernel_sync_set_datapath_blocked(false);
         runtime_config_cancel_reload(config_generation,
                                      previous_config_generation);
         log_error("[CFG-TRACE user=%lu] KERNEL_SYNC_FAILED node=%d mode=%s",
@@ -457,20 +499,37 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
         return;
     }
 
-    log_info("[CFG-TRACE user=%lu] CTX_REPLACED node=%d mode=%s key_len=%zu",
-             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg),
-             ctx->cfg.encrypt.key_len);
-    provision_reconcile_accept(ctx);
+    if (sync_result == KERNEL_SYNC_APPLIED) {
+        runtime_config_lock();
+        *ctx = candidate;
+        runtime_config_unlock();
+        provision_reconcile_accept(&candidate);
+        provision_transaction_finish(config_generation);
+        log_info("[CFG-TRACE user=%lu] COMMIT_ACTIVE node=%d mode=%s key_len=%zu",
+                 generation, candidate.cfg.node_id,
+                 provision_mode_name(&candidate.cfg),
+                 candidate.cfg.encrypt.key_len);
+    } else {
+        log_info("[CFG-TRACE user=%lu] PENDING_FULL_APPLY node=%d mode=%s key_len=%zu",
+                 generation, candidate.cfg.node_id,
+                 provision_mode_name(&candidate.cfg),
+                 candidate.cfg.encrypt.key_len);
+    }
 
     log_info("[CFG-TRACE user=%lu] KERNEL_SYNC_RETURNED_SUCCESS node=%d mode=%s",
-             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
+             generation, candidate.cfg.node_id,
+             provision_mode_name(&candidate.cfg));
     log_info("[CFG-AUDIT req=%lu] SYNC_RESULT=%s node=%d mode=%s",
              generation,
              sync_result == KERNEL_SYNC_APPLIED ? "APPLIED" : "DEFERRED",
-             ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
-    log_provision_snapshot(generation, "USERSPACE_ACTIVE", &ctx->cfg);
+             candidate.cfg.node_id, provision_mode_name(&candidate.cfg));
+    log_provision_snapshot(generation,
+                           sync_result == KERNEL_SYNC_APPLIED ?
+                               "USERSPACE_ACTIVE" : "USERSPACE_PENDING",
+                           &candidate.cfg);
 
-    cpu_tune_apply(ctx);
+    if (sync_result == KERNEL_SYNC_APPLIED)
+        cpu_tune_apply(&candidate);
     save_node_id(req_id);
 
     sig_pqc_prepare_reload();
@@ -489,7 +548,8 @@ static void handle_provision(int client_fd, int req_id, app_context_t *ctx)
     }
 
     log_info("[CFG-TRACE user=%lu] END response=200 node=%d mode=%s",
-             generation, ctx->cfg.node_id, provision_mode_name(&ctx->cfg));
+             generation, candidate.cfg.node_id,
+             provision_mode_name(&candidate.cfg));
     reply_json(client_fd, 200, "Success");
 }
 
@@ -512,21 +572,36 @@ static void handle_add_tunnels(int client_fd, int profile_id,
                                size_t tunnel_count, app_context_t *ctx)
 {
     app_context_t candidate;
+    enum provision_transaction_kind transaction_kind = PROVISION_TX_NONE;
+    uint64_t transaction_generation = 0;
     bool ack_changed[MAX_SDWAN_TUNS] = { false };
     bool ack_added[MAX_SDWAN_TUNS] = { false };
     bool reconcile_needed = false;
+    bool committed_full_apply = false;
 
     runtime_config_lock();
-    if (ctx->cfg.node_id <= 0 || ctx->cfg.node_id != profile_id ||
+    if (provision_transaction_snapshot(profile_id, &candidate,
+                                       &transaction_kind,
+                                       &transaction_generation, NULL)) {
+        if (transaction_kind != PROVISION_TX_FULL_APPLY) {
+            runtime_config_unlock();
+            reply_json(client_fd, 409,
+                       "Security transition is still pending");
+            return;
+        }
+    } else {
+        candidate = *ctx;
+    }
+    if (candidate.cfg.node_id <= 0 ||
+        candidate.cfg.node_id != profile_id ||
         provision_reconcile_validate_profile(profile_id) != 0) {
         runtime_config_unlock();
         log_warn("[ADD] Rejected profile=%d active_profile=%d: profile is not provisioned",
-                 profile_id, ctx->cfg.node_id);
+                 profile_id, candidate.cfg.node_id);
         reply_json(client_fd, 409,
                    "Profile is not provisioned or is not active");
         return;
     }
-    candidate = *ctx;
 
     for (size_t n = 0; n < tunnel_count; n++) {
         const char *tunnel_name = tunnel_names[n];
@@ -643,15 +718,40 @@ static void handle_add_tunnels(int client_fd, int profile_id,
     }
 
     /* Sync to kernel */
-    if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
-        *ctx = candidate;
-        provision_reconcile_accept(ctx);
+    enum kernel_sync_result sync_result = kernel_sync_push_config(&candidate);
+    if (sync_result != KERNEL_SYNC_ERROR) {
+        if (transaction_kind == PROVISION_TX_FULL_APPLY) {
+            if (provision_transaction_update(
+                    &candidate, transaction_generation) != 0) {
+                rollback_add_acknowledgements(profile_id, tunnel_names,
+                                              tunnel_count, ack_changed,
+                                              ack_added);
+                runtime_config_unlock();
+                reply_json(client_fd, 409,
+                           "Full apply transaction changed; retry add");
+                return;
+            }
+            if (sync_result == KERNEL_SYNC_APPLIED) {
+                *ctx = candidate;
+                provision_reconcile_accept(ctx);
+                provision_transaction_finish(transaction_generation);
+                committed_full_apply = true;
+            }
+        } else {
+            *ctx = candidate;
+            provision_reconcile_accept(ctx);
+        }
         runtime_config_unlock();
+        if (committed_full_apply)
+            cpu_tune_apply(&candidate);
         for (size_t n = 0; n < tunnel_count; n++) {
             log_info("[ADD] Tunnel '%s' added and synced to kernel (total: %zu)",
                      tunnel_names[n], candidate.cfg.sdwan_tun_count);
         }
-        reply_json(client_fd, 200, "Tunnel added successfully");
+        reply_json(client_fd, 200,
+                   sync_result == KERNEL_SYNC_APPLIED ?
+                       "Tunnel added successfully" :
+                       "Tunnel accepted; waiting for PQC key");
     } else {
         rollback_add_acknowledgements(profile_id, tunnel_names,
                                       tunnel_count, ack_changed, ack_added);
@@ -668,6 +768,12 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                                size_t tunnel_count, app_context_t *ctx)
 {
     app_context_t candidate;
+
+    if (provision_transaction_any()) {
+        reply_json(client_fd, 409,
+                   "Cannot delete tunnels while an apply/security transition is pending");
+        return;
+    }
 
     runtime_config_lock();
     candidate = *ctx;
@@ -755,6 +861,12 @@ static void handle_del_profile(int client_fd, int profile_id,
     uint64_t previous_config_generation;
     uint64_t config_generation;
 
+    if (provision_transaction_any()) {
+        reply_json(client_fd, 409,
+                   "Cannot delete profile while an apply/security transition is pending");
+        return;
+    }
+
     (void)profile_id;
     config_generation = runtime_config_begin_reload(
         &previous_config_generation);
@@ -787,6 +899,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     bool refresh_tunnels = false;
     bool refresh_pqc_keys = false;
     bool refresh_pqc_tunnels = false;
+    bool refresh_pqc_binding = false;
     bool metadata_seen = false;
     bool unknown_prefix = false;
     char unknown_name[128] = {0};
@@ -815,6 +928,8 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
             refresh_pqc_keys = true;
         } else if (strncmp(token, "pqc_exchange_tunnels.", 21) == 0) {
             refresh_pqc_tunnels = true;
+        } else if (strncmp(token, "sdwan_pqc_ref.", 14) == 0) {
+            refresh_pqc_binding = true;
         } else {
             unknown_prefix = true;
             strncpy(unknown_name, token, sizeof(unknown_name) - 1);
@@ -832,7 +947,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     if (unknown_prefix) {
         log_warn("[EDIT] Unknown table prefix in '%s'", unknown_name);
         char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use sdwan_profiles.<field>, sdwan_tunnels.<field>, pqc_keys.<field> or pqc_exchange_tunnels.<field>", unknown_name);
+        snprintf(err_msg, sizeof(err_msg), "Unknown table prefix in '%s'. Use sdwan_profiles.<field>, sdwan_tunnels.<field>, pqc_keys.<field>, sdwan_pqc_ref.<field> or pqc_exchange_tunnels.<field>", unknown_name);
         reply_json(client_fd, 400, err_msg);
         return;
     }
@@ -844,6 +959,13 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     bool failover_reconcile_needed = false;
     bool reload_pqc_lifecycle = false;
     bool trigger_pqc_handshake = false;
+    bool stage_security_transition = false;
+
+    if (provision_transaction_any()) {
+        reply_json(client_fd, 409,
+                   "Another apply/security transition is still pending");
+        return;
+    }
 
     /* Profile weight_enable changes affect every tunnel's effective weight,
      * so profile and tunnel refreshes both reload one coherent snapshot. */
@@ -883,8 +1005,11 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
                 &ctx->cfg, &candidate.cfg);
     }
 
-    if (refresh_pqc_keys || refresh_pqc_tunnels)
+    if (refresh_pqc_keys || refresh_pqc_tunnels || refresh_pqc_binding)
         reload_pqc_lifecycle = true;
+    stage_security_transition = reload_pqc_lifecycle &&
+        candidate.cfg.encrypt.enabled &&
+        candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM;
     runtime_config_unlock();
 
     if (!runtime_update_needed && !reload_pqc_lifecycle) {
@@ -901,9 +1026,17 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
 
     runtime_config_lock();
 
+    /* A PQC security edit is make-before-break.  The candidate must wait for
+     * a newly authenticated traffic key; never copy the ACTIVE key into it. */
+    if (stage_security_transition) {
+        memset(candidate.cfg.encrypt.key, 0,
+               sizeof(candidate.cfg.encrypt.key));
+        candidate.cfg.encrypt.key_len = 0;
+    }
+
     /* A PQC key callback may have completed between the DB read and this
      * commit. Preserve that newest runtime key in the candidate as well. */
-    if (sync_needed &&
+    if (!stage_security_transition && sync_needed &&
         ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
         ctx->cfg.encrypt.key_len == PQC_TRAFFIC_KEY_SZ &&
         candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
@@ -913,7 +1046,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     // 3. Sync config to kernel if needed
-    if (sync_needed) {
+    if (sync_needed && !stage_security_transition) {
         int sync_failed;
 
         used_weight_update = weight_only_update &&
@@ -940,7 +1073,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
                      profile_id);
             log_info("[EDIT] Config changes successfully synced to kernel");
         }
-    } else if (runtime_update_needed) {
+    } else if (runtime_update_needed && !stage_security_transition) {
         /* Monitoring and other userspace-only values must be refreshed in
          * the active snapshot without replacing the kernel datapath. */
         *ctx = candidate;
@@ -951,12 +1084,19 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     /* Weight, monitoring and other non-PQC profile changes must not disturb
      * an established PQC session. A new handshake is needed only when the
      * PQC lifecycle was deliberately reloaded above. */
-    if (reload_pqc_lifecycle && ctx->cfg.encrypt.enabled &&
-        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM)
+    if (stage_security_transition)
         trigger_pqc_handshake = true;
     runtime_config_unlock();
 
-    if (failover_reconcile_needed &&
+    if (stage_security_transition) {
+        provision_transaction_stage(PROVISION_TX_SECURITY_EDIT, &candidate,
+                                    config_generation,
+                                    previous_config_generation);
+        log_info("[EDIT] Security candidate staged for profile %d; ACTIVE datapath/key remains in use",
+                 profile_id);
+    }
+
+    if (!stage_security_transition && failover_reconcile_needed &&
         (!sync_needed || used_weight_update)) {
         uint32_t kernel_generation =
             kernel_sync_current_config_generation();
@@ -968,7 +1108,7 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
                      profile_id, strerror(-failover_rc));
     }
 
-    if (reload_pqc_lifecycle) {
+    if (reload_pqc_lifecycle && !stage_security_transition) {
         sig_pqc_prepare_reload();
         sig_pqc_finalize_reload();
     }
@@ -985,7 +1125,10 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         }
     }
 
-    reply_json(client_fd, 200, "Config updated and synced successfully");
+    reply_json(client_fd, 200,
+               stage_security_transition ?
+                   "Security update accepted; old config remains active until handshake commit" :
+                   "Config updated and synced successfully");
 }
 
 #define SDWAN_TUNNEL_TOKEN_PREFIX "sdwan_tunnels."

@@ -15,12 +15,120 @@ struct provision_runtime {
     size_t desired_count;
     char desired_ifnames[MAX_SDWAN_TUNS][IFNAMSIZ];
     bool acknowledged[MAX_SDWAN_TUNS];
+    bool transaction_valid;
+    enum provision_transaction_kind transaction_kind;
+    app_context_t transaction_candidate;
+    uint64_t transaction_generation;
+    uint64_t transaction_previous_generation;
 };
 
 static struct provision_runtime provision = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .state = PROVISION_UNPROVISIONED,
 };
+
+void provision_transaction_stage(enum provision_transaction_kind kind,
+                                 const app_context_t *candidate,
+                                 uint64_t generation,
+                                 uint64_t previous_generation)
+{
+    pthread_mutex_lock(&provision.lock);
+    provision.transaction_valid = candidate && kind != PROVISION_TX_NONE &&
+                                  generation != 0;
+    provision.transaction_kind = provision.transaction_valid ? kind :
+                                                            PROVISION_TX_NONE;
+    if (candidate)
+        provision.transaction_candidate = *candidate;
+    else
+        memset(&provision.transaction_candidate, 0,
+               sizeof(provision.transaction_candidate));
+    provision.transaction_generation = provision.transaction_valid ?
+        generation : 0;
+    provision.transaction_previous_generation = provision.transaction_valid ?
+        previous_generation : 0;
+    pthread_mutex_unlock(&provision.lock);
+}
+
+bool provision_transaction_snapshot(int profile_id,
+                                    app_context_t *candidate,
+                                    enum provision_transaction_kind *kind,
+                                    uint64_t *generation,
+                                    uint64_t *previous_generation)
+{
+    bool found;
+
+    pthread_mutex_lock(&provision.lock);
+    found = provision.transaction_valid &&
+            (profile_id <= 0 ||
+             provision.transaction_candidate.cfg.node_id == profile_id);
+    if (found) {
+        if (candidate)
+            *candidate = provision.transaction_candidate;
+        if (kind)
+            *kind = provision.transaction_kind;
+        if (generation)
+            *generation = provision.transaction_generation;
+        if (previous_generation)
+            *previous_generation =
+                provision.transaction_previous_generation;
+    }
+    pthread_mutex_unlock(&provision.lock);
+    return found;
+}
+
+bool provision_transaction_any(void)
+{
+    bool active;
+
+    pthread_mutex_lock(&provision.lock);
+    active = provision.transaction_valid;
+    pthread_mutex_unlock(&provision.lock);
+    return active;
+}
+
+int provision_transaction_update(const app_context_t *candidate,
+                                 uint64_t generation)
+{
+    int ret = 0;
+
+    if (!candidate || !generation)
+        return -EINVAL;
+    pthread_mutex_lock(&provision.lock);
+    if (!provision.transaction_valid ||
+        provision.transaction_generation != generation ||
+        provision.transaction_candidate.cfg.node_id !=
+            candidate->cfg.node_id) {
+        ret = -ESTALE;
+    } else {
+        provision.transaction_candidate = *candidate;
+    }
+    pthread_mutex_unlock(&provision.lock);
+    return ret;
+}
+
+static void transaction_clear_locked(void)
+{
+    provision.transaction_valid = false;
+    provision.transaction_kind = PROVISION_TX_NONE;
+    memset(&provision.transaction_candidate, 0,
+           sizeof(provision.transaction_candidate));
+    provision.transaction_generation = 0;
+    provision.transaction_previous_generation = 0;
+}
+
+void provision_transaction_finish(uint64_t generation)
+{
+    pthread_mutex_lock(&provision.lock);
+    if (provision.transaction_valid &&
+        provision.transaction_generation == generation)
+        transaction_clear_locked();
+    pthread_mutex_unlock(&provision.lock);
+}
+
+void provision_transaction_cancel(uint64_t generation)
+{
+    provision_transaction_finish(generation);
+}
 
 static size_t count_missing_locked(void)
 {
@@ -109,6 +217,7 @@ void provision_reconcile_clear(void)
     memset(provision.desired_ifnames, 0, sizeof(provision.desired_ifnames));
     memset(provision.acknowledged, 0, sizeof(provision.acknowledged));
     provision.state = PROVISION_UNPROVISIONED;
+    transaction_clear_locked();
     pthread_mutex_unlock(&provision.lock);
 }
 

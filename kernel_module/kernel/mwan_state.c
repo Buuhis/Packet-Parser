@@ -24,6 +24,7 @@ DEFINE_MUTEX(mwan_cfg_update_lock);
  * share this monotonic source. */
 static atomic64_t packet_nonce;
 static atomic64_t no_active_tunnel_drops;
+static atomic_t mwan_datapath_blocked = ATOMIC_INIT(0);
 
 static struct mwan_active_paths *
 mwan_active_paths_build_weights(const struct mwan_config *cfg,
@@ -197,6 +198,19 @@ void mwan_state_init(void)
     BUILD_BUG_ON(sizeof(struct mwan_l2_pqc_hdr) != MWAN_L2_HDR_LEN);
     atomic64_set(&packet_nonce, get_random_u64());
     atomic64_set(&no_active_tunnel_drops, 0);
+    atomic_set(&mwan_datapath_blocked, 0);
+}
+
+void mwan_state_set_datapath_blocked(bool blocked)
+{
+    atomic_set(&mwan_datapath_blocked, blocked ? 1 : 0);
+    pr_info("mwan_kmod: DATAPATH-GATE state=%s\n",
+            blocked ? "BLOCKED" : "ACTIVE");
+}
+
+bool mwan_state_datapath_blocked(void)
+{
+    return atomic_read(&mwan_datapath_blocked) != 0;
 }
 
 u64 mwan_next_packet_nonce(void)
@@ -223,6 +237,7 @@ void mwan_state_cleanup(void)
         mwan_config_destroy(old);
     }
     mutex_unlock(&mwan_cfg_update_lock);
+    atomic_set(&mwan_datapath_blocked, 0);
 }
 
 int mwan_state_update(struct mwan_config *new_cfg)
@@ -509,6 +524,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
     }
     RCU_INIT_POINTER(new_cfg->active_paths, new_paths);
     rcu_assign_pointer(g_mwan_cfg, new_cfg);
+    /* A successful SET_CONFIG is the atomic commit point.  A full -id keeps
+     * the previous config installed but blocked until this publish occurs. */
+    atomic_set(&mwan_datapath_blocked, 0);
     synchronize_rcu();
     mwan_config_destroy(old);
     pr_info("mwan_kmod: CFG-TRACE ACTIVE node=%u mode=%u/%u/%u tunnels=%u\n",

@@ -529,6 +529,8 @@ extern char *mwan_l2_worker_cpus;
 /* API Functions */
 void mwan_state_init(void);
 void mwan_state_cleanup(void);
+void mwan_state_set_datapath_blocked(bool blocked);
+bool mwan_state_datapath_blocked(void);
 int mwan_state_update(struct mwan_config *new_cfg);
 int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
                                      const u32 *ifindices,

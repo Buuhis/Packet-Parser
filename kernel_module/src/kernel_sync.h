@@ -17,6 +17,9 @@ enum kernel_sync_result {
  * has nevertheless been registered independently with the kernel. */
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx);
 uint32_t kernel_sync_current_config_generation(void);
+/* Full -id fail-close gate.  Blocking leaves the active config/key installed
+ * for diagnostics, but data, discovery and BFD cannot use data tunnels. */
+int kernel_sync_set_datapath_blocked(bool blocked);
 int kernel_sync_update_tunnel_weights(const app_context_t *ctx);
 int kernel_sync_stage_pqc_key(int profile_id, uint64_t epoch, uint8_t key_id,
                               const uint8_t key[32]);
