@@ -164,10 +164,12 @@ static uint64_t g_rx_tuple_drop_suppressed;
 static uint64_t g_rx_tuple_drop_last_log;
 static char g_dispatcher_ifname[IFNAMSIZ];
 static char g_dispatcher_local_ip[INET_ADDRSTRLEN];
+static unsigned int g_dispatcher_ifindex;
 
 typedef struct {
     char ifname[IFNAMSIZ];
     char local_ip[INET_ADDRSTRLEN];
+    unsigned int ifindex;
 } pqc_dispatcher_endpoint_t;
 
 static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz, pqc_rx_pkt_info_t *info, int timeout_ms);
@@ -2230,6 +2232,7 @@ static void pqc_dispatcher_publish_failure(int error_code) {
     g_dispatcher_reconfiguring = false;
     g_dispatcher_ifname[0] = '\0';
     g_dispatcher_local_ip[0] = '\0';
+    g_dispatcher_ifindex = 0;
     pthread_cond_broadcast(&g_dispatcher_cond);
     pthread_mutex_unlock(&g_key_mutex);
 }
@@ -2238,11 +2241,20 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
                                          const char *local_ip) {
     struct timespec deadline;
     pthread_t udp_tid;
+    unsigned int current_ifindex;
     int rc;
 
     if (!ifname || !ifname[0] || strlen(ifname) >= IFNAMSIZ ||
         !local_ip || !local_ip[0] || strlen(local_ip) >= INET_ADDRSTRLEN)
         return -EINVAL;
+
+    /* A PPPoE interface can be deleted and recreated with the same name and
+     * address but a different ifindex.  SO_BINDTODEVICE resolves the name
+     * only when the socket is bound, so the running socket must be restarted
+     * whenever that identity changes. */
+    current_ifindex = if_nametoindex(ifname);
+    if (current_ifindex == 0)
+        return -ENODEV;
 
     pthread_mutex_lock(&g_key_mutex);
     clock_gettime(CLOCK_REALTIME, &deadline);
@@ -2259,11 +2271,13 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
          pqc_dispatcher_is_running()) ||
         g_dispatcher_state == PQC_RUNTIME_STARTING) {
         if (strcmp(g_dispatcher_ifname, ifname) != 0 ||
-            strcmp(g_dispatcher_local_ip, local_ip) != 0) {
+            strcmp(g_dispatcher_local_ip, local_ip) != 0 ||
+            g_dispatcher_ifindex != current_ifindex) {
             fprintf(stderr,
-                    "[PQC-HS] Rebinding UDP dispatcher from %s/%s to %s/%s.\n",
+                    "[PQC-HS] Rebinding UDP dispatcher from %s/%s ifindex=%u to %s/%s ifindex=%u.\n",
                     g_dispatcher_ifname, g_dispatcher_local_ip,
-                    ifname, local_ip);
+                    g_dispatcher_ifindex, ifname, local_ip,
+                    current_ifindex);
             if (g_dispatcher_state == PQC_RUNTIME_STARTING) {
                 pthread_mutex_unlock(&g_key_mutex);
                 return -EAGAIN;
@@ -2302,10 +2316,12 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
         snprintf(endpoint->ifname, sizeof(endpoint->ifname), "%s", ifname);
         snprintf(endpoint->local_ip, sizeof(endpoint->local_ip), "%s",
                  local_ip);
+        endpoint->ifindex = current_ifindex;
         snprintf(g_dispatcher_ifname, sizeof(g_dispatcher_ifname), "%s",
                  ifname);
         snprintf(g_dispatcher_local_ip, sizeof(g_dispatcher_local_ip), "%s",
                  local_ip);
+        g_dispatcher_ifindex = current_ifindex;
         g_dispatcher_state = PQC_RUNTIME_STARTING;
         g_dispatcher_last_error = 0;
         atomic_store_explicit(&g_dispatcher_running, false,
@@ -2318,6 +2334,7 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
             g_dispatcher_last_error = rc;
             g_dispatcher_ifname[0] = '\0';
             g_dispatcher_local_ip[0] = '\0';
+            g_dispatcher_ifindex = 0;
             pthread_cond_broadcast(&g_dispatcher_cond);
             pthread_mutex_unlock(&g_key_mutex);
             fprintf(stderr,
@@ -2409,6 +2426,16 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     endpoint = *(const pqc_dispatcher_endpoint_t *)arg;
     free(arg);
 
+    if (endpoint.ifindex == 0 ||
+        if_nametoindex(endpoint.ifname) != endpoint.ifindex) {
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Interface %s changed before socket bind (expected ifindex=%u, current=%u).\n",
+                endpoint.ifname, endpoint.ifindex,
+                if_nametoindex(endpoint.ifname));
+        pqc_dispatcher_publish_failure(ENODEV);
+        return NULL;
+    }
+
     int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
     if (sockfd < 0) {
         int saved_errno = errno;
@@ -2450,6 +2477,16 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
         pqc_dispatcher_publish_failure(saved_errno);
         return NULL;
     }
+    if (if_nametoindex(endpoint.ifname) != endpoint.ifindex) {
+        unsigned int current_ifindex = if_nametoindex(endpoint.ifname);
+
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Interface %s changed during socket bind (expected ifindex=%u, current=%u).\n",
+                endpoint.ifname, endpoint.ifindex, current_ifindex);
+        close(sockfd);
+        pqc_dispatcher_publish_failure(ESTALE);
+        return NULL;
+    }
 
     struct sockaddr_in servaddr;
     memset(&servaddr, 0, sizeof(servaddr));
@@ -2474,6 +2511,17 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
         return NULL;
     }
 
+    if (if_nametoindex(endpoint.ifname) != endpoint.ifindex) {
+        unsigned int current_ifindex = if_nametoindex(endpoint.ifname);
+
+        fprintf(stderr,
+                "[PQC-DISPATCHER] Interface %s changed before dispatcher activation (expected ifindex=%u, current=%u).\n",
+                endpoint.ifname, endpoint.ifindex, current_ifindex);
+        close(sockfd);
+        pqc_dispatcher_publish_failure(ESTALE);
+        return NULL;
+    }
+
     pthread_mutex_lock(&g_key_mutex);
     atomic_store_explicit(&g_dispatcher_running, true,
                           memory_order_release);
@@ -2486,8 +2534,9 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     struct sockaddr_in clientaddr;
 
     fprintf(stderr,
-            "[PQC-DISPATCHER] UDP listener running on %s/%s:%d\n",
-            endpoint.ifname, endpoint.local_ip, PQC_HS_PORT);
+            "[PQC-DISPATCHER] UDP listener running on %s/%s:%d ifindex=%u\n",
+            endpoint.ifname, endpoint.local_ip, PQC_HS_PORT,
+            endpoint.ifindex);
 
     while (pqc_dispatcher_is_running()) {
         struct iovec iov = {
@@ -2556,6 +2605,7 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     }
     g_dispatcher_ifname[0] = '\0';
     g_dispatcher_local_ip[0] = '\0';
+    g_dispatcher_ifindex = 0;
     pthread_cond_broadcast(&g_dispatcher_cond);
     pthread_mutex_unlock(&g_key_mutex);
     return NULL;
