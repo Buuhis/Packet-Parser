@@ -768,6 +768,8 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                                size_t tunnel_count, app_context_t *ctx)
 {
     app_context_t candidate;
+    enum kernel_sync_result sync_result;
+    size_t already_absent = 0;
 
     if (provision_transaction_any()) {
         reply_json(client_fd, 409,
@@ -794,11 +796,14 @@ static void handle_del_tunnels(int client_fd, int profile_id,
         }
 
         if (found < 0) {
-            runtime_config_unlock();
-            log_warn("[DEL] Tunnel '%s' not found in running config",
+            /* Delete is idempotent.  The userspace snapshot may already have
+             * dropped this tunnel while the active kernel snapshot still
+             * owns its net_device reference.  Keep the candidate unchanged
+             * and push it below so the kernel can destroy any stale binding. */
+            already_absent++;
+            log_warn("[DEL] Tunnel '%s' already absent from running config; reconciling kernel snapshot",
                      tunnel_name);
-            reply_json(client_fd, 404, "Tunnel not found in running config");
-            return;
+            continue;
         }
 
         /* Shift remaining elements down in the candidate only. */
@@ -835,21 +840,27 @@ static void handle_del_tunnels(int client_fd, int profile_id,
         return;
     }
 
-    /* Sync to kernel */
-    if (kernel_sync_push_config(&candidate) != KERNEL_SYNC_ERROR) {
+    /* Always reconcile the complete snapshot, including the idempotent case
+     * where every requested tunnel was already absent in userspace.  Success
+     * means the active kernel config was acknowledged, not merely deferred. */
+    sync_result = kernel_sync_push_config(&candidate);
+    if (sync_result == KERNEL_SYNC_APPLIED) {
         *ctx = candidate;
         provision_reconcile_accept(ctx);
         runtime_config_unlock();
         for (size_t n = 0; n < tunnel_count; n++) {
-            log_info("[DEL] Tunnel '%s' removed and synced to kernel (remaining: %zu)",
+            log_info("[DEL] Tunnel '%s' absent and kernel snapshot reconciled (remaining: %zu)",
                      tunnel_names[n], candidate.cfg.sdwan_tun_count);
         }
-        reply_json(client_fd, 200, "Tunnel deleted successfully");
+        reply_json(client_fd, 200,
+                   already_absent == tunnel_count ?
+                       "Tunnel already absent; stale kernel binding removed" :
+                       "Tunnel deleted successfully");
     } else {
         runtime_config_unlock();
-        log_error("[DEL] Netlink push failed after removing tunnel '%s'",
-                  tunnel_names[0]);
-        reply_json(client_fd, 500, "Netlink push error");
+        log_error("[DEL] Kernel cleanup not applied for tunnel '%s' (result=%d)",
+                  tunnel_names[0], sync_result);
+        reply_json(client_fd, 500, "Kernel tunnel cleanup was not applied");
     }
 }
 
