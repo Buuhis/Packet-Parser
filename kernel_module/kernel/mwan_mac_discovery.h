@@ -23,6 +23,7 @@ int mwan_mac_discovery_get_pending_state(u32 ifindex, u32 *generation,
                                          u32 *sequence, bool *up);
 int mwan_mac_discovery_rebind_pending(u32 node_id, u32 generation,
                                       u32 old_ifindex, u32 new_ifindex);
+int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex);
 bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[6]);
 bool mwan_mac_get_peer_tunnel_ip(struct mwan_tunnel *tun,
                                  __be32 *peer_tunnel_ip);

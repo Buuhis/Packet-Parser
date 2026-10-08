@@ -542,6 +542,9 @@ int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,
                                 u32 *sequence, bool *up);
 int mwan_state_rebind_tunnel(u32 node_id, u32 generation,
                              u32 old_ifindex, u32 new_ifindex);
+int mwan_state_detach_tunnel(u32 node_id, u32 ifindex);
+int mwan_state_netdev_notifier_init(void);
+void mwan_state_netdev_notifier_cleanup(void);
 int mwan_state_stage_pqc_key(u32 node_id, u32 generation, u64 epoch,
                              u8 key_id, const u8 *key, u8 key_len);
 int mwan_state_activate_pqc_key(u32 node_id, u32 generation, u64 epoch,

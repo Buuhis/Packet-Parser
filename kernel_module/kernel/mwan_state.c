@@ -43,7 +43,7 @@ mwan_active_paths_build_weights(const struct mwan_config *cfg,
         const struct mwan_tunnel *tun = &cfg->tunnels[i];
         u32 weight = weights ? weights[i] : tun->weight;
 
-        if (!tun->published_up || !weight)
+        if (!tun->dev || !tun->published_up || !weight)
             continue;
         paths->active_count++;
         paths->total_weight += weight;
@@ -59,7 +59,7 @@ mwan_active_paths_build_weights(const struct mwan_config *cfg,
         u32 count;
         u32 j;
 
-        if (!tun->published_up || !weight)
+        if (!tun->dev || !tun->published_up || !weight)
             continue;
         count = (u32)(((u64)weight * MWAN_LUT_SIZE) /
                       paths->total_weight);
@@ -702,6 +702,10 @@ int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
         ret = -ENOENT;
         goto out_unlock;
     }
+    if (up && !tun->dev) {
+        ret = -ENODEV;
+        goto out_unlock;
+    }
     if (sequence < tun->state_sequence ||
         (sequence == tun->state_sequence && tun->published_up != up)) {
         ret = -ESTALE;
@@ -883,6 +887,115 @@ out_unlock:
     if (replacement_dev)
         dev_put(replacement_dev);
     return ret;
+}
+
+int mwan_state_detach_tunnel(u32 node_id, u32 ifindex)
+{
+    struct mwan_active_paths *new_paths;
+    struct mwan_active_paths *old_paths;
+    struct net_device *old_dev;
+    struct mwan_config *cfg;
+    struct mwan_tunnel *tun = NULL;
+    bool old_up;
+    u32 i;
+    int ret = 0;
+
+    if (!ifindex)
+        return -EINVAL;
+
+    mutex_lock(&mwan_cfg_update_lock);
+    cfg = rcu_dereference_protected(g_mwan_cfg,
+                                    lockdep_is_held(&mwan_cfg_update_lock));
+    if (!cfg || (node_id && cfg->node_id != node_id)) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+    for (i = 0; i < cfg->num_tunnels; i++) {
+        if (cfg->tunnels[i].configured_ifindex == ifindex ||
+            cfg->tunnels[i].ifindex == ifindex) {
+            tun = &cfg->tunnels[i];
+            break;
+        }
+    }
+    if (!tun || !tun->dev) {
+        ret = -ENOENT;
+        goto out_unlock;
+    }
+
+    old_up = tun->published_up;
+    tun->published_up = false;
+    new_paths = mwan_active_paths_build(cfg);
+    if (!new_paths) {
+        tun->published_up = old_up;
+        ret = -ENOMEM;
+        goto out_unlock;
+    }
+    old_paths = rcu_dereference_protected(
+        cfg->active_paths, lockdep_is_held(&mwan_cfg_update_lock));
+    rcu_assign_pointer(cfg->active_paths, new_paths);
+    synchronize_rcu();
+    kfree(old_paths);
+
+    old_dev = tun->dev;
+    WRITE_ONCE(tun->dev, NULL);
+    tun->is_ethernet = false;
+    spin_lock_bh(&tun->gateway_mac_lock);
+    eth_zero_addr(tun->gateway_mac);
+    tun->mac_resolved = false;
+    tun->peer_tunnel_ip = 0;
+    tun->peer_ip_resolved = false;
+    tun->discovery_nonce = 0;
+    tun->discovery_unresolved_reported = false;
+    spin_unlock_bh(&tun->gateway_mac_lock);
+
+    /* Readers which observed old_dev may enqueue asynchronous crypto/TX work.
+     * Wait for both the RCU readers and those workqueues before dropping the
+     * final module-owned net_device reference. */
+    synchronize_rcu();
+    mwan_l2_workers_flush();
+    dev_put(old_dev);
+    pr_info("mwan_kmod: TUNNEL-DETACH node=%u ifindex=%u slot=%u state=DETACHED active=%u\n",
+            cfg->node_id, ifindex, i, new_paths->active_count);
+
+out_unlock:
+    mutex_unlock(&mwan_cfg_update_lock);
+    return ret;
+}
+
+static int mwan_netdev_event(struct notifier_block *nb,
+                             unsigned long event, void *ptr)
+{
+    struct net_device *dev;
+    int active_ret;
+    int pending_ret;
+
+    (void)nb;
+    if (event != NETDEV_UNREGISTER)
+        return NOTIFY_DONE;
+    dev = netdev_notifier_info_to_dev(ptr);
+    if (!dev || !dev->ifindex)
+        return NOTIFY_DONE;
+
+    active_ret = mwan_state_detach_tunnel(0, dev->ifindex);
+    pending_ret = mwan_mac_discovery_detach_pending(0, dev->ifindex);
+    if (!active_ret || !pending_ret)
+        pr_info("mwan_kmod: NETDEV-UNREGISTER if=%s ifindex=%d action=AUTO_DETACH active=%d pending=%d\n",
+                dev->name, dev->ifindex, active_ret, pending_ret);
+    return NOTIFY_DONE;
+}
+
+static struct notifier_block mwan_netdev_notifier = {
+    .notifier_call = mwan_netdev_event,
+};
+
+int mwan_state_netdev_notifier_init(void)
+{
+    return register_netdevice_notifier(&mwan_netdev_notifier);
+}
+
+void mwan_state_netdev_notifier_cleanup(void)
+{
+    unregister_netdevice_notifier(&mwan_netdev_notifier);
 }
 
 void mwan_state_count_no_active_drop(void)

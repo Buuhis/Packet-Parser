@@ -70,6 +70,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_REBIND_TUNNEL,    /* replace one DOWN tunnel's net_device */
     MWAN_CMD_SET_DISCOVERY_CONFIG, /* register data tunnels before PQC key */
     MWAN_CMD_SET_DATAPATH_GATE, /* full -id: block/unblock active data paths */
+    MWAN_CMD_DETACH_TUNNEL,    /* release one data tunnel independently of key */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)

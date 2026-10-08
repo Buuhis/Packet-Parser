@@ -338,13 +338,10 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         return KERNEL_SYNC_ERROR;
     }
 
-    /* A PQC profile is desired state.  Missing net_devices do not invalidate
-     * the profile: only the interfaces acknowledged by -id/-a are serialized
-     * into the current kernel snapshot.  The complete userspace snapshot is
-     * retained so a later -a can add one tunnel without reconstructing or
-     * restarting the other tunnels. */
-    if (ctx->cfg.encrypt.enabled &&
-        ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+    /* Tunnel availability is independent of encryption mode. Missing
+     * net_devices do not invalidate PQC, AES or BYPASS desired state: only
+     * interfaces acknowledged by -id/-a enter the current kernel snapshot. */
+    if (ctx->cfg.node_id > 0) {
         present_ret = provision_reconcile_build_present(
             ctx, &present_ctx, &missing_tunnels);
         push_ctx = &present_ctx;
@@ -580,6 +577,68 @@ int kernel_sync_set_datapath_blocked(bool blocked)
         ret = kernel_sync_nl_to_errno(ret);
     else
         ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_detach_tunnel(int profile_id, const char *ifname)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    unsigned int ifindex;
+    int family_id;
+    int ret = -EIO;
+
+    if (profile_id <= 0 || !ifname || !ifname[0])
+        return -EINVAL;
+    ifindex = if_nametoindex(ifname);
+    if (!ifindex) {
+        /* NETDEV_UNREGISTER may have won the race and already invoked the
+         * kernel notifier. A later -d is deliberately idempotent. */
+        log_info("[TUNNEL-DETACH] profile=%d tunnel=%s state=ALREADY_ABSENT",
+                 profile_id, ifname);
+        return 0;
+    }
+
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    ret = genl_connect(sock);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = kernel_sync_nl_to_errno(family_id);
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_DETACH_TUNNEL, MWAN_GENL_VERSION) ||
+        nla_put_u32(msg, MWAN_ATTR_NODE_ID, (uint32_t)profile_id) < 0 ||
+        nla_put_u32(msg, MWAN_ATTR_QUERY_IFINDEX, ifindex) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    if (ret < 0)
+        ret = kernel_sync_nl_to_errno(ret);
+    else {
+        log_info("[TUNNEL-DETACH] profile=%d tunnel=%s ifindex=%u state=ACKED",
+                 profile_id, ifname, ifindex);
+        ret = 0;
+    }
 out:
     if (msg)
         nlmsg_free(msg);

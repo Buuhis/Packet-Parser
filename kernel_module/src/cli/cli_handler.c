@@ -800,9 +800,22 @@ static void handle_del_tunnels(int client_fd, int profile_id,
 
     for (size_t n = 0; n < tunnel_count; n++) {
         const char *tunnel_name = tunnel_names[n];
+        int detach_rc;
 
         log_info(">>> [DEL] Profile %d: removing tunnel '%s'", profile_id,
                  tunnel_name);
+
+        /* Releasing a net_device is cleanup, not a config activation.  It must
+         * complete even while a FULL_APPLY is waiting for its PQC key. */
+        detach_rc = kernel_sync_detach_tunnel(profile_id, tunnel_name);
+        if (detach_rc != 0) {
+            runtime_config_unlock();
+            log_error("[DEL] Kernel detach failed for tunnel '%s': %s",
+                      tunnel_name, strerror(-detach_rc));
+            reply_json(client_fd, 500,
+                       "Kernel tunnel detach was not acknowledged");
+            return;
+        }
 
         int found = -1;
         for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
@@ -897,11 +910,23 @@ static void handle_del_tunnels(int client_fd, int profile_id,
                        "Full apply transaction changed; retry delete");
             return;
         }
+        if (transaction_pending)
+            provision_reconcile_accept(&candidate);
         runtime_config_unlock();
-        log_warn("[DEL] Tunnel '%s' removed from pending full apply, but kernel cleanup is not applied yet",
+        {
+            uint32_t kernel_generation =
+                kernel_sync_current_config_generation();
+            int failover_rc = failover_service_reconcile(
+                &candidate, kernel_generation);
+
+            if (failover_rc != 0)
+                log_warn("[DEL] BFD cleanup deferred for profile %d: %s",
+                         profile_id, strerror(-failover_rc));
+        }
+        log_info("[DEL] Tunnel '%s' detached from kernel; pending full apply still waits for activation",
                  tunnel_names[0]);
-        reply_json(client_fd, 503,
-                   "Tunnel cleanup pending; retry delete after kernel apply");
+        reply_json(client_fd, 200,
+                   "Tunnel detached; full apply remains pending");
     } else {
         runtime_config_unlock();
         log_error("[DEL] Kernel cleanup not applied for tunnel '%s' (result=%d)",
@@ -1023,13 +1048,17 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     bool trigger_pqc_handshake = false;
     bool stage_security_transition = false;
     bool replace_pending_full_apply = false;
+    bool replace_pending_non_pqc = false;
+    bool pending_full_apply_committed = false;
+    bool edit_sync_deferred = false;
     bool pqc_edit_requested = refresh_pqc_keys || refresh_pqc_tunnels ||
                               refresh_pqc_binding;
 
     if (provision_transaction_snapshot(profile_id, &pending_candidate,
                                        &pending_kind, &pending_generation,
                                        &pending_previous_generation)) {
-        if (pending_kind != PROVISION_TX_FULL_APPLY || !pqc_edit_requested) {
+        if (pending_kind != PROVISION_TX_FULL_APPLY ||
+            (!pqc_edit_requested && !refresh_profiles)) {
             reply_json(client_fd, 409,
                        "Another apply/security transition is still pending");
             return;
@@ -1085,11 +1114,14 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     stage_security_transition = reload_pqc_lifecycle &&
         candidate.cfg.encrypt.enabled &&
         candidate.cfg.encrypt.type == MWAN_CRYPT_PQC_GCM;
+    replace_pending_non_pqc = replace_pending_full_apply &&
+                              reload_pqc_lifecycle &&
+                              !stage_security_transition;
     runtime_config_unlock();
 
-    if (replace_pending_full_apply && !stage_security_transition) {
+    if (replace_pending_full_apply && !reload_pqc_lifecycle) {
         reply_json(client_fd, 409,
-                   "Pending PQC full apply cannot be replaced by a non-PQC edit");
+                   "Pending full apply accepts only a security mode update");
         return;
     }
 
@@ -1135,33 +1167,73 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
         candidate.cfg.encrypt.key_len = PQC_TRAFFIC_KEY_SZ;
     }
 
+    if (replace_pending_non_pqc) {
+        if (provision_transaction_replace_full_apply(
+                &candidate, pending_generation, config_generation) != 0) {
+            runtime_config_unlock();
+            runtime_config_cancel_reload(config_generation,
+                                         previous_config_generation);
+            reply_json(client_fd, 409,
+                       "Full apply transaction changed; retry edit");
+            return;
+        }
+        provision_reconcile_accept(&candidate);
+        log_info("[EDIT] Pending PQC full apply replaced by non-PQC mode for profile %d generation=%llu",
+                 profile_id, (unsigned long long)config_generation);
+    }
+
     // 3. Sync config to kernel if needed
     if (sync_needed && !stage_security_transition) {
-        int sync_failed;
+        enum kernel_sync_result edit_sync_result;
 
         used_weight_update = weight_only_update &&
             kernel_sync_current_config_generation() != 0;
         if (used_weight_update)
-            sync_failed = kernel_sync_update_tunnel_weights(&candidate) != 0;
+            edit_sync_result =
+                kernel_sync_update_tunnel_weights(&candidate) == 0 ?
+                    KERNEL_SYNC_APPLIED : KERNEL_SYNC_ERROR;
         else
-            sync_failed = kernel_sync_push_config(&candidate) ==
-                          KERNEL_SYNC_ERROR;
-        if (sync_failed) {
+            edit_sync_result = kernel_sync_push_config(&candidate);
+        if (edit_sync_result == KERNEL_SYNC_ERROR) {
             runtime_config_unlock();
-            if (reload_pqc_lifecycle)
+            if (reload_pqc_lifecycle && !replace_pending_non_pqc)
                 runtime_config_cancel_reload(config_generation,
                                              previous_config_generation);
+            if (replace_pending_non_pqc) {
+                sig_pqc_prepare_reload();
+                sig_pqc_finalize_reload();
+            }
             reply_json(client_fd, 500, "Netlink push error");
             return;
         }
-        *ctx = candidate;
-        if (used_weight_update)
-            log_info("[EDIT] Tunnel weights updated in place for profile %d; flow/BFD/worker state preserved",
+        if (edit_sync_result == KERNEL_SYNC_DEFERRED) {
+            if (!replace_pending_non_pqc) {
+                runtime_config_unlock();
+                if (reload_pqc_lifecycle)
+                    runtime_config_cancel_reload(
+                        config_generation, previous_config_generation);
+                reply_json(client_fd, 503,
+                           "Config accepted; waiting for tunnel interface");
+                return;
+            }
+            edit_sync_deferred = true;
+            log_info("[EDIT] Non-PQC full apply for profile %d waits for a data tunnel -a event",
                      profile_id);
-        else {
-            log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
-                     profile_id);
-            log_info("[EDIT] Config changes successfully synced to kernel");
+        } else {
+            *ctx = candidate;
+            provision_reconcile_accept(ctx);
+            if (replace_pending_non_pqc) {
+                provision_transaction_finish(config_generation);
+                pending_full_apply_committed = true;
+            }
+            if (used_weight_update)
+                log_info("[EDIT] Tunnel weights updated in place for profile %d; flow/BFD/worker state preserved",
+                         profile_id);
+            else {
+                log_info("[EDIT] Profile/tunnel config refreshed for profile %d",
+                         profile_id);
+                log_info("[EDIT] Config changes successfully synced to kernel");
+            }
         }
     } else if (runtime_update_needed && !stage_security_transition) {
         /* Monitoring and other userspace-only values must be refreshed in
@@ -1177,6 +1249,9 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     if (stage_security_transition)
         trigger_pqc_handshake = true;
     runtime_config_unlock();
+
+    if (pending_full_apply_committed)
+        cpu_tune_apply(&candidate);
 
     if (stage_security_transition) {
         if (replace_pending_full_apply) {
@@ -1233,6 +1308,10 @@ static void handle_edit_config_multi(int client_fd, int profile_id, const char *
     }
 
     reply_json(client_fd, 200,
+               replace_pending_non_pqc && edit_sync_deferred ?
+                   "Non-PQC update accepted; waiting for tunnel interface" :
+               replace_pending_non_pqc ?
+                   "Pending full apply replaced; non-PQC config active" :
                replace_pending_full_apply ?
                    "Pending full apply updated; PQC handshake restarted" :
                stage_security_transition ?

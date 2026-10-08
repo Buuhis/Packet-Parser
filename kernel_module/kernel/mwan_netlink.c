@@ -305,6 +305,39 @@ static int mwan_genl_set_datapath_gate(struct sk_buff *skb,
     return 0;
 }
 
+static int mwan_genl_detach_tunnel(struct sk_buff *skb,
+                                   struct genl_info *info)
+{
+    u32 node_id;
+    u32 ifindex;
+    int active_ret;
+    int pending_ret;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_NODE_ID] ||
+        !info->attrs[MWAN_ATTR_QUERY_IFINDEX])
+        return -EINVAL;
+    node_id = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    ifindex = nla_get_u32(info->attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    if (!node_id || !ifindex)
+        return -EINVAL;
+
+    active_ret = mwan_state_detach_tunnel(node_id, ifindex);
+    pending_ret = mwan_mac_discovery_detach_pending(node_id, ifindex);
+    if (active_ret && active_ret != -ENOENT)
+        return active_ret;
+    if (pending_ret && pending_ret != -ENOENT)
+        return pending_ret;
+
+    /* Idempotent by contract: a prior NETDEV_UNREGISTER notifier may already
+     * have detached both references before userspace receives -d. */
+    pr_info("mwan_kmod: TUNNEL-DETACH-ACK node=%u ifindex=%u active=%s pending=%s\n",
+            node_id, ifindex,
+            active_ret ? "ALREADY_ABSENT" : "DETACHED",
+            pending_ret ? "ALREADY_ABSENT" : "DETACHED");
+    return 0;
+}
+
 static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
                                         struct genl_info *info)
 {
@@ -708,6 +741,12 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = GENL_ADMIN_PERM,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_set_datapath_gate,
+    },
+    {
+        .cmd    = MWAN_CMD_DETACH_TUNNEL,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_detach_tunnel,
     },
 };
 

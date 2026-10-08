@@ -100,6 +100,12 @@ static int __init mwan_kmod_init(void)
 
     mwan_state_init();
 
+    ret = mwan_state_netdev_notifier_init();
+    if (ret < 0) {
+        pr_err("mwan_kmod: Failed to register netdevice notifier\n");
+        goto err_notifier;
+    }
+
     /* Bring up the packet path/workqueue before exposing the configuration
      * API, so a SET_CONFIG request can always create its L2 workers. */
     ret = mwan_steer_init();
@@ -120,6 +126,8 @@ static int __init mwan_kmod_init(void)
 err_netlink:
     mwan_steer_cleanup();
 err_steer:
+    mwan_state_netdev_notifier_cleanup();
+err_notifier:
     mwan_state_cleanup();
     return ret;
 }
@@ -129,6 +137,7 @@ static void __exit mwan_kmod_exit(void)
     pr_info("mwan_kmod: Shutting down...\n");
     /* Stop config updates before tearing down packet workers and state. */
     mwan_netlink_cleanup();
+    mwan_state_netdev_notifier_cleanup();
     mwan_steer_cleanup();
     mwan_state_cleanup();
     pr_info("mwan_kmod: Unloaded successfully.\n");
