@@ -817,6 +817,12 @@ static void handle_del_tunnels(int client_fd, int profile_id,
             return;
         }
 
+        /* Fence the detached interface in desired-state reconciliation.
+         * Later -e/full-apply retries cannot register it again merely because
+         * its old net_device still exists. Only an explicit -a acknowledges
+         * that tunnel name again. */
+        provision_reconcile_rollback_tunnel(profile_id, tunnel_name, false);
+
         int found = -1;
         for (size_t i = 0; i < candidate.cfg.sdwan_tun_count; i++) {
             if (strcmp(candidate.cfg.sdwan_tuns[i].tunnel_ifname,

@@ -119,6 +119,26 @@ static void mwan_config_release_devices(struct mwan_config *cfg)
 
 }
 
+bool mwan_state_tunnel_device_registered(const struct mwan_tunnel *tun)
+{
+    struct net_device *configured_dev;
+    bool registered;
+
+    if (!tun || !tun->dev || !tun->configured_ifindex ||
+        READ_ONCE(tun->dev->reg_state) != NETREG_REGISTERED)
+        return false;
+
+    /* tun->dev can be an upper device. Verify the configured interface too,
+     * because its NETDEV_UNREGISTER event is what invalidates the binding. */
+    rcu_read_lock();
+    configured_dev = dev_get_by_index_rcu(&init_net,
+                                           tun->configured_ifindex);
+    registered = configured_dev &&
+        READ_ONCE(configured_dev->reg_state) == NETREG_REGISTERED;
+    rcu_read_unlock();
+    return registered;
+}
+
 static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
                                             struct mwan_config *old_cfg)
 {
@@ -495,6 +515,20 @@ int mwan_state_update(struct mwan_config *new_cfg)
      * the old config in this process context. No RCU callback survives module
      * unload, and no blocking operation runs from softirq context. */
     mutex_lock(&mwan_cfg_update_lock);
+    for (i = 0; i < new_cfg->num_tunnels; i++) {
+        struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+
+        if (mwan_state_tunnel_device_registered(tun))
+            continue;
+        pr_warn("mwan_kmod: CFG-TRACE REJECT_STALE_DEVICE node=%u configured_ifindex=%u effective_ifindex=%u reg_state=%u refcnt=%d\n",
+                new_cfg->node_id, tun->configured_ifindex, tun->ifindex,
+                tun->dev ? READ_ONCE(tun->dev->reg_state) :
+                           NETREG_UNREGISTERED,
+                tun->dev ? netdev_refcnt_read(tun->dev) : 0);
+        mutex_unlock(&mwan_cfg_update_lock);
+        err = -ENODEV;
+        goto err_free_tfm;
+    }
     old = rcu_dereference_protected(g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
     if (old) {
         pr_info("mwan_kmod: CFG-TRACE REPLACE old=%u/%u/%u/%u new=%u/%u/%u/%u\n",
@@ -852,6 +886,18 @@ int mwan_state_rebind_tunnel(u32 node_id, u32 generation,
         ret = -EBUSY;
         goto out_unlock;
     }
+    {
+        struct mwan_tunnel replacement = {
+            .configured_ifindex = new_ifindex,
+            .ifindex = effective_ifindex,
+            .dev = replacement_dev,
+        };
+
+        if (!mwan_state_tunnel_device_registered(&replacement)) {
+            ret = -ENODEV;
+            goto out_unlock;
+        }
+    }
 
     /* SET_TUNNEL_STATE(DOWN) has already removed this slot from the active
      * RCU path view.  The BFD socket is then stopped by userspace.  Wait for
@@ -953,7 +999,14 @@ int mwan_state_detach_tunnel(u32 node_id, u32 ifindex)
      * final module-owned net_device reference. */
     synchronize_rcu();
     mwan_l2_workers_flush();
-    dev_put(old_dev);
+    {
+        int ref_before = netdev_refcnt_read(old_dev);
+
+        dev_put(old_dev);
+        pr_info("mwan_kmod: TUNNEL-DETACH-REF dev=%s ifindex=%d ref_before=%d ref_after=%d\n",
+                old_dev->name, old_dev->ifindex, ref_before,
+                netdev_refcnt_read(old_dev));
+    }
     pr_info("mwan_kmod: TUNNEL-DETACH node=%u ifindex=%u slot=%u state=DETACHED active=%u\n",
             cfg->node_id, ifindex, i, new_paths->active_count);
 
@@ -966,6 +1019,8 @@ static int mwan_netdev_event(struct notifier_block *nb,
                              unsigned long event, void *ptr)
 {
     struct net_device *dev;
+    int ref_before;
+    int ref_after;
     int active_ret;
     int pending_ret;
 
@@ -976,11 +1031,13 @@ static int mwan_netdev_event(struct notifier_block *nb,
     if (!dev || !dev->ifindex)
         return NOTIFY_DONE;
 
+    ref_before = netdev_refcnt_read(dev);
     active_ret = mwan_state_detach_tunnel(0, dev->ifindex);
     pending_ret = mwan_mac_discovery_detach_pending(0, dev->ifindex);
-    if (!active_ret || !pending_ret)
-        pr_info("mwan_kmod: NETDEV-UNREGISTER if=%s ifindex=%d action=AUTO_DETACH active=%d pending=%d\n",
-                dev->name, dev->ifindex, active_ret, pending_ret);
+    ref_after = netdev_refcnt_read(dev);
+    pr_info("mwan_kmod: NETDEV-UNREGISTER if=%s ifindex=%d action=AUTO_DETACH active=%d pending=%d ref_before=%d ref_after=%d reg_state=%u\n",
+            dev->name, dev->ifindex, active_ret, pending_ret,
+            ref_before, ref_after, READ_ONCE(dev->reg_state));
     return NOTIFY_DONE;
 }
 

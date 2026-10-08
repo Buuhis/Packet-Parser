@@ -216,6 +216,20 @@ int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
     rcu_read_unlock();
 
     mutex_lock(&mwan_mac_pending_lock);
+    for (i = 0; i < new_cfg->num_tunnels; i++) {
+        struct mwan_tunnel *tun = &new_cfg->tunnels[i];
+
+        if (mwan_state_tunnel_device_registered(tun))
+            continue;
+        pr_warn("mwan_kmod: MAC-DISCOVERY-CONFIG state=REJECT_STALE_DEVICE node=%u generation=%u configured_ifindex=%u effective_ifindex=%u reg_state=%u refcnt=%d\n",
+                node_id, generation, tun->configured_ifindex, tun->ifindex,
+                tun->dev ? READ_ONCE(tun->dev->reg_state) :
+                           NETREG_UNREGISTERED,
+                tun->dev ? netdev_refcnt_read(tun->dev) : 0);
+        mutex_unlock(&mwan_mac_pending_lock);
+        ret = -ENODEV;
+        goto err_destroy;
+    }
     old_cfg = rcu_dereference_protected(
         mwan_mac_pending_cfg,
         lockdep_is_held(&mwan_mac_pending_lock));
@@ -433,6 +447,8 @@ int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex)
 {
     struct mwan_mac_pending_config *new_cfg;
     struct mwan_mac_pending_config *old_cfg;
+    struct net_device *detached_dev = NULL;
+    int detached_ref_before = 0;
     u32 i;
     u32 count = 0;
     bool found = false;
@@ -462,6 +478,9 @@ int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex)
 
         if (src->configured_ifindex == ifindex || src->ifindex == ifindex) {
             found = true;
+            detached_dev = src->dev;
+            if (detached_dev)
+                detached_ref_before = netdev_refcnt_read(detached_dev);
             continue;
         }
         dst = &new_cfg->tunnels[count++];
@@ -485,6 +504,10 @@ int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex)
     rcu_assign_pointer(mwan_mac_pending_cfg, new_cfg);
     synchronize_rcu();
     mwan_mac_pending_destroy(old_cfg);
+    if (detached_dev)
+        pr_info("mwan_kmod: MAC-DISCOVERY-DETACH-REF dev=%s ifindex=%d ref_before=%d ref_after=%d\n",
+                detached_dev->name, detached_dev->ifindex,
+                detached_ref_before, netdev_refcnt_read(detached_dev));
     pr_info("mwan_kmod: MAC-DISCOVERY-CONFIG state=DETACHED node=%u ifindex=%u remaining=%u\n",
             new_cfg->node_id, ifindex, count);
     mutex_unlock(&mwan_mac_pending_lock);
