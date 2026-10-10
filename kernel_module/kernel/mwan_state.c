@@ -125,7 +125,7 @@ bool mwan_state_tunnel_device_registered(const struct mwan_tunnel *tun)
     bool registered;
 
     if (!tun || !tun->dev || !tun->configured_ifindex ||
-        READ_ONCE(tun->dev->reg_state) != NETREG_REGISTERED)
+        mwan_netdev_reg_state(tun->dev) != NETREG_REGISTERED)
         return false;
 
     /* tun->dev can be an upper device. Verify the configured interface too,
@@ -134,7 +134,7 @@ bool mwan_state_tunnel_device_registered(const struct mwan_tunnel *tun)
     configured_dev = dev_get_by_index_rcu(&init_net,
                                            tun->configured_ifindex);
     registered = configured_dev &&
-        READ_ONCE(configured_dev->reg_state) == NETREG_REGISTERED;
+        mwan_netdev_reg_state(configured_dev) == NETREG_REGISTERED;
     rcu_read_unlock();
     return registered;
 }
@@ -157,6 +157,13 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
             if (new_tun->configured_ifindex !=
                 old_tun->configured_ifindex)
                 continue;
+            /* Peer state learned by plaintext BYPASS discovery must never be
+             * promoted into L2-PQC, whose peer tuple is accepted only after
+             * authenticated discovery.  Likewise, switching to BYPASS starts
+             * a fresh plaintext discovery episode instead of inheriting
+             * crypto-mode state. */
+            if (new_tun->encap_type != old_tun->encap_type)
+                break;
             spin_lock_bh(&old_tun->gateway_mac_lock);
             if (old_tun->mac_resolved &&
                 is_valid_ether_addr(old_tun->gateway_mac)) {
@@ -522,7 +529,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
             continue;
         pr_warn("mwan_kmod: CFG-TRACE REJECT_STALE_DEVICE node=%u configured_ifindex=%u effective_ifindex=%u reg_state=%u refcnt=%d\n",
                 new_cfg->node_id, tun->configured_ifindex, tun->ifindex,
-                tun->dev ? READ_ONCE(tun->dev->reg_state) :
+                tun->dev ? mwan_netdev_reg_state(tun->dev) :
                            NETREG_UNREGISTERED,
                 tun->dev ? netdev_refcnt_read(tun->dev) : 0);
         mutex_unlock(&mwan_cfg_update_lock);
@@ -1037,7 +1044,7 @@ static int mwan_netdev_event(struct notifier_block *nb,
     ref_after = netdev_refcnt_read(dev);
     pr_info("mwan_kmod: NETDEV-UNREGISTER if=%s ifindex=%d action=AUTO_DETACH active=%d pending=%d ref_before=%d ref_after=%d reg_state=%u\n",
             dev->name, dev->ifindex, active_ret, pending_ret,
-            ref_before, ref_after, READ_ONCE(dev->reg_state));
+            ref_before, ref_after, mwan_netdev_reg_state(dev));
     return NOTIFY_DONE;
 }
 

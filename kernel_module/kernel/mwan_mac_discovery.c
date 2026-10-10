@@ -129,6 +129,12 @@ static void mwan_mac_copy_peer_state(struct mwan_tunnel *dst,
     if (!dst || !src)
         return;
 
+    /* Plaintext BYPASS discovery and authenticated L2-PQC discovery have
+     * different trust levels.  A peer tuple may survive a reload only while
+     * the tunnel remains in the same encapsulation mode. */
+    if (dst->encap_type != src->encap_type)
+        return;
+
     spin_lock_bh(&src->gateway_mac_lock);
     if (src->mac_resolved && src->peer_ip_resolved &&
         is_valid_ether_addr(src->gateway_mac) &&
@@ -193,6 +199,11 @@ int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
         }
         tun->ifindex = tun->dev->ifindex;
         tun->is_ethernet = tun->dev->type == ARPHRD_ETHER;
+        /* Pending discovery registrations are created only for L2-PQC while
+         * its traffic key is unavailable.  Tagging the intended mode prevents
+         * peer state learned by an active BYPASS profile from being imported
+         * into the later authenticated datapath. */
+        tun->encap_type = MWAN_ENCAP_L2_PQC;
         spin_lock_init(&tun->gateway_mac_lock);
         if (!tun->is_ethernet) {
             ret = -EAFNOSUPPORT;
@@ -629,16 +640,15 @@ static __be32 mwan_mac_local_ipv4(struct net_device *dev)
     return 0;
 }
 
-static int mwan_mac_send(struct mwan_config *cfg, struct mwan_tunnel *tun,
-                         const u8 *dest, u8 type, u32 node_id,
-                         u64 response_nonce)
+static int mwan_mac_prepare_header(struct mwan_tunnel *tun, u8 type,
+                                   u32 node_id, u64 response_nonce,
+                                   struct mwan_mac_discovery_hdr *hdr)
 {
-    struct mwan_mac_discovery_hdr hdr = { 0 };
     struct net_device *dev;
     __be32 local_ip;
     u64 nonce;
 
-    if (!cfg || !tun)
+    if (!tun || !hdr)
         return -EINVAL;
     dev = tun->dev;
     if (!dev || dev->type != ARPHRD_ETHER || !netif_running(dev))
@@ -661,16 +671,78 @@ static int mwan_mac_send(struct mwan_config *cfg, struct mwan_tunnel *tun,
         return -EINVAL;
     }
 
-    hdr.magic = cpu_to_be32(MWAN_MAC_DISCOVERY_MAGIC);
-    hdr.version = MWAN_MAC_DISCOVERY_VERSION;
-    hdr.type = type;
-    hdr.node_id = cpu_to_be32(node_id);
-    hdr.tunnel_ip = local_ip;
-    hdr.nonce = cpu_to_be64(nonce);
-    ether_addr_copy(hdr.sender_mac, dev->dev_addr);
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->magic = cpu_to_be32(MWAN_MAC_DISCOVERY_MAGIC);
+    hdr->version = MWAN_MAC_DISCOVERY_VERSION;
+    hdr->type = type;
+    hdr->node_id = cpu_to_be32(node_id);
+    hdr->tunnel_ip = local_ip;
+    hdr->nonce = cpu_to_be64(nonce);
+    ether_addr_copy(hdr->sender_mac, dev->dev_addr);
+    return 0;
+}
+
+static int mwan_mac_send_encrypted(struct mwan_config *cfg,
+                                   struct mwan_tunnel *tun,
+                                   const u8 *dest, u8 type, u32 node_id,
+                                   u64 response_nonce)
+{
+    struct mwan_mac_discovery_hdr hdr;
+    int ret;
+
+    if (!cfg || !tun || tun->encap_type != MWAN_ENCAP_L2_PQC)
+        return -EINVAL;
+    ret = mwan_mac_prepare_header(tun, type, node_id, response_nonce, &hdr);
+    if (ret)
+        return ret;
 
     return mwan_l2_pqc_encrypt_control_xmit(cfg, tun, dest, &hdr,
                                              sizeof(hdr));
+}
+
+/* BYPASS still needs a per-tunnel peer MAC because its asynchronous TX path
+ * emits directly on the load-balancer-selected Ethernet device.  Discovery
+ * is therefore plaintext only in MWAN_ENCAP_NONE; L2-PQC continues to use the
+ * authenticated control frame above and never enters this function. */
+static int mwan_mac_send_plaintext(struct mwan_config *cfg,
+                                   struct mwan_tunnel *tun,
+                                   const u8 *dest, u8 type, u32 node_id,
+                                   u64 response_nonce, gfp_t gfp)
+{
+    struct mwan_mac_discovery_hdr hdr;
+    struct net_device *dev;
+    struct sk_buff *skb;
+    struct ethhdr *eth;
+    unsigned int headroom;
+    int ret;
+
+    if (!cfg || !tun || !dest || tun->encap_type != MWAN_ENCAP_NONE ||
+        mwan_state_datapath_blocked())
+        return -EACCES;
+    ret = mwan_mac_prepare_header(tun, type, node_id, response_nonce, &hdr);
+    if (ret)
+        return ret;
+
+    dev = tun->dev;
+    headroom = LL_RESERVED_SPACE(dev);
+    skb = alloc_skb(headroom + ETH_HLEN + sizeof(hdr), gfp);
+    if (!skb)
+        return -ENOMEM;
+
+    skb_reserve(skb, headroom);
+    memcpy(skb_put(skb, sizeof(hdr)), &hdr, sizeof(hdr));
+    eth = skb_push(skb, ETH_HLEN);
+    skb_reset_mac_header(skb);
+    ether_addr_copy(eth->h_dest, dest);
+    ether_addr_copy(eth->h_source, dev->dev_addr);
+    eth->h_proto = htons(MWAN_MAC_DISCOVERY_ETHERTYPE);
+
+    skb->dev = dev;
+    skb->protocol = eth->h_proto;
+    skb_reset_network_header(skb);
+    skb->ip_summed = CHECKSUM_NONE;
+    ret = dev_queue_xmit(skb);
+    return net_xmit_eval(ret) ? -EIO : 0;
 }
 
 int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
@@ -702,7 +774,8 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
     }
 
     tun = mwan_mac_find_tunnel(cfg, ingress_ifindex);
-    if (!tun || !tun->is_ethernet) {
+    if (!tun || !tun->is_ethernet ||
+        tun->encap_type != MWAN_ENCAP_L2_PQC) {
         pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=UNKNOWN_TUNNEL ingress_ifindex=%d ethernet=%u active_config=1 encrypted=1\n",
                             ingress_ifindex,
                             tun && tun->is_ethernet ? 1 : 0);
@@ -729,7 +802,7 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
     peer_changed = mwan_mac_learn_peer(tun, hdr->sender_mac,
                                        hdr->tunnel_ip);
     if (hdr->type == MWAN_MAC_DISCOVERY_REQUEST) {
-        int response_ret = mwan_mac_send(
+        int response_ret = mwan_mac_send_encrypted(
             cfg, tun, hdr->sender_mac, MWAN_MAC_DISCOVERY_RESPONSE,
             cfg->node_id, nonce);
 
@@ -746,6 +819,114 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
     return 0;
 }
 
+/* Plaintext EtherType 0x88B6 is a BYPASS-only bootstrap protocol.  It is
+ * deliberately separate from mwan_mac_discovery_receive_encrypted(): the
+ * latter is reached only after AES-GCM authentication and remains the sole
+ * discovery path for L2-PQC. */
+static int mwan_mac_discovery_plaintext_rx(struct sk_buff *skb,
+                                           struct net_device *dev,
+                                           struct packet_type *pt,
+                                           struct net_device *orig_dev)
+{
+    struct mwan_mac_discovery_hdr hdr_buf;
+    const struct mwan_mac_discovery_hdr *hdr;
+    const struct ethhdr *eth;
+    struct mwan_config *cfg;
+    struct mwan_tunnel *tun;
+    u64 nonce;
+    bool nonce_matches = false;
+    bool peer_changed = false;
+    bool active;
+    bool blocked;
+    bool bypass;
+    u8 msg_type;
+    int ingress_ifindex;
+    int response_ret = 0;
+    int verdict;
+
+    (void)pt;
+    if (!skb)
+        return NET_RX_DROP;
+
+    ingress_ifindex = skb->dev ? skb->dev->ifindex :
+                      (dev ? dev->ifindex :
+                       (orig_dev ? orig_dev->ifindex : 0));
+    eth = eth_hdr(skb);
+    hdr = skb_header_pointer(skb, 0, sizeof(hdr_buf), &hdr_buf);
+    if (!eth || !hdr ||
+        be32_to_cpu(hdr->magic) != MWAN_MAC_DISCOVERY_MAGIC ||
+        hdr->version != MWAN_MAC_DISCOVERY_VERSION ||
+        (hdr->type != MWAN_MAC_DISCOVERY_REQUEST &&
+         hdr->type != MWAN_MAC_DISCOVERY_RESPONSE) ||
+        hdr->tunnel_ip == 0 || hdr->nonce == 0 ||
+        !is_valid_ether_addr(hdr->sender_mac) ||
+        !ether_addr_equal(eth->h_source, hdr->sender_mac)) {
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=PLAINTEXT_MALFORMED ingress_ifindex=%d\n",
+                            ingress_ifindex);
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+    msg_type = hdr->type;
+
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    tun = mwan_mac_find_tunnel(cfg, ingress_ifindex);
+    active = cfg != NULL;
+    blocked = mwan_state_datapath_blocked();
+    bypass = tun && tun->is_ethernet &&
+             tun->encap_type == MWAN_ENCAP_NONE;
+    if (!active || blocked || !bypass) {
+        rcu_read_unlock();
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=PLAINTEXT_REJECT ingress_ifindex=%d active=%u blocked=%u bypass=%u\n",
+                            ingress_ifindex, active ? 1 : 0,
+                            blocked ? 1 : 0, bypass ? 1 : 0);
+        kfree_skb(skb);
+        return NET_RX_DROP;
+    }
+
+    nonce = be64_to_cpu(hdr->nonce);
+    if (msg_type == MWAN_MAC_DISCOVERY_REQUEST) {
+        /* An unauthenticated request is sufficient only to address a direct
+         * response.  Do not commit its advertised peer tuple.  Each side
+         * learns only from a response matching its own random challenge. */
+        response_ret = mwan_mac_send_plaintext(
+            cfg, tun, hdr->sender_mac, MWAN_MAC_DISCOVERY_RESPONSE,
+            cfg->node_id, nonce, GFP_ATOMIC);
+    } else {
+        spin_lock_bh(&tun->gateway_mac_lock);
+        nonce_matches = tun->discovery_nonce == nonce;
+        if (nonce_matches)
+            tun->discovery_nonce = 0;
+        spin_unlock_bh(&tun->gateway_mac_lock);
+        if (nonce_matches)
+            peer_changed = mwan_mac_learn_peer(tun, hdr->sender_mac,
+                                               hdr->tunnel_ip);
+    }
+    rcu_read_unlock();
+
+    if (response_ret)
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=PLAINTEXT_RESPONSE_FAILED tunnel=%s ifindex=%d error=%d\n",
+                            dev ? dev->name : "unknown", ingress_ifindex,
+                            response_ret);
+    else if (msg_type == MWAN_MAC_DISCOVERY_RESPONSE && !nonce_matches)
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=PLAINTEXT_NONCE_MISMATCH ingress_ifindex=%d nonce=%llu\n",
+                            ingress_ifindex, (unsigned long long)nonce);
+    else if (peer_changed)
+        pr_info("mwan_kmod: MAC-DISCOVERY-RX stage=PLAINTEXT_RESOLVED tunnel=%s ifindex=%d\n",
+                dev ? dev->name : "unknown", ingress_ifindex);
+
+    verdict = response_ret ||
+              (msg_type == MWAN_MAC_DISCOVERY_RESPONSE && !nonce_matches) ?
+              NET_RX_DROP : NET_RX_SUCCESS;
+    kfree_skb(skb);
+    return verdict;
+}
+
+static struct packet_type mwan_mac_discovery_packet_type __read_mostly = {
+    .type = cpu_to_be16(MWAN_MAC_DISCOVERY_ETHERTYPE),
+    .func = mwan_mac_discovery_plaintext_rx,
+};
+
 static void mwan_mac_discovery_workfn(struct work_struct *work)
 {
     struct mwan_config *cfg;
@@ -756,16 +937,14 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
     if (!READ_ONCE(mwan_mac_discovery_running))
         return;
 
-    /* Encryption can sleep, so keep the active config stable with the update
-     * mutex rather than holding an RCU read lock across crypto.  Pending
-     * profiles have no traffic key and deliberately send nothing. */
+    /* Encrypted discovery can sleep, so keep the active config stable with the
+     * update mutex rather than holding an RCU read lock across crypto. Pending
+     * profiles have no traffic key and deliberately send nothing. Active
+     * BYPASS uses only the separate plaintext 0x88B6 transport. */
     mutex_lock(&mwan_cfg_update_lock);
     cfg = rcu_dereference_protected(
         g_mwan_cfg, lockdep_is_held(&mwan_cfg_update_lock));
-    if (!mwan_state_datapath_blocked() &&
-        cfg && cfg->num_tunnels && cfg->encrypt_on &&
-        cfg->encrypt_layer == 2 &&
-        cfg->encrypt_type == MWAN_CRYPT_PQC_GCM && cfg->key_id) {
+    if (!mwan_state_datapath_blocked() && cfg && cfg->num_tunnels) {
         for (i = 0; i < cfg->num_tunnels; i++) {
             struct mwan_tunnel *tun = &cfg->tunnels[i];
             bool tunnel_resolved;
@@ -773,22 +952,38 @@ static void mwan_mac_discovery_workfn(struct work_struct *work)
 
             if (!tun->is_ethernet || !tun->dev)
                 continue;
+            if (tun->encap_type != MWAN_ENCAP_NONE &&
+                !(tun->encap_type == MWAN_ENCAP_L2_PQC &&
+                  cfg->encrypt_on && cfg->encrypt_layer == 2 &&
+                  cfg->encrypt_type == MWAN_CRYPT_PQC_GCM &&
+                  cfg->key_id))
+                continue;
             tunnel_resolved = mwan_mac_is_resolved(tun);
             if (tunnel_resolved)
                 continue;
             unresolved = true;
-            send_ret = mwan_mac_send(cfg, tun, tun->dev->broadcast,
-                                     MWAN_MAC_DISCOVERY_REQUEST,
-                                     cfg->node_id, 0);
+            if (tun->encap_type == MWAN_ENCAP_NONE)
+                send_ret = mwan_mac_send_plaintext(
+                    cfg, tun, tun->dev->broadcast,
+                    MWAN_MAC_DISCOVERY_REQUEST, cfg->node_id, 0,
+                    GFP_KERNEL);
+            else
+                send_ret = mwan_mac_send_encrypted(
+                    cfg, tun, tun->dev->broadcast,
+                    MWAN_MAC_DISCOVERY_REQUEST, cfg->node_id, 0);
             if (send_ret)
-                pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=SEND_FAILED tunnel=%s ifindex=%d error=%d resolved=%u\n",
+                pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=SEND_FAILED tunnel=%s ifindex=%d error=%d resolved=%u transport=%s\n",
                                     tun->dev->name, tun->dev->ifindex,
                                     send_ret,
-                                    mwan_mac_is_resolved(tun) ? 1 : 0);
+                                    mwan_mac_is_resolved(tun) ? 1 : 0,
+                                    tun->encap_type == MWAN_ENCAP_NONE ?
+                                    "plaintext" : "encrypted");
             else if (!tunnel_resolved &&
                      mwan_mac_report_unresolved_once(tun))
-                pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=REQUEST_SENT tunnel=%s ifindex=%d peer_state=UNRESOLVED\n",
-                        tun->dev->name, tun->dev->ifindex);
+                pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=REQUEST_SENT tunnel=%s ifindex=%d peer_state=UNRESOLVED transport=%s\n",
+                        tun->dev->name, tun->dev->ifindex,
+                        tun->encap_type == MWAN_ENCAP_NONE ?
+                        "plaintext" : "encrypted");
         }
     }
     mutex_unlock(&mwan_cfg_update_lock);
@@ -808,6 +1003,9 @@ int mwan_mac_discovery_init(void)
 {
     BUILD_BUG_ON(sizeof(struct mwan_mac_discovery_hdr) != 30);
     WRITE_ONCE(mwan_mac_discovery_running, true);
+    dev_add_pack(&mwan_mac_discovery_packet_type);
+    pr_info("mwan_kmod: registered BYPASS plaintext MAC discovery (0x%04x)\n",
+            MWAN_MAC_DISCOVERY_ETHERTYPE);
     return 0;
 }
 
@@ -815,5 +1013,7 @@ void mwan_mac_discovery_cleanup(void)
 {
     WRITE_ONCE(mwan_mac_discovery_running, false);
     cancel_delayed_work_sync(&mwan_mac_discovery_work);
+    dev_remove_pack(&mwan_mac_discovery_packet_type);
     mwan_mac_discovery_clear_pending(0);
+    pr_info("mwan_kmod: unregistered BYPASS plaintext MAC discovery\n");
 }

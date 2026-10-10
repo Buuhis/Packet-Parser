@@ -15,6 +15,7 @@
 #include <linux/refcount.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
 #include "mwan_proto.h"
 #include "mwan_bitrate.h"
 
@@ -252,6 +253,10 @@ static inline u32 mwan_l2_rx_cb_checksum(const struct mwan_l2_rx_cb *cb)
            lower_32_bits(cb->diag_cookie) ^
            upper_32_bits(cb->diag_cookie) ^ cb->dispatch_headlen ^
            cb->dispatch_flags ^ 0x6d77616eU;
+}
+
+static inline u8 mwan_netdev_reg_state(const struct net_device *dev) {
+    return dev->reg_state;
 }
 
 struct mwan_l2_tx_cb {
