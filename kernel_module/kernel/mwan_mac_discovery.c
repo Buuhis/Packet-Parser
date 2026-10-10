@@ -234,7 +234,7 @@ int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
             continue;
         pr_warn("mwan_kmod: MAC-DISCOVERY-CONFIG state=REJECT_STALE_DEVICE node=%u generation=%u configured_ifindex=%u effective_ifindex=%u reg_state=%u refcnt=%d\n",
                 node_id, generation, tun->configured_ifindex, tun->ifindex,
-                tun->dev ? READ_ONCE(tun->dev->reg_state) :
+                tun->dev ? mwan_netdev_reg_state(tun->dev->reg_state) :
                            NETREG_UNREGISTERED,
                 tun->dev ? netdev_refcnt_read(tun->dev) : 0);
         mutex_unlock(&mwan_mac_pending_lock);
