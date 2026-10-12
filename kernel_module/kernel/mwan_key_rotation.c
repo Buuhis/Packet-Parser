@@ -1,4 +1,5 @@
 #include "mwan_key_rotation.h"
+#include "mwan_replay.h"
 
 #include <linux/errno.h>
 #include <linux/ktime.h>
@@ -216,8 +217,15 @@ int mwan_state_stage_pqc_key(u32 node_id, u32 generation, u64 epoch,
     started_ns = ktime_get_ns();
     mwan_rekey_diag_event(cfg, MWAN_REKEY_DIAG_STAGING,
                           "STAGE_BEGIN", epoch, key_id, 0, started_ns);
+    ret = mwan_l2_replay_prepare_key(cfg->replay, key_id);
+    if (ret) {
+        mwan_rekey_diag_event(cfg, old_phase, "STAGE_REPLAY_FAIL", epoch,
+                              key_id, ret, started_ns);
+        goto out;
+    }
     ret = mwan_l2_workers_stage_next_key(cfg, key, key_len, key_id);
     if (ret) {
+        mwan_l2_replay_forget_key(cfg->replay, key_id);
         mwan_rekey_diag_event(cfg, old_phase, "STAGE_FAIL", epoch,
                               key_id, ret, started_ns);
         goto out;
@@ -349,6 +357,7 @@ int mwan_state_retire_pqc_key(u32 node_id, u32 generation, u64 epoch,
     memzero_explicit(cfg->prev_key, sizeof(cfg->prev_key));
     cfg->prev_key_len = 0;
     cfg->prev_key_id = 0;
+    mwan_l2_replay_forget_key(cfg->replay, key_id);
     cfg->key_state = MWAN_PQC_KEY_STABLE;
     pr_info("mwan_kmod: PQC-REKEY RETIRED node=%u epoch=%llu current=%u\n",
             node_id, epoch, cfg->key_id);
@@ -403,6 +412,7 @@ int mwan_state_abort_pqc_key(u32 node_id, u32 generation, u64 epoch,
     cfg->next_key_len = 0;
     cfg->next_key_id = 0;
     cfg->next_key_valid = false;
+    mwan_l2_replay_forget_key(cfg->replay, key_id);
     cfg->rekey_epoch = 0;
     cfg->key_state = cfg->prev_key_valid ?
         MWAN_PQC_KEY_ACTIVE_WITH_PREV : MWAN_PQC_KEY_STABLE;

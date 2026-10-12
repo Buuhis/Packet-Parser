@@ -1,4 +1,5 @@
 #include "mwan_state.h"
+#include "mwan_replay.h"
 #include "mwan_mac_discovery.h"
 #include "mwan_tunnel_balance.h"
 #include <linux/timer.h>
@@ -188,6 +189,35 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
     }
 }
 
+/* A normal SET_CONFIG may replace the immutable config snapshot without
+ * changing the L2-PQC security association.  Share the replay manager only
+ * when the authenticated current-key identity is unchanged.  If the new
+ * snapshot carries PREV, require that identity to match as well. */
+static bool mwan_config_replay_compatible(const struct mwan_config *new_cfg,
+                                          const struct mwan_config *old_cfg)
+{
+    if (!new_cfg || !old_cfg || !old_cfg->replay ||
+        !new_cfg->encrypt_on || !old_cfg->encrypt_on ||
+        new_cfg->encrypt_layer != 2 || old_cfg->encrypt_layer != 2 ||
+        new_cfg->encrypt_type != MWAN_CRYPT_PQC_GCM ||
+        old_cfg->encrypt_type != MWAN_CRYPT_PQC_GCM ||
+        new_cfg->node_id != old_cfg->node_id ||
+        new_cfg->key_id != old_cfg->key_id ||
+        new_cfg->encrypt_key_len != old_cfg->encrypt_key_len ||
+        memcmp(new_cfg->encrypt_key, old_cfg->encrypt_key,
+               new_cfg->encrypt_key_len) ||
+        memcmp(new_cfg->encrypt_salt, old_cfg->encrypt_salt,
+               MWAN_SALT_LEN))
+        return false;
+    if (!new_cfg->prev_key_valid)
+        return true;
+    return old_cfg->prev_key_valid &&
+           new_cfg->prev_key_id == old_cfg->prev_key_id &&
+           new_cfg->prev_key_len == old_cfg->prev_key_len &&
+           !memcmp(new_cfg->prev_key, old_cfg->prev_key,
+                   new_cfg->prev_key_len);
+}
+
 /* Destroy only a config that has been published. The caller first waits for
  * all RCU readers; flow-manager shutdown then blocks timer rearming before
  * synchronously deleting each per-flow timer (including on kernel 5.19). */
@@ -206,6 +236,8 @@ static void mwan_config_destroy(struct mwan_config *cfg)
      * references first, then destroy the per-connection flow tables/timers. */
     mwan_l2_workers_cleanup(cfg);
     mwan_l2_flow_manager_stop(cfg);
+    mwan_l2_replay_manager_put(cfg->replay);
+    cfg->replay = NULL;
 
     if (cfg->tfm) {
         crypto_free_aead(cfg->tfm);
@@ -273,6 +305,7 @@ int mwan_state_update(struct mwan_config *new_cfg)
     struct mwan_active_paths *new_paths;
     struct crypto_aead *tfm = NULL;
     struct crypto_aead *prev_tfm = NULL;
+    bool l2_pqc;
     int i, err = 0;
 
     if (!new_cfg)
@@ -310,6 +343,16 @@ int mwan_state_update(struct mwan_config *new_cfg)
 
     if (new_cfg->key_id == 0)
         new_cfg->key_id = 1;
+    l2_pqc = new_cfg->encrypt_on && new_cfg->encrypt_layer == 2 &&
+             new_cfg->encrypt_type == MWAN_CRYPT_PQC_GCM;
+    new_cfg->replay = NULL;
+    if (l2_pqc) {
+        new_cfg->replay = mwan_l2_replay_manager_alloc(
+            new_cfg->key_id, new_cfg->prev_key_valid,
+            new_cfg->prev_key_id);
+        if (!new_cfg->replay)
+            return -ENOMEM;
+    }
     new_cfg->next_key_id = 0;
     new_cfg->next_key_len = 0;
     new_cfg->next_key_valid = false;
@@ -319,8 +362,11 @@ int mwan_state_update(struct mwan_config *new_cfg)
     mwan_rekey_diag_init(new_cfg);
     mwan_tunnel_balance_init(new_cfg);
     err = mwan_l2_flow_manager_init(new_cfg);
-    if (err)
+    if (err) {
+        mwan_l2_replay_manager_put(new_cfg->replay);
+        new_cfg->replay = NULL;
         return err;
+    }
 
     /* Phase 1: Pre-calculate and cache expensive data before publishing */
     new_cfg->total_weight = 0;
@@ -548,6 +594,13 @@ int mwan_state_update(struct mwan_config *new_cfg)
                 new_cfg->node_id, new_cfg->encrypt_on,
                 new_cfg->encrypt_layer, new_cfg->encrypt_type);
     }
+    if (mwan_config_replay_compatible(new_cfg, old)) {
+        struct mwan_l2_replay_manager *shared;
+
+        shared = mwan_l2_replay_manager_get(old->replay);
+        mwan_l2_replay_manager_put(new_cfg->replay);
+        new_cfg->replay = shared;
+    }
     /* A PQC profile may already have learned its peer and BFD state through
      * the control-plane-only discovery registry. Import it before preserving
      * an existing active config; established active state wins on reload. */
@@ -570,6 +623,11 @@ int mwan_state_update(struct mwan_config *new_cfg)
     atomic_set(&mwan_datapath_blocked, 0);
     synchronize_rcu();
     mwan_config_destroy(old);
+    mwan_l2_replay_retain_keys(new_cfg->replay, new_cfg->key_id,
+                               new_cfg->prev_key_valid,
+                               new_cfg->prev_key_id,
+                               new_cfg->next_key_valid,
+                               new_cfg->next_key_id);
     pr_info("mwan_kmod: CFG-TRACE ACTIVE node=%u mode=%u/%u/%u tunnels=%u\n",
             new_cfg->node_id, new_cfg->encrypt_on,
             new_cfg->encrypt_layer, new_cfg->encrypt_type,
@@ -595,6 +653,8 @@ err_free_tfm:
 err_release_devices:
     mwan_l2_flow_manager_stop(new_cfg);
     mwan_config_release_devices(new_cfg);
+    mwan_l2_replay_manager_put(new_cfg->replay);
+    new_cfg->replay = NULL;
     return err;
 }
 

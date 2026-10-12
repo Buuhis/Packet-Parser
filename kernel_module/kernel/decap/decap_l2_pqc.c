@@ -5,6 +5,7 @@
 #include "../mwan_mtu.h"
 #include "../mwan_drop_trace.h"
 #include "../mwan_mac_discovery.h"
+#include "../mwan_replay.h"
 
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
@@ -193,6 +194,7 @@ void mwan_l2_diag_reset_all(void)
             atomic64_set(&worker->rx_backpressure_wait_ns, 0);
         }
         mwan_rekey_diag_reset(cfg);
+        mwan_l2_replay_reset_stats(cfg->replay);
     }
     rcu_read_unlock();
 
@@ -634,6 +636,7 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
             u64 start_ns = ktime_get_ns();
             bool pipeline_owned = false;
             int decrypt_ret;
+            int replay_ret = 0;
             int ret;
 
             memcpy(&cb, MWAN_L2_RX_CB(skb), sizeof(cb));
@@ -709,6 +712,19 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                                  dispatch_flow_seq != flow_seq ||
                                  dispatch_nonce != packet_nonce))
                 ret = -EINVAL;
+
+            /* packet_nonce is authenticated AAD and is global to the
+             * sender's key generation.  Commit it before any control action
+             * or flow creation so an expired flow cannot be recreated by a
+             * captured ciphertext.  Never advance this state on auth fail. */
+            if (!ret) {
+                replay_ret = mwan_l2_replay_check_and_mark(
+                    worker->cfg->replay,
+                    (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT),
+                    packet_nonce);
+                if (replay_ret)
+                    ret = replay_ret;
+            }
 
             /* The reserved cookie is authenticated with the same traffic
              * key as data but is not an IPv4 flow.  Handle it per ingress
@@ -802,7 +818,17 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                 u8 packet_key_id =
                     (u8)(dispatch_flow_token >> MWAN_FLOW_KEY_ID_SHIFT);
 
-                if (!decrypt_ret && ret == -ENOSPC) {
+                if (!decrypt_ret &&
+                    (replay_ret == -EALREADY || replay_ret == -ERANGE)) {
+                    mwan_l2_rx_drop_trace(
+                        replay_ret == -EALREADY ?
+                            MWAN_DROP_RX_REPLAY_DUPLICATE :
+                            MWAN_DROP_RX_REPLAY_TOO_OLD,
+                        worker, skb, dispatch_flow_token,
+                        dispatch_flow_seq, replay_ret,
+                        atomic64_read(&worker->queued_packets),
+                        atomic64_read(&worker->queued_bytes));
+                } else if (!decrypt_ret && ret == -ENOSPC) {
                     mwan_l2_rx_drop_trace(
                         MWAN_DROP_RX_FLOW_FAILED, worker, skb,
                         dispatch_flow_token, dispatch_flow_seq, ret,
@@ -1046,6 +1072,7 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     struct mwan_mtu_stats_snapshot bypass_mtu;
     struct mwan_mtu_stats_snapshot l2_mtu;
     struct mwan_config *cfg;
+    struct mwan_replay_stats replay_stats;
     u64 pending_current = 0;
     u64 pending_previous = 0;
     u64 pending_next = 0;
@@ -1107,6 +1134,12 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
     rcu_read_lock();
     cfg = rcu_dereference(g_mwan_cfg);
     if (cfg) {
+        mwan_l2_replay_get_stats(cfg->replay, &replay_stats);
+        seq_printf(m, "replay accepted=%llu reordered=%llu duplicate=%llu too_old=%llu no_key=%llu window=%u\n",
+                   replay_stats.accepted,
+                   replay_stats.accepted_reordered,
+                   replay_stats.duplicate, replay_stats.too_old,
+                   replay_stats.no_key, MWAN_REPLAY_WINDOW_BITS);
         seq_printf(m, "flow_table key_id=%u prev_key_id=%u prev_valid=%u tx_active=%d rx_active=%d tx_created=%lld tx_expired=%lld rx_created=%lld rx_expired=%lld full=%lld\n",
                    cfg->key_id, cfg->prev_key_id, cfg->prev_key_valid,
                    atomic_read(&cfg->flows.tx_count),

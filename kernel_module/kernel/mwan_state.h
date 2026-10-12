@@ -468,6 +468,8 @@ struct mwan_pipeline_worker {
     atomic64_t rx_backpressure_wait_ns;
 };
 
+struct mwan_l2_replay_manager;
+
 struct mwan_config {
     u32 node_id;
     u32 generation;
@@ -496,6 +498,9 @@ struct mwan_config {
     struct crypto_aead *prev_tfm;         /* Previous PQC key during grace */
     
     struct mwan_l2_flow_manager flows;
+    /* Shared across compatible config publications so anti-replay state is
+     * never tied to the shorter lifetime of an RX flow or config snapshot. */
+    struct mwan_l2_replay_manager *replay;
     u8 key_id;
     u8 prev_key_id;
     u8 prev_key[MWAN_MAX_KEY_LEN];
