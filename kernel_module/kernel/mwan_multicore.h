@@ -53,8 +53,9 @@ bool mwan_multicore_rx_congestion_feedback(struct mwan_l2_worker *worker,
                                            struct sk_buff *skb);
 
 /* This function always consumes preselected_flow when it is non-NULL. On
- * success ownership of skb and that flow reference moves to the selected
- * worker. On failure skb remains owned by the caller. */
+ * success ownership of skb and that flow reference moves to a worker or the
+ * bounded per-flow backlog. A backlogged packet has no sequence yet, so
+ * flow_seq is returned as zero. On failure skb remains owned by the caller. */
 int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              u16 tunnel_idx,
                              const struct mwan_tx_flow_info *info,
@@ -62,5 +63,10 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              enum mwan_packet_class packet_class,
                              bool closing, bool allow_tunnel_override,
                              u32 *flow_seq, int *owner_cpu);
+bool mwan_multicore_tx_refill(struct mwan_config *cfg,
+                              struct mwan_l2_tx_flow *flow);
+void mwan_multicore_tx_backlog_kick(struct mwan_config *cfg);
+void mwan_multicore_tx_backlog_purge(struct mwan_config *cfg,
+                                     struct mwan_l2_tx_flow *flow);
 
 #endif /* MWAN_MULTICORE_H */

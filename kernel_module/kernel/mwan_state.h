@@ -30,6 +30,13 @@
 #define MWAN_FLOW_BALANCE_IDLE_TIMEOUT msecs_to_jiffies(2000)
 #define MWAN_L2_QUEUE_MAX_PACKETS 4096
 #define MWAN_L2_QUEUE_MAX_BYTES   (8U * 1024U * 1024U)
+#define MWAN_L2_TX_WINDOW_PER_WORKER 4U
+#define MWAN_L2_TX_WINDOW_MIN        8U
+#define MWAN_L2_TX_BACKLOG_MAX_PACKETS 512U
+#define MWAN_L2_TX_BACKLOG_MAX_BYTES   (2U * 1024U * 1024U)
+#define MWAN_L2_TX_BACKLOG_GLOBAL_PACKETS 16384U
+#define MWAN_L2_TX_BACKLOG_GLOBAL_BYTES   (64U * 1024U * 1024U)
+#define MWAN_L2_TX_BACKLOG_RETRY msecs_to_jiffies(10)
 #define MWAN_L2_DIAG_MAX_FLOWS    128
 #define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
 #define MWAN_FLOW_KEY_ID_SHIFT 56
@@ -138,6 +145,7 @@ struct mwan_l2_tx_flow {
     u64 flow_token;
     atomic_t next_seq;
     atomic_t pending_crypto;
+    u32 flow_id;
     /* Independent from the flow-table lifetime. A UDP mapping may remain in
      * the table for reorder/stickiness after it is no longer counted as
      * current tunnel load. */
@@ -151,6 +159,11 @@ struct mwan_l2_tx_flow {
      * flow.  A sequence number is consumed only after the packet is certain
      * to enter one selected crypto lane. */
     spinlock_t submit_lock;
+    /* Packets wait here without a sequence number when the ordered crypto
+     * execution window is full. This preserves admission order without
+     * consuming commit-ring slots behind a straggling crypto lane. */
+    struct sk_buff_head backlog;
+    u64 backlog_bytes;
     /* Crypto may complete on any worker.  The completion ring publishes
      * results by flow_seq and grants exactly one emitter at a time, so the
      * device sees a monotonically ordered stream even for a single flow that
@@ -191,6 +204,7 @@ struct mwan_l2_rx_flow {
     spinlock_t reorder_lock;
     struct timer_list reorder_timer;
     struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
+    u32 slot_seq[MWAN_FLOW_RING_SIZE];
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
@@ -234,10 +248,13 @@ struct mwan_l2_tx_cb {
     u16 tunnel_idx;
     u16 magic;
     u8 encap_type;
-    u8 reserved[3];
+    u8 packet_class;
+    u8 flags;
+    u8 reserved;
 };
 
 #define MWAN_L2_TX_CB_MAGIC 0x4d54U
+#define MWAN_L2_TX_CB_BACKLOG BIT(0)
 #define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
 
 struct mwan_l2_flow_bucket {
@@ -268,7 +285,12 @@ struct mwan_l2_flow_manager {
     atomic64_t reorder_resync;
     atomic64_t reorder_resync_skipped;
     atomic64_t reorder_resync_flushed;
+    atomic64_t tx_backlog_packets;
+    atomic64_t tx_backlog_bytes;
+    atomic_t tx_backlog_flows;
+    spinlock_t tx_backlog_lock;
     struct delayed_work gc_work;
+    struct delayed_work tx_dispatch_work;
     struct mwan_config *cfg;
     bool stopping;
 };
