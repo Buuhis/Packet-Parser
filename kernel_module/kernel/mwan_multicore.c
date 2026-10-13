@@ -752,8 +752,10 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         worker->cpu = cpu;
         mutex_init(&worker->crypto_lock);
         skb_queue_head_init(&worker->rx_queue);
+        skb_queue_head_init(&worker->rx_output_queue);
         skb_queue_head_init(&worker->tx_queue);
         INIT_WORK(&worker->work, mwan_l2_rx_worker_fn);
+        INIT_WORK(&worker->rx_output_work, mwan_l2_rx_output_worker_fn);
         INIT_WORK(&worker->tx_work, mwan_l2_tx_worker_fn);
         worker->balance_tx_bytes = kcalloc(
             cfg->num_tunnels, sizeof(*worker->balance_tx_bytes), GFP_KERNEL);
@@ -801,10 +803,19 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
 
     if (!cfg || !cfg->l2_workers)
         return;
+    /* RX reorder timers outlive the crypto work until flow-manager teardown.
+     * Close their reinjection gate before any output queue is cancelled or
+     * worker storage is released. */
+    WRITE_ONCE(cfg->flows.stopping, true);
+    /* Stop every crypto producer before cancelling any output consumer.
+     * Otherwise a worker cancelled later could append to an already-cancelled
+     * home-CPU output queue. */
     for (i = 0; i < cfg->num_workers; i++) {
         cancel_work_sync(&cfg->l2_workers[i].work);
         cancel_work_sync(&cfg->l2_workers[i].tx_work);
     }
+    for (i = 0; i < cfg->num_workers; i++)
+        cancel_work_sync(&cfg->l2_workers[i].rx_output_work);
 
     for (i = 0; i < cfg->num_workers; i++) {
         struct mwan_l2_worker *worker = &cfg->l2_workers[i];
@@ -855,6 +866,13 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
             } else if (!mwan_release_tx_queue_ref(worker, skb))
                 pr_warn_ratelimited("mwan_kmod: unable to recover corrupt TX queue reference during cleanup on CPU %d\n",
                                     worker->cpu);
+            kfree_skb(skb);
+        }
+        while ((skb = skb_dequeue(&worker->rx_output_queue)) != NULL) {
+            atomic64_dec(&worker->rx_output_queued_packets);
+            atomic64_sub(skb->truesize,
+                         &worker->rx_output_queued_bytes);
+            atomic64_inc(&worker->rx_output_dropped_packets);
             kfree_skb(skb);
         }
 
@@ -1076,6 +1094,73 @@ int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
 {
     return mwan_select_worker(cfg, flow_id, current_owner, false,
                               allow_blocked_fallback);
+}
+
+/* Select a per-packet crypto lane without changing flow ownership counters.
+ * The sequence-dependent start point gives an idle single flow round-robin
+ * spread, while the live directional queue score steers around a slower
+ * worker.  Correctness never depends on this approximate load snapshot. */
+static int mwan_select_packet_lane(const struct mwan_config *cfg, u32 flow_id,
+                                   u32 flow_seq, int home_worker, bool tx)
+{
+    int start;
+    int offset;
+    int best = -1;
+
+    if (!cfg || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -1;
+
+    start = jhash_2words(flow_id, flow_seq, 0x85ebca6bU) %
+            cfg->num_workers;
+    for (offset = 0; offset < cfg->num_workers; offset++) {
+        int idx = (start + offset) % cfg->num_workers;
+        const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+
+        if (!cpu_online(worker->cpu) ||
+            atomic_read(&worker->admission_blocked) ||
+            (tx && (atomic_read(&worker->emergency_shed) ||
+                    mwan_tx_worker_queue_high(worker))))
+            continue;
+        if (mwan_worker_better(worker, 0, best,
+                               best >= 0 ? &cfg->l2_workers[best] : NULL,
+                               0, tx))
+            best = idx;
+    }
+
+    /* An existing flow must retain liveness when every CPU is temporarily
+     * admission-blocked. Prefer its home lane when it is online and no more
+     * loaded than the alternatives; otherwise choose the least pressured
+     * online lane. */
+    if (best < 0) {
+        if (home_worker >= 0 && home_worker < cfg->num_workers &&
+            cpu_online(cfg->l2_workers[home_worker].cpu))
+            best = home_worker;
+        for (offset = 0; offset < cfg->num_workers; offset++) {
+            int idx = (start + offset) % cfg->num_workers;
+            const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+
+            if (!cpu_online(worker->cpu))
+                continue;
+            if (mwan_worker_better(worker, 0, best,
+                                   best >= 0 ? &cfg->l2_workers[best] : NULL,
+                                   0, tx))
+                best = idx;
+        }
+    }
+    return best;
+}
+
+int mwan_l2_select_tx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker)
+{
+    return mwan_select_packet_lane(cfg, flow_id, flow_seq, home_worker, true);
+}
+
+int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker)
+{
+    return mwan_select_packet_lane(cfg, flow_id, flow_seq, home_worker,
+                                   false);
 }
 
 u64 mwan_multicore_admitted_get(void)
@@ -1378,8 +1463,8 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         return -ENOSPC;
     }
     /* Per-flow mode pins the path before MTU handling. Per-packet mode may
-     * override only the egress tunnel while retaining one sticky flow object
-     * for worker ownership, flow token and L2-PQC sequence ordering. */
+     * override only the egress tunnel while retaining one flow object for
+     * home accounting, the token and L2-PQC sequence ordering. */
     if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx) &&
         !allow_tunnel_override) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
@@ -1390,6 +1475,21 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
     mwan_l2_tx_flow_touch(flow, closing);
     spin_lock_bh(&flow->submit_lock);
     owner = READ_ONCE(flow->owner_worker);
+    if (tun->encap_type == MWAN_ENCAP_L2_PQC) {
+        u32 candidate_seq = (u32)atomic_read(&flow->next_seq) + 1U;
+
+        if (atomic_read(&flow->pending_crypto) >=
+            MWAN_FLOW_RING_SIZE - 1) {
+            spin_unlock_bh(&flow->submit_lock);
+            if (owner >= 0 && owner < cfg->num_workers)
+                atomic64_inc(&cfg->l2_workers[owner].tx_dropped_packets);
+            mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
+            mwan_l2_tx_flow_put(flow);
+            return -ENOSPC;
+        }
+        owner = mwan_l2_select_tx_lane(cfg, info->flow_id, candidate_seq,
+                                       owner);
+    }
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu)) {
         spin_unlock_bh(&flow->submit_lock);
@@ -1517,7 +1617,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             if (!cb_ok || tunnel_idx >= cfg->num_tunnels) {
                 err = -EINVAL;
             } else if (encap_type == MWAN_ENCAP_L2_PQC) {
-                err = mwan_l2_pqc_encrypt_xmit(
+                err = mwan_l2_pqc_encrypt(
                     skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
                     flow_seq);
             } else if (encap_type == MWAN_ENCAP_NONE) {
@@ -1545,12 +1645,17 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                 atomic64_inc(&worker->tx_xmit_failures);
                 atomic64_inc(&worker->tx_dropped_packets);
                 kfree_skb(skb);
+                if (flow && encap_type == MWAN_ENCAP_L2_PQC)
+                    skb = NULL;
             } else if (flow &&
                        atomic_read(&flow->balance_counted)) {
                 mwan_tunnel_balance_account_bytes(
                     cfg, worker, tunnel_idx, transmitted_bytes);
             }
-            if (flow) {
+            if (flow && encap_type == MWAN_ENCAP_L2_PQC)
+                mwan_l2_tx_flow_publish(cfg, flow, err ? NULL : skb,
+                                        flow_seq);
+            else if (flow) {
                 mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
             }

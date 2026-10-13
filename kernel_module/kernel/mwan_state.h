@@ -14,6 +14,7 @@
 #include <linux/refcount.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/bitmap.h>
 #include "mwan_proto.h"
 
 #define MWAN_REORDER_TIMEOUT       msecs_to_jiffies(30)
@@ -141,15 +142,25 @@ struct mwan_l2_tx_flow {
      * the table for reorder/stickiness after it is no longer counted as
      * current tunnel load. */
     atomic_t balance_counted;
-    /* Worker ownership is independent from the lifetime of the sticky flow
-     * object. UDP mappings remain cached for sequence/tunnel stability, but
-     * an idle mapping must not keep skewing new-flow CPU admission for the
-     * full 60-second table timeout. */
+    /* Home-worker accounting is independent from the lifetime of the sticky
+     * flow object. UDP mappings remain cached for sequence/tunnel stability,
+     * but an idle mapping must not keep skewing new-flow CPU admission for the
+     * full 60-second table timeout. Packet crypto lanes are selected later. */
     atomic_t worker_counted;
     /* Serializes admission + sequence allocation + queue insertion for one
      * flow.  A sequence number is consumed only after the packet is certain
-     * to enter its sticky owner's FIFO. */
+     * to enter one selected crypto lane. */
     spinlock_t submit_lock;
+    /* Crypto may complete on any worker.  The completion ring publishes
+     * results by flow_seq and grants exactly one emitter at a time, so the
+     * device sees a monotonically ordered stream even for a single flow that
+     * is striped across all CPUs.  A set bit with a NULL skb is a completed
+     * (failed) crypto operation and lets the emitter advance past the gap. */
+    spinlock_t reorder_lock;
+    u32 emit_seq;
+    bool emitting;
+    DECLARE_BITMAP(ready, MWAN_FLOW_RING_SIZE);
+    struct sk_buff *ring[MWAN_FLOW_RING_SIZE];
     int owner_worker;
     /* Keep the path chosen when the flow was admitted. Failover changes only
      * tunnel_idx, so a recovered path can be restored without re-hashing or
@@ -183,7 +194,7 @@ struct mwan_l2_rx_flow {
     unsigned long slot_time[MWAN_FLOW_RING_SIZE];
 };
 
-/* skb->cb metadata while an encrypted RX frame waits for its sticky worker. */
+/* skb->cb metadata while an encrypted RX frame waits for a crypto lane. */
 struct mwan_l2_rx_cb {
     uintptr_t flow_ptr;
     u64 dispatch_flow_token;
@@ -262,9 +273,8 @@ struct mwan_l2_flow_manager {
     bool stopping;
 };
 
-/* Ordered RX/TX crypto queues per CPU. A flow bucket is owned by exactly one
- * worker in each direction, so its packets are processed serially while
- * independent buckets can run in parallel on different CPUs. */
+/* Ordered RX/TX crypto queues per CPU. Packets are serialized within a lane,
+ * while one flow can occupy several lanes and is committed by flow_seq. */
 struct mwan_l2_worker {
     struct mwan_config *cfg;
     struct sk_buff_head rx_queue;
@@ -305,6 +315,17 @@ struct mwan_l2_worker {
     atomic64_t schedule_failures;
     atomic_t scheduled;
     atomic_t busy;
+
+    /* Authenticated RX packets are reordered by flow, then handed to this
+     * bounded home-CPU queue.  Keeping reinjection on one CPU prevents two
+     * crypto workers from enqueueing consecutive packets into different
+     * per-CPU network backlogs. */
+    struct sk_buff_head rx_output_queue;
+    struct work_struct rx_output_work;
+    atomic64_t rx_output_queued_packets;
+    atomic64_t rx_output_queued_bytes;
+    atomic64_t rx_output_dropped_packets;
+    atomic_t rx_output_scheduled;
 
     /* TX has a separate queue, work item and AEAD request. RX and TX may run
      * concurrently on the same CPU, so sharing an aead_request would race. */
@@ -469,9 +490,15 @@ int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
 int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
                              int current_owner,
                              bool allow_blocked_fallback);
+int mwan_l2_select_tx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker);
+int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker);
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_rx_worker_fn(struct work_struct *work);
+void mwan_l2_rx_output_worker_fn(struct work_struct *work);
+bool mwan_l2_rx_reinject(struct mwan_l2_rx_flow *flow, struct sk_buff *skb);
 void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker);
 int mwan_l2_workers_stage_next_key(struct mwan_config *cfg, const u8 *key,
                                    u8 key_len, u8 key_id);
@@ -516,6 +543,9 @@ void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
 void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
                               struct mwan_l2_tx_flow *flow);
+void mwan_l2_tx_flow_publish(struct mwan_config *cfg,
+                             struct mwan_l2_tx_flow *flow,
+                             struct sk_buff *skb, u32 flow_seq);
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);
 bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
                                    const struct mwan_l2_flow_key *key,

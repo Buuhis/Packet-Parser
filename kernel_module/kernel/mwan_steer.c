@@ -315,9 +315,10 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             hash = mwan_multicore_flow_info(skb, &tx_ctx.info);
             tx_ctx.packet_class = mwan_multicore_packet_classify(skb);
             if (mwan_per_packet_enabled()) {
-                /* Keep one flow token/worker/sequence space for the
-                 * connection. Only this original packet's egress tunnel is
-                 * selected before any GSO or IPv4 fragmentation. */
+                /* Keep one flow token/sequence space for the connection.
+                 * Crypto lanes are selected per child packet; only this
+                 * original packet's egress tunnel is selected before any GSO
+                 * or IPv4 fragmentation. */
                 tx_ctx.flow = mwan_l2_tx_flow_get(
                     cfg, &tx_ctx.info.key, hash,
                     tx_ctx.packet_class == MWAN_PACKET_CONTROL,

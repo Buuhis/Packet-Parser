@@ -461,10 +461,10 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
     }
 }
 
-int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
-                             struct mwan_l2_worker *worker,
-                             struct mwan_tunnel *tun, u64 flow_token,
-                             u32 seq)
+int mwan_l2_pqc_encrypt(struct sk_buff *skb,
+                        struct mwan_l2_worker *worker,
+                        struct mwan_tunnel *tun, u64 flow_token,
+                        u32 seq)
 {
     struct net_device *target_dev = tun->dev;
     struct aead_request *req = NULL;
@@ -574,15 +574,20 @@ int mwan_l2_pqc_encrypt_xmit(struct sk_buff *skb,
     skb->encapsulation = 0;
 
     if (likely(target_dev->real_num_tx_queues > 1)) {
-        u16 cpu_id = smp_processor_id();
-        u16 q_idx = cpu_id % target_dev->real_num_tx_queues;
+        /* All packets of one flow use one hardware TX queue.  Crypto can run
+         * on every CPU, but mapping consecutive packets to independent NIC
+         * rings would reintroduce reordering after the software commit ring. */
+        u16 q_idx = reciprocal_scale(lower_32_bits(flow_token),
+                                     target_dev->real_num_tx_queues);
         skb_set_queue_mapping(skb, q_idx);
     }
 
     skb->dev = target_dev;
     skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
 
-    dev_queue_xmit(skb);
+    /* The multicore completion path owns skb now and emits it only after all
+     * preceding flow_seq values have either completed or published a failure
+     * tombstone. */
     return 0;
 }
 

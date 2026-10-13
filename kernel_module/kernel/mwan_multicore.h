@@ -38,8 +38,8 @@ struct mwan_tx_flow_context {
     struct mwan_tx_flow_info info;
     struct mwan_l2_tx_flow *flow;
     enum mwan_packet_class packet_class;
-    /* Per-packet mode keeps worker/token/sequence state sticky but may send
-     * this original packet on a tunnel other than flow->tunnel_idx. */
+    /* Per-packet mode keeps one flow/token/sequence space but may send this
+     * original packet on a tunnel other than flow->tunnel_idx. */
     bool allow_tunnel_override;
     /* Optional synchronous aggregate result for GSO/fragment children. */
     bool *whole_packet_sent;

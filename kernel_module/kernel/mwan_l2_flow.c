@@ -149,7 +149,7 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
             flow->ring[slot] = NULL;
             flow->slot_time[slot] = 0;
             flow->expected_seq++;
-            netif_rx(skb);
+            mwan_l2_rx_reinject(flow, skb);
             continue;
         }
 
@@ -518,6 +518,10 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                requested_tunnel_idx < 0 ? 1 : 0);
     atomic_set(&candidate->worker_counted, 1);
     spin_lock_init(&candidate->submit_lock);
+    spin_lock_init(&candidate->reorder_lock);
+    candidate->emit_seq = 1;
+    candidate->emitting = false;
+    bitmap_zero(candidate->ready, MWAN_FLOW_RING_SIZE);
     candidate->owner_worker = owner;
     candidate->home_tunnel_idx = (u16)tunnel_idx;
     candidate->tunnel_idx = (u16)tunnel_idx;
@@ -608,8 +612,9 @@ bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
 
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
-        if (!mwan_l2_flow_key_equal(&flow->key, key) ||
-            flow->owner_worker != owner_worker)
+        /* A single flow can now have packets queued on several crypto lanes;
+         * the full key, not the home worker, identifies the reference. */
+        if (!mwan_l2_flow_key_equal(&flow->key, key))
             continue;
         if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
             /* The table reference keeps flow alive while bucket->lock is
@@ -640,6 +645,95 @@ void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
     if (atomic_dec_return(&flow->pending_crypto) == 0 &&
         READ_ONCE(flow->closing))
         mwan_l2_tx_balance_deactivate(cfg, flow);
+}
+
+/* Publish one completed TX crypto operation into its flow commit ring.  The
+ * caller transfers both the skb (when non-NULL) and exactly one flow
+ * reference.  A NULL skb is a tombstone for a failed crypto operation, so a
+ * later packet can never wait forever behind a known failure. */
+void mwan_l2_tx_flow_publish(struct mwan_config *cfg,
+                             struct mwan_l2_tx_flow *flow,
+                             struct sk_buff *skb, u32 flow_seq)
+{
+    bool emitter = false;
+    u32 delta;
+    u32 slot;
+
+    if (unlikely(!cfg || !flow)) {
+        kfree_skb(skb);
+        if (flow) {
+            mwan_l2_tx_flow_complete(cfg, flow);
+            mwan_l2_tx_flow_put(flow);
+        }
+        return;
+    }
+
+    spin_lock_bh(&flow->reorder_lock);
+    if (unlikely((s32)(flow_seq - flow->emit_seq) < 0)) {
+        spin_unlock_bh(&flow->reorder_lock);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+    delta = flow_seq - flow->emit_seq;
+    if (unlikely(delta >= MWAN_FLOW_RING_SIZE)) {
+        /* submit_lock caps pending_crypto below the ring size, so reaching
+         * this branch indicates broken accounting rather than congestion. */
+        spin_unlock_bh(&flow->reorder_lock);
+        WARN_ON_ONCE(1);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+
+    slot = flow_seq & MWAN_FLOW_RING_MASK;
+    if (unlikely(test_bit(slot, flow->ready))) {
+        spin_unlock_bh(&flow->reorder_lock);
+        WARN_ON_ONCE(1);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+    flow->ring[slot] = skb;
+    set_bit(slot, flow->ready);
+    if (!flow->emitting) {
+        flow->emitting = true;
+        /* Slot references are released one by one below.  Keep a separate
+         * drain reference so GC cannot free the flow after the final pending
+         * operation reaches zero but before the emitter exits its loop. */
+        refcount_inc(&flow->refs);
+        emitter = true;
+    }
+    spin_unlock_bh(&flow->reorder_lock);
+
+    if (!emitter)
+        return;
+
+    for (;;) {
+        struct sk_buff *pending;
+
+        spin_lock_bh(&flow->reorder_lock);
+        slot = flow->emit_seq & MWAN_FLOW_RING_MASK;
+        if (!test_bit(slot, flow->ready)) {
+            flow->emitting = false;
+            spin_unlock_bh(&flow->reorder_lock);
+            break;
+        }
+        pending = flow->ring[slot];
+        flow->ring[slot] = NULL;
+        clear_bit(slot, flow->ready);
+        flow->emit_seq++;
+        spin_unlock_bh(&flow->reorder_lock);
+
+        if (pending)
+            dev_queue_xmit(pending);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+    }
+    mwan_l2_tx_flow_put(flow); /* emitter reference */
 }
 
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow)
@@ -743,8 +837,9 @@ bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
 
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
-        if (flow->flow_token != flow_token ||
-            flow->owner_worker != owner_worker)
+        /* flow_token is globally unique for the configuration.  Packets of
+         * this flow may be queued on any crypto worker. */
+        if (flow->flow_token != flow_token)
             continue;
         if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
             mwan_l2_rx_flow_put(flow);
@@ -832,7 +927,7 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         flow->ring[expected_slot] = NULL;
         flow->slot_time[expected_slot] = 0;
         flow->expected_seq++;
-        netif_rx(pending);
+        mwan_l2_rx_reinject(flow, pending);
     }
     if (!READ_ONCE(flow->stopping))
         mod_timer(&flow->reorder_timer, jiffies + MWAN_REORDER_TIMEOUT);
