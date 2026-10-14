@@ -6,6 +6,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
+#include <linux/jhash.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/cpu.h>
@@ -573,11 +574,24 @@ int mwan_l2_pqc_encrypt(struct sk_buff *skb,
     skb_shinfo(skb)->gso_segs = 0;
     skb->encapsulation = 0;
 
+    /* VXLAN derives its outer UDP source port from skb->hash.  Include the
+     * authenticated sequence so one inner flow can reach several RSS queues
+     * at the receiver without changing the L2-PQC wire format. */
+    {
+        u32 rss_hash = jhash_3words(lower_32_bits(flow_token),
+                                    upper_32_bits(flow_token), seq,
+                                    0x72737368U);
+
+        skb_set_hash(skb, rss_hash ? rss_hash : 1U, PKT_HASH_TYPE_L4);
+    }
+
     if (likely(target_dev->real_num_tx_queues > 1)) {
-        /* All packets of one flow use one hardware TX queue.  Crypto can run
-         * on every CPU, but mapping consecutive packets to independent NIC
-         * rings would reintroduce reordering after the software commit ring. */
-        u16 q_idx = reciprocal_scale(lower_32_bits(flow_token),
+        /* Keep one NIC queue per (flow,tunnel); per-packet RSS entropy is for
+         * the remote VXLAN receive side, not local multi-ring reordering. */
+        u32 queue_hash = jhash_3words(lower_32_bits(flow_token),
+                                      upper_32_bits(flow_token),
+                                      target_dev->ifindex, 0x71756575U);
+        u16 q_idx = reciprocal_scale(queue_hash,
                                      target_dev->real_num_tx_queues);
         skb_set_queue_mapping(skb, q_idx);
     }
