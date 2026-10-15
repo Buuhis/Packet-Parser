@@ -92,18 +92,18 @@ static struct failover_service service = {
 };
 
 /* A config push changes the kernel generation before its Netlink ACK returns.
- * Keep the worker out of that interval so it never reconciles a committed
- * kernel generation against the preceding userspace snapshot. */
-static pthread_rwlock_t config_update_gate = PTHREAD_RWLOCK_INITIALIZER;
+ * Keep reconciliation out of that interval, while the worker continues BFD
+ * polling without ever blocking on this gate. */
+static pthread_mutex_t config_update_gate = PTHREAD_MUTEX_INITIALIZER;
 
 void failover_config_update_begin(void)
 {
-    (void)pthread_rwlock_wrlock(&config_update_gate);
+    (void)pthread_mutex_lock(&config_update_gate);
 }
 
 void failover_config_update_end(void)
 {
-    (void)pthread_rwlock_unlock(&config_update_gate);
+    (void)pthread_mutex_unlock(&config_update_gate);
 }
 
 static int parse_ipv4_cidr(const char *text, struct in_addr *address)
@@ -503,6 +503,7 @@ static int reconcile_sessions(
         .reuse_threshold = 750,
     };
     uint32_t active_generation;
+    bool snapshot_stale = false;
     size_t i;
 
     active_generation = kernel_sync_current_config_generation();
@@ -560,7 +561,9 @@ static int reconcile_sessions(
                     ret ? ret : -ESTALE, ifindex, &desired->local_ip,
                     snapshot->config_generation,
                     ret ? 0 : kernel_state.generation);
-                return ret ? ret : -ESTALE;
+                if (!ret)
+                    snapshot_stale = true;
+                continue;
             } else {
                 entry->config_generation = kernel_state.generation;
                 entry->state_sequence = kernel_state.sequence;
@@ -620,7 +623,9 @@ static int reconcile_sessions(
                     snapshot->config_generation,
                     ret ? 0 : kernel_state.generation);
                 memset(entry, 0, sizeof(*entry));
-                return ret ? ret : -ESTALE;
+                if (!ret)
+                    snapshot_stale = true;
+                continue;
             }
             entry->state_sequence = kernel_state.sequence;
             entry->kernel_published = kernel_state.up ?
@@ -725,7 +730,9 @@ static int reconcile_sessions(
                     &desired->local_ip, entry->config_generation,
                     ret ? 0 : kernel_state.generation);
                 entry->rebind_pending = true;
-                return ret ? ret : -ESTALE;
+                if (!ret)
+                    snapshot_stale = true;
+                continue;
             }
             entry->state_sequence = kernel_state.sequence;
             entry->kernel_published = kernel_state.up ?
@@ -769,7 +776,7 @@ static int reconcile_sessions(
         else
             clear_wait_stage(diagnostics, desired->ifname);
     }
-    return 0;
+    return snapshot_stale ? -ESTALE : 0;
 }
 
 static void flush_published_states(
@@ -869,33 +876,44 @@ static void *failover_worker(void *unused)
         int reconcile_ret;
         bool stop;
 
-        (void)pthread_rwlock_rdlock(&config_update_gate);
         pthread_mutex_lock(&service.lock);
         stop = service.stop;
-        desired_generation = service.desired_generation;
-        if (desired_generation != applied_generation)
-            snapshot = service.desired;
-        if (stop) {
-            pthread_mutex_unlock(&service.lock);
-            (void)pthread_rwlock_unlock(&config_update_gate);
+        pthread_mutex_unlock(&service.lock);
+        if (stop)
             break;
+
+        /* A config push may wait for a short reconciliation already in
+         * progress.  In the opposite direction the worker must never wait:
+         * when the push owns the gate, skip config work and keep polling BFD
+         * so control packets and detection timers continue to run. */
+        if (pthread_mutex_trylock(&config_update_gate) == 0) {
+            pthread_mutex_lock(&service.lock);
+            stop = service.stop;
+            desired_generation = service.desired_generation;
+            if (desired_generation != applied_generation)
+                snapshot = service.desired;
+            if (!stop) {
+                /* Keep the selected desired snapshot stable for the whole
+                 * pass.  A replacement can be published after this pass, but
+                 * cannot make it stale halfway through. */
+                reconcile_ret = reconcile_sessions(
+                    manager, entries, diagnostics, &snapshot);
+                if (reconcile_ret == 0) {
+                    flush_published_states(entries, diagnostics);
+                    applied_generation = desired_generation;
+                }
+            }
+            pthread_mutex_unlock(&service.lock);
+            (void)pthread_mutex_unlock(&config_update_gate);
+            if (stop)
+                break;
         }
 
-        /* Keep the selected desired snapshot stable for the whole pass.  A
-         * concurrent reconcile may publish its replacement as soon as this
-         * pass finishes, but cannot make this pass stale halfway through. */
-        reconcile_ret = reconcile_sessions(manager, entries, diagnostics,
-                                           &snapshot);
-        if (reconcile_ret == 0) {
-            flush_published_states(entries, diagnostics);
-            applied_generation = desired_generation;
-        }
-        pthread_mutex_unlock(&service.lock);
-        (void)pthread_rwlock_unlock(&config_update_gate);
         (void)bfd_manager_poll(manager, FAILOVER_RECONCILE_MS);
-        (void)pthread_rwlock_rdlock(&config_update_gate);
-        flush_published_states(entries, diagnostics);
-        (void)pthread_rwlock_unlock(&config_update_gate);
+        if (pthread_mutex_trylock(&config_update_gate) == 0) {
+            flush_published_states(entries, diagnostics);
+            (void)pthread_mutex_unlock(&config_update_gate);
+        }
     }
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
