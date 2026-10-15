@@ -13,6 +13,7 @@ SRC := \
     src/app_context.c \
     src/runtime_config.c \
     failover/src/bfd.c \
+    failover/src/failover_policy.c \
     failover/src/failover.c \
     sig_encrypt/src/traffic_crypto.c \
     sig_encrypt/src/pqc_handshake.c \

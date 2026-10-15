@@ -310,8 +310,8 @@ out:
 
 
 enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
-    struct nl_sock *sock;
-    struct nl_msg *msg;
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
     static unsigned long push_generation;
     static uint32_t config_generation;
     unsigned long push_id;
@@ -325,6 +325,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     uint8_t pqc_key_ids[KEY_SLOT_COUNT] = {0};
     bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
     bool have_pqc_slots = false;
+    bool failover_gate_held = false;
     app_context_t present_ctx;
     const app_context_t *push_ctx = ctx;
     size_t missing_tunnels = 0;
@@ -391,6 +392,9 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         return KERNEL_SYNC_DEFERRED;
     }
 
+    failover_config_update_begin();
+    failover_gate_held = true;
+
     generation = __atomic_add_fetch(&config_generation, 1,
                                     __ATOMIC_RELAXED) &
                  ~MWAN_DISCOVERY_GENERATION_FLAG;
@@ -413,26 +417,23 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     log_info("Pushing configuration to mwan_kmod via Generic Netlink...");
 
     sock = nl_socket_alloc();
-    if (!sock) return KERNEL_SYNC_ERROR;
+    if (!sock)
+        goto out;
     
     if (genl_connect(sock) < 0) {
         log_error("Failed to connect to Generic Netlink");
-        nl_socket_free(sock);
-        return KERNEL_SYNC_ERROR;
+        goto out;
     }
 
     family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
     if (family_id < 0) {
         log_error("Kernel Module (mwan_kmod) not loaded or family not found");
-        nl_socket_free(sock);
-        return KERNEL_SYNC_ERROR;
+        goto out;
     }
 
     msg = nlmsg_alloc();
-    if (!msg) {
-        nl_socket_free(sock);
-        return KERNEL_SYNC_ERROR;
-    }
+    if (!msg)
+        goto out;
 
     genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0, MWAN_CMD_SET_CONFIG, MWAN_GENL_VERSION);
 
@@ -527,8 +528,12 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     (void)failover_service_reconcile(push_ctx, generation);
 
 out:
-    nlmsg_free(msg);
-    nl_socket_free(sock);
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    if (failover_gate_held)
+        failover_config_update_end();
     return ret;
 }
 

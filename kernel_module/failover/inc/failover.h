@@ -10,6 +10,11 @@
 int failover_service_reconcile(const app_context_t *ctx,
                                uint32_t config_generation);
 
+/* Serialize an active kernel config commit with the failover worker.  The
+ * caller must end every update it begins, including failed Netlink pushes. */
+void failover_config_update_begin(void);
+void failover_config_update_end(void);
+
 /* Stop the worker and release every BFD session. */
 void failover_service_stop(void);
 

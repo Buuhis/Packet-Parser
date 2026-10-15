@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "failover.h"
+#include "failover_policy.h"
 #include "kernel_sync.h"
 #include "utils/logger.h"
 
@@ -89,6 +90,21 @@ static struct failover_service service = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
+
+/* A config push changes the kernel generation before its Netlink ACK returns.
+ * Keep the worker out of that interval so it never reconciles a committed
+ * kernel generation against the preceding userspace snapshot. */
+static pthread_rwlock_t config_update_gate = PTHREAD_RWLOCK_INITIALIZER;
+
+void failover_config_update_begin(void)
+{
+    (void)pthread_rwlock_wrlock(&config_update_gate);
+}
+
+void failover_config_update_end(void)
+{
+    (void)pthread_rwlock_unlock(&config_update_gate);
+}
 
 static int parse_ipv4_cidr(const char *text, struct in_addr *address)
 {
@@ -472,7 +488,7 @@ static void remove_undesired_entries(
     }
 }
 
-static void reconcile_sessions(
+static int reconcile_sessions(
     struct bfd_manager *manager,
     struct failover_runtime_entry entries[MAX_SDWAN_TUNS],
     struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
@@ -486,7 +502,21 @@ static void reconcile_sessions(
         .suppress_threshold = 2000,
         .reuse_threshold = 750,
     };
+    uint32_t active_generation;
     size_t i;
+
+    active_generation = kernel_sync_current_config_generation();
+    if (snapshot->config_generation != 0 && active_generation != 0 &&
+        active_generation != snapshot->config_generation) {
+        for (i = 0; i < snapshot->count; i++) {
+            report_wait_stage(diagnostics, snapshot->tunnels[i].ifname,
+                              FAILOVER_WAIT_KERNEL_STATE, -ESTALE, 0,
+                              &snapshot->tunnels[i].local_ip,
+                              snapshot->config_generation,
+                              active_generation);
+        }
+        return -ESTALE;
+    }
 
     remove_undesired_entries(manager, entries, snapshot);
     for (i = 0; i < snapshot->count; i++) {
@@ -507,6 +537,7 @@ static void reconcile_sessions(
         entry = find_runtime(entries, desired->ifname);
         if (entry && entry->config_generation !=
                      snapshot->config_generation) {
+            enum failover_snapshot_action action;
             uint32_t old_generation = entry->config_generation;
 
             /* A full-config push also happens for -d/-a. Reuse a healthy
@@ -514,12 +545,22 @@ static void reconcile_sessions(
              * only its kernel sequence namespace changed. */
             ret = ifindex ? kernel_sync_get_tunnel_state_by_ifindex(
                                 ifindex, &kernel_state) : -ENODEV;
-            if (ret || kernel_state.generation !=
-                       snapshot->config_generation ||
-                entry->ifindex != ifindex) {
+            action = failover_snapshot_action(
+                entry->ifindex, ifindex, ret,
+                snapshot->config_generation,
+                ret ? 0 : kernel_state.generation);
+            if (action == FAILOVER_SNAPSHOT_REBIND) {
                 remove_runtime_entry(manager, entry,
                                      "CONFIG_DEVICE_CHANGED");
                 entry = NULL;
+            } else if (action == FAILOVER_SNAPSHOT_WAIT) {
+                report_wait_stage(
+                    diagnostics, desired->ifname,
+                    FAILOVER_WAIT_KERNEL_STATE,
+                    ret ? ret : -ESTALE, ifindex, &desired->local_ip,
+                    snapshot->config_generation,
+                    ret ? 0 : kernel_state.generation);
+                return ret ? ret : -ESTALE;
             } else {
                 entry->config_generation = kernel_state.generation;
                 entry->state_sequence = kernel_state.sequence;
@@ -579,7 +620,7 @@ static void reconcile_sessions(
                     snapshot->config_generation,
                     ret ? 0 : kernel_state.generation);
                 memset(entry, 0, sizeof(*entry));
-                continue;
+                return ret ? ret : -ESTALE;
             }
             entry->state_sequence = kernel_state.sequence;
             entry->kernel_published = kernel_state.up ?
@@ -684,7 +725,7 @@ static void reconcile_sessions(
                     &desired->local_ip, entry->config_generation,
                     ret ? 0 : kernel_state.generation);
                 entry->rebind_pending = true;
-                continue;
+                return ret ? ret : -ESTALE;
             }
             entry->state_sequence = kernel_state.sequence;
             entry->kernel_published = kernel_state.up ?
@@ -728,6 +769,7 @@ static void reconcile_sessions(
         else
             clear_wait_stage(diagnostics, desired->ifname);
     }
+    return 0;
 }
 
 static void flush_published_states(
@@ -824,22 +866,36 @@ static void *failover_worker(void *unused)
 
     for (;;) {
         uint64_t desired_generation;
+        int reconcile_ret;
         bool stop;
 
+        (void)pthread_rwlock_rdlock(&config_update_gate);
         pthread_mutex_lock(&service.lock);
         stop = service.stop;
         desired_generation = service.desired_generation;
         if (desired_generation != applied_generation)
             snapshot = service.desired;
-        pthread_mutex_unlock(&service.lock);
-        if (stop)
+        if (stop) {
+            pthread_mutex_unlock(&service.lock);
+            (void)pthread_rwlock_unlock(&config_update_gate);
             break;
+        }
 
-        reconcile_sessions(manager, entries, diagnostics, &snapshot);
-        flush_published_states(entries, diagnostics);
-        applied_generation = desired_generation;
+        /* Keep the selected desired snapshot stable for the whole pass.  A
+         * concurrent reconcile may publish its replacement as soon as this
+         * pass finishes, but cannot make this pass stale halfway through. */
+        reconcile_ret = reconcile_sessions(manager, entries, diagnostics,
+                                           &snapshot);
+        if (reconcile_ret == 0) {
+            flush_published_states(entries, diagnostics);
+            applied_generation = desired_generation;
+        }
+        pthread_mutex_unlock(&service.lock);
+        (void)pthread_rwlock_unlock(&config_update_gate);
         (void)bfd_manager_poll(manager, FAILOVER_RECONCILE_MS);
+        (void)pthread_rwlock_rdlock(&config_update_gate);
         flush_published_states(entries, diagnostics);
+        (void)pthread_rwlock_unlock(&config_update_gate);
     }
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
