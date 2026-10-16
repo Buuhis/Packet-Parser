@@ -9,6 +9,17 @@
 
 static struct genl_family mwan_genl_family;
 
+enum mwan_genl_multicast_groups {
+    MWAN_MCGRP_PEER_EVENTS = 0,
+};
+
+static const struct genl_multicast_group mwan_genl_mcgrps[] = {
+    [MWAN_MCGRP_PEER_EVENTS] = {
+        .name = MWAN_GENL_PEER_EVENTS_GROUP,
+        .flags = GENL_MCAST_CAP_NET_ADMIN,
+    },
+};
+
 /* Netlink Policy for parsing payload */
 static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NODE_ID]   = { .type = NLA_U32 },
@@ -33,7 +44,50 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_KEY_STATE] = { .type = NLA_U8 },
     [MWAN_ATTR_NEW_IFINDEX] = { .type = NLA_U32 },
     [MWAN_ATTR_DATAPATH_BLOCKED] = { .type = NLA_U8 },
+    [MWAN_ATTR_PEER_GENERATION] = { .type = NLA_U32 },
 };
+
+int mwan_netlink_notify_peer_changed(u32 ifindex, __be32 peer_tunnel_ip,
+                                     u32 peer_generation)
+{
+    struct sk_buff *event;
+    void *header;
+    int ret;
+
+    if (!ifindex || !peer_tunnel_ip || !peer_generation)
+        return -EINVAL;
+
+    event = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_ATOMIC);
+    if (!event)
+        return -ENOMEM;
+    header = genlmsg_put(event, 0, 0, &mwan_genl_family, 0,
+                         MWAN_CMD_PEER_CHANGED);
+    if (!header) {
+        nlmsg_free(event);
+        return -EMSGSIZE;
+    }
+
+    ret = nla_put_u32(event, MWAN_ATTR_QUERY_IFINDEX, ifindex);
+    if (!ret)
+        ret = nla_put_u8(event, MWAN_ATTR_PEER_RESOLVED, 1);
+    if (!ret)
+        ret = nla_put(event, MWAN_ATTR_PEER_TUNNEL_IP,
+                      sizeof(peer_tunnel_ip), &peer_tunnel_ip);
+    if (!ret)
+        ret = nla_put_u32(event, MWAN_ATTR_PEER_GENERATION,
+                          peer_generation);
+    if (ret) {
+        genlmsg_cancel(event, header);
+        nlmsg_free(event);
+        return ret;
+    }
+
+    genlmsg_end(event, header);
+    ret = genlmsg_multicast(&mwan_genl_family, event, 0,
+                            MWAN_MCGRP_PEER_EVENTS, GFP_ATOMIC);
+    /* No subscribed daemon is a normal state during boot and shutdown. */
+    return ret == -ESRCH ? 0 : ret;
+}
 
 static const struct nla_policy mwan_tunnel_policy[MWAN_TUN_MAX + 1] = {
     [MWAN_TUN_IFINDEX] = { .type = NLA_U32 },
@@ -597,6 +651,7 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
     struct sk_buff *reply;
     void *reply_hdr;
     __be32 peer_tunnel_ip = 0;
+    u32 peer_generation = 0;
     u32 ifindex;
     bool resolved = false;
     u32 i;
@@ -617,7 +672,7 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
                 cfg->tunnels[i].configured_ifindex == ifindex) {
                 tun = &cfg->tunnels[i];
                 resolved = mwan_mac_get_peer_tunnel_ip(
-                    tun, &peer_tunnel_ip);
+                    tun, &peer_tunnel_ip, &peer_generation);
                 break;
             }
         }
@@ -625,7 +680,8 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
     rcu_read_unlock();
     if (!tun) {
         ret = mwan_mac_discovery_get_pending_peer(ifindex,
-                                                  &peer_tunnel_ip);
+                                                  &peer_tunnel_ip,
+                                                  &peer_generation);
         if (ret != 0 && ret != -EAGAIN)
             return ret;
         resolved = ret == 0;
@@ -648,6 +704,9 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
     if (!ret && resolved)
         ret = nla_put(reply, MWAN_ATTR_PEER_TUNNEL_IP,
                       sizeof(peer_tunnel_ip), &peer_tunnel_ip);
+    if (!ret && resolved)
+        ret = nla_put_u32(reply, MWAN_ATTR_PEER_GENERATION,
+                          peer_generation);
     if (ret) {
         genlmsg_cancel(reply, reply_hdr);
         nlmsg_free(reply);
@@ -759,6 +818,8 @@ static struct genl_family mwan_genl_family = {
     .module   = THIS_MODULE,
     .ops      = mwan_genl_ops,
     .n_ops    = ARRAY_SIZE(mwan_genl_ops),
+    .mcgrps   = mwan_genl_mcgrps,
+    .n_mcgrps = ARRAY_SIZE(mwan_genl_mcgrps),
 };
 
 int mwan_netlink_init(void) {

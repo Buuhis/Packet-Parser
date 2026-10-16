@@ -20,9 +20,16 @@
 struct tunnel_peer_reply {
     unsigned int expected_ifindex;
     struct in_addr peer_addr;
+    uint32_t generation;
     bool resolved;
     bool received;
     bool valid;
+};
+
+struct kernel_peer_event_listener {
+    struct nl_sock *sock;
+    kernel_peer_event_callback callback;
+    void *user;
 };
 
 struct tunnel_state_reply {
@@ -144,6 +151,7 @@ static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
         return NL_STOP;
     }
     if (!attrs[MWAN_ATTR_PEER_TUNNEL_IP] ||
+        !attrs[MWAN_ATTR_PEER_GENERATION] ||
         nla_len(attrs[MWAN_ATTR_PEER_TUNNEL_IP]) !=
             sizeof(reply->peer_addr.s_addr))
         return NL_STOP;
@@ -151,8 +159,41 @@ static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
     memcpy(&reply->peer_addr.s_addr,
            nla_data(attrs[MWAN_ATTR_PEER_TUNNEL_IP]),
            sizeof(reply->peer_addr.s_addr));
+    reply->generation = nla_get_u32(attrs[MWAN_ATTR_PEER_GENERATION]);
+    if (reply->generation == 0)
+        return NL_STOP;
     reply->valid = true;
     return NL_STOP;
+}
+
+static int kernel_sync_peer_event_valid_cb(struct nl_msg *msg, void *arg)
+{
+    struct kernel_peer_event_listener *listener = arg;
+    struct kernel_tunnel_peer peer = {0};
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *ghdr = nlmsg_data(nlh);
+    struct nlattr *attrs[MWAN_ATTR_MAX + 1] = {0};
+
+    if (!listener || !listener->callback || !ghdr ||
+        ghdr->cmd != MWAN_CMD_PEER_CHANGED ||
+        genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
+        !attrs[MWAN_ATTR_QUERY_IFINDEX] ||
+        !attrs[MWAN_ATTR_PEER_RESOLVED] ||
+        !attrs[MWAN_ATTR_PEER_TUNNEL_IP] ||
+        !attrs[MWAN_ATTR_PEER_GENERATION] ||
+        nla_get_u8(attrs[MWAN_ATTR_PEER_RESOLVED]) != 1 ||
+        nla_len(attrs[MWAN_ATTR_PEER_TUNNEL_IP]) !=
+            sizeof(peer.address.s_addr))
+        return NL_OK;
+
+    peer.ifindex = nla_get_u32(attrs[MWAN_ATTR_QUERY_IFINDEX]);
+    peer.generation = nla_get_u32(attrs[MWAN_ATTR_PEER_GENERATION]);
+    memcpy(&peer.address.s_addr,
+           nla_data(attrs[MWAN_ATTR_PEER_TUNNEL_IP]),
+           sizeof(peer.address.s_addr));
+    if (peer.ifindex && peer.generation && peer.address.s_addr)
+        listener->callback(&peer, listener->user);
+    return NL_OK;
 }
 
 static int kernel_sync_tunnel_state_valid_cb(struct nl_msg *msg, void *arg)
@@ -1092,8 +1133,8 @@ out:
     return ret;
 }
 
-int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
-                                size_t peer_ip_len)
+int kernel_sync_get_tunnel_peer_state(const char *ifname,
+                                      struct kernel_tunnel_peer *peer)
 {
     struct tunnel_peer_reply reply = {0};
     struct nl_sock *sock = NULL;
@@ -1104,9 +1145,9 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
     int nl_rc;
     int ret = -EIO;
 
-    if (!ifname || !ifname[0] || !peer_ip || peer_ip_len == 0)
+    if (!ifname || !ifname[0] || !peer)
         return -EINVAL;
-    peer_ip[0] = '\0';
+    memset(peer, 0, sizeof(*peer));
     ifindex = if_nametoindex(ifname);
     if (ifindex == 0)
         return -ENODEV;
@@ -1175,10 +1216,9 @@ int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
         ret = -EAGAIN;
         goto out;
     }
-    if (!inet_ntop(AF_INET, &reply.peer_addr, peer_ip, peer_ip_len)) {
-        ret = -errno;
-        goto out;
-    }
+    peer->ifindex = ifindex;
+    peer->address = reply.peer_addr;
+    peer->generation = reply.generation;
     ret = 0;
 
 out:
@@ -1187,6 +1227,112 @@ out:
     if (sock)
         nl_socket_free(sock);
     return ret;
+}
+
+int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
+                                size_t peer_ip_len)
+{
+    struct kernel_tunnel_peer peer;
+    int ret;
+
+    if (!peer_ip || peer_ip_len == 0)
+        return -EINVAL;
+    peer_ip[0] = '\0';
+    ret = kernel_sync_get_tunnel_peer_state(ifname, &peer);
+    if (ret)
+        return ret;
+    if (!inet_ntop(AF_INET, &peer.address, peer_ip, peer_ip_len))
+        return -errno;
+    return 0;
+}
+
+int kernel_sync_peer_events_open(struct kernel_peer_event_listener **listener,
+                                 kernel_peer_event_callback callback,
+                                 void *user)
+{
+    struct kernel_peer_event_listener *next;
+    int group_id;
+    int ret;
+
+    if (!listener || !callback)
+        return -EINVAL;
+    *listener = NULL;
+    next = calloc(1, sizeof(*next));
+    if (!next)
+        return -ENOMEM;
+    next->sock = nl_socket_alloc();
+    if (!next->sock) {
+        free(next);
+        return -ENOMEM;
+    }
+    next->callback = callback;
+    next->user = user;
+
+    ret = genl_connect(next->sock);
+    if (ret < 0)
+        goto error;
+    group_id = genl_ctrl_resolve_grp(next->sock, MWAN_GENL_NAME,
+                                     MWAN_GENL_PEER_EVENTS_GROUP);
+    if (group_id < 0) {
+        ret = group_id;
+        goto error;
+    }
+    nl_socket_disable_seq_check(next->sock);
+    ret = nl_socket_modify_cb(next->sock, NL_CB_VALID, NL_CB_CUSTOM,
+                              kernel_sync_peer_event_valid_cb, next);
+    if (ret < 0)
+        goto error;
+    ret = nl_socket_add_membership(next->sock, group_id);
+    if (ret < 0)
+        goto error;
+    ret = nl_socket_set_nonblocking(next->sock);
+    if (ret < 0)
+        goto error;
+
+    *listener = next;
+    return 0;
+
+error:
+    ret = kernel_sync_nl_to_errno(ret);
+    nl_socket_free(next->sock);
+    free(next);
+    return ret;
+}
+
+int kernel_sync_peer_events_fd(
+    const struct kernel_peer_event_listener *listener)
+{
+    if (!listener || !listener->sock)
+        return -1;
+    return nl_socket_get_fd(listener->sock);
+}
+
+int kernel_sync_peer_events_receive(
+    struct kernel_peer_event_listener *listener)
+{
+    int ret;
+
+    if (!listener || !listener->sock)
+        return -EINVAL;
+    for (;;) {
+        ret = nl_recvmsgs_default(listener->sock);
+        if (ret == -NLE_AGAIN)
+            return 0;
+        if (ret == -NLE_INTR)
+            continue;
+        if (ret < 0)
+            return kernel_sync_nl_to_errno(ret);
+    }
+}
+
+void kernel_sync_peer_events_close(
+    struct kernel_peer_event_listener *listener)
+{
+    if (!listener)
+        return;
+    if (listener->sock)
+        nl_socket_free(listener->sock);
+    free(listener);
 }
 
 void kernel_sync_cleanup(void) {

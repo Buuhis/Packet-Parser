@@ -917,6 +917,19 @@ void bfd_manager_destroy(struct bfd_manager *manager)
     free(manager);
 }
 
+int bfd_manager_watch_fd(struct bfd_manager *manager, int fd)
+{
+    struct epoll_event event;
+
+    if (!manager || manager->epoll_fd < 0 || fd < 0 || fd == manager->rx_fd)
+        return -EINVAL;
+    memset(&event, 0, sizeof(event));
+    event.events = EPOLLIN;
+    event.data.fd = fd;
+    return epoll_ctl(manager->epoll_fd, EPOLL_CTL_ADD, fd, &event) < 0 ?
+        -errno : 0;
+}
+
 struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
                                              const struct bfd_session_config *config,
                                              const struct bfd_stability_config *stability,
@@ -1036,7 +1049,8 @@ int bfd_manager_poll(struct bfd_manager *manager, int timeout_ms)
     }
     now_ns = monotonic_ns();
     for (i = 0; i < count; i++) {
-        if ((events[i].events & EPOLLIN) != 0)
+        if ((events[i].events & EPOLLIN) != 0 &&
+            events[i].data.fd == manager->rx_fd)
             receive_packets(manager, now_ns);
     }
     process_due_timers(manager, monotonic_ns());

@@ -103,6 +103,10 @@ struct bfd_counters {
 struct bfd_manager *bfd_manager_create(void);
 void bfd_manager_destroy(struct bfd_manager *manager);
 
+/* Add a read-ready wakeup source to the manager's epoll set. The owner drains
+ * the fd after bfd_manager_poll() returns; BFD never reads external fds. */
+int bfd_manager_watch_fd(struct bfd_manager *manager, int fd);
+
 struct bfd_session *bfd_manager_add_session(struct bfd_manager *manager,
                                              const struct bfd_session_config *config,
                                              const struct bfd_stability_config *stability,

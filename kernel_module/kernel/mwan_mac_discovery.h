@@ -16,7 +16,8 @@ int mwan_mac_discovery_configure_pending(u32 node_id, u32 generation,
 void mwan_mac_discovery_import_pending(struct mwan_config *cfg);
 void mwan_mac_discovery_clear_pending(u32 node_id);
 int mwan_mac_discovery_get_pending_peer(u32 ifindex,
-                                        __be32 *peer_tunnel_ip);
+                                        __be32 *peer_tunnel_ip,
+                                        u32 *peer_generation);
 int mwan_mac_discovery_set_pending_state(u32 ifindex, u32 generation,
                                          u32 sequence, bool up);
 int mwan_mac_discovery_get_pending_state(u32 ifindex, u32 *generation,
@@ -26,7 +27,8 @@ int mwan_mac_discovery_rebind_pending(u32 node_id, u32 generation,
 int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex);
 bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[6]);
 bool mwan_mac_get_peer_tunnel_ip(struct mwan_tunnel *tun,
-                                 __be32 *peer_tunnel_ip);
+                                 __be32 *peer_tunnel_ip,
+                                 u32 *peer_generation);
 bool mwan_mac_discovery_is_pending_tunnel(u32 ifindex);
 int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
                                          struct sk_buff *skb);

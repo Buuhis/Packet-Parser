@@ -22,6 +22,17 @@
 #define FAILOVER_BFD_DETECT_MULT    3U
 #define FAILOVER_BFD_UP_HOLD_MS     5000U
 #define FAILOVER_DIAG_REPEAT_MS     5000U
+#define FAILOVER_PEER_AUDIT_MS      30000U
+#define FAILOVER_PEER_EVENT_RETRY_MS 5000U
+
+static const struct bfd_stability_config failover_stability = {
+    .up_hold_ms = FAILOVER_BFD_UP_HOLD_MS,
+    .down_hold_ms = 0,
+    .half_life_ms = 15000,
+    .flap_penalty = 1000,
+    .suppress_threshold = 2000,
+    .reuse_threshold = 750,
+};
 
 enum failover_wait_stage {
     FAILOVER_WAIT_NONE = 0,
@@ -66,14 +77,19 @@ struct failover_runtime_entry {
     unsigned int ifindex;
     struct in_addr local_ip;
     struct in_addr peer_ip;
+    struct in_addr pending_peer_ip;
     int segment_id;
     struct bfd_session *session;
     enum bfd_stable_state published;
     enum bfd_stable_state kernel_published;
     uint32_t config_generation;
+    uint32_t peer_generation;
+    uint32_t pending_peer_generation;
     uint32_t state_sequence;
+    uint64_t next_peer_audit_ms;
     bool state_dirty;
     bool rebind_pending;
+    bool peer_change_pending;
 };
 
 struct failover_service {
@@ -90,6 +106,9 @@ static struct failover_service service = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .cond = PTHREAD_COND_INITIALIZER,
 };
+
+static const char *format_ipv4(const struct in_addr *address,
+                               char buffer[INET_ADDRSTRLEN]);
 
 /* A config push changes the kernel generation before its Netlink ACK returns.
  * Keep reconciliation out of that interval, while the worker continues BFD
@@ -172,6 +191,111 @@ static struct failover_runtime_entry *find_runtime(
             return &entries[i];
     }
     return NULL;
+}
+
+static struct failover_runtime_entry *find_runtime_by_ifindex(
+    struct failover_runtime_entry entries[MAX_SDWAN_TUNS],
+    unsigned int ifindex)
+{
+    size_t i;
+
+    for (i = 0; i < MAX_SDWAN_TUNS; i++) {
+        if (entries[i].in_use && entries[i].ifindex == ifindex)
+            return &entries[i];
+    }
+    return NULL;
+}
+
+struct failover_peer_event_context {
+    struct failover_runtime_entry *entries;
+};
+
+static bool peer_generation_newer(uint32_t candidate, uint32_t current)
+{
+    return current == 0 || (int32_t)(candidate - current) > 0;
+}
+
+static void queue_peer_change(struct failover_runtime_entry *entry,
+                              const struct kernel_tunnel_peer *peer,
+                              const char *source, bool authoritative)
+{
+    char old_peer[INET_ADDRSTRLEN];
+    char new_peer[INET_ADDRSTRLEN];
+
+    if (!entry || !peer || !peer->generation || !peer->address.s_addr)
+        return;
+    if (entry->peer_change_pending) {
+        if (!authoritative &&
+            !peer_generation_newer(peer->generation,
+                                   entry->pending_peer_generation))
+            return;
+        if (peer->address.s_addr == entry->peer_ip.s_addr) {
+            entry->peer_generation = peer->generation;
+            entry->pending_peer_ip.s_addr = 0;
+            entry->pending_peer_generation = 0;
+            entry->peer_change_pending = false;
+            log_info("[BFD-DIAG] event=peer_change_superseded "
+                     "tunnel=%s ifindex=%u peer_generation=%" PRIu32,
+                     entry->ifname, entry->ifindex, peer->generation);
+            return;
+        }
+    }
+    if (peer->address.s_addr == entry->peer_ip.s_addr) {
+        if (authoritative ||
+            peer_generation_newer(peer->generation,
+                                  entry->peer_generation))
+            entry->peer_generation = peer->generation;
+        return;
+    }
+    if (!authoritative &&
+        !peer_generation_newer(peer->generation, entry->peer_generation) &&
+        entry->peer_generation != 0)
+        return;
+    entry->pending_peer_ip = peer->address;
+    entry->pending_peer_generation = peer->generation;
+    entry->peer_change_pending = true;
+    log_info("[BFD-DIAG] event=peer_change_detected tunnel=%s ifindex=%u "
+             "old_peer=%s new_peer=%s peer_generation=%" PRIu32
+             " source=%s",
+             entry->ifname, entry->ifindex,
+             format_ipv4(&entry->peer_ip, old_peer),
+             format_ipv4(&peer->address, new_peer), peer->generation,
+             source ? source : "unknown");
+}
+
+static void peer_event_received(const struct kernel_tunnel_peer *peer,
+                                void *user)
+{
+    struct failover_peer_event_context *context = user;
+    struct failover_runtime_entry *entry;
+
+    if (!context || !context->entries || !peer)
+        return;
+    entry = find_runtime_by_ifindex(context->entries, peer->ifindex);
+    if (!entry || entry->rebind_pending)
+        return;
+    queue_peer_change(entry, peer, "NETLINK_EVENT", false);
+}
+
+static int open_peer_event_listener(
+    struct bfd_manager *manager,
+    struct failover_peer_event_context *context,
+    struct kernel_peer_event_listener **listener)
+{
+    int ret;
+
+    ret = kernel_sync_peer_events_open(listener, peer_event_received, context);
+    if (ret)
+        return ret;
+    ret = bfd_manager_watch_fd(manager,
+                               kernel_sync_peer_events_fd(*listener));
+    if (ret) {
+        kernel_sync_peer_events_close(*listener);
+        *listener = NULL;
+        return ret;
+    }
+    log_info("[BFD-DIAG] event=peer_event_listener_ready");
+    return 0;
 }
 
 static struct failover_runtime_entry *find_free_runtime(
@@ -461,6 +585,7 @@ static int create_runtime_session(
                  entry->config_generation);
         return -EIO;
     }
+    entry->next_peer_audit_ms = monotonic_ms() + FAILOVER_PEER_AUDIT_MS;
     log_info("[BFD-DIAG] event=session_create tunnel=%s ifindex=%u "
              "local=%s peer=%s generation=%" PRIu32,
              entry->ifname, entry->ifindex,
@@ -494,14 +619,6 @@ static int reconcile_sessions(
     struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS],
     const struct failover_snapshot *snapshot)
 {
-    const struct bfd_stability_config stability = {
-        .up_hold_ms = FAILOVER_BFD_UP_HOLD_MS,
-        .down_hold_ms = 0,
-        .half_life_ms = 15000,
-        .flap_penalty = 1000,
-        .suppress_threshold = 2000,
-        .reuse_threshold = 750,
-    };
     uint32_t active_generation;
     bool snapshot_stale = false;
     size_t i;
@@ -525,8 +642,7 @@ static int reconcile_sessions(
             &snapshot->tunnels[i];
         struct failover_runtime_entry *entry;
         struct kernel_tunnel_state kernel_state;
-        struct in_addr peer_ip;
-        char peer_text[INET_ADDRSTRLEN];
+        struct kernel_tunnel_peer peer;
         unsigned int ifindex;
         bool identity_changed;
         bool has_local_ip;
@@ -718,6 +834,8 @@ static int reconcile_sessions(
             }
             entry->ifindex = ifindex;
             entry->peer_ip.s_addr = 0;
+            entry->peer_generation = 0;
+            entry->peer_change_pending = false;
             entry->rebind_pending = false;
             ret = kernel_sync_get_tunnel_state_by_ifindex(
                 entry->ifindex, &kernel_state);
@@ -743,12 +861,61 @@ static int reconcile_sessions(
                      entry->segment_id);
         }
 
+        if (entry->session &&
+            monotonic_ms() >= entry->next_peer_audit_ms) {
+            entry->next_peer_audit_ms = monotonic_ms() +
+                                        FAILOVER_PEER_AUDIT_MS;
+            ret = kernel_sync_get_tunnel_peer_state(desired->ifname, &peer);
+            if (ret == 0)
+                queue_peer_change(entry, &peer, "PERIODIC_AUDIT", true);
+            else
+                log_warn("[BFD-DIAG] event=peer_audit_failed tunnel=%s "
+                         "ifindex=%u error=%s",
+                         entry->ifname, entry->ifindex, strerror(-ret));
+        }
+
+        if (entry->peer_change_pending) {
+            char old_peer[INET_ADDRSTRLEN];
+            char new_peer[INET_ADDRSTRLEN];
+
+            ret = publish_runtime_down(entry);
+            if (ret) {
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_DOWN_ACK, ret,
+                                  entry->ifindex, &desired->local_ip,
+                                  entry->config_generation, 0);
+                continue;
+            }
+            log_info("[BFD-DIAG] event=peer_rebind tunnel=%s ifindex=%u "
+                     "old_peer=%s new_peer=%s peer_generation=%" PRIu32,
+                     entry->ifname, entry->ifindex,
+                     format_ipv4(&entry->peer_ip, old_peer),
+                     format_ipv4(&entry->pending_peer_ip, new_peer),
+                     entry->pending_peer_generation);
+            stop_runtime_session(manager, entry, "PEER_CHANGED");
+            entry->peer_ip = entry->pending_peer_ip;
+            entry->peer_generation = entry->pending_peer_generation;
+            entry->pending_peer_ip.s_addr = 0;
+            entry->pending_peer_generation = 0;
+            entry->peer_change_pending = false;
+            ret = create_runtime_session(manager, entry,
+                                         &failover_stability);
+            if (ret)
+                report_wait_stage(diagnostics, desired->ifname,
+                                  FAILOVER_WAIT_SESSION_CREATE, ret,
+                                  entry->ifindex, &desired->local_ip,
+                                  entry->config_generation,
+                                  entry->config_generation);
+            else
+                clear_wait_stage(diagnostics, desired->ifname);
+            continue;
+        }
+
         if (entry->session) {
             clear_wait_stage(diagnostics, desired->ifname);
             continue;
         }
-        ret = kernel_sync_get_tunnel_peer(desired->ifname, peer_text,
-                                          sizeof(peer_text));
+        ret = kernel_sync_get_tunnel_peer_state(desired->ifname, &peer);
         if (ret) {
             report_wait_stage(diagnostics, desired->ifname,
                               FAILOVER_WAIT_PEER, ret, entry->ifindex,
@@ -757,16 +924,9 @@ static int reconcile_sessions(
                               entry->config_generation);
             continue;
         }
-        if (inet_pton(AF_INET, peer_text, &peer_ip) != 1) {
-            report_wait_stage(diagnostics, desired->ifname,
-                              FAILOVER_WAIT_PEER, -EPROTO,
-                              entry->ifindex, &desired->local_ip,
-                              entry->config_generation,
-                              entry->config_generation);
-            continue;
-        }
-        entry->peer_ip = peer_ip;
-        ret = create_runtime_session(manager, entry, &stability);
+        entry->peer_ip = peer.address;
+        entry->peer_generation = peer.generation;
+        ret = create_runtime_session(manager, entry, &failover_stability);
         if (ret)
             report_wait_stage(diagnostics, desired->ifname,
                               FAILOVER_WAIT_SESSION_CREATE, ret,
@@ -852,8 +1012,13 @@ static void *failover_worker(void *unused)
     struct failover_runtime_entry entries[MAX_SDWAN_TUNS] = {{0}};
     struct failover_wait_diag diagnostics[MAX_SDWAN_TUNS] = {{0}};
     struct failover_snapshot snapshot = {0};
+    struct failover_peer_event_context peer_event_context = {
+        .entries = entries,
+    };
+    struct kernel_peer_event_listener *peer_listener = NULL;
     struct bfd_manager *manager;
     uint64_t applied_generation = 0;
+    uint64_t peer_listener_retry_ms = 0;
 
     (void)unused;
     manager = NULL;
@@ -864,11 +1029,26 @@ static void *failover_worker(void *unused)
         pthread_mutex_lock(&service.lock);
         stop = service.stop;
         pthread_mutex_unlock(&service.lock);
-        if (stop)
+        if (stop) {
+            bfd_manager_destroy(manager);
             return NULL;
+        }
         manager = bfd_manager_create();
         if (!manager)
             nanosleep(&retry, NULL);
+    }
+
+    {
+        int listener_ret = open_peer_event_listener(
+            manager, &peer_event_context, &peer_listener);
+
+        if (listener_ret) {
+            log_warn("[BFD-DIAG] event=peer_event_listener_deferred "
+                     "error=%s fallback_audit_ms=%u",
+                     strerror(-listener_ret), FAILOVER_PEER_AUDIT_MS);
+            peer_listener_retry_ms = monotonic_ms() +
+                                     FAILOVER_PEER_EVENT_RETRY_MS;
+        }
     }
 
     for (;;) {
@@ -881,6 +1061,29 @@ static void *failover_worker(void *unused)
         pthread_mutex_unlock(&service.lock);
         if (stop)
             break;
+
+        if (!peer_listener &&
+            monotonic_ms() >= peer_listener_retry_ms) {
+            (void)open_peer_event_listener(
+                manager, &peer_event_context, &peer_listener);
+
+            peer_listener_retry_ms = monotonic_ms() +
+                                     FAILOVER_PEER_EVENT_RETRY_MS;
+        }
+
+        if (peer_listener) {
+            int peer_event_ret = kernel_sync_peer_events_receive(
+                peer_listener);
+
+            if (peer_event_ret) {
+                log_warn("[BFD-DIAG] event=peer_event_receive_failed "
+                         "error=%s", strerror(-peer_event_ret));
+                kernel_sync_peer_events_close(peer_listener);
+                peer_listener = NULL;
+                peer_listener_retry_ms = monotonic_ms() +
+                                         FAILOVER_PEER_EVENT_RETRY_MS;
+            }
+        }
 
         /* A config push may wait for a short reconciliation already in
          * progress.  In the opposite direction the worker must never wait:
@@ -918,6 +1121,7 @@ static void *failover_worker(void *unused)
 
     for (size_t i = 0; i < MAX_SDWAN_TUNS; i++)
         remove_runtime_entry(manager, &entries[i], "SERVICE_STOP");
+    kernel_sync_peer_events_close(peer_listener);
     bfd_manager_destroy(manager);
     return NULL;
 }

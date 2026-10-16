@@ -102,6 +102,7 @@ struct mwan_tunnel {
     u8 gateway_mac[ETH_ALEN];
     bool mac_resolved;
     __be32 peer_tunnel_ip;
+    u32 peer_generation;
     u64 discovery_nonce;
     bool peer_ip_resolved;
     /* Logging edge only; discovery retries do not depend on this flag. */

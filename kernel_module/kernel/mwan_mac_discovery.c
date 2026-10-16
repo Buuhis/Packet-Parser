@@ -1,4 +1,5 @@
 #include "mwan_mac_discovery.h"
+#include "mwan_netlink.h"
 #include "mwan_proto.h"
 #include "mwan_state.h"
 #include "mwan_steer.h"
@@ -132,11 +133,10 @@ static void mwan_mac_copy_peer_state(struct mwan_tunnel *dst,
     /* Plaintext BYPASS discovery and authenticated L2-PQC discovery have
      * different trust levels.  A peer tuple may survive a reload only while
      * the tunnel remains in the same encapsulation mode. */
-    if (dst->encap_type != src->encap_type)
-        return;
-
     spin_lock_bh(&src->gateway_mac_lock);
-    if (src->mac_resolved && src->peer_ip_resolved &&
+    dst->peer_generation = src->peer_generation;
+    if (dst->encap_type == src->encap_type &&
+        src->mac_resolved && src->peer_ip_resolved &&
         is_valid_ether_addr(src->gateway_mac) &&
         src->peer_tunnel_ip != 0) {
         ether_addr_copy(dst->gateway_mac, src->gateway_mac);
@@ -313,20 +313,22 @@ void mwan_mac_discovery_clear_pending(u32 node_id)
 }
 
 int mwan_mac_discovery_get_pending_peer(u32 ifindex,
-                                        __be32 *peer_tunnel_ip)
+                                        __be32 *peer_tunnel_ip,
+                                        u32 *peer_generation)
 {
     struct mwan_mac_pending_config *cfg;
     struct mwan_tunnel *tun;
     int ret = -ENOENT;
 
-    if (!ifindex || !peer_tunnel_ip)
+    if (!ifindex || !peer_tunnel_ip || !peer_generation)
         return -EINVAL;
 
     rcu_read_lock();
     cfg = rcu_dereference(mwan_mac_pending_cfg);
     tun = mwan_mac_find_pending_tunnel(cfg, ifindex);
     if (tun)
-        ret = mwan_mac_get_peer_tunnel_ip(tun, peer_tunnel_ip) ?
+        ret = mwan_mac_get_peer_tunnel_ip(tun, peer_tunnel_ip,
+                                          peer_generation) ?
               0 : -EAGAIN;
     rcu_read_unlock();
     return ret;
@@ -576,17 +578,20 @@ bool mwan_mac_get_peer(struct mwan_tunnel *tun, u8 mac[ETH_ALEN])
 }
 
 bool mwan_mac_get_peer_tunnel_ip(struct mwan_tunnel *tun,
-                                 __be32 *peer_tunnel_ip)
+                                 __be32 *peer_tunnel_ip,
+                                 u32 *peer_generation)
 {
     bool resolved;
 
-    if (unlikely(!tun || !peer_tunnel_ip))
+    if (unlikely(!tun || !peer_tunnel_ip || !peer_generation))
         return false;
 
     spin_lock_bh(&tun->gateway_mac_lock);
     resolved = tun->peer_ip_resolved && tun->peer_tunnel_ip != 0;
-    if (resolved)
+    if (resolved) {
         *peer_tunnel_ip = tun->peer_tunnel_ip;
+        *peer_generation = tun->peer_generation;
+    }
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     if (unlikely(!resolved))
@@ -598,25 +603,41 @@ static bool mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
                                 __be32 peer_tunnel_ip)
 {
     bool changed;
+    bool ip_changed;
+    u32 peer_generation;
+    u32 ifindex;
 
     if (!tun || !is_valid_ether_addr(mac) || peer_tunnel_ip == 0)
         return false;
 
     spin_lock_bh(&tun->gateway_mac_lock);
+    ip_changed = !tun->peer_ip_resolved ||
+                 tun->peer_tunnel_ip != peer_tunnel_ip;
     changed = !tun->mac_resolved || !tun->peer_ip_resolved ||
               !ether_addr_equal(tun->gateway_mac, mac) ||
               tun->peer_tunnel_ip != peer_tunnel_ip;
+    if (ip_changed) {
+        tun->peer_generation++;
+        if (tun->peer_generation == 0)
+            tun->peer_generation++;
+    }
     ether_addr_copy(tun->gateway_mac, mac);
     tun->mac_resolved = true;
     tun->peer_tunnel_ip = peer_tunnel_ip;
     tun->peer_ip_resolved = true;
     tun->discovery_unresolved_reported = false;
+    peer_generation = tun->peer_generation;
+    ifindex = tun->configured_ifindex ? tun->configured_ifindex :
+              tun->ifindex;
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     if (changed)
         pr_info("mwan_kmod: learned peer MAC %pM and tunnel IP %pI4 on data tunnel %s\n",
                 mac, &peer_tunnel_ip,
                 tun->dev ? tun->dev->name : "unknown");
+    if (ip_changed)
+        (void)mwan_netlink_notify_peer_changed(ifindex, peer_tunnel_ip,
+                                               peer_generation);
     return changed;
 }
 

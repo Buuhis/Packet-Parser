@@ -4,7 +4,8 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 5
+#define MWAN_GENL_VERSION 6
+#define MWAN_GENL_PEER_EVENTS_GROUP "peer_events"
 
 /* ---- Crypto Constants ---- */
 #define MWAN_CRYPTO_MAGIC   0x4D57   /* ASCII "MW" — identify encrypted packets */
@@ -71,6 +72,7 @@ enum mwan_genl_cmds {
     MWAN_CMD_SET_DISCOVERY_CONFIG, /* register data tunnels before PQC key */
     MWAN_CMD_SET_DATAPATH_GATE, /* full -id: block/unblock active data paths */
     MWAN_CMD_DETACH_TUNNEL,    /* release one data tunnel independently of key */
+    MWAN_CMD_PEER_CHANGED,     /* kernel multicast: discovery learned a new peer */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -100,6 +102,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_KEY_STATE,         /* u8: enum mwan_pqc_key_state */
     MWAN_ATTR_NEW_IFINDEX,       /* u32: replacement data-tunnel ifindex */
     MWAN_ATTR_DATAPATH_BLOCKED,  /* u8: 1=fail closed, 0=allow active cfg */
+    MWAN_ATTR_PEER_GENERATION,   /* u32: monotonic discovery peer identity */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

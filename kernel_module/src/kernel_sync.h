@@ -3,6 +3,7 @@
 
 #include "app_context.h"
 #include <stdbool.h>
+#include <netinet/in.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -45,13 +46,37 @@ struct kernel_tunnel_state {
     uint32_t sequence;
     bool up;
 };
+
+struct kernel_tunnel_peer {
+    unsigned int ifindex;
+    struct in_addr address;
+    uint32_t generation;
+};
+
+struct kernel_peer_event_listener;
+typedef void (*kernel_peer_event_callback)(
+    const struct kernel_tunnel_peer *peer, void *user);
 int kernel_sync_get_pqc_key_state(int profile_id,
                                   struct kernel_pqc_key_state *state);
 
 /* Query the peer tunnel IPv4 address learned at runtime by the kernel's
  * point-to-point discovery protocol. */
+int kernel_sync_get_tunnel_peer_state(const char *ifname,
+                                      struct kernel_tunnel_peer *peer);
 int kernel_sync_get_tunnel_peer(const char *ifname, char *peer_ip,
                                 size_t peer_ip_len);
+
+/* Subscribe to discovery peer changes. The listener fd may be added to an
+ * existing epoll loop; receive() drains all currently queued notifications. */
+int kernel_sync_peer_events_open(struct kernel_peer_event_listener **listener,
+                                 kernel_peer_event_callback callback,
+                                 void *user);
+int kernel_sync_peer_events_fd(
+    const struct kernel_peer_event_listener *listener);
+int kernel_sync_peer_events_receive(
+    struct kernel_peer_event_listener *listener);
+void kernel_sync_peer_events_close(
+    struct kernel_peer_event_listener *listener);
 int kernel_sync_set_tunnel_state(const char *ifname, uint32_t generation,
                                  uint32_t sequence, bool up);
 int kernel_sync_set_tunnel_state_by_ifindex(unsigned int ifindex,

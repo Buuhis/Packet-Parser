@@ -158,6 +158,9 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
             if (new_tun->configured_ifindex !=
                 old_tun->configured_ifindex)
                 continue;
+            spin_lock_bh(&old_tun->gateway_mac_lock);
+            new_tun->peer_generation = old_tun->peer_generation;
+            spin_unlock_bh(&old_tun->gateway_mac_lock);
             /* Peer state learned by plaintext BYPASS discovery must never be
              * promoted into L2-PQC, whose peer tuple is accepted only after
              * authenticated discovery.  Likewise, switching to BYPASS starts
