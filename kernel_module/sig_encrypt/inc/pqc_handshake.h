@@ -224,6 +224,7 @@ struct pqc_hs_msg {
  *         condition or startup failure.
  */
 int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *peer_ip);
+int sig_pqc_shutdown(void);
 
 /**
  * Checks whether the Handshake has completed and the key is available.

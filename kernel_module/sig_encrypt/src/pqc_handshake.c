@@ -159,6 +159,7 @@ static int g_dispatcher_last_error;
 static bool g_dispatcher_reconfiguring;
 static pthread_cond_t g_dispatcher_cond = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_worker_state_cond = PTHREAD_COND_INITIALIZER;
+static bool g_pqc_shutting_down;
 static uint64_t g_rx_tuple_drop_count;
 static uint64_t g_rx_tuple_drop_suppressed;
 static uint64_t g_rx_tuple_drop_last_log;
@@ -2203,11 +2204,15 @@ static int pqc_policy_rx_recv(policy_key_binding_t *b, uint8_t *buf, int buf_sz,
     if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
 
     pthread_mutex_lock(&b->rx_mutex);
-    while (b->rx_head == b->rx_tail) {
+    while (b->rx_head == b->rx_tail && !b->thread_exit_sig) {
         if (pthread_cond_timedwait(&b->rx_cond, &b->rx_mutex, &ts) != 0) {
             pthread_mutex_unlock(&b->rx_mutex);
             return -1; // timeout
         }
+    }
+    if (b->thread_exit_sig) {
+        pthread_mutex_unlock(&b->rx_mutex);
+        return -1;
     }
     int len = b->rx_len[b->rx_tail];
     if (len > buf_sz) len = buf_sz;
@@ -2257,6 +2262,10 @@ static int pqc_dispatcher_ensure_running(const char *ifname,
         return -ENODEV;
 
     pthread_mutex_lock(&g_key_mutex);
+    if (g_pqc_shutting_down) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ESHUTDOWN;
+    }
     clock_gettime(CLOCK_REALTIME, &deadline);
     deadline.tv_sec += 2;
     while (g_dispatcher_reconfiguring) {
@@ -2523,6 +2532,20 @@ static void* pqc_udp_dispatcher_thread(void* arg) {
     }
 
     pthread_mutex_lock(&g_key_mutex);
+    if (g_pqc_shutting_down) {
+        atomic_store_explicit(&g_dispatcher_running, false,
+                              memory_order_release);
+        g_dispatcher_state = PQC_RUNTIME_STOPPED;
+        g_dispatcher_last_error = 0;
+        g_dispatcher_reconfiguring = false;
+        g_dispatcher_ifname[0] = '\0';
+        g_dispatcher_local_ip[0] = '\0';
+        g_dispatcher_ifindex = 0;
+        pthread_cond_broadcast(&g_dispatcher_cond);
+        pthread_mutex_unlock(&g_key_mutex);
+        close(sockfd);
+        return NULL;
+    }
     atomic_store_explicit(&g_dispatcher_running, true,
                           memory_order_release);
     g_dispatcher_state = PQC_RUNTIME_RUNNING;
@@ -2652,6 +2675,67 @@ static int pqc_stop_worker_locked(policy_key_binding_t *b, int timeout_ms) {
 
     b->thread_exit_sig = false;
     return 0;
+}
+
+int sig_pqc_shutdown(void)
+{
+    struct timespec deadline;
+    int ret = 0;
+
+    pthread_mutex_lock(&g_key_mutex);
+    g_pqc_shutting_down = true;
+
+    /* Prevent queued receive waits from delaying worker shutdown. */
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        policy_key_binding_t *b = &g_policy_bindings[i];
+
+        if (!b->thread_started)
+            continue;
+        b->thread_exit_sig = true;
+        pthread_cond_broadcast(&b->rx_cond);
+    }
+
+    /* Stop packet delivery before waiting for the workers which consume it. */
+    if (g_dispatcher_state == PQC_RUNTIME_STARTING ||
+        g_dispatcher_state == PQC_RUNTIME_RUNNING ||
+        pqc_dispatcher_is_running()) {
+        g_dispatcher_reconfiguring = true;
+        atomic_store_explicit(&g_dispatcher_running, false,
+                              memory_order_release);
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += PQC_WORKER_STOP_TIMEOUT_MS / 1000;
+        deadline.tv_nsec +=
+            (long)(PQC_WORKER_STOP_TIMEOUT_MS % 1000) * 1000000L;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        while (g_dispatcher_reconfiguring ||
+               g_dispatcher_state == PQC_RUNTIME_STARTING ||
+               pqc_dispatcher_is_running()) {
+            int wait_rc = pthread_cond_timedwait(
+                &g_dispatcher_cond, &g_key_mutex, &deadline);
+
+            if (wait_rc == ETIMEDOUT) {
+                ret = -ETIMEDOUT;
+                break;
+            }
+            if (wait_rc != 0 && wait_rc != EINTR) {
+                ret = -wait_rc;
+                break;
+            }
+        }
+    }
+
+    for (int i = 0; i < g_policy_bindings_count; i++) {
+        int stop_rc = pqc_stop_worker_locked(
+            &g_policy_bindings[i], PQC_WORKER_STOP_TIMEOUT_MS);
+
+        if (stop_rc != 0 && ret == 0)
+            ret = stop_rc;
+    }
+    pthread_mutex_unlock(&g_key_mutex);
+    return ret;
 }
 
 static void* pqc_policy_handshake_worker_run(void *arg) {
@@ -3531,6 +3615,10 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
     int rc;
 
     pthread_mutex_lock(&g_key_mutex);
+    if (g_pqc_shutting_down) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ESHUTDOWN;
+    }
     for (int i = 0; i < g_policy_bindings_count; i++) {
         if (g_policy_bindings_active[i] &&
             g_policy_bindings[i].profile_id == profile_id) {
@@ -3595,6 +3683,10 @@ int sig_pqc_handshake_start(int profile_id, const char *wan_ifname, const char *
     }
 
     pthread_mutex_lock(&g_key_mutex);
+    if (g_pqc_shutting_down) {
+        pthread_mutex_unlock(&g_key_mutex);
+        return -ESHUTDOWN;
+    }
     if (binding_idx >= g_policy_bindings_count ||
         !g_policy_bindings_active[binding_idx] ||
         g_policy_bindings[binding_idx].profile_id != profile_id) {

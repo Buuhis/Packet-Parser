@@ -840,8 +840,7 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
         spin_unlock_bh(&tun->gateway_mac_lock);
     }
     if (!nonce_matches) {
-        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=NONCE_MISMATCH tunnel=%s ingress_ifindex=%d received_nonce=%llu\n",
-                            tun->dev ? tun->dev->name : "unknown",
+        pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-RX stage=NONCE_MISMATCH ingress_ifindex=%d received_nonce=%llu\n",
                             ingress_ifindex,
                             (unsigned long long)nonce);
         return -ESTALE;
@@ -858,14 +857,12 @@ int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,
             cfg->node_id, nonce);
 
         if (response_ret)
-            pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_FAILED tunnel=%s ifindex=%d error=%d\n",
-                                tun->dev ? tun->dev->name : "unknown",
-                                tun->dev ? tun->dev->ifindex : 0,
+            pr_warn_ratelimited("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_FAILED ingress_ifindex=%d error=%d\n",
+                                ingress_ifindex,
                                 response_ret);
         else if (peer_changed)
-            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT tunnel=%s ifindex=%d peer_state=CHANGED encrypted=1\n",
-                    tun->dev ? tun->dev->name : "unknown",
-                    tun->dev ? tun->dev->ifindex : 0);
+            pr_info("mwan_kmod: MAC-DISCOVERY-TX stage=RESPONSE_SENT ingress_ifindex=%d peer_state=CHANGED encrypted=1\n",
+                    ingress_ifindex);
     }
     return 0;
 }
