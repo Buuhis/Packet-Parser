@@ -632,9 +632,8 @@ static bool mwan_mac_learn_peer(struct mwan_tunnel *tun, const u8 *mac,
     spin_unlock_bh(&tun->gateway_mac_lock);
 
     if (changed)
-        pr_info("mwan_kmod: learned peer MAC %pM and tunnel IP %pI4 on data tunnel %s\n",
-                mac, &peer_tunnel_ip,
-                tun->dev ? tun->dev->name : "unknown");
+        pr_info("mwan_kmod: learned peer MAC %pM and tunnel IP %pI4 on data tunnel ifindex=%u\n",
+                mac, &peer_tunnel_ip, ifindex);
     if (ip_changed)
         (void)mwan_netlink_notify_peer_changed(ifindex, peer_tunnel_ip,
                                                peer_generation);
@@ -661,17 +660,30 @@ static __be32 mwan_mac_local_ipv4(struct net_device *dev)
     return 0;
 }
 
-static int mwan_mac_prepare_header(struct mwan_tunnel *tun, u8 type,
+static struct net_device *mwan_mac_tunnel_dev_get(struct mwan_tunnel *tun)
+{
+    struct net_device *dev;
+
+    if (!tun)
+        return NULL;
+    rcu_read_lock();
+    dev = READ_ONCE(tun->dev);
+    if (dev)
+        dev_hold(dev);
+    rcu_read_unlock();
+    return dev;
+}
+
+static int mwan_mac_prepare_header(struct mwan_tunnel *tun,
+                                   struct net_device *dev, u8 type,
                                    u32 node_id, u64 response_nonce,
                                    struct mwan_mac_discovery_hdr *hdr)
 {
-    struct net_device *dev;
     __be32 local_ip;
     u64 nonce;
 
-    if (!tun || !hdr)
+    if (!tun || !dev || !hdr)
         return -EINVAL;
-    dev = tun->dev;
     if (!dev || dev->type != ARPHRD_ETHER || !netif_running(dev))
         return -ENETDOWN;
     rcu_read_lock();
@@ -709,16 +721,25 @@ static int mwan_mac_send_encrypted(struct mwan_config *cfg,
                                    u64 response_nonce)
 {
     struct mwan_mac_discovery_hdr hdr;
+    struct net_device *dev;
     int ret;
 
     if (!cfg || !tun || tun->encap_type != MWAN_ENCAP_L2_PQC)
         return -EINVAL;
-    ret = mwan_mac_prepare_header(tun, type, node_id, response_nonce, &hdr);
-    if (ret)
+    dev = mwan_mac_tunnel_dev_get(tun);
+    if (!dev)
+        return -ENETDOWN;
+    ret = mwan_mac_prepare_header(tun, dev, type, node_id, response_nonce,
+                                  &hdr);
+    if (ret) {
+        dev_put(dev);
         return ret;
+    }
 
-    return mwan_l2_pqc_encrypt_control_xmit(cfg, tun, dest, &hdr,
-                                             sizeof(hdr));
+    ret = mwan_l2_pqc_encrypt_control_xmit(cfg, tun, dest, &hdr,
+                                           sizeof(hdr));
+    dev_put(dev);
+    return ret;
 }
 
 /* BYPASS still needs a per-tunnel peer MAC because its asynchronous TX path
@@ -740,15 +761,20 @@ static int mwan_mac_send_plaintext(struct mwan_config *cfg,
     if (!cfg || !tun || !dest || tun->encap_type != MWAN_ENCAP_NONE ||
         mwan_state_datapath_blocked())
         return -EACCES;
-    ret = mwan_mac_prepare_header(tun, type, node_id, response_nonce, &hdr);
+    dev = mwan_mac_tunnel_dev_get(tun);
+    if (!dev)
+        return -ENETDOWN;
+    ret = mwan_mac_prepare_header(tun, dev, type, node_id, response_nonce,
+                                  &hdr);
     if (ret)
-        return ret;
+        goto out_put_dev;
 
-    dev = tun->dev;
     headroom = LL_RESERVED_SPACE(dev);
     skb = alloc_skb(headroom + ETH_HLEN + sizeof(hdr), gfp);
-    if (!skb)
-        return -ENOMEM;
+    if (!skb) {
+        ret = -ENOMEM;
+        goto out_put_dev;
+    }
 
     skb_reserve(skb, headroom);
     memcpy(skb_put(skb, sizeof(hdr)), &hdr, sizeof(hdr));
@@ -763,7 +789,11 @@ static int mwan_mac_send_plaintext(struct mwan_config *cfg,
     skb_reset_network_header(skb);
     skb->ip_summed = CHECKSUM_NONE;
     ret = dev_queue_xmit(skb);
-    return net_xmit_eval(ret) ? -EIO : 0;
+    ret = net_xmit_eval(ret) ? -EIO : 0;
+
+out_put_dev:
+    dev_put(dev);
+    return ret;
 }
 
 int mwan_mac_discovery_receive_encrypted(struct mwan_config *cfg,

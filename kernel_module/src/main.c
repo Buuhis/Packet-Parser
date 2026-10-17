@@ -28,13 +28,15 @@
 #include <net/if.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #define NODE_INFO_DIR "/etc/sd-wan"
 #define NODE_INFO_FILE NODE_INFO_DIR "/node.info"
 
 /* ---------- global state ---------- */
-static volatile int running_server = 1;
+static volatile sig_atomic_t stop_requested;
 static int unix_server_fd = -1;
+static int signal_wake_pipe[2] = { -1, -1 };
 static char socket_path[256] = "/var/run/sd-wan.sock";
 static app_context_t running_ctx;
 
@@ -102,16 +104,16 @@ static int normalize_ipv4(const char *input, char *output, size_t output_len,
 
 /* ---------- signal handler ---------- */
 static void handle_signal(int sig) {
+    int saved_errno = errno;
+    const unsigned char wake = 1;
+    ssize_t write_ret = 0;
+
     (void)sig;
-    running_server = 0;
-    cpu_tune_restore();
-    kernel_sync_cleanup();
-    trf_pqc_cleanup();
-    if (unix_server_fd >= 0) {
-        close(unix_server_fd);
-        unix_server_fd = -1;
-        unlink(socket_path);
-    }
+    stop_requested = 1;
+    if (signal_wake_pipe[1] >= 0)
+        write_ret = write(signal_wake_pipe[1], &wake, sizeof(wake));
+    (void)write_ret;
+    errno = saved_errno;
 }
 
 int pqc_bind_node(int node_id, uint64_t config_generation) {
@@ -504,9 +506,34 @@ int main(int argc, char **argv) {
     // Load PQC identities from disk
     sig_pqc_init_vault();
 
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
-    signal(SIGPIPE, SIG_IGN);
+    if (pipe2(signal_wake_pipe, O_NONBLOCK | O_CLOEXEC) < 0) {
+        log_error("Failed to create signal wakeup pipe: %s", strerror(errno));
+        trf_pqc_cleanup();
+        db_client_disconnect();
+        return 1;
+    }
+    {
+        struct sigaction stop_action = {0};
+        struct sigaction ignore_action = {0};
+
+        stop_action.sa_handler = handle_signal;
+        sigemptyset(&stop_action.sa_mask);
+        ignore_action.sa_handler = SIG_IGN;
+        sigemptyset(&ignore_action.sa_mask);
+        stop_requested = 0;
+        if (sigaction(SIGINT, &stop_action, NULL) < 0 ||
+            sigaction(SIGTERM, &stop_action, NULL) < 0 ||
+            sigaction(SIGPIPE, &ignore_action, NULL) < 0) {
+            log_error("Failed to configure signal handling: %s",
+                      strerror(errno));
+            close(signal_wake_pipe[0]);
+            close(signal_wake_pipe[1]);
+            signal_wake_pipe[0] = signal_wake_pipe[1] = -1;
+            trf_pqc_cleanup();
+            db_client_disconnect();
+            return 1;
+        }
+    }
     
     unix_server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (unix_server_fd < 0) return 1;
@@ -558,9 +585,59 @@ int main(int argc, char **argv) {
     }
 
     /* ======================== MAIN LOOP ======================== */
-    while(running_server) {
-        int client_fd = accept(unix_server_fd, NULL, NULL);
-        if (client_fd < 0) continue;
+    while (!stop_requested) {
+        struct pollfd fds[2] = {
+            { .fd = unix_server_fd, .events = POLLIN },
+            { .fd = signal_wake_pipe[0], .events = POLLIN },
+        };
+        int poll_ret = poll(fds, 2, -1);
+        int client_fd;
+
+        if (poll_ret < 0) {
+            if (errno == EINTR)
+                continue;
+            log_error("Control-plane poll failed: %s", strerror(errno));
+            break;
+        }
+        if (fds[1].revents & POLLIN)
+            break;
+        if (stop_requested)
+            break;
+        if (!(fds[0].revents & POLLIN)) {
+            if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                log_error("Control-plane listener became unavailable");
+                break;
+            }
+            continue;
+        }
+
+        client_fd = accept(unix_server_fd, NULL, NULL);
+        if (client_fd < 0) {
+            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                continue;
+            if (!stop_requested)
+                log_warn("Control-plane accept failed: %s", strerror(errno));
+            continue;
+        }
+        {
+            struct pollfd client_fds[2] = {
+                { .fd = client_fd, .events = POLLIN },
+                { .fd = signal_wake_pipe[0], .events = POLLIN },
+            };
+            int client_poll = poll(client_fds, 2, -1);
+
+            if (client_poll < 0 || stop_requested ||
+                (client_fds[1].revents & POLLIN) ||
+                !(client_fds[0].revents & (POLLIN | POLLHUP))) {
+                close(client_fd);
+                if (client_poll < 0 && errno != EINTR)
+                    log_warn("Control-plane client poll failed: %s",
+                             strerror(errno));
+                if (stop_requested || (client_fds[1].revents & POLLIN))
+                    break;
+                continue;
+            }
+        }
         char buf[256] = {0};
         int n = recv(client_fd, buf, sizeof(buf)-1, 0);
         if (n <= 0) { close(client_fd); continue; }
@@ -575,9 +652,12 @@ int main(int argc, char **argv) {
     
     log_info("Server shutting down...");
     failover_service_stop();
-    cpu_tune_restore();
     kernel_sync_cleanup();
+    trf_pqc_cleanup();
+    cpu_tune_restore();
     db_client_disconnect();
     if (unix_server_fd >= 0) { close(unix_server_fd); unlink(socket_path); }
+    if (signal_wake_pipe[0] >= 0) close(signal_wake_pipe[0]);
+    if (signal_wake_pipe[1] >= 0) close(signal_wake_pipe[1]);
     return 0;
 }
