@@ -24,6 +24,7 @@ DEFINE_MUTEX(mwan_cfg_update_lock);
  * cannot reuse an AES-GCM IV while the active key is unchanged. L2 and L3
  * share this monotonic source. */
 static atomic64_t packet_nonce;
+static u64 packet_nonce_start;
 static atomic64_t no_active_tunnel_drops;
 static atomic_t mwan_datapath_blocked = ATOMIC_INIT(0);
 
@@ -192,33 +193,71 @@ static void mwan_config_preserve_peer_state(struct mwan_config *new_cfg,
     }
 }
 
-/* A normal SET_CONFIG may replace the immutable config snapshot without
- * changing the L2-PQC security association.  Share the replay manager only
- * when the authenticated current-key identity is unchanged.  If the new
- * snapshot carries PREV, require that identity to match as well. */
+static bool mwan_config_l2_pqc(const struct mwan_config *cfg)
+{
+    return cfg && cfg->replay && cfg->encrypt_on &&
+           cfg->encrypt_layer == 2 &&
+           cfg->encrypt_type == MWAN_CRYPT_PQC_GCM;
+}
+
+static bool mwan_config_key_material(const struct mwan_config *cfg,
+                                     u8 key_id, const u8 **key,
+                                     u8 *key_len)
+{
+    if (cfg->key_id == key_id) {
+        *key = cfg->encrypt_key;
+        *key_len = cfg->encrypt_key_len;
+        return true;
+    }
+    if (cfg->prev_key_valid && cfg->prev_key_id == key_id) {
+        *key = cfg->prev_key;
+        *key_len = cfg->prev_key_len;
+        return true;
+    }
+    if (cfg->next_key_valid && cfg->next_key_id == key_id) {
+        *key = cfg->next_key;
+        *key_len = cfg->next_key_len;
+        return true;
+    }
+    return false;
+}
+
+/* A full config replacement may move the same authenticated key identity
+ * between CURRENT and PREV. Preserve its replay window across that handoff. */
 static bool mwan_config_replay_compatible(const struct mwan_config *new_cfg,
                                           const struct mwan_config *old_cfg)
 {
-    if (!new_cfg || !old_cfg || !old_cfg->replay ||
-        !new_cfg->encrypt_on || !old_cfg->encrypt_on ||
-        new_cfg->encrypt_layer != 2 || old_cfg->encrypt_layer != 2 ||
-        new_cfg->encrypt_type != MWAN_CRYPT_PQC_GCM ||
-        old_cfg->encrypt_type != MWAN_CRYPT_PQC_GCM ||
+    u8 new_ids[2];
+    bool common_key = false;
+    unsigned int i;
+
+    if (!mwan_config_l2_pqc(new_cfg) || !mwan_config_l2_pqc(old_cfg) ||
         new_cfg->node_id != old_cfg->node_id ||
-        new_cfg->key_id != old_cfg->key_id ||
-        new_cfg->encrypt_key_len != old_cfg->encrypt_key_len ||
-        memcmp(new_cfg->encrypt_key, old_cfg->encrypt_key,
-               new_cfg->encrypt_key_len) ||
         memcmp(new_cfg->encrypt_salt, old_cfg->encrypt_salt,
                MWAN_SALT_LEN))
         return false;
-    if (!new_cfg->prev_key_valid)
-        return true;
-    return old_cfg->prev_key_valid &&
-           new_cfg->prev_key_id == old_cfg->prev_key_id &&
-           new_cfg->prev_key_len == old_cfg->prev_key_len &&
-           !memcmp(new_cfg->prev_key, old_cfg->prev_key,
-                   new_cfg->prev_key_len);
+
+    new_ids[0] = new_cfg->key_id;
+    new_ids[1] = new_cfg->prev_key_valid ? new_cfg->prev_key_id : 0;
+    for (i = 0; i < ARRAY_SIZE(new_ids); i++) {
+        const u8 *new_key;
+        const u8 *old_key;
+        u8 new_len;
+        u8 old_len;
+
+        if (!new_ids[i] ||
+            !mwan_config_key_material(new_cfg, new_ids[i], &new_key,
+                                      &new_len) ||
+            !mwan_config_key_material(old_cfg, new_ids[i], &old_key,
+                                      &old_len))
+            continue;
+        /* The manager is indexed by key_id, so an ID collision with changed
+         * material cannot safely share the existing window. */
+        if (new_len != old_len || memcmp(new_key, old_key, new_len))
+            return false;
+        common_key = true;
+    }
+    return common_key;
 }
 
 /* Destroy only a config that has been published. The caller first waits for
@@ -258,7 +297,8 @@ static void mwan_config_destroy(struct mwan_config *cfg)
 void mwan_state_init(void)
 {
     BUILD_BUG_ON(sizeof(struct mwan_l2_pqc_hdr) != MWAN_L2_HDR_LEN);
-    atomic64_set(&packet_nonce, get_random_u64());
+    packet_nonce_start = get_random_u64();
+    atomic64_set(&packet_nonce, packet_nonce_start);
     atomic64_set(&no_active_tunnel_drops, 0);
     atomic_set(&mwan_datapath_blocked, 0);
 }
@@ -285,6 +325,12 @@ u64 mwan_next_packet_nonce(void)
         return 0;
 
     return nonce;
+}
+
+bool mwan_packet_nonce_is_local(u64 nonce)
+{
+    return nonce > READ_ONCE(packet_nonce_start) &&
+           nonce <= (u64)atomic64_read(&packet_nonce);
 }
 
 void mwan_state_cleanup(void)
@@ -599,6 +645,18 @@ int mwan_state_update(struct mwan_config *new_cfg)
     }
     if (mwan_config_replay_compatible(new_cfg, old)) {
         struct mwan_l2_replay_manager *shared;
+        int replay_err;
+
+        replay_err = mwan_l2_replay_prepare_key(old->replay,
+                                                new_cfg->key_id);
+        if (!replay_err && new_cfg->prev_key_valid)
+            replay_err = mwan_l2_replay_prepare_key(old->replay,
+                                                    new_cfg->prev_key_id);
+        if (replay_err) {
+            mutex_unlock(&mwan_cfg_update_lock);
+            err = replay_err;
+            goto err_free_tfm;
+        }
 
         shared = mwan_l2_replay_manager_get(old->replay);
         mwan_l2_replay_manager_put(new_cfg->replay);

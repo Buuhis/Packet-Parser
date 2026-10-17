@@ -8,7 +8,7 @@
  * enough for packets encrypted on different CPUs and paths to complete out
  * of order without weakening duplicate detection after an RX flow expires. */
 #define MWAN_REPLAY_WINDOW_BITS 65536U
-#define MWAN_REPLAY_MAX_KEYS    3U
+#define MWAN_REPLAY_MAX_KEYS    5U
 
 struct mwan_l2_replay_manager;
 

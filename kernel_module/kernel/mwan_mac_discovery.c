@@ -508,12 +508,12 @@ int mwan_mac_discovery_detach_pending(u32 node_id, u32 ifindex)
         }
         mwan_mac_copy_peer_state(dst, src, true);
     }
+    new_cfg->num_tunnels = count;
     if (!found) {
         mutex_unlock(&mwan_mac_pending_lock);
         mwan_mac_pending_destroy(new_cfg);
         return -ENOENT;
     }
-    new_cfg->num_tunnels = count;
     rcu_assign_pointer(mwan_mac_pending_cfg, new_cfg);
     synchronize_rcu();
     mwan_mac_pending_destroy(old_cfg);

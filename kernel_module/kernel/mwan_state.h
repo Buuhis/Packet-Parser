@@ -578,6 +578,7 @@ const char *mwan_rekey_drop_reason_name(int reason);
 void mwan_state_count_no_active_drop(void);
 u64 mwan_state_no_active_drops(void);
 u64 mwan_next_packet_nonce(void);
+bool mwan_packet_nonce_is_local(u64 nonce);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
 void mwan_l2_workers_flush(void);

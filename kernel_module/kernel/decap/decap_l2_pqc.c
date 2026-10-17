@@ -718,10 +718,17 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
              * or flow creation so an expired flow cannot be recreated by a
              * captured ciphertext.  Never advance this state on auth fail. */
             if (!ret) {
-                replay_ret = mwan_l2_replay_check_and_mark(
-                    worker->cfg->replay,
-                    (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT),
-                    packet_nonce);
+                /* Both peers use the same key and nonce space. Reject a
+                 * successfully authenticated reflection of a nonce this
+                 * node itself has emitted before it can advance the window. */
+                if (mwan_packet_nonce_is_local(packet_nonce)) {
+                    replay_ret = -EALREADY;
+                } else {
+                    replay_ret = mwan_l2_replay_check_and_mark(
+                        worker->cfg->replay,
+                        (u8)(flow_token >> MWAN_FLOW_KEY_ID_SHIFT),
+                        packet_nonce);
+                }
                 if (replay_ret)
                     ret = replay_ret;
             }

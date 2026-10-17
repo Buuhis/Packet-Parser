@@ -16,7 +16,9 @@ enum mwan_genl_multicast_groups {
 static const struct genl_multicast_group mwan_genl_mcgrps[] = {
     [MWAN_MCGRP_PEER_EVENTS] = {
         .name = MWAN_GENL_PEER_EVENTS_GROUP,
+#ifdef GENL_MCAST_CAP_NET_ADMIN,
         .flags = GENL_MCAST_CAP_NET_ADMIN,
+#endif
     },
 };
 
