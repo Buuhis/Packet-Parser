@@ -495,6 +495,7 @@ struct mwan_config {
     u8   encrypt_key[MWAN_MAX_KEY_LEN];
     u8   encrypt_key_len;                 /* 16 (128-bit) or 32 (256-bit) */
     u8   encrypt_salt[MWAN_SALT_LEN];
+    u8   nonce_domain;
     struct crypto_aead *tfm;              /* Crypto transform context */
     struct crypto_aead *prev_tfm;         /* Previous PQC key during grace */
     
@@ -579,6 +580,8 @@ void mwan_state_count_no_active_drop(void);
 u64 mwan_state_no_active_drops(void);
 u64 mwan_next_packet_nonce(void);
 bool mwan_packet_nonce_is_local(u64 nonce);
+u64 mwan_next_l2_packet_nonce(u8 nonce_domain);
+bool mwan_l2_packet_nonce_is_local(u64 nonce, u8 nonce_domain);
 int mwan_l2_workers_init(struct mwan_config *cfg);
 void mwan_l2_workers_cleanup(struct mwan_config *cfg);
 void mwan_l2_workers_flush(void);

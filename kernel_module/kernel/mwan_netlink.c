@@ -47,6 +47,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_NEW_IFINDEX] = { .type = NLA_U32 },
     [MWAN_ATTR_DATAPATH_BLOCKED] = { .type = NLA_U8 },
     [MWAN_ATTR_PEER_GENERATION] = { .type = NLA_U32 },
+    [MWAN_ATTR_NONCE_DOMAIN] = { .type = NLA_U8 },
 };
 
 int mwan_netlink_notify_peer_changed(u32 ifindex, __be32 peer_tunnel_ip,
@@ -196,6 +197,20 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
                 nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_LAYER]);
             new_cfg->encrypt_type =
                 nla_get_u8(info->attrs[MWAN_ATTR_ENCRYPT_TYPE]);
+
+            if (new_cfg->encrypt_layer == 2 &&
+                new_cfg->encrypt_type == MWAN_CRYPT_PQC_GCM) {
+                if (!info->attrs[MWAN_ATTR_NONCE_DOMAIN]) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+                new_cfg->nonce_domain =
+                    nla_get_u8(info->attrs[MWAN_ATTR_NONCE_DOMAIN]);
+                if (new_cfg->nonce_domain > 1) {
+                    ret = -EINVAL;
+                    goto err_free_config;
+                }
+            }
             
             if (info->attrs[MWAN_ATTR_ENCRYPT_KEY]) {
                 int klen = nla_len(info->attrs[MWAN_ATTR_ENCRYPT_KEY]);

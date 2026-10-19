@@ -1,5 +1,6 @@
 #include "../inc/pqc_handshake.h"
 #include "../inc/traffic_crypto.h"
+#include "../inc/scrypt.h"
 #include "../inc/pqc_logger.h"
 #include "../inc/pqc_vault.h"
 #include <sys/stat.h>
@@ -43,9 +44,12 @@
 #define PQC_HS_STATE_READY 1
 #define PQC_HS_STATE_FAILED 2
 #define PQC_HS_STATE_HANDSHAKING 3
-#define PQC_HS_INIT_WIRE_VERSION 2
+#define PQC_HS_INIT_WIRE_VERSION 3
 #define PQC_HS_INIT_HAS_CURRENT 0x01
 #define PQC_HS_INIT_HAS_PREVIOUS 0x02
+#define PQC_HS_REKEY_HELLO_WIRE_VERSION 1
+#define PQC_HS_REKEY_CHALLENGE_WINDOW 4
+#define PQC_HS_KDF_VERSION 1
 
 enum pqc_hs_hello_diag_status {
     PQC_HS_HELLO_DIAG_OK = 0,
@@ -108,6 +112,13 @@ typedef struct {
     uint8_t agreed_key_id;
     uint8_t key_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ];
 } pqc_hs_init_resp_wire_t;
+
+typedef struct {
+    uint8_t version;
+    uint8_t reserved[7];
+    uint8_t challenge_epoch_be[sizeof(uint64_t)];
+    uint8_t challenge_sequence_be[sizeof(uint64_t)];
+} pqc_hs_rekey_hello_wire_t;
 #pragma pack(pop)
 
 #define PQC_HS_KEEPALIVE_DATA_SZ \
@@ -939,11 +950,104 @@ static void pqc_hs_begin_profile_recovery_locked(policy_key_binding_t *b,
     pqc_hs_clear_cache_locked(b);
 }
 
-// Helper to calculate SHA256 hash
-static void derive_traffic_key(const uint8_t *shared_secret, int ss_len, uint8_t *out_key) {
-    uint8_t hash[64]; // Enough for SHA512
-    trf_calculate_digest(DIGEST_TYPE_SHA256, shared_secret, ss_len, hash);
-    memcpy(out_key, hash, PQC_TRAFFIC_KEY_SZ);
+static int derive_traffic_key(
+    const uint8_t *shared_secret, int ss_len,
+    const struct pqc_hs_msg *hello, const uint8_t *ciphertext,
+    size_t ciphertext_len, bool is_rekey,
+    uint8_t out_key[PQC_TRAFFIC_KEY_SZ])
+{
+    static const uint8_t init_info[] =
+        "SDWAN-PQC-INIT-TRAFFIC-KEY-V1";
+    static const uint8_t rekey_info[] =
+        "SDWAN-PQC-REKEY-TRAFFIC-KEY-V1";
+    uint8_t hello_hash[32];
+    uint8_t ciphertext_hash[32];
+    uint8_t context[1 + 1 + sizeof(uint32_t) + 32 + 32];
+    uint8_t salt[32];
+    uint32_t session_be;
+    const uint8_t *info = is_rekey ? rekey_info : init_info;
+    size_t info_len = is_rekey ? sizeof(rekey_info) - 1 :
+                                 sizeof(init_info) - 1;
+    int rc = -EIO;
+    size_t hello_len;
+
+    if (!shared_secret || ss_len <= 0 || !hello || !ciphertext ||
+        ciphertext_len == 0 || ciphertext_len > INT_MAX || !out_key)
+        return -EINVAL;
+    hello_len = sizeof(*hello) + (size_t)hello->data_len +
+                (size_t)hello->sig_len;
+    if (hello->sig_len == 0 || hello_len > PQC_HS_MSG_MAX_SZ ||
+        trf_calculate_digest(DIGEST_TYPE_SHA256,
+                             (const uint8_t *)hello, (int)hello_len,
+                             hello_hash) != TRF_PQC_OK ||
+        trf_calculate_digest(DIGEST_TYPE_SHA256, ciphertext,
+                             (int)ciphertext_len,
+                             ciphertext_hash) != TRF_PQC_OK)
+        goto out;
+
+    context[0] = PQC_HS_KDF_VERSION;
+    context[1] = hello->msg_type;
+    session_be = htobe32(hello->session_id);
+    memcpy(context + 2, &session_be, sizeof(session_be));
+    memcpy(context + 2 + sizeof(session_be), hello_hash,
+           sizeof(hello_hash));
+    memcpy(context + 2 + sizeof(session_be) + sizeof(hello_hash),
+           ciphertext_hash, sizeof(ciphertext_hash));
+    if (trf_calculate_digest(DIGEST_TYPE_SHA256, context,
+                             sizeof(context), salt) != TRF_PQC_OK)
+        goto out;
+    if (scrypt_HKDF(DIGEST_TYPE_SHA256, shared_secret, (word32)ss_len,
+                    salt, sizeof(salt), info, (word32)info_len,
+                    out_key, PQC_TRAFFIC_KEY_SZ) != 0)
+        goto out;
+    rc = 0;
+
+out:
+    memset(hello_hash, 0, sizeof(hello_hash));
+    memset(ciphertext_hash, 0, sizeof(ciphertext_hash));
+    memset(context, 0, sizeof(context));
+    memset(salt, 0, sizeof(salt));
+    return rc;
+}
+
+static int pqc_hs_nonce_domain_from_identity(const char *local_pub,
+                                             const char *peer_pub,
+                                             uint8_t *nonce_domain)
+{
+    uint8_t local_raw[8192];
+    uint8_t peer_raw[8192];
+    uint8_t local_hash[32];
+    uint8_t peer_hash[32];
+    size_t local_raw_sz = 0;
+    size_t peer_raw_sz = 0;
+    int order;
+    int rc = -EKEYREJECTED;
+
+    if (!local_pub || !local_pub[0] || !peer_pub || !peer_pub[0] ||
+        !nonce_domain)
+        return -EINVAL;
+    trf_base64_decode(local_pub, local_raw, &local_raw_sz);
+    trf_base64_decode(peer_pub, peer_raw, &peer_raw_sz);
+    if (!local_raw_sz || !peer_raw_sz || local_raw_sz > INT_MAX ||
+        peer_raw_sz > INT_MAX)
+        goto out;
+    if (trf_calculate_digest(DIGEST_TYPE_SHA256, local_raw,
+                             (int)local_raw_sz, local_hash) != TRF_PQC_OK ||
+        trf_calculate_digest(DIGEST_TYPE_SHA256, peer_raw,
+                             (int)peer_raw_sz, peer_hash) != TRF_PQC_OK)
+        goto out;
+    order = memcmp(local_hash, peer_hash, sizeof(local_hash));
+    if (order == 0)
+        goto out;
+    *nonce_domain = order < 0 ? 0 : 1;
+    rc = 0;
+
+out:
+    memset(local_raw, 0, sizeof(local_raw));
+    memset(peer_raw, 0, sizeof(peer_raw));
+    memset(local_hash, 0, sizeof(local_hash));
+    memset(peer_hash, 0, sizeof(peer_hash));
+    return rc;
 }
 
 static bool pqc_hs_key_id_reserved(uint8_t candidate,
@@ -1179,6 +1283,7 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     bool session_conflict = false;
     bool is_rekey;
     pqc_hs_init_hello_wire_t peer_init_state = {0};
+    pqc_hs_rekey_hello_wire_t rekey_hello = {0};
     const uint8_t *kem_public_key;
     size_t kem_public_key_len;
     uint8_t init_key_fingerprint[PQC_HS_KEY_FINGERPRINT_SZ] = {0};
@@ -1187,6 +1292,8 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     uint8_t rekey_id = 0;
     uint64_t sender_epoch = 0;
     uint64_t responder_challenge = 0;
+    uint64_t rekey_challenge_epoch = 0;
+    uint64_t rekey_challenge_sequence = 0;
     size_t response_prefix = 0;
     char *new_my_priv = NULL;
     char *new_peer_pub = NULL;
@@ -1248,8 +1355,27 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         kem_public_key = msg->payload + sizeof(peer_init_state);
         kem_public_key_len = msg->data_len - sizeof(peer_init_state);
     } else {
-        kem_public_key = msg->payload;
-        kem_public_key_len = msg->data_len;
+        uint64_t value_be;
+
+        if (msg->data_len <= sizeof(rekey_hello))
+            return -EPROTO;
+        memcpy(&rekey_hello, msg->payload, sizeof(rekey_hello));
+        if (rekey_hello.version != PQC_HS_REKEY_HELLO_WIRE_VERSION)
+            return -EPROTO;
+        for (size_t i = 0; i < sizeof(rekey_hello.reserved); i++) {
+            if (rekey_hello.reserved[i] != 0)
+                return -EPROTO;
+        }
+        memcpy(&value_be, rekey_hello.challenge_epoch_be,
+               sizeof(value_be));
+        rekey_challenge_epoch = be64toh(value_be);
+        memcpy(&value_be, rekey_hello.challenge_sequence_be,
+               sizeof(value_be));
+        rekey_challenge_sequence = be64toh(value_be);
+        if (!rekey_challenge_epoch || !rekey_challenge_sequence)
+            return -EPROTO;
+        kem_public_key = msg->payload + sizeof(rekey_hello);
+        kem_public_key_len = msg->data_len - sizeof(rekey_hello);
     }
 
     if (trf_calculate_digest(DIGEST_TYPE_SHA256, rx_buf, rx_len, hello_hash) != TRF_PQC_OK) {
@@ -1386,6 +1512,24 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
                     b->profile_id, msg->session_id,
                     (unsigned long long)sender_epoch,
                     (unsigned long long)responder_challenge);
+    } else {
+        bool challenge_valid;
+
+        pthread_mutex_lock(&g_key_mutex);
+        challenge_valid =
+            rekey_challenge_epoch == b->local_request_id &&
+            rekey_challenge_sequence <= b->local_keepalive_seq &&
+            b->local_keepalive_seq - rekey_challenge_sequence <
+                PQC_HS_REKEY_CHALLENGE_WINDOW &&
+            (rekey_challenge_epoch != b->last_rekey_challenge_epoch ||
+             rekey_challenge_sequence >
+                 b->last_rekey_challenge_sequence);
+        if (!challenge_valid)
+            (void)pqc_hs_record_drop_locked(
+                b, PQC_HS_DROP_BAD_FRESHNESS, msg->msg_type);
+        pthread_mutex_unlock(&g_key_mutex);
+        if (!challenge_valid)
+            return -ESTALE;
     }
 
     if (trf_kem_encapsulate(kem_public_key, (int)kem_public_key_len,
@@ -1398,7 +1542,12 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         return -1;
     }
 
-    derive_traffic_key(ss, 32, derived_master);
+    if (derive_traffic_key(ss, 32, msg, ct, (size_t)ct_sz,
+                           is_rekey, derived_master) != 0) {
+        memset(ss, 0, sizeof(ss));
+        return -EIO;
+    }
+    memset(ss, 0, sizeof(ss));
     if (is_rekey) {
         if (!b->key_ready ||
             trf_calculate_digest(DIGEST_TYPE_SHA256, derived_master,
@@ -1478,10 +1627,20 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
         int stage_rc;
 
         pthread_mutex_lock(&g_key_mutex);
-        stage_rc = pqc_key_rotation_stage(
-            &b->rotation, b->profile_id, (uint64_t)msg->session_id,
-            rekey_id, derived_master, rekey_fingerprint, b->keys,
-            b->key_ids, b->key_slots_valid, get_time_ms_hs());
+        if (rekey_challenge_epoch != b->local_request_id ||
+            rekey_challenge_sequence > b->local_keepalive_seq ||
+            b->local_keepalive_seq - rekey_challenge_sequence >=
+                PQC_HS_REKEY_CHALLENGE_WINDOW ||
+            (rekey_challenge_epoch == b->last_rekey_challenge_epoch &&
+             rekey_challenge_sequence <=
+                 b->last_rekey_challenge_sequence)) {
+            stage_rc = -ESTALE;
+        } else {
+            stage_rc = pqc_key_rotation_stage(
+                &b->rotation, b->profile_id, (uint64_t)msg->session_id,
+                rekey_id, derived_master, rekey_fingerprint, b->keys,
+                b->key_ids, b->key_slots_valid, get_time_ms_hs());
+        }
         pthread_mutex_unlock(&g_key_mutex);
         if (stage_rc != 0) {
             free(response_copy);
@@ -1508,7 +1667,10 @@ static int pqc_hs_handle_responder_hello(policy_key_binding_t *b,
     b->hs_cache[cached_slot].peer_epoch = sender_epoch;
     b->hs_cache[cached_slot].valid = true;
     b->hs_cache[cached_slot].is_rekey = is_rekey;
-    if (!is_rekey) {
+    if (is_rekey) {
+        b->last_rekey_challenge_epoch = rekey_challenge_epoch;
+        b->last_rekey_challenge_sequence = rekey_challenge_sequence;
+    } else {
         b->peer_keepalive_epoch = sender_epoch;
         b->peer_keepalive_seq = 0;
     }
@@ -1705,7 +1867,11 @@ static int initiate_key_rotation(policy_key_binding_t *b, int sockfd,
     int sig_sz = 0;
     bool staged = false;
     uint64_t rotation_started;
+    uint64_t challenge_epoch = 0;
+    uint64_t challenge_sequence = 0;
     struct pqc_hs_msg *msg = (struct pqc_hs_msg *)buffer;
+    pqc_hs_rekey_hello_wire_t *hello_wire =
+        (pqc_hs_rekey_hello_wire_t *)msg->payload;
 
     /* Resume an already staged transaction before trying to generate a new
      * one.  This is required when READY reached the responder (which may
@@ -1731,12 +1897,29 @@ static int initiate_key_rotation(policy_key_binding_t *b, int sockfd,
     if (trf_kem_generate_keys(pk, &pk_sz, sk, &sk_sz) != TRF_PQC_OK ||
         pqc_generate_session_id(&msg_id) != 0)
         return -EIO;
+    pthread_mutex_lock(&g_key_mutex);
+    challenge_epoch = b->peer_keepalive_epoch;
+    challenge_sequence = b->peer_keepalive_seq;
+    pthread_mutex_unlock(&g_key_mutex);
+    if (!challenge_epoch || !challenge_sequence)
+        return -EAGAIN;
     msg->magic = PQC_HS_MAGIC;
     msg->msg_type = PQC_HS_MSG_REKEY_HELLO;
     msg->session_id = msg_id;
     msg->profile_id = (uint32_t)profile_id;
-    msg->data_len = (uint16_t)pk_sz;
-    memcpy(msg->payload, pk, (size_t)pk_sz);
+    msg->data_len = (uint16_t)(sizeof(*hello_wire) + (size_t)pk_sz);
+    memset(hello_wire, 0, sizeof(*hello_wire));
+    hello_wire->version = PQC_HS_REKEY_HELLO_WIRE_VERSION;
+    {
+        uint64_t value_be = htobe64(challenge_epoch);
+
+        memcpy(hello_wire->challenge_epoch_be, &value_be,
+               sizeof(value_be));
+        value_be = htobe64(challenge_sequence);
+        memcpy(hello_wire->challenge_sequence_be, &value_be,
+               sizeof(value_be));
+    }
+    memcpy(msg->payload + sizeof(*hello_wire), pk, (size_t)pk_sz);
     {
         size_t raw_priv_sz = 0;
         uint8_t raw_priv[8192];
@@ -1744,12 +1927,12 @@ static int initiate_key_rotation(policy_key_binding_t *b, int sockfd,
         trf_base64_decode(my_priv, raw_priv, &raw_priv_sz);
         if (!raw_priv_sz ||
             pqc_hs_sign_message(raw_priv, raw_priv_sz, msg,
-                                msg->payload + pk_sz,
+                                msg->payload + msg->data_len,
                                 &sig_sz) != TRF_PQC_OK)
             return -EKEYREJECTED;
     }
     msg->sig_len = (uint16_t)sig_sz;
-    payload_tot_sz = (int)sizeof(*msg) + pk_sz + sig_sz;
+    payload_tot_sz = (int)sizeof(*msg) + msg->data_len + sig_sz;
     rotation_started = get_time_ms_hs();
     fprintf(stderr,
             "[PQC-REKEY] Profile %d START epoch=%u; CURRENT remains active.\n",
@@ -1819,7 +2002,15 @@ exchange:
                             resp->data_len - PQC_REKEY_WIRE_SIZE,
                             ss) != TRF_PQC_OK)
                         continue;
-                    derive_traffic_key(ss, 32, derived_master);
+                    if (derive_traffic_key(
+                            ss, 32, msg,
+                            resp->payload + PQC_REKEY_WIRE_SIZE,
+                            resp->data_len - PQC_REKEY_WIRE_SIZE,
+                            true, derived_master) != 0) {
+                        memset(ss, 0, sizeof(ss));
+                        continue;
+                    }
+                    memset(ss, 0, sizeof(ss));
                     if (trf_calculate_digest(
                             DIGEST_TYPE_SHA256, derived_master,
                             sizeof(derived_master), calculated_fp) !=
@@ -3286,7 +3477,15 @@ static void* pqc_policy_handshake_worker_run(void *arg) {
                                 uint8_t derived_master[PQC_TRAFFIC_KEY_SZ];
                                 uint8_t calculated_fingerprint[
                                     PQC_HS_KEY_FINGERPRINT_SZ];
-                                derive_traffic_key(ss, 32, derived_master);
+                                if (derive_traffic_key(
+                                        ss, 32, msg,
+                                        resp->payload + sizeof(*resp_wire),
+                                        resp->data_len - sizeof(*resp_wire),
+                                        false, derived_master) != 0) {
+                                    memset(ss, 0, sizeof(ss));
+                                    continue;
+                                }
+                                memset(ss, 0, sizeof(ss));
 
                                 if (trf_calculate_digest(
                                         DIGEST_TYPE_SHA256, derived_master,
@@ -3835,7 +4034,9 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
                          uint64_t config_generation,
                          bool l2_rekey_enabled) {
     uint64_t new_request_id = 0;
+    uint8_t nonce_domain = 0;
     int request_id_rc;
+    int nonce_domain_rc;
     char *new_local_priv = local_priv ? strdup(local_priv) : NULL;
     char *new_local_pub = local_pub ? strdup(local_pub) : NULL;
     char *deobf_peer = peer_pub ? strdup(peer_pub) : NULL;
@@ -3853,6 +4054,14 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         free(new_local_pub);
         free(deobf_peer);
         return -ENOMEM;
+    }
+    nonce_domain_rc = pqc_hs_nonce_domain_from_identity(
+        new_local_pub, deobf_peer, &nonce_domain);
+    if (nonce_domain_rc != 0) {
+        free(new_local_priv);
+        free(new_local_pub);
+        free(deobf_peer);
+        return nonce_domain_rc;
     }
 
     pthread_mutex_lock(&g_key_mutex);
@@ -3902,6 +4111,8 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->local_keepalive_seq = 0;
         b->peer_keepalive_epoch = 0;
         b->peer_keepalive_seq = 0;
+        b->last_rekey_challenge_epoch = 0;
+        b->last_rekey_challenge_sequence = 0;
         b->pending_peer_epoch = 0;
         b->keepalive_monitor_start_time = 0;
         b->last_keepalive_rx_time = 0;
@@ -3984,7 +4195,11 @@ int sig_pqc_bind_profile(int profile_id, const char *key_id, int role_mode,
         b->local_keepalive_seq = 0;
         b->peer_keepalive_epoch = 0;
         b->peer_keepalive_seq = 0;
+        b->last_rekey_challenge_epoch = 0;
+        b->last_rekey_challenge_sequence = 0;
         b->pending_peer_epoch = 0;
+        b->nonce_domain = nonce_domain;
+        b->nonce_domain_valid = true;
         b->last_recovery_request_time = 0;
         b->request_replay_next = 0;
         b->completed_hello_next = 0;
@@ -4131,6 +4346,7 @@ void sig_pqc_finalize_reload(void) {
                     }
                 }
                 b->key_ready = false;
+                b->nonce_domain_valid = false;
                 if (b->local_priv) { free(b->local_priv); b->local_priv = NULL; }
                 if (b->local_pub) { free(b->local_pub); b->local_pub = NULL; }
                 if (b->peer_pub) { free(b->peer_pub); b->peer_pub = NULL; }
@@ -4149,6 +4365,8 @@ void sig_pqc_finalize_reload(void) {
             b->local_keepalive_seq = 0;
             b->peer_keepalive_epoch = 0;
             b->peer_keepalive_seq = 0;
+            b->last_rekey_challenge_epoch = 0;
+            b->last_rekey_challenge_sequence = 0;
             b->pending_peer_epoch = 0;
             b->last_recovery_request_time = 0;
             b->request_replay_next = 0;
@@ -4216,7 +4434,8 @@ int sig_pqc_get_keys(int profile_id, uint8_t keys[3][32], uint8_t key_ids[3], bo
 }
 
 int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
-                          uint8_t key_ids[3], bool key_slots_valid[3]) {
+                          uint8_t key_ids[3], bool key_slots_valid[3],
+                          uint8_t *nonce_domain) {
     int idx = -1;
 
     pthread_mutex_lock(&g_key_mutex);
@@ -4226,12 +4445,16 @@ int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
             break;
         }
     }
-    if (idx >= 0) {
+    if (idx >= 0 && g_policy_bindings[idx].nonce_domain_valid &&
+        nonce_domain) {
         memcpy(keys, g_policy_bindings[idx].keys,
                KEY_SLOT_COUNT * PQC_TRAFFIC_KEY_SZ);
         memcpy(key_ids, g_policy_bindings[idx].key_ids, KEY_SLOT_COUNT);
         memcpy(key_slots_valid, g_policy_bindings[idx].key_slots_valid,
                KEY_SLOT_COUNT * sizeof(bool));
+        *nonce_domain = g_policy_bindings[idx].nonce_domain;
+    } else if (idx >= 0) {
+        idx = -1;
     }
     pthread_mutex_unlock(&g_key_mutex);
     return idx >= 0 ? 0 : -1;

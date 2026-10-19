@@ -114,6 +114,8 @@ typedef struct {
     uint64_t local_keepalive_seq;
     uint64_t peer_keepalive_epoch;
     uint64_t peer_keepalive_seq;
+    uint64_t last_rekey_challenge_epoch;
+    uint64_t last_rekey_challenge_sequence;
     uint64_t pending_peer_epoch;
     /* Per-profile liveness state.  Keepalive transmission remains on its
      * own 15-second schedule; these timestamps only decide when this one
@@ -171,6 +173,8 @@ typedef struct {
     uint8_t keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ];
     uint8_t key_ids[KEY_SLOT_COUNT];
     bool key_slots_valid[KEY_SLOT_COUNT];
+    uint8_t nonce_domain;
+    bool nonce_domain_valid;
 
     char local_ip[64];
     char peer_ip[64];
@@ -293,7 +297,8 @@ void sig_pqc_record_recv(int profile_id);
 
 int sig_pqc_get_keys(int profile_id, uint8_t keys[3][32], uint8_t key_ids[3], bool key_slots_valid[3]);
 int sig_pqc_snapshot_keys(int profile_id, uint8_t keys[3][32],
-                          uint8_t key_ids[3], bool key_slots_valid[3]);
+                          uint8_t key_ids[3], bool key_slots_valid[3],
+                          uint8_t *nonce_domain);
 void sig_pqc_trigger_retry(int profile_id);
 int sig_pqc_trigger_retry_with_info(int profile_id, char *out_info, size_t out_max);
 

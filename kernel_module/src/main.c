@@ -651,8 +651,8 @@ int main(int argc, char **argv) {
     }
     
     log_info("Server shutting down...");
-    failover_service_stop();
     int pqc_shutdown_rc = sig_pqc_shutdown();
+    failover_service_stop();
     kernel_sync_cleanup();
     if (pqc_shutdown_rc == 0) {
         trf_pqc_cleanup();

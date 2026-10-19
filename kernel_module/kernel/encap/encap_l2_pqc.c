@@ -542,7 +542,7 @@ int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
             return -EINVAL;
     }
 
-    packet_nonce = mwan_next_packet_nonce();
+    packet_nonce = mwan_next_l2_packet_nonce(worker->cfg->nonce_domain);
     if (unlikely(packet_nonce == 0))
         return -EOVERFLOW;
     nonce_be = cpu_to_be64(packet_nonce);
@@ -668,7 +668,7 @@ int mwan_l2_pqc_encrypt_control_xmit(struct mwan_config *cfg,
     if (!worker)
         return -ENODEV;
 
-    packet_nonce = mwan_next_packet_nonce();
+    packet_nonce = mwan_next_l2_packet_nonce(cfg->nonce_domain);
     if (!packet_nonce)
         return -EOVERFLOW;
     flow_token = ((u64)cfg->key_id << MWAN_FLOW_KEY_ID_SHIFT) |

@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 6
+#define MWAN_GENL_VERSION 7
 #define MWAN_GENL_PEER_EVENTS_GROUP "peer_events"
 
 /* ---- Crypto Constants ---- */
@@ -103,6 +103,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_NEW_IFINDEX,       /* u32: replacement data-tunnel ifindex */
     MWAN_ATTR_DATAPATH_BLOCKED,  /* u8: 1=fail closed, 0=allow active cfg */
     MWAN_ATTR_PEER_GENERATION,   /* u32: monotonic discovery peer identity */
+    MWAN_ATTR_NONCE_DOMAIN,      /* u8: identity-ordered L2-PQC nonce half */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

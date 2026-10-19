@@ -20,11 +20,17 @@ struct mwan_config __rcu *g_mwan_cfg = NULL;
  * sleep while waiting for an RCU grace period and shutting down timers. */
 DEFINE_MUTEX(mwan_cfg_update_lock);
 
-/* Keep the packet nonce outside mwan_config so pushing the same config again
- * cannot reuse an AES-GCM IV while the active key is unchanged. L2 and L3
- * share this monotonic source. */
+/* Keep nonce counters outside mwan_config so pushing the same config again
+ * cannot reuse an AES-GCM IV while the active key is unchanged. L2 uses a
+ * separate 63-bit counter because its high bit is the identity domain. */
 static atomic64_t packet_nonce;
 static u64 packet_nonce_start;
+static atomic64_t l2_packet_counter;
+static u64 l2_packet_counter_start;
+
+#define MWAN_L2_NONCE_DOMAIN_SHIFT 63
+#define MWAN_L2_NONCE_COUNTER_MASK GENMASK_ULL(62, 0)
+#define MWAN_L2_NONCE_START_MASK   GENMASK_ULL(61, 0)
 static atomic64_t no_active_tunnel_drops;
 static atomic_t mwan_datapath_blocked = ATOMIC_INIT(0);
 
@@ -233,6 +239,7 @@ static bool mwan_config_replay_compatible(const struct mwan_config *new_cfg,
 
     if (!mwan_config_l2_pqc(new_cfg) || !mwan_config_l2_pqc(old_cfg) ||
         new_cfg->node_id != old_cfg->node_id ||
+        new_cfg->nonce_domain != old_cfg->nonce_domain ||
         memcmp(new_cfg->encrypt_salt, old_cfg->encrypt_salt,
                MWAN_SALT_LEN))
         return false;
@@ -299,6 +306,11 @@ void mwan_state_init(void)
     BUILD_BUG_ON(sizeof(struct mwan_l2_pqc_hdr) != MWAN_L2_HDR_LEN);
     packet_nonce_start = get_random_u64();
     atomic64_set(&packet_nonce, packet_nonce_start);
+    l2_packet_counter_start = get_random_u64() &
+                              MWAN_L2_NONCE_START_MASK;
+    if (!l2_packet_counter_start)
+        l2_packet_counter_start = 1;
+    atomic64_set(&l2_packet_counter, l2_packet_counter_start);
     atomic64_set(&no_active_tunnel_drops, 0);
     atomic_set(&mwan_datapath_blocked, 0);
 }
@@ -331,6 +343,23 @@ bool mwan_packet_nonce_is_local(u64 nonce)
 {
     return nonce > READ_ONCE(packet_nonce_start) &&
            nonce <= (u64)atomic64_read(&packet_nonce);
+}
+
+u64 mwan_next_l2_packet_nonce(u8 nonce_domain)
+{
+    u64 counter = (u64)atomic64_inc_return(&l2_packet_counter);
+
+    if (WARN_ON_ONCE(nonce_domain > 1 ||
+                     counter > MWAN_L2_NONCE_COUNTER_MASK))
+        return 0;
+
+    return ((u64)nonce_domain << MWAN_L2_NONCE_DOMAIN_SHIFT) | counter;
+}
+
+bool mwan_l2_packet_nonce_is_local(u64 nonce, u8 nonce_domain)
+{
+    return nonce_domain <= 1 &&
+           (u8)(nonce >> MWAN_L2_NONCE_DOMAIN_SHIFT) == nonce_domain;
 }
 
 void mwan_state_cleanup(void)

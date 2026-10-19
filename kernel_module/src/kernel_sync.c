@@ -365,6 +365,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     uint8_t pqc_keys[KEY_SLOT_COUNT][PQC_TRAFFIC_KEY_SZ] = {{0}};
     uint8_t pqc_key_ids[KEY_SLOT_COUNT] = {0};
     bool pqc_slots_valid[KEY_SLOT_COUNT] = {false};
+    uint8_t pqc_nonce_domain = 0;
     bool have_pqc_slots = false;
     bool failover_gate_held = false;
     app_context_t present_ctx;
@@ -447,7 +448,7 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
     if (push_ctx->cfg.encrypt.enabled &&
         push_ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM &&
         sig_pqc_snapshot_keys(push_ctx->cfg.node_id, pqc_keys, pqc_key_ids,
-                              pqc_slots_valid) == 0 &&
+                              pqc_slots_valid, &pqc_nonce_domain) == 0 &&
         pqc_slots_valid[KEY_SLOT_CURRENT] &&
         pqc_key_ids[KEY_SLOT_CURRENT] != 0 &&
         memcmp(pqc_keys[KEY_SLOT_CURRENT], push_ctx->cfg.encrypt.key,
@@ -510,6 +511,14 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
         nla_put_u8(msg,  MWAN_ATTR_ENCRYPT_TYPE,  push_ctx->cfg.encrypt.type);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_KEY,   push_ctx->cfg.encrypt.key_len, push_ctx->cfg.encrypt.key);
         nla_put(msg,     MWAN_ATTR_ENCRYPT_SALT,  MAX_ENCRYPT_SALT_LEN,     push_ctx->cfg.encrypt.salt);
+        if (push_ctx->cfg.encrypt.layer == 2 &&
+            push_ctx->cfg.encrypt.type == MWAN_CRYPT_PQC_GCM) {
+            if (!have_pqc_slots) {
+                log_error("Refusing L2-PQC config without authenticated key slots and nonce domain");
+                goto out;
+            }
+            nla_put_u8(msg, MWAN_ATTR_NONCE_DOMAIN, pqc_nonce_domain);
+        }
         if (have_pqc_slots) {
             nla_put_u8(msg, MWAN_ATTR_KEY_ID,
                        pqc_key_ids[KEY_SLOT_CURRENT]);
