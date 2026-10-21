@@ -472,8 +472,12 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     }
     if (new_diag_flow)
         atomic64_inc(&mwan_l2_rx_diag_flows_count);
-    owner = mwan_l2_select_rx_lane(cfg, diag_id, flow_seq,
-                                   READ_ONCE(flow->owner_worker));
+    /* Unknown tokens intentionally have no flow until authentication succeeds.
+     * Preserve the caller's deterministic candidate worker in that case;
+     * only established flows can supply a home worker for lane selection. */
+    if (flow)
+        owner = mwan_l2_select_rx_lane(cfg, diag_id, flow_seq,
+                                       READ_ONCE(flow->owner_worker));
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu))
         return -ENODEV;
