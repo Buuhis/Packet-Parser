@@ -48,6 +48,12 @@ struct pqc_key_state_reply {
     bool valid;
 };
 
+struct lb_mode_reply {
+    uint8_t mode;
+    bool received;
+    bool valid;
+};
+
 static uint32_t active_kernel_config_generation;
 static uint32_t pending_discovery_generation;
 
@@ -162,6 +168,27 @@ static int kernel_sync_tunnel_peer_valid_cb(struct nl_msg *msg, void *arg)
     reply->generation = nla_get_u32(attrs[MWAN_ATTR_PEER_GENERATION]);
     if (reply->generation == 0)
         return NL_STOP;
+    reply->valid = true;
+    return NL_STOP;
+}
+
+static int kernel_sync_lb_mode_valid_cb(struct nl_msg *msg, void *arg)
+{
+    struct lb_mode_reply *reply = arg;
+    struct nlmsghdr *nlh = nlmsg_hdr(msg);
+    struct genlmsghdr *ghdr = nlmsg_data(nlh);
+    struct nlattr *attrs[MWAN_ATTR_MAX + 1] = {0};
+    uint8_t mode;
+
+    reply->received = true;
+    if (!ghdr || ghdr->cmd != MWAN_CMD_GET_LB_MODE ||
+        genlmsg_parse(nlh, 0, attrs, MWAN_ATTR_MAX, NULL) < 0 ||
+        !attrs[MWAN_ATTR_LB_MODE])
+        return NL_STOP;
+    mode = nla_get_u8(attrs[MWAN_ATTR_LB_MODE]);
+    if (mode != MWAN_LB_PER_FLOW && mode != MWAN_LB_PER_PACKET)
+        return NL_STOP;
+    reply->mode = mode;
     reply->valid = true;
     return NL_STOP;
 }
@@ -632,6 +659,127 @@ int kernel_sync_set_datapath_blocked(bool blocked)
         ret = kernel_sync_nl_to_errno(ret);
     else
         ret = 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_set_lb_mode(uint8_t mode)
+{
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    int family_id;
+    int ret = -EIO;
+
+    if (mode != MWAN_LB_PER_FLOW && mode != MWAN_LB_PER_PACKET)
+        return -EINVAL;
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    ret = genl_connect(sock);
+    if (ret < 0) {
+        ret = kernel_sync_nl_to_errno(ret);
+        goto out;
+    }
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = kernel_sync_nl_to_errno(family_id);
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_SET_LB_MODE, MWAN_GENL_VERSION) ||
+        nla_put_u8(msg, MWAN_ATTR_LB_MODE, mode) < 0) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    ret = nl_send_auto(sock, msg);
+    if (ret >= 0)
+        ret = nl_wait_for_ack(sock);
+    ret = ret < 0 ? kernel_sync_nl_to_errno(ret) : 0;
+out:
+    if (msg)
+        nlmsg_free(msg);
+    if (sock)
+        nl_socket_free(sock);
+    return ret;
+}
+
+int kernel_sync_get_lb_mode(uint8_t *mode)
+{
+    struct lb_mode_reply reply = {0};
+    struct nl_sock *sock = NULL;
+    struct nl_msg *msg = NULL;
+    int kernel_error = 0;
+    int family_id;
+    int nl_rc;
+    int ret = -EIO;
+
+    if (!mode)
+        return -EINVAL;
+    sock = nl_socket_alloc();
+    if (!sock)
+        return -ENOMEM;
+    nl_rc = genl_connect(sock);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    family_id = genl_ctrl_resolve(sock, MWAN_GENL_NAME);
+    if (family_id < 0) {
+        ret = kernel_sync_nl_to_errno(family_id);
+        goto out;
+    }
+    msg = nlmsg_alloc();
+    if (!msg) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, family_id, 0, 0,
+                     MWAN_CMD_GET_LB_MODE, MWAN_GENL_VERSION)) {
+        ret = -EMSGSIZE;
+        goto out;
+    }
+    nl_rc = nl_socket_modify_cb(sock, NL_CB_VALID, NL_CB_CUSTOM,
+                               kernel_sync_lb_mode_valid_cb, &reply);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_socket_modify_err_cb(sock, NL_CB_CUSTOM,
+                                    kernel_sync_nl_error_cb,
+                                    &kernel_error);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_send_auto(sock, msg);
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    nl_rc = nl_recvmsgs_default(sock);
+    if (kernel_error) {
+        ret = kernel_error;
+        goto out;
+    }
+    if (nl_rc < 0) {
+        ret = kernel_sync_nl_to_errno(nl_rc);
+        goto out;
+    }
+    if (!reply.received || !reply.valid) {
+        ret = -EPROTO;
+        goto out;
+    }
+    *mode = reply.mode;
+    ret = 0;
 out:
     if (msg)
         nlmsg_free(msg);

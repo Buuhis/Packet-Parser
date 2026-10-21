@@ -16,6 +16,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/netdevice.h>
+#include <linux/bitmap.h>
 #include "mwan_proto.h"
 #include "mwan_bitrate.h"
 
@@ -38,6 +39,15 @@
  * exhaustion. */
 #define MWAN_L2_CANDIDATE_MAX_PACKETS 256
 #define MWAN_L2_CANDIDATE_MAX_BYTES   (1U * 1024U * 1024U)
+#define MWAN_L2_TX_WINDOW_PER_WORKER 4U
+#define MWAN_L2_TX_WINDOW_MIN        8U
+#define MWAN_L2_TX_BACKLOG_MAX_PACKETS 512U
+#define MWAN_L2_TX_BACKLOG_MAX_BYTES   (2U * 1024U * 1024U)
+#define MWAN_L2_TX_BACKLOG_GLOBAL_PACKETS 16384U
+#define MWAN_L2_TX_BACKLOG_GLOBAL_BYTES   (64U * 1024U * 1024U)
+#define MWAN_L2_TX_BACKLOG_RETRY msecs_to_jiffies(10)
+#define MWAN_L2_TX_EMIT_BATCH       16U
+#define MWAN_L2_RX_OUTPUT_BATCH     32U
 #define MWAN_L2_DIAG_MAX_FLOWS    128
 #define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
 #define MWAN_FLOW_KEY_ID_SHIFT 56
@@ -155,6 +165,31 @@ enum mwan_flow_exec_mode {
     MWAN_FLOW_EXEC_PIPELINE,
 };
 
+struct mwan_l2_tx_flow;
+
+/* TX keeps the authenticated flow sequence global, but commits completed
+ * crypto independently for every egress tunnel.  emit_seq is local to this
+ * (flow,tunnel) stream and is never placed on the wire. */
+struct mwan_l2_tx_emit_slot {
+    struct sk_buff *skb;
+    u32 emit_seq;
+    bool ready;
+};
+
+struct mwan_l2_tx_stream {
+    struct mwan_l2_tx_flow *flow;
+    struct work_struct emit_work;
+    spinlock_t lock;
+    u32 next_emit_seq;
+    u32 emit_seq;
+    u16 tunnel_idx;
+    u16 ring_size;
+    u16 ring_mask;
+    int emitter_worker;
+    bool emitting;
+    struct mwan_l2_tx_emit_slot slots[];
+};
+
 struct mwan_l2_tx_flow {
     struct hlist_node node;
     struct mwan_l2_flow_key key;
@@ -162,14 +197,15 @@ struct mwan_l2_tx_flow {
     u64 flow_token;
     atomic_t next_seq;
     atomic_t pending_crypto;
+    u32 flow_id;
     /* Independent from the flow-table lifetime. A UDP mapping may remain in
      * the table for reorder/stickiness after it is no longer counted as
      * current tunnel load. */
     atomic_t balance_counted;
-    /* Worker ownership is independent from the lifetime of the sticky flow
-     * object. UDP mappings remain cached for sequence/tunnel stability, but
-     * an idle mapping must not keep skewing new-flow CPU admission for the
-     * full 60-second table timeout. */
+    /* Home-worker accounting is independent from the lifetime of the sticky
+     * flow object. UDP mappings remain cached for sequence/tunnel stability,
+     * but an idle mapping must not keep skewing new-flow CPU admission for the
+     * full 60-second table timeout. Packet crypto lanes are selected later. */
     atomic_t worker_counted;
     /* LEGACY keeps crypto and transmit on owner_worker.  PIPELINE keeps the
      * same ordered crypto owner but hands the encrypted skb to a separate
@@ -178,8 +214,19 @@ struct mwan_l2_tx_flow {
     int pipeline_worker;
     /* Serializes admission + sequence allocation + queue insertion for one
      * flow.  A sequence number is consumed only after the packet is certain
-     * to enter its sticky owner's FIFO. */
+     * to enter one selected crypto lane. */
     spinlock_t submit_lock;
+    /* Packets wait here without a sequence number when the ordered crypto
+     * execution window is full. This preserves admission order without
+     * consuming commit-ring slots behind a straggling crypto lane. */
+    struct sk_buff_head backlog;
+    u64 backlog_bytes;
+    /* Streams are allocated lazily for tunnels actually used by this flow.
+     * Each stream has its own ordered commit ring and emitter work item, while
+     * next_seq remains the global sequence consumed by the RX reorder stage. */
+    struct mwan_l2_flow_manager *manager;
+    struct mwan_l2_tx_stream **streams;
+    u16 num_streams;
     int owner_worker;
     /* Keep the path chosen when the flow was admitted. Failover changes only
      * tunnel_idx, so a recovered path can be restored without re-hashing or
@@ -219,10 +266,11 @@ struct mwan_l2_rx_flow {
      * signed-delta comparison remain wrap-safe for intervals below 2^31
      * ticks and keep a 512-slot RX flow in the same kmalloc-8k class as the
      * previous 256-slot layout. */
+    u32 slot_seq[MWAN_FLOW_RING_SIZE];
     u32 slot_time[MWAN_FLOW_RING_SIZE];
 };
 
-/* skb->cb metadata while an encrypted RX frame waits for its sticky worker. */
+/* skb->cb metadata while an encrypted RX frame waits for a crypto lane. */
 struct mwan_l2_rx_cb {
     uintptr_t flow_ptr;
     u64 dispatch_flow_token;
@@ -264,16 +312,20 @@ struct mwan_l2_tx_cb {
     uintptr_t flow_ptr;
     u64 flow_token;
     u32 flow_seq;
+    u32 emit_seq;
     u32 accounted_bytes;
     u32 check;
     u16 tunnel_idx;
     u16 magic;
     u8 encap_type;
     u8 packet_class;
-    u8 reserved[2];
+    u8 flags;
+    u8 reserved;
 };
 
 #define MWAN_L2_TX_CB_MAGIC 0x4d54U
+#define MWAN_L2_TX_CB_BACKLOG BIT(0)
+#define MWAN_L2_TX_CB_PER_PACKET BIT(1)
 #define MWAN_L2_TX_CB(skb) ((struct mwan_l2_tx_cb *)((skb)->cb))
 
 struct mwan_l2_flow_bucket {
@@ -311,14 +363,25 @@ struct mwan_l2_flow_manager {
     atomic64_t rx_pipeline_promoted;
     atomic64_t tx_pipeline_dropped;
     atomic64_t rx_pipeline_dropped;
+    atomic64_t tx_backlog_packets;
+    atomic64_t tx_backlog_bytes;
+    atomic_t tx_backlog_flows;
+    spinlock_t tx_backlog_lock;
+    struct workqueue_struct *tx_emit_wq;
+    atomic64_t tx_emit_batches;
+    atomic64_t tx_emit_packets;
+    atomic64_t tx_emit_tombstones;
+    atomic64_t tx_emit_max_batch;
+    atomic64_t tx_emit_xmit_failures;
+    atomic64_t tx_emit_schedule_collisions;
     struct delayed_work gc_work;
+    struct delayed_work tx_dispatch_work;
     struct mwan_config *cfg;
     bool stopping;
 };
 
-/* Ordered RX/TX crypto queues per CPU. A flow bucket is owned by exactly one
- * worker in each direction, so its packets are processed serially while
- * independent buckets can run in parallel on different CPUs. */
+/* Ordered RX/TX crypto queues per CPU. Packets are serialized within a lane,
+ * while one flow can occupy several lanes and is committed by flow_seq. */
 struct mwan_l2_worker {
     struct mwan_config *cfg;
     struct sk_buff_head rx_queue;
@@ -362,6 +425,17 @@ struct mwan_l2_worker {
     atomic_t scheduled;
     atomic_t busy;
 
+    /* Authenticated RX packets are reordered by flow, then handed to this
+     * bounded home-CPU queue.  Keeping reinjection on one CPU prevents two
+     * crypto workers from enqueueing consecutive packets into different
+     * per-CPU network backlogs. */
+    struct sk_buff_head rx_output_queue;
+    struct work_struct rx_output_work;
+    atomic64_t rx_output_queued_packets;
+    atomic64_t rx_output_queued_bytes;
+    atomic64_t rx_output_dropped_packets;
+    atomic_t rx_output_scheduled;
+
     /* TX has a separate queue, work item and AEAD request. RX and TX may run
      * concurrently on the same CPU, so sharing an aead_request would race. */
     struct sk_buff_head tx_queue;
@@ -392,6 +466,7 @@ struct mwan_l2_worker {
     atomic_t tx_scheduled;
     atomic_t tx_busy;
     struct mwan_bitrate_state tx_bitrate;
+    atomic_t tx_emit_busy;
 
     /* Per-CPU admission signals from kernel CPU accounting.  Values are
      * basis points (10000 == 100%).  The sampler is the only writer; RX/TX
@@ -591,9 +666,17 @@ int mwan_l2_select_tx_worker(const struct mwan_config *cfg, u32 flow_id,
 int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
                              int current_owner,
                              bool allow_blocked_fallback);
+int mwan_l2_select_tx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker);
+int mwan_l2_select_tx_emitter(const struct mwan_config *cfg, u32 flow_id,
+                              u16 tunnel_idx);
+int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker);
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_rx_worker_fn(struct work_struct *work);
+void mwan_l2_rx_output_worker_fn(struct work_struct *work);
+bool mwan_l2_rx_reinject(struct mwan_l2_rx_flow *flow, struct sk_buff *skb);
 void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker);
 int mwan_l2_workers_stage_next_key(struct mwan_config *cfg, const u8 *key,
                                    u8 key_len, u8 key_id);
@@ -638,6 +721,16 @@ void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow);
 void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing);
 void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
                               struct mwan_l2_tx_flow *flow);
+int mwan_l2_tx_flow_prepare_stream(struct mwan_config *cfg,
+                                   struct mwan_l2_tx_flow *flow,
+                                   u16 tunnel_idx);
+u32 mwan_l2_tx_flow_next_emit_seq(struct mwan_l2_tx_flow *flow,
+                                  u16 tunnel_idx);
+void mwan_l2_tx_flow_publish(struct mwan_config *cfg,
+                             struct mwan_l2_tx_flow *flow,
+                             struct sk_buff *skb, u16 tunnel_idx,
+                             u32 emit_seq);
+void mwan_l2_tx_emit_stop(struct mwan_config *cfg);
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow);
 bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
                                    const struct mwan_l2_flow_key *key,
@@ -651,6 +744,8 @@ void mwan_l2_rx_flow_put(struct mwan_l2_rx_flow *flow);
 void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing);
 bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
                                    int owner_worker);
+bool mwan_l2_rx_reinject_batch(struct mwan_l2_rx_flow *flow,
+                               struct sk_buff_head *batch);
 void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                              struct sk_buff *skb, u32 flow_seq);
 

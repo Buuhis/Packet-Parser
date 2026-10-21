@@ -245,6 +245,7 @@ void mwan_multicore_worker_cpu_init(struct mwan_l2_worker *worker)
     atomic_set(&worker->tx_pipeline_ready, 0);
     atomic_set(&worker->rx_pipeline_ready, 0);
 #endif
+    atomic_set(&worker->tx_emit_busy, 0);
     atomic64_set(&worker->emergency_enter_count, 0);
     atomic64_set(&worker->emergency_last_enter_ns, 0);
     atomic64_set(&worker->overload_last_drop_ns, 0);
@@ -803,9 +804,11 @@ static u32 mwan_l2_tx_cb_checksum(const struct mwan_l2_tx_cb *cb)
 {
     return lower_32_bits(cb->flow_ptr) ^ upper_32_bits(cb->flow_ptr) ^
            lower_32_bits(cb->flow_token) ^ upper_32_bits(cb->flow_token) ^
-           cb->flow_seq ^ cb->accounted_bytes ^ cb->tunnel_idx ^
+           cb->flow_seq ^ cb->emit_seq ^ cb->accounted_bytes ^
+           cb->tunnel_idx ^
            cb->magic ^ ((u32)cb->encap_type << 24) ^
-           ((u32)cb->packet_class << 16) ^ 0x74786362U;
+           ((u32)cb->packet_class << 16) ^ ((u32)cb->flags << 8) ^
+           0x74786362U;
 }
 
 static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
@@ -815,7 +818,9 @@ static bool mwan_l2_tx_cb_valid(const struct mwan_config *cfg,
     if (!cfg || !skb || !cb || cb->magic != MWAN_L2_TX_CB_MAGIC ||
         !cb->flow_ptr || cb->accounted_bytes != skb->truesize ||
         cb->check != mwan_l2_tx_cb_checksum(cb) ||
-        cb->tunnel_idx >= cfg->num_tunnels)
+        cb->tunnel_idx >= cfg->num_tunnels ||
+        (cb->flags & ~MWAN_L2_TX_CB_PER_PACKET) ||
+        cb->packet_class > MWAN_PACKET_OTHER_DATA)
         return false;
     if (cb->encap_type != MWAN_ENCAP_NONE &&
         cb->encap_type != MWAN_ENCAP_L2_PQC)
@@ -1627,8 +1632,10 @@ int mwan_l2_workers_init(struct mwan_config *cfg)
         worker->cpu = cpu;
         mutex_init(&worker->crypto_lock);
         skb_queue_head_init(&worker->rx_queue);
+        skb_queue_head_init(&worker->rx_output_queue);
         skb_queue_head_init(&worker->tx_queue);
         INIT_WORK(&worker->work, mwan_l2_rx_worker_fn);
+        INIT_WORK(&worker->rx_output_work, mwan_l2_rx_output_worker_fn);
         INIT_WORK(&worker->tx_work, mwan_l2_tx_worker_fn);
         worker->balance_tx_bytes = kcalloc(
             cfg->num_tunnels, sizeof(*worker->balance_tx_bytes), GFP_KERNEL);
@@ -1727,6 +1734,14 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
         wake_up_all(&cfg->pipeline_workers[i].tx_room_wait);
         wake_up_all(&cfg->pipeline_workers[i].rx_room_wait);
     }
+    /* RX reorder timers outlive the crypto work until flow-manager teardown.
+     * Close their reinjection gate before any output queue is cancelled or
+     * worker storage is released. */
+    WRITE_ONCE(cfg->flows.stopping, true);
+    cancel_delayed_work_sync(&cfg->flows.tx_dispatch_work);
+    /* Stop every crypto producer before cancelling any output consumer.
+     * Otherwise a worker cancelled later could append to an already-cancelled
+     * home-CPU output queue. */
     for (i = 0; i < cfg->num_workers; i++) {
         cancel_work_sync(&cfg->l2_workers[i].work);
         cancel_work_sync(&cfg->l2_workers[i].tx_work);
@@ -1734,6 +1749,11 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
     /* Crypto workers can enqueue final output while they are draining.  Stop
      * them first, then synchronously drain/free every pipeline-owned skb and
      * flow reference before crypto contexts or flow tables are destroyed. */
+    /* Crypto producers are now stopped. Drain the per-config emitters before
+     * their worker affinity/accounting storage is released. */
+    mwan_l2_tx_emit_stop(cfg);
+    for (i = 0; i < cfg->num_workers; i++)
+        cancel_work_sync(&cfg->l2_workers[i].rx_output_work);
     mwan_pipeline_workers_cleanup(cfg);
 
     for (i = 0; i < cfg->num_workers; i++) {
@@ -1807,6 +1827,13 @@ void mwan_l2_workers_cleanup(struct mwan_config *cfg)
                 -ESHUTDOWN, atomic64_read(&worker->tx_queued_packets),
                 atomic64_read(&worker->tx_queued_bytes), 0, 0,
                 cb_ok ? cb.tunnel_idx : MWAN_DROP_TUNNEL_UNKNOWN);
+            kfree_skb(skb);
+        }
+        while ((skb = skb_dequeue(&worker->rx_output_queue)) != NULL) {
+            atomic64_dec(&worker->rx_output_queued_packets);
+            atomic64_sub(skb->truesize,
+                         &worker->rx_output_queued_bytes);
+            atomic64_inc(&worker->rx_output_dropped_packets);
             kfree_skb(skb);
         }
 
@@ -2028,6 +2055,106 @@ int mwan_l2_select_rx_worker(const struct mwan_config *cfg, u32 flow_id,
 {
     return mwan_select_worker(cfg, flow_id, current_owner, false,
                               allow_blocked_fallback);
+}
+
+/* Select a per-packet crypto lane without changing flow ownership counters.
+ * The sequence-dependent start point gives an idle single flow round-robin
+ * spread, while the live directional queue score steers around a slower
+ * worker.  Correctness never depends on this approximate load snapshot. */
+static int mwan_select_packet_lane(const struct mwan_config *cfg, u32 flow_id,
+                                   u32 flow_seq, int home_worker, bool tx)
+{
+    int start;
+    int offset;
+    int pass;
+    int best = -1;
+
+    if (!cfg || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -1;
+
+    start = jhash_2words(flow_id, flow_seq, 0x85ebca6bU) %
+            cfg->num_workers;
+    for (pass = 0; pass < (tx ? 2 : 1) && best < 0; pass++) {
+        for (offset = 0; offset < cfg->num_workers; offset++) {
+            int idx = (start + offset) % cfg->num_workers;
+            const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+
+            if (!cpu_online(worker->cpu) ||
+                atomic_read(&worker->admission_blocked) ||
+                (tx && (atomic_read(&worker->emergency_shed) ||
+                        mwan_tx_worker_queue_high(worker))) ||
+                (tx && !pass && atomic_read(&worker->tx_emit_busy)))
+                continue;
+            if (mwan_worker_better(
+                    worker, 0, best,
+                    best >= 0 ? &cfg->l2_workers[best] : NULL, 0, tx))
+                best = idx;
+        }
+    }
+
+    /* An existing flow must retain liveness when every CPU is temporarily
+     * admission-blocked. Prefer its home lane when it is online and no more
+     * loaded than the alternatives; otherwise choose the least pressured
+     * online lane. */
+    if (best < 0) {
+        if (home_worker >= 0 && home_worker < cfg->num_workers &&
+            cpu_online(cfg->l2_workers[home_worker].cpu))
+            best = home_worker;
+        for (offset = 0; offset < cfg->num_workers; offset++) {
+            int idx = (start + offset) % cfg->num_workers;
+            const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+
+            if (!cpu_online(worker->cpu))
+                continue;
+            if (mwan_worker_better(worker, 0, best,
+                                   best >= 0 ? &cfg->l2_workers[best] : NULL,
+                                   0, tx))
+                best = idx;
+        }
+    }
+    return best;
+}
+
+int mwan_l2_select_tx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker)
+{
+    return mwan_select_packet_lane(cfg, flow_id, flow_seq, home_worker, true);
+}
+
+int mwan_l2_select_tx_emitter(const struct mwan_config *cfg, u32 flow_id,
+                              u16 tunnel_idx)
+{
+    int start;
+    int offset;
+    int best = -1;
+
+    if (!cfg || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -ENODEV;
+    start = jhash_2words(flow_id, tunnel_idx, 0x656d6974U) %
+            cfg->num_workers;
+    for (offset = 0; offset < cfg->num_workers; offset++) {
+        int idx = (start + offset) % cfg->num_workers;
+        const struct mwan_l2_worker *worker = &cfg->l2_workers[idx];
+
+        if (!cpu_online(worker->cpu))
+            continue;
+        if (best < 0 ||
+            atomic_read(&worker->tx_emit_busy) <
+                atomic_read(&cfg->l2_workers[best].tx_emit_busy) ||
+            (atomic_read(&worker->tx_emit_busy) ==
+                 atomic_read(&cfg->l2_workers[best].tx_emit_busy) &&
+             mwan_worker_better(worker, 0, best,
+                                &cfg->l2_workers[best], 0, true)))
+            best = idx;
+    }
+    return best;
+}
+
+int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
+                           u32 flow_seq, int home_worker)
+{
+    return mwan_select_packet_lane(cfg, flow_id, flow_seq, home_worker,
+                                   false);
 }
 
 u64 mwan_multicore_admitted_get(void)
@@ -2428,23 +2555,244 @@ bool mwan_multicore_rx_congestion_feedback(struct mwan_l2_worker *worker,
     return true;
 }
 
+static unsigned int mwan_l2_tx_execution_window(const struct mwan_config *cfg)
+{
+    unsigned int window;
+
+    window = max_t(unsigned int, MWAN_L2_TX_WINDOW_MIN,
+                   (unsigned int)cfg->num_workers *
+                       MWAN_L2_TX_WINDOW_PER_WORKER);
+    return min_t(unsigned int, window, MWAN_FLOW_RING_SIZE - 1);
+}
+
+static bool mwan_l2_tx_backlog_cb_valid(const struct mwan_config *cfg,
+                                        const struct sk_buff *skb,
+                                        const struct mwan_l2_tx_cb *cb,
+                                        const struct mwan_l2_tx_flow *flow)
+{
+    return cfg && skb && cb && flow &&
+           cb->magic == MWAN_L2_TX_CB_MAGIC &&
+           cb->flow_ptr == (uintptr_t)flow &&
+           cb->accounted_bytes == skb->truesize &&
+           cb->check == mwan_l2_tx_cb_checksum(cb) &&
+           cb->flags == MWAN_L2_TX_CB_BACKLOG &&
+           cb->packet_class <= MWAN_PACKET_OTHER_DATA &&
+           cb->tunnel_idx < cfg->num_tunnels &&
+           cb->encap_type == MWAN_ENCAP_L2_PQC &&
+           cfg->tunnels[cb->tunnel_idx].encap_type == MWAN_ENCAP_L2_PQC;
+}
+
+/* submit_lock serializes this queue. The manager lock makes the global
+ * packet/byte limits exact across flows. Ownership of the skb's flow
+ * reference moves to the backlog on success. */
+static int mwan_l2_tx_backlog_enqueue_locked(
+    struct mwan_config *cfg, struct mwan_l2_tx_flow *flow,
+    struct sk_buff *skb, u16 tunnel_idx, enum mwan_packet_class packet_class)
+{
+    struct mwan_l2_flow_manager *manager = &cfg->flows;
+    u64 bytes = skb->truesize;
+    bool was_empty;
+
+    if (flow->backlog.qlen >= MWAN_L2_TX_BACKLOG_MAX_PACKETS ||
+        flow->backlog_bytes + bytes > MWAN_L2_TX_BACKLOG_MAX_BYTES)
+        return -ENOSPC;
+
+    BUILD_BUG_ON(sizeof(struct mwan_l2_tx_cb) > sizeof(skb->cb));
+    memset(skb->cb, 0, sizeof(skb->cb));
+    MWAN_L2_TX_CB(skb)->flow_ptr = (uintptr_t)flow;
+    MWAN_L2_TX_CB(skb)->accounted_bytes = (u32)bytes;
+    MWAN_L2_TX_CB(skb)->tunnel_idx = tunnel_idx;
+    MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
+    MWAN_L2_TX_CB(skb)->encap_type = MWAN_ENCAP_L2_PQC;
+    MWAN_L2_TX_CB(skb)->packet_class = (u8)packet_class;
+    MWAN_L2_TX_CB(skb)->flags = MWAN_L2_TX_CB_BACKLOG;
+    MWAN_L2_TX_CB(skb)->check =
+        mwan_l2_tx_cb_checksum(MWAN_L2_TX_CB(skb));
+
+    spin_lock(&manager->tx_backlog_lock);
+    if ((u64)atomic64_read(&manager->tx_backlog_packets) >=
+            MWAN_L2_TX_BACKLOG_GLOBAL_PACKETS ||
+        (u64)atomic64_read(&manager->tx_backlog_bytes) + bytes >
+            MWAN_L2_TX_BACKLOG_GLOBAL_BYTES) {
+        spin_unlock(&manager->tx_backlog_lock);
+        return -ENOSPC;
+    }
+    was_empty = skb_queue_empty(&flow->backlog);
+    __skb_queue_tail(&flow->backlog, skb);
+    flow->backlog_bytes += bytes;
+    atomic64_inc(&manager->tx_backlog_packets);
+    atomic64_add(bytes, &manager->tx_backlog_bytes);
+    if (was_empty)
+        atomic_inc(&manager->tx_backlog_flows);
+    spin_unlock(&manager->tx_backlog_lock);
+    return 0;
+}
+
+static struct sk_buff *mwan_l2_tx_backlog_dequeue_locked(
+    struct mwan_config *cfg, struct mwan_l2_tx_flow *flow)
+{
+    struct mwan_l2_flow_manager *manager = &cfg->flows;
+    struct sk_buff *skb;
+
+    spin_lock(&manager->tx_backlog_lock);
+    skb = __skb_dequeue(&flow->backlog);
+    if (skb) {
+        flow->backlog_bytes -= skb->truesize;
+        atomic64_dec(&manager->tx_backlog_packets);
+        atomic64_sub(skb->truesize, &manager->tx_backlog_bytes);
+        if (skb_queue_empty(&flow->backlog))
+            atomic_dec(&manager->tx_backlog_flows);
+    }
+    spin_unlock(&manager->tx_backlog_lock);
+    return skb;
+}
+
+void mwan_multicore_tx_backlog_kick(struct mwan_config *cfg)
+{
+    if (!cfg || READ_ONCE(cfg->flows.stopping) ||
+        !atomic64_read(&cfg->flows.tx_backlog_packets))
+        return;
+    schedule_delayed_work(&cfg->flows.tx_dispatch_work,
+                          MWAN_L2_TX_BACKLOG_RETRY);
+}
+
+void mwan_multicore_tx_backlog_purge(struct mwan_config *cfg,
+                                     struct mwan_l2_tx_flow *flow)
+{
+    struct sk_buff *skb;
+
+    if (!cfg || !flow)
+        return;
+    spin_lock_bh(&flow->submit_lock);
+    while ((skb = mwan_l2_tx_backlog_dequeue_locked(cfg, flow)) != NULL) {
+        kfree_skb(skb);
+        mwan_l2_tx_flow_put(flow);
+    }
+    spin_unlock_bh(&flow->submit_lock);
+}
+
+bool mwan_multicore_tx_refill(struct mwan_config *cfg,
+                              struct mwan_l2_tx_flow *flow)
+{
+    unsigned int window;
+    bool remains;
+
+    if (!cfg || !flow || !cfg->l2_workers || cfg->num_workers <= 0 ||
+        READ_ONCE(cfg->flows.stopping))
+        return false;
+    window = mwan_l2_tx_execution_window(cfg);
+
+    spin_lock_bh(&flow->submit_lock);
+    while (atomic_read(&flow->pending_crypto) < window) {
+        struct mwan_l2_worker *worker;
+        struct mwan_l2_tx_cb cb;
+        struct sk_buff *skb;
+        unsigned int accounted_bytes;
+        int was_scheduled;
+        int owner;
+        u32 emit_seq;
+        u32 seq;
+
+        skb = skb_peek(&flow->backlog);
+        if (!skb)
+            break;
+        memcpy(&cb, MWAN_L2_TX_CB(skb), sizeof(cb));
+        if (unlikely(!mwan_l2_tx_backlog_cb_valid(cfg, skb, &cb, flow))) {
+            skb = mwan_l2_tx_backlog_dequeue_locked(cfg, flow);
+            if (!skb)
+                break;
+            mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
+            kfree_skb(skb);
+            mwan_l2_tx_flow_put(flow);
+            continue;
+        }
+        if (mwan_l2_tx_flow_prepare_stream(cfg, flow, cb.tunnel_idx))
+            break;
+
+        seq = (u32)atomic_read(&flow->next_seq) + 1U;
+        owner = mwan_l2_select_tx_lane(cfg, flow->flow_id, seq,
+                                       READ_ONCE(flow->owner_worker));
+        if (owner < 0 || owner >= cfg->num_workers ||
+            !cpu_online(cfg->l2_workers[owner].cpu))
+            break;
+        worker = &cfg->l2_workers[owner];
+        accounted_bytes = skb->truesize;
+
+        spin_lock(&worker->tx_queue.lock);
+        if (worker->tx_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
+            atomic64_read(&worker->tx_queued_bytes) + accounted_bytes >
+                MWAN_L2_QUEUE_MAX_BYTES) {
+            spin_unlock(&worker->tx_queue.lock);
+            break;
+        }
+        skb = mwan_l2_tx_backlog_dequeue_locked(cfg, flow);
+        if (WARN_ON_ONCE(!skb)) {
+            spin_unlock(&worker->tx_queue.lock);
+            break;
+        }
+        seq = mwan_l2_tx_flow_next_seq(flow);
+        emit_seq = mwan_l2_tx_flow_next_emit_seq(flow, cb.tunnel_idx);
+        memset(skb->cb, 0, sizeof(skb->cb));
+        MWAN_L2_TX_CB(skb)->flow_ptr = (uintptr_t)flow;
+        MWAN_L2_TX_CB(skb)->flow_token =
+            ((u64)READ_ONCE(cfg->key_id) << MWAN_FLOW_KEY_ID_SHIFT) |
+            (flow->flow_token & MWAN_FLOW_COOKIE_MASK);
+        MWAN_L2_TX_CB(skb)->flow_seq = seq;
+        MWAN_L2_TX_CB(skb)->emit_seq = emit_seq;
+        MWAN_L2_TX_CB(skb)->accounted_bytes = accounted_bytes;
+        MWAN_L2_TX_CB(skb)->tunnel_idx = cb.tunnel_idx;
+        MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
+        MWAN_L2_TX_CB(skb)->encap_type = MWAN_ENCAP_L2_PQC;
+        MWAN_L2_TX_CB(skb)->packet_class = cb.packet_class;
+        MWAN_L2_TX_CB(skb)->flags = MWAN_L2_TX_CB_PER_PACKET;
+        MWAN_L2_TX_CB(skb)->check =
+            mwan_l2_tx_cb_checksum(MWAN_L2_TX_CB(skb));
+        atomic_inc(&worker->crypto_key_pending[
+            (u8)(MWAN_L2_TX_CB(skb)->flow_token >>
+                 MWAN_FLOW_KEY_ID_SHIFT)]);
+        __skb_queue_tail(&worker->tx_queue, skb);
+        atomic64_inc(&worker->tx_queued_packets);
+        atomic64_add(accounted_bytes, &worker->tx_queued_bytes);
+        atomic64_inc(&worker->tx_enqueued_packets);
+        atomic_inc(&flow->pending_crypto);
+        was_scheduled = atomic_cmpxchg(&worker->tx_scheduled, 0, 1);
+        mwan_atomic64_update_max(&worker->tx_max_queued_packets,
+                                 worker->tx_queue.qlen);
+        mwan_atomic64_update_max(&worker->tx_max_queued_bytes,
+                                 atomic64_read(&worker->tx_queued_bytes));
+        spin_unlock(&worker->tx_queue.lock);
+        if (was_scheduled == 0 &&
+            unlikely(!mwan_l2_schedule_tx_worker(worker)))
+            atomic64_inc(&worker->tx_schedule_failures);
+    }
+    remains = !skb_queue_empty(&flow->backlog);
+    spin_unlock_bh(&flow->submit_lock);
+    return remains;
+}
+
 int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                              u16 tunnel_idx,
                              const struct mwan_tx_flow_info *info,
                              struct mwan_l2_tx_flow *preselected_flow,
                              enum mwan_packet_class packet_class,
-                             bool closing, u32 *flow_seq, int *owner_cpu)
+                             bool closing, bool allow_tunnel_override,
+                             u32 *flow_seq, int *owner_cpu)
 {
     struct mwan_l2_tx_flow *flow;
     struct mwan_l2_worker *worker;
     struct mwan_tunnel *tun;
     unsigned int accounted_bytes;
+    unsigned int execution_window = 0;
+    int err;
     int owner;
     int was_scheduled;
     u32 seq = 0;
+    u32 emit_seq = 0;
+    bool per_packet_path;
 
     flow = preselected_flow;
-    if (!skb || !cfg || !info || tunnel_idx >= cfg->num_tunnels) {
+    if (!skb || !cfg || !info || tunnel_idx >= cfg->num_tunnels ||
+        READ_ONCE(cfg->flows.stopping)) {
         if (skb)
             mwan_worker_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, NULL,
                                    skb, 0, MWAN_DROP_SEQ_UNKNOWN,
@@ -2471,11 +2819,11 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                                -ENOSPC, 0, 0, 0, 0, tunnel_idx);
         return -ENOSPC;
     }
-    /* POST_ROUTING selected and pinned the data flow before MTU handling.
-     * A mismatch here means a stale caller or a path-state transition raced
-     * this packet. Drop this one packet instead of moving fragments or
-     * already-normalized data onto a different-MTU tunnel. */
-    if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx)) {
+    /* Per-flow mode pins the path before MTU handling. Per-packet mode may
+     * override only the egress tunnel while retaining one flow object for
+     * home accounting, the token and L2-PQC sequence ordering. */
+    if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx) &&
+        !allow_tunnel_override) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         mwan_worker_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, NULL, skb,
                                flow->flow_token, MWAN_DROP_SEQ_UNKNOWN,
@@ -2485,9 +2833,24 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         return -ESTALE;
     }
     tun = &cfg->tunnels[tunnel_idx];
+    per_packet_path = allow_tunnel_override &&
+                      tun->encap_type == MWAN_ENCAP_L2_PQC;
     mwan_l2_tx_flow_touch(flow, closing);
     spin_lock_bh(&flow->submit_lock);
     owner = READ_ONCE(flow->owner_worker);
+    if (per_packet_path) {
+        u32 candidate_seq = (u32)atomic_read(&flow->next_seq) + 1U;
+
+        err = mwan_l2_tx_flow_prepare_stream(cfg, flow, tunnel_idx);
+        if (err) {
+            spin_unlock_bh(&flow->submit_lock);
+            mwan_l2_tx_flow_put(flow);
+            return err;
+        }
+        execution_window = mwan_l2_tx_execution_window(cfg);
+        owner = mwan_l2_select_tx_lane(cfg, info->flow_id, candidate_seq,
+                                       owner);
+    }
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu)) {
         spin_unlock_bh(&flow->submit_lock);
@@ -2504,14 +2867,33 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         *owner_cpu = worker->cpu;
 
 #if MWAN_ENABLE_ROLE_PIPELINE
-    mwan_pipeline_tx_maybe_promote(cfg, flow, worker, info->flow_id,
-                                   (u8)tun->encap_type);
+    if (!per_packet_path)
+        mwan_pipeline_tx_maybe_promote(cfg, flow, worker, info->flow_id,
+                                       (u8)tun->encap_type);
 #endif
 
     if (mwan_tx_should_drop(worker, skb, packet_class)) {
         spin_unlock_bh(&flow->submit_lock);
         mwan_l2_tx_flow_put(flow);
         return -EAGAIN;
+    }
+
+    if (per_packet_path &&
+        (!skb_queue_empty(&flow->backlog) ||
+         atomic_read(&flow->pending_crypto) >= execution_window)) {
+        err = mwan_l2_tx_backlog_enqueue_locked(cfg, flow, skb,
+                                                 tunnel_idx, packet_class);
+        spin_unlock_bh(&flow->submit_lock);
+        if (err) {
+            atomic64_inc(&worker->tx_dropped_packets);
+            mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
+            mwan_l2_tx_flow_put(flow);
+            return err;
+        }
+        if (flow_seq)
+            *flow_seq = 0;
+        mwan_multicore_tx_backlog_kick(cfg);
+        return 0;
     }
 
     /* ECN marking may make a cloned skb writable and change truesize. */
@@ -2524,7 +2906,20 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         u64 queue_bytes = atomic64_read(&worker->tx_queued_bytes);
 
         spin_unlock(&worker->tx_queue.lock);
-        spin_unlock_bh(&flow->submit_lock);
+        if (per_packet_path) {
+            err = mwan_l2_tx_backlog_enqueue_locked(
+                cfg, flow, skb, tunnel_idx, packet_class);
+            spin_unlock_bh(&flow->submit_lock);
+            if (!err) {
+                if (flow_seq)
+                    *flow_seq = 0;
+                mwan_multicore_tx_backlog_kick(cfg);
+                return 0;
+            }
+        } else {
+            spin_unlock_bh(&flow->submit_lock);
+            err = -ENOSPC;
+        }
         atomic64_inc(&worker->tx_dropped_packets);
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_QUEUE, 0);
         mwan_worker_drop_trace(MWAN_DROP_TX_QUEUE_FULL, worker, skb,
@@ -2533,11 +2928,14 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
                                queue_bytes, mwan_worker_pressure(worker),
                                0, tunnel_idx);
         mwan_l2_tx_flow_put(flow);
-        return -ENOSPC;
+        return err;
     }
 
-    if (tun->encap_type == MWAN_ENCAP_L2_PQC)
+    if (tun->encap_type == MWAN_ENCAP_L2_PQC) {
         seq = mwan_l2_tx_flow_next_seq(flow);
+        if (per_packet_path)
+            emit_seq = mwan_l2_tx_flow_next_emit_seq(flow, tunnel_idx);
+    }
     BUILD_BUG_ON(sizeof(struct mwan_l2_tx_cb) > sizeof(skb->cb));
     memset(skb->cb, 0, sizeof(skb->cb));
     MWAN_L2_TX_CB(skb)->flow_ptr = (uintptr_t)flow;
@@ -2545,11 +2943,14 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
         ((u64)READ_ONCE(cfg->key_id) << MWAN_FLOW_KEY_ID_SHIFT) |
         (flow->flow_token & MWAN_FLOW_COOKIE_MASK);
     MWAN_L2_TX_CB(skb)->flow_seq = seq;
+    MWAN_L2_TX_CB(skb)->emit_seq = emit_seq;
     MWAN_L2_TX_CB(skb)->accounted_bytes = accounted_bytes;
     MWAN_L2_TX_CB(skb)->tunnel_idx = (u16)tunnel_idx;
     MWAN_L2_TX_CB(skb)->magic = MWAN_L2_TX_CB_MAGIC;
     MWAN_L2_TX_CB(skb)->encap_type = (u8)tun->encap_type;
     MWAN_L2_TX_CB(skb)->packet_class = (u8)packet_class;
+    if (per_packet_path)
+        MWAN_L2_TX_CB(skb)->flags = MWAN_L2_TX_CB_PER_PACKET;
     MWAN_L2_TX_CB(skb)->check =
         mwan_l2_tx_cb_checksum(MWAN_L2_TX_CB(skb));
     if (tun->encap_type == MWAN_ENCAP_L2_PQC)
@@ -2609,6 +3010,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             struct mwan_l2_tx_flow *flow;
             u64 flow_token;
             u32 flow_seq;
+            u32 emit_seq;
             u16 tunnel_idx;
             u8 encap_type;
             u8 packet_class;
@@ -2617,6 +3019,7 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             bool pipeline_owned = false;
             bool pipeline_selected = false;
             bool pipeline_submit_attempted = false;
+            bool per_packet_emit;
             int err;
 
             memcpy(&cb, MWAN_L2_TX_CB(skb), sizeof(cb));
@@ -2624,11 +3027,15 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             flow = cb_ok ? (struct mwan_l2_tx_flow *)cb.flow_ptr : NULL;
             flow_token = cb_ok ? cb.flow_token : 0;
             flow_seq = cb_ok ? cb.flow_seq : 0;
+            emit_seq = cb_ok ? cb.emit_seq : 0;
             tunnel_idx = cb_ok ? cb.tunnel_idx : 0;
             encap_type = cb_ok ? cb.encap_type : 0;
             packet_class = cb_ok ? cb.packet_class : MWAN_PACKET_OTHER_DATA;
+            per_packet_emit = cb_ok &&
+                (cb.flags & MWAN_L2_TX_CB_PER_PACKET) != 0;
 #if MWAN_ENABLE_ROLE_PIPELINE
-            if (cb_ok && flow && encap_type == MWAN_ENCAP_L2_PQC &&
+            if (cb_ok && flow && !per_packet_emit &&
+                encap_type == MWAN_ENCAP_L2_PQC &&
                 atomic_read(&flow->exec_mode) ==
                     MWAN_FLOW_EXEC_PIPELINE)
                 mwan_pipeline_wait_for_room(
@@ -2652,31 +3059,37 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             if (!cb_ok || tunnel_idx >= cfg->num_tunnels) {
                 err = -EINVAL;
             } else if (encap_type == MWAN_ENCAP_L2_PQC) {
-#if MWAN_ENABLE_ROLE_PIPELINE
-                if (flow && atomic_read(&flow->exec_mode) ==
-                                MWAN_FLOW_EXEC_PIPELINE) {
-                    pipeline_selected = true;
+                if (per_packet_emit) {
                     err = mwan_l2_pqc_encrypt_skb(
                         skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
                         flow_seq);
-                    if (!err) {
-                        pipeline_submit_attempted = true;
-                        err = mwan_pipeline_tx_submit(
-                            skb, worker, flow, flow_token, flow_seq,
-                            tunnel_idx, transmitted_bytes);
-                        pipeline_owned = !err;
-                        if (err)
-                            atomic64_inc(
-                                &cfg->flows.tx_pipeline_dropped);
-                    }
                 } else {
-#endif
-                    err = mwan_l2_pqc_encrypt_xmit(
-                        skb, worker, &cfg->tunnels[tunnel_idx], flow_token,
-                        flow_seq);
 #if MWAN_ENABLE_ROLE_PIPELINE
-                }
+                    if (flow && atomic_read(&flow->exec_mode) ==
+                                    MWAN_FLOW_EXEC_PIPELINE) {
+                        pipeline_selected = true;
+                        err = mwan_l2_pqc_encrypt_skb(
+                            skb, worker, &cfg->tunnels[tunnel_idx],
+                            flow_token, flow_seq);
+                        if (!err) {
+                            pipeline_submit_attempted = true;
+                            err = mwan_pipeline_tx_submit(
+                                skb, worker, flow, flow_token, flow_seq,
+                                tunnel_idx, transmitted_bytes);
+                            pipeline_owned = !err;
+                            if (err)
+                                atomic64_inc(
+                                    &cfg->flows.tx_pipeline_dropped);
+                        }
+                    } else {
 #endif
+                        err = mwan_l2_pqc_encrypt_xmit(
+                            skb, worker, &cfg->tunnels[tunnel_idx],
+                            flow_token, flow_seq);
+#if MWAN_ENABLE_ROLE_PIPELINE
+                    }
+#endif
+                }
             } else if (encap_type == MWAN_ENCAP_NONE) {
                 err = mwan_encap_none_xmit(skb, &cfg->tunnels[tunnel_idx]);
             } else {
@@ -2744,12 +3157,17 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
                     drop_queue_bytes, mwan_worker_pressure(worker), 0,
                     tunnel_idx);
                 kfree_skb(skb);
+                if (per_packet_emit)
+                    skb = NULL;
             } else if (!pipeline_owned && flow &&
                        atomic_read(&flow->balance_counted)) {
                 mwan_tunnel_balance_account_bytes(
                     cfg, worker, tunnel_idx, transmitted_bytes);
             }
-            if (flow && !pipeline_owned) {
+            if (flow && per_packet_emit)
+                mwan_l2_tx_flow_publish(cfg, flow, err ? NULL : skb,
+                                        tunnel_idx, emit_seq);
+            else if (flow && !pipeline_owned) {
                 mwan_l2_tx_flow_complete(cfg, flow);
                 mwan_l2_tx_flow_put(flow);
             }

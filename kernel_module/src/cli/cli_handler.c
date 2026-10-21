@@ -69,6 +69,26 @@ static int client_send_and_print(const char *socket_path, const char *msg)
     return 1;
 }
 
+static int parse_lb_mode(const char *value, uint8_t *mode)
+{
+    if (!value || !mode)
+        return -1;
+    if (strcmp(value, "per-flow") == 0) {
+        *mode = MWAN_LB_PER_FLOW;
+        return 0;
+    }
+    if (strcmp(value, "per-packet") == 0) {
+        *mode = MWAN_LB_PER_PACKET;
+        return 0;
+    }
+    return -1;
+}
+
+static const char *lb_mode_name(uint8_t mode)
+{
+    return mode == MWAN_LB_PER_PACKET ? "per-packet" : "per-flow";
+}
+
 /* ================================================================== */
 /*  PUBLIC: Parse argv and handle client-mode commands                */
 /*  Returns:  0 = success, 1 = error, -1 = not client mode           */
@@ -78,6 +98,30 @@ int cli_handle_client_args(int argc, char **argv, const char *socket_path)
     if (argc < 2) return -1;
 
     for (int i = 1; i < argc; i++) {
+        /* ----- -m / --mode <per-flow|per-packet> --------------------------- */
+        if (strcmp(argv[i], "-m") == 0 ||
+            strcmp(argv[i], "--mode") == 0) {
+            uint8_t mode;
+            char msg[32];
+
+            if (i + 2 != argc || parse_lb_mode(argv[i + 1], &mode) != 0) {
+                fprintf(stderr,
+                        "Error: Usage: -m/--mode <per-flow|per-packet>\n");
+                return 1;
+            }
+            snprintf(msg, sizeof(msg), "mode %s", lb_mode_name(mode));
+            return client_send_and_print(socket_path, msg);
+        }
+
+        /* ----- --get-mode -------------------------------------------------- */
+        if (strcmp(argv[i], "--get-mode") == 0) {
+            if (i + 1 != argc) {
+                fprintf(stderr, "Error: Usage: --get-mode\n");
+                return 1;
+            }
+            return client_send_and_print(socket_path, "get-mode");
+        }
+
         /* ----- -id <node_id> ------------------------------------------------ */
         if (strcmp(argv[i], "-id") == 0 && i + 1 < argc) {
             int node_id = atoi(argv[++i]);
@@ -1382,6 +1426,58 @@ static int parse_tunnel_command(const char *args, int *profile_id,
 /* ================================================================== */
 void cli_handle_daemon_message(int client_fd, const char *buf, app_context_t *running_ctx)
 {
+
+    /* mode <per-flow|per-packet>: application data must be stopped by the
+     * operator. PQC control and BFD may remain active. */
+    if (strncmp(buf, "mode ", 5) == 0) {
+        uint8_t requested;
+        uint8_t effective;
+        char reply[128];
+        int rc;
+
+        if (parse_lb_mode(buf + 5, &requested) != 0) {
+            reply_json(client_fd, 400,
+                       "Usage: mode <per-flow|per-packet>");
+            return;
+        }
+        log_warn("[LB-MODE] Switching to %s; application data must already be stopped (PQC control and BFD may remain active)",
+                 lb_mode_name(requested));
+        rc = kernel_sync_set_lb_mode(requested);
+        if (rc != 0) {
+            snprintf(reply, sizeof(reply),
+                     "Failed to set mode %s: %s",
+                     lb_mode_name(requested), strerror(-rc));
+            reply_json(client_fd, 500, reply);
+            return;
+        }
+        rc = kernel_sync_get_lb_mode(&effective);
+        if (rc != 0 || effective != requested) {
+            reply_json(client_fd, 500,
+                       "Kernel did not confirm the requested mode");
+            return;
+        }
+        snprintf(reply, sizeof(reply), "Mode changed to %s",
+                 lb_mode_name(effective));
+        reply_json(client_fd, 200, reply);
+        return;
+    }
+
+    if (strcmp(buf, "get-mode") == 0) {
+        uint8_t mode;
+        char reply[64];
+        int rc = kernel_sync_get_lb_mode(&mode);
+
+        if (rc != 0) {
+            snprintf(reply, sizeof(reply), "Failed to get mode: %s",
+                     strerror(-rc));
+            reply_json(client_fd, 500, reply);
+            return;
+        }
+        snprintf(reply, sizeof(reply), "Current mode: %s",
+                 lb_mode_name(mode));
+        reply_json(client_fd, 200, reply);
+        return;
+    }
 
     /* get-peer-ip <data_tunnel_interface> */
     if (strncmp(buf, "get-peer-ip ", 12) == 0) {

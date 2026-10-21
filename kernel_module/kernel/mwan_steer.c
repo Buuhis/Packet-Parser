@@ -5,6 +5,7 @@
 #include "mwan_multicore.h"
 #include "mwan_drop_trace.h"
 #include "mwan_control_plane.h"
+#include "per_packet/mwan_per_packet.h"
 
 #include <linux/module.h>
 #include <linux/netfilter.h>
@@ -387,6 +388,9 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
         u8 tun_idx;
         bool has_selectable_path = active && active->active_count &&
                                    active->total_weight;
+        struct mwan_per_packet_ticket packet_ticket = { 0 };
+        bool whole_packet_sent = true;
+        bool packet_selected = false;
 
         if (!has_selectable_path && !cfg->num_tunnels) {
             mwan_state_count_no_active_drop();
@@ -458,10 +462,36 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
             tun->encap_type == MWAN_ENCAP_L2_PQC) {
             hash = mwan_multicore_flow_info(skb, &tx_ctx.info);
             tx_ctx.packet_class = mwan_multicore_packet_classify(skb);
-            select_ret = mwan_l2_tx_flow_select_tunnel(
-                cfg, &tx_ctx.info.key, hash,
-                tx_ctx.packet_class == MWAN_PACKET_CONTROL,
-                &selected_tun_idx, &tx_ctx.flow);
+            if (mwan_per_packet_enabled()) {
+                /* Keep one flow token/sequence space for the connection.
+                 * Crypto lanes are selected per child packet; only this
+                 * original packet's egress tunnel is selected before any GSO
+                 * or IPv4 fragmentation. */
+                tx_ctx.flow = mwan_l2_tx_flow_get(
+                    cfg, &tx_ctx.info.key, hash,
+                    tx_ctx.packet_class == MWAN_PACKET_CONTROL,
+                    (int)tun_idx, false);
+                if (!tx_ctx.flow) {
+                    rcu_read_unlock();
+                    return NF_DROP;
+                }
+                select_ret = mwan_per_packet_select(
+                    cfg, &tx_ctx.info, tun_idx, &selected_tun_idx,
+                    &packet_ticket);
+                if (unlikely(select_ret)) {
+                    mwan_l2_tx_flow_put(tx_ctx.flow);
+                    rcu_read_unlock();
+                    return NF_DROP;
+                }
+                tx_ctx.allow_tunnel_override = true;
+                tx_ctx.whole_packet_sent = &whole_packet_sent;
+                packet_selected = true;
+            } else {
+                select_ret = mwan_l2_tx_flow_select_tunnel(
+                    cfg, &tx_ctx.info.key, hash,
+                    tx_ctx.packet_class == MWAN_PACKET_CONTROL,
+                    &selected_tun_idx, &tx_ctx.flow);
+            }
             if (unlikely(select_ret)) {
                 if (!has_selectable_path) {
                     mwan_state_count_no_active_drop();
@@ -497,6 +527,11 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
                          "DISPATCH", tun->dev ? tun->dev->name : NULL);
 
         ret = mwan_dispatch_encap(skb, cfg, tun_idx, dispatch_ctx);
+        if (packet_selected) {
+            if (ret != NF_STOLEN)
+                whole_packet_sent = false;
+            mwan_per_packet_complete(&packet_ticket, whole_packet_sent);
+        }
         mwan_l2_tx_flow_put(tx_ctx.flow);
         
         rcu_read_unlock();
@@ -655,13 +690,19 @@ static struct nf_hook_ops mwan_nf_ops[] = {
 int mwan_steer_init(void) {
     int err;
     pr_info("mwan_kmod: Registering Netfilter steering hooks\n");
-    err = nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    err = mwan_per_packet_init();
     if (err)
         return err;
+    err = nf_register_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
+    if (err) {
+        mwan_per_packet_cleanup();
+        return err;
+    }
     err = mwan_decap_l2_pqc_init();
     if (err) {
         nf_unregister_net_hooks(&init_net, mwan_nf_ops,
                                 ARRAY_SIZE(mwan_nf_ops));
+        mwan_per_packet_cleanup();
         return err;
     }
     err = mwan_mac_discovery_init();
@@ -669,6 +710,7 @@ int mwan_steer_init(void) {
         mwan_decap_l2_pqc_cleanup();
         nf_unregister_net_hooks(&init_net, mwan_nf_ops,
                                 ARRAY_SIZE(mwan_nf_ops));
+        mwan_per_packet_cleanup();
         return err;
     }
     return 0;
@@ -679,4 +721,5 @@ void mwan_steer_cleanup(void) {
     mwan_mac_discovery_cleanup();
     nf_unregister_net_hooks(&init_net, mwan_nf_ops, ARRAY_SIZE(mwan_nf_ops));
     mwan_decap_l2_pqc_cleanup();
+    mwan_per_packet_cleanup();
 }

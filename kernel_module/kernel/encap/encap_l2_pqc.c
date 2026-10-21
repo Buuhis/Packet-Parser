@@ -7,6 +7,7 @@
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
 #include <linux/ip.h>
+#include <linux/jhash.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <linux/cpu.h>
@@ -323,6 +324,13 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
                                 u16 tunnel_idx,
                                 const struct mwan_tx_flow_context *tx_ctx);
 
+static void
+mwan_l2_mark_incomplete(const struct mwan_tx_flow_context *tx_ctx)
+{
+    if (tx_ctx && tx_ctx->whole_packet_sent)
+        WRITE_ONCE(*tx_ctx->whole_packet_sent, false);
+}
+
 struct mwan_l2_fragment_context {
     struct mwan_config *cfg;
     u16 tunnel_idx;
@@ -406,7 +414,10 @@ mwan_l2_submit_fragment(struct sk_buff *fragment,
     }
     err = mwan_multicore_tx_submit(
         fragment, fragment_context->cfg, fragment_context->tunnel_idx,
-        info, flow, packet_class, false, &seq, &owner_cpu);
+        info, flow, packet_class, false,
+        fragment_context->tx_ctx &&
+            fragment_context->tx_ctx->allow_tunnel_override,
+        &seq, &owner_cpu);
     if (err)
         return err;
 
@@ -472,6 +483,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
     if (skb_is_gso(skb)) {
         struct sk_buff *segs, *nskb, *next;
         netdev_features_t features = netif_skb_features(skb);
+        bool all_sent = true;
 
         /* Force software segmentation by clearing all GSO features.
          * This splits 64KB GSO super-packets into MTU-compliant SKBs */
@@ -480,6 +492,7 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
             mwan_l2_encap_drop_trace(
                 MWAN_DROP_TX_GSO_FAILED, skb, tx_ctx,
                 IS_ERR(segs) ? PTR_ERR(segs) : -ENOMEM, tunnel_idx);
+            mwan_l2_mark_incomplete(tx_ctx);
             return NF_DROP;
         }
 
@@ -492,16 +505,26 @@ unsigned int mwan_handle_encap_l2_pqc(struct sk_buff *skb,
             if (mwan_handle_encap_l2_pqc_single(nskb, cfg, tunnel_idx,
                                                 tx_ctx) !=
                 NF_STOLEN) {
+                all_sent = false;
                 kfree_skb(nskb);
             }
 
             nskb = next;
         }
+        if (!all_sent)
+            mwan_l2_mark_incomplete(tx_ctx);
         consume_skb(skb);
         return NF_STOLEN;
     }
 
-    return mwan_handle_encap_l2_pqc_single(skb, cfg, tunnel_idx, tx_ctx);
+    {
+        unsigned int verdict = mwan_handle_encap_l2_pqc_single(
+            skb, cfg, tunnel_idx, tx_ctx);
+
+        if (verdict != NF_STOLEN)
+            mwan_l2_mark_incomplete(tx_ctx);
+        return verdict;
+    }
 }
 
 int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
@@ -615,6 +638,25 @@ int mwan_l2_pqc_encrypt_skb(struct sk_buff *skb,
     skb_shinfo(skb)->gso_type = 0;
     skb_shinfo(skb)->gso_segs = 0;
     skb->encapsulation = 0;
+
+    /* Give remote VXLAN/RSS a sequence-dependent hash while keeping one
+     * local NIC queue for each (flow,tunnel) stream. */
+    {
+        u32 rss_hash = jhash_3words(lower_32_bits(flow_token),
+                                    upper_32_bits(flow_token), seq,
+                                    0x72737368U);
+
+        skb_set_hash(skb, rss_hash ? rss_hash : 1U, PKT_HASH_TYPE_L4);
+    }
+    if (likely(target_dev->real_num_tx_queues > 1)) {
+        u32 queue_hash = jhash_3words(lower_32_bits(flow_token),
+                                      upper_32_bits(flow_token),
+                                      target_dev->ifindex, 0x71756575U);
+        u16 q_idx = reciprocal_scale(queue_hash,
+                                     target_dev->real_num_tx_queues);
+
+        skb_set_queue_mapping(skb, q_idx);
+    }
 
     skb->dev = target_dev;
     skb->protocol = htons(MWAN_L2_PQC_ETHERTYPE);
@@ -932,6 +974,8 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
                                      tx_ctx, err, tunnel_idx);
             return NF_DROP;
         }
+        if (err)
+            mwan_l2_mark_incomplete(tx_ctx);
         return NF_STOLEN;
     }
     if (mtu_result != MWAN_MTU_FITS) {
@@ -984,7 +1028,9 @@ mwan_handle_encap_l2_pqc_single(struct sk_buff *skb, struct mwan_config *cfg,
     flow_idx = flow_id & (MWAN_FLOW_HASH_SIZE - 1);
     err = mwan_multicore_tx_submit(skb, cfg, tunnel_idx, info, flow,
                                    packet_class,
-                                   mwan_l2_tcp_flow_closing(skb), &seq,
+                                   mwan_l2_tcp_flow_closing(skb),
+                                   tx_ctx && tx_ctx->allow_tunnel_override,
+                                   &seq,
                                    &owner_cpu);
     if (!err)
         mwan_l2_tx_diag_log(&flow_diag, tun, flow_id, flow_idx, seq,

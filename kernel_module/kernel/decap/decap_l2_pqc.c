@@ -6,6 +6,7 @@
 #include "../mwan_drop_trace.h"
 #include "../mwan_mac_discovery.h"
 #include "../mwan_replay.h"
+#include "../per_packet/mwan_per_packet.h"
 
 #include <linux/cpu.h>
 #include <linux/debugfs.h>
@@ -101,6 +102,7 @@ void mwan_l2_diag_reset_all(void)
     mwan_drop_trace_reset();
     mwan_mtu_stats_reset(MWAN_MTU_PROFILE_BYPASS);
     mwan_mtu_stats_reset(MWAN_MTU_PROFILE_L2_PQC);
+    mwan_per_packet_diag_reset();
 
     spin_lock_bh(&mwan_l2_rx_diag_lock);
     memset(mwan_l2_rx_diag_flows, 0, sizeof(mwan_l2_rx_diag_flows));
@@ -193,6 +195,12 @@ void mwan_l2_diag_reset_all(void)
             atomic64_set(&worker->tx_backpressure_wait_ns, 0);
             atomic64_set(&worker->rx_backpressure_wait_ns, 0);
         }
+        atomic64_set(&cfg->flows.tx_emit_batches, 0);
+        atomic64_set(&cfg->flows.tx_emit_packets, 0);
+        atomic64_set(&cfg->flows.tx_emit_tombstones, 0);
+        atomic64_set(&cfg->flows.tx_emit_max_batch, 0);
+        atomic64_set(&cfg->flows.tx_emit_xmit_failures, 0);
+        atomic64_set(&cfg->flows.tx_emit_schedule_collisions, 0);
         mwan_rekey_diag_reset(cfg);
         mwan_l2_replay_reset_stats(cfg->replay);
     }
@@ -321,6 +329,118 @@ static int mwan_l2_candidate_worker(const struct mwan_config *cfg,
     return -ENODEV;
 }
 
+static bool mwan_l2_schedule_rx_output(struct mwan_l2_worker *worker)
+{
+    if (queue_work_on(worker->cpu, system_highpri_wq,
+                      &worker->rx_output_work))
+        return true;
+    if (work_busy(&worker->rx_output_work))
+        return true;
+    return queue_work(system_highpri_wq, &worker->rx_output_work);
+}
+
+/* Consume an already-authenticated skb and queue it on the flow's stable
+ * home CPU.  The per-flow reorder lock serializes calls for a given flow;
+ * this worker FIFO preserves that order through netif_rx's per-CPU backlog. */
+bool mwan_l2_rx_reinject_batch(struct mwan_l2_rx_flow *flow,
+                               struct sk_buff_head *batch)
+{
+    struct mwan_config *cfg;
+    struct mwan_l2_worker *worker;
+    struct sk_buff *skb;
+    bool accepted_all = true;
+    bool enqueued = false;
+    int home;
+    int was_scheduled;
+
+    if (unlikely(!batch))
+        return false;
+    if (unlikely(!flow)) {
+        __skb_queue_purge(batch);
+        return false;
+    }
+    cfg = flow->manager ? flow->manager->cfg : NULL;
+    home = READ_ONCE(flow->owner_worker);
+    if (unlikely(!cfg || READ_ONCE(cfg->flows.stopping) ||
+                 !cfg->l2_workers || home < 0 ||
+                 home >= cfg->num_workers ||
+                 !cpu_online(cfg->l2_workers[home].cpu))) {
+        __skb_queue_purge(batch);
+        return false;
+    }
+    worker = &cfg->l2_workers[home];
+
+    spin_lock(&worker->rx_output_queue.lock);
+    while ((skb = __skb_dequeue(batch)) != NULL) {
+        unsigned int accounted_bytes = skb->truesize;
+
+        if (worker->rx_output_queue.qlen >= MWAN_L2_QUEUE_MAX_PACKETS ||
+            atomic64_read(&worker->rx_output_queued_bytes) +
+                    accounted_bytes > MWAN_L2_QUEUE_MAX_BYTES) {
+            accepted_all = false;
+            atomic64_inc(&worker->rx_output_dropped_packets);
+            atomic64_inc(&worker->dropped_packets);
+            kfree_skb(skb);
+            continue;
+        }
+        __skb_queue_tail(&worker->rx_output_queue, skb);
+        atomic64_inc(&worker->rx_output_queued_packets);
+        atomic64_add(accounted_bytes, &worker->rx_output_queued_bytes);
+        enqueued = true;
+    }
+    was_scheduled = enqueued ?
+        atomic_cmpxchg(&worker->rx_output_scheduled, 0, 1) : 1;
+    spin_unlock(&worker->rx_output_queue.lock);
+
+    if (was_scheduled == 0 &&
+        unlikely(!mwan_l2_schedule_rx_output(worker))) {
+        atomic64_inc(&worker->schedule_failures);
+        return false;
+    }
+    return accepted_all;
+}
+
+bool mwan_l2_rx_reinject(struct mwan_l2_rx_flow *flow, struct sk_buff *skb)
+{
+    struct sk_buff_head batch;
+
+    if (unlikely(!skb))
+        return false;
+    __skb_queue_head_init(&batch);
+    __skb_queue_tail(&batch, skb);
+    return mwan_l2_rx_reinject_batch(flow, &batch);
+}
+
+void mwan_l2_rx_output_worker_fn(struct work_struct *work)
+{
+    struct mwan_l2_worker *worker = container_of(
+        work, struct mwan_l2_worker, rx_output_work);
+    struct sk_buff *skb;
+    unsigned int batch = 0;
+
+    for (;;) {
+        while ((skb = skb_dequeue(&worker->rx_output_queue)) != NULL) {
+            atomic64_dec(&worker->rx_output_queued_packets);
+            atomic64_sub(skb->truesize,
+                         &worker->rx_output_queued_bytes);
+            netif_rx(skb);
+            if (++batch == 64) {
+                batch = 0;
+                cond_resched();
+            }
+        }
+
+        spin_lock_bh(&worker->rx_output_queue.lock);
+        if (!skb_queue_empty(&worker->rx_output_queue)) {
+            spin_unlock_bh(&worker->rx_output_queue.lock);
+            continue;
+        }
+        atomic_set(&worker->rx_output_scheduled, 0);
+        spin_unlock_bh(&worker->rx_output_queue.lock);
+        break;
+    }
+}
+
 static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
                                struct mwan_l2_rx_flow *flow, int owner,
                                u64 flow_token, u32 flow_seq, u64 packet_nonce,
@@ -352,6 +472,8 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
     }
     if (new_diag_flow)
         atomic64_inc(&mwan_l2_rx_diag_flows_count);
+    owner = mwan_l2_select_rx_lane(cfg, diag_id, flow_seq,
+                                   READ_ONCE(flow->owner_worker));
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu))
         return -ENODEV;
@@ -951,7 +1073,7 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
 
     (void)unused;
 #if MWAN_L2_STATS_VERBOSE
-    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_dqx_calls tx_dqx_ok tx_dqx_cn tx_dqx_drop tx_dqx_err tx_dqx_last_fail_ns tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp rate_on rate_target_bp rate_burst_ns rate_tokens_ns rate_throttle rate_wait_ns rate_max_wait_ns rate_accounted_ns rate_packets rate_bytes rate_control_bypass rate_max_debt_ns\n");
+    seq_puts(m, "cpu rx_q_pkts rx_q_bytes rx_max_pkts rx_max_bytes rx_enqueued rx_processed rx_drops rx_decrypt_fail rx_owned rx_ewma_ns rx_runs rx_schedule_fail rx_busy rx_out_pkts rx_out_bytes rx_out_drops tx_q_pkts tx_q_bytes tx_max_pkts tx_max_bytes tx_enqueued tx_processed tx_drops tx_xmit_fail tx_dqx_calls tx_dqx_ok tx_dqx_cn tx_dqx_drop tx_dqx_err tx_dqx_last_fail_ns tx_owned tx_ewma_ns tx_runs tx_schedule_fail tx_busy tx_emit_busy score sys_raw_bp sys_ewma_bp soft_raw_bp soft_ewma_bp idle_raw_bp idle_ewma_bp busy_raw_bp busy_ewma_bp blocked emergency tx_ecn_marked rx_ecn_marked overload_drop control_preserved emergency_hot emergency_cool emergency_enters emergency_last_ns overload_last_ns busy_peak_bp idle_min_bp rate_on rate_target_bp rate_burst_ns rate_tokens_ns rate_throttle rate_wait_ns rate_max_wait_ns rate_accounted_ns rate_packets rate_bytes rate_control_bypass rate_max_debt_ns\n");
 #else
     seq_puts(m, "cpu rx_q rx_q_kib rx_max_q rx_max_kib rx_drop decrypt_fail tx_q tx_q_kib tx_max_q tx_max_kib tx_drop xmit_drop xmit_err overload_drop sys_bp soft_bp idle_bp rate_bp rate_throttle rate_wait_ms\n");
 #endif
@@ -985,7 +1107,11 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->work_runs),
                    atomic64_read(&w->schedule_failures),
                    atomic_read(&w->busy));
-        seq_printf(m, "%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d ",
+        seq_printf(m, "%lld %lld %lld ",
+                   atomic64_read(&w->rx_output_queued_packets),
+                   atomic64_read(&w->rx_output_queued_bytes),
+                   atomic64_read(&w->rx_output_dropped_packets));
+        seq_printf(m, "%lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %lld %d %d ",
                    atomic64_read(&w->tx_queued_packets),
                    atomic64_read(&w->tx_queued_bytes),
                    atomic64_read(&w->tx_max_queued_packets),
@@ -1004,7 +1130,8 @@ static int mwan_l2_stats_show(struct seq_file *m, void *unused)
                    atomic64_read(&w->tx_processing_ewma_ns),
                    atomic64_read(&w->tx_work_runs),
                    atomic64_read(&w->tx_schedule_failures),
-                   atomic_read(&w->tx_busy));
+                   atomic_read(&w->tx_busy),
+                   atomic_read(&w->tx_emit_busy));
         seq_printf(m, "%llu %d %d %d %d %d %d %d %d %d %d %lld %lld %lld %lld ",
                    mwan_multicore_worker_score(w),
                    atomic_read(&w->system_raw_bp),
@@ -1101,6 +1228,7 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                READ_ONCE(mwan_l2_diag_enabled),
                min_t(unsigned int, READ_ONCE(mwan_l2_diag_limit),
                      MWAN_L2_DIAG_MAX_FLOWS));
+    mwan_per_packet_diag_show(m);
     seq_printf(m, "tx_flows=%llu tx_zero_packets=%llu\n",
                mwan_l2_tx_diag_flows_get(), mwan_l2_tx_diag_zero_get());
     seq_printf(m, "rx_flows=%lld rx_zero_packets=%lld collisions=%lld\n",
@@ -1228,6 +1356,14 @@ static int mwan_l2_diag_show(struct seq_file *m, void *unused)
                    atomic64_read(&cfg->flows.reorder_resync_flushed));
         seq_printf(m, "reorder_slide preserved=%lld\n",
                    atomic64_read(&cfg->flows.reorder_resync_preserved));
+        seq_printf(m, "tx_emit batches=%lld packets=%lld tombstones=%lld max_batch=%lld xmit_failures=%lld schedule_collisions=%lld\n",
+                   atomic64_read(&cfg->flows.tx_emit_batches),
+                   atomic64_read(&cfg->flows.tx_emit_packets),
+                   atomic64_read(&cfg->flows.tx_emit_tombstones),
+                   atomic64_read(&cfg->flows.tx_emit_max_batch),
+                   atomic64_read(&cfg->flows.tx_emit_xmit_failures),
+                   atomic64_read(
+                       &cfg->flows.tx_emit_schedule_collisions));
         if (cfg->l2_workers) {
             int i;
 

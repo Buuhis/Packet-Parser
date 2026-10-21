@@ -2,6 +2,8 @@
 #include "mwan_mac_discovery.h"
 #include "mwan_proto.h"
 #include "mwan_state.h"
+#include "per_packet/mwan_per_packet.h"
+#include "per_packet/mwan_lb_mode.h"
 
 #include <net/genetlink.h>
 #include <linux/module.h>
@@ -16,7 +18,7 @@ enum mwan_genl_multicast_groups {
 static const struct genl_multicast_group mwan_genl_mcgrps[] = {
     [MWAN_MCGRP_PEER_EVENTS] = {
         .name = MWAN_GENL_PEER_EVENTS_GROUP,
-#ifdef GENL_MCAST_CAP_NET_ADMIN,
+#ifdef GENL_MCAST_CAP_NET_ADMIN
         .flags = GENL_MCAST_CAP_NET_ADMIN,
 #endif
     },
@@ -48,6 +50,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_DATAPATH_BLOCKED] = { .type = NLA_U8 },
     [MWAN_ATTR_PEER_GENERATION] = { .type = NLA_U32 },
     [MWAN_ATTR_NONCE_DOMAIN] = { .type = NLA_U8 },
+    [MWAN_ATTR_LB_MODE] = { .type = NLA_U8 },
 };
 
 int mwan_netlink_notify_peer_changed(u32 ifindex, __be32 peer_tunnel_ip,
@@ -734,6 +737,45 @@ static int mwan_genl_get_tunnel_peers(struct sk_buff *skb,
     return genlmsg_reply(reply, info);
 }
 
+static int mwan_genl_set_lb_mode(struct sk_buff *skb,
+                                 struct genl_info *info)
+{
+    u8 mode;
+
+    (void)skb;
+    if (!info->attrs[MWAN_ATTR_LB_MODE])
+        return -EINVAL;
+    mode = nla_get_u8(info->attrs[MWAN_ATTR_LB_MODE]);
+    return mwan_per_packet_set_mode(mode);
+}
+
+static int mwan_genl_get_lb_mode(struct sk_buff *skb,
+                                 struct genl_info *info)
+{
+    struct sk_buff *reply;
+    void *reply_hdr;
+    int ret;
+
+    (void)skb;
+    reply = genlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
+    if (!reply)
+        return -ENOMEM;
+    reply_hdr = genlmsg_put_reply(reply, info, &mwan_genl_family, 0,
+                                  MWAN_CMD_GET_LB_MODE);
+    if (!reply_hdr) {
+        nlmsg_free(reply);
+        return -EMSGSIZE;
+    }
+    ret = nla_put_u8(reply, MWAN_ATTR_LB_MODE, mwan_lb_mode_get());
+    if (ret) {
+        genlmsg_cancel(reply, reply_hdr);
+        nlmsg_free(reply);
+        return ret;
+    }
+    genlmsg_end(reply, reply_hdr);
+    return genlmsg_reply(reply, info);
+}
+
 /* Operation Definition */
 static const struct genl_ops mwan_genl_ops[] = {
     {
@@ -823,6 +865,18 @@ static const struct genl_ops mwan_genl_ops[] = {
         .flags  = GENL_ADMIN_PERM,
         .policy = mwan_genl_policy,
         .doit   = mwan_genl_detach_tunnel,
+    },
+    {
+        .cmd    = MWAN_CMD_SET_LB_MODE,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_set_lb_mode,
+    },
+    {
+        .cmd    = MWAN_CMD_GET_LB_MODE,
+        .flags  = GENL_ADMIN_PERM,
+        .policy = mwan_genl_policy,
+        .doit   = mwan_genl_get_lb_mode,
     },
 };
 

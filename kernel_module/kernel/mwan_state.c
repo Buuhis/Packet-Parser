@@ -636,8 +636,9 @@ int mwan_state_update(struct mwan_config *new_cfg)
 
     }
 
-    /* Bypass and L2-PQC share the sticky per-flow TX dispatcher.  Other
-     * encryption modes retain their existing synchronous datapaths. */
+    /* Bypass and L2-PQC share the flow table and asynchronous TX dispatcher.
+     * L2-PQC selects crypto lanes per packet; bypass keeps the inexpensive
+     * home-worker path. Other encryption modes remain synchronous. */
     err = mwan_l2_workers_init(new_cfg);
     if (err)
         goto err_free_tfm;

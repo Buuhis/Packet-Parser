@@ -1,17 +1,36 @@
 #include "mwan_state.h"
 #include "mwan_drop_trace.h"
+#include "mwan_multicore.h"
 #include "mwan_tunnel_balance.h"
 
 #include <linux/cpu.h>
 #include <linux/etherdevice.h>
 #include <linux/in.h>
+#include <linux/interrupt.h>
 #include <linux/jhash.h>
+#include <linux/log2.h>
+#include <linux/netdevice.h>
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/timer.h>
 #include <linux/version.h>
 
 static void mwan_l2_flow_gc_workfn(struct work_struct *work);
+static void mwan_l2_tx_dispatch_workfn(struct work_struct *work);
+static void mwan_l2_tx_emit_workfn(struct work_struct *work);
+
+static void mwan_l2_atomic64_update_max(atomic64_t *maximum, u64 value)
+{
+    s64 old = atomic64_read(maximum);
+
+    while (value > (u64)old) {
+        s64 observed = atomic64_cmpxchg(maximum, old, (s64)value);
+
+        if (observed == old)
+            break;
+        old = observed;
+    }
+}
 
 static const struct mwan_l2_worker *
 mwan_reorder_owner(const struct mwan_l2_rx_flow *flow)
@@ -141,6 +160,33 @@ static bool mwan_l2_tx_balance_inactive(const struct mwan_l2_tx_flow *flow)
                                MWAN_FLOW_BALANCE_IDLE_TIMEOUT);
 }
 
+static bool mwan_l2_tx_flow_idle(const struct mwan_l2_tx_flow *flow)
+{
+    return !atomic_read(&flow->pending_crypto) &&
+           skb_queue_empty(&flow->backlog);
+}
+
+static void mwan_l2_tx_flow_free(struct mwan_l2_tx_flow *flow)
+{
+    u16 tunnel_idx;
+
+    if (!flow)
+        return;
+    for (tunnel_idx = 0; tunnel_idx < flow->num_streams; tunnel_idx++) {
+        struct mwan_l2_tx_stream *stream = flow->streams[tunnel_idx];
+        u16 slot;
+
+        if (!stream)
+            continue;
+        WARN_ON_ONCE(work_busy(&stream->emit_work));
+        for (slot = 0; slot < stream->ring_size; slot++)
+            kfree_skb(stream->slots[slot].skb);
+        kfree(stream);
+    }
+    kfree(flow->streams);
+    kfree(flow);
+}
+
 static void mwan_l2_tx_balance_deactivate(struct mwan_config *cfg,
                                           struct mwan_l2_tx_flow *flow)
 {
@@ -173,6 +219,17 @@ static void mwan_l2_tx_worker_deactivate(struct mwan_config *cfg,
     atomic64_inc(&cfg->flows.tx_worker_deactivated);
 }
 
+/* The caller holds reorder_lock, so flushing here preserves global flow
+ * order while amortizing the home-CPU output queue lock and work scheduling. */
+static void mwan_l2_rx_batch_append(struct mwan_l2_rx_flow *flow,
+                                    struct sk_buff_head *batch,
+                                    struct sk_buff *skb)
+{
+    __skb_queue_tail(batch, skb);
+    if (batch->qlen >= MWAN_L2_RX_OUTPUT_BATCH)
+        mwan_l2_rx_reinject_batch(flow, batch);
+}
+
 /* Called with both the TX flow bucket and submit locks held. An inactive UDP
  * mapping may select a fresh worker only after its old queue references
  * reached zero. The flow object, tunnel and sequence stay intact, so this is
@@ -188,8 +245,7 @@ static bool mwan_l2_tx_worker_reactivate(struct mwan_config *cfg,
     if (atomic_read(&flow->worker_counted))
         return true;
     old_owner = READ_ONCE(flow->owner_worker);
-    if (READ_ONCE(flow->closing) ||
-        atomic_read(&flow->pending_crypto)) {
+    if (READ_ONCE(flow->closing) || !mwan_l2_tx_flow_idle(flow)) {
         owner = old_owner;
         if (!cfg->l2_workers || owner < 0 || owner >= cfg->num_workers ||
             !cpu_online(cfg->l2_workers[owner].cpu))
@@ -217,28 +273,22 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
     u32 next_expected;
     u32 skipped = 0;
     bool restart = false;
+    struct sk_buff_head batch;
     int i;
 
+    __skb_queue_head_init(&batch);
     spin_lock_bh(&flow->reorder_lock);
     while (1) {
         u32 slot = flow->expected_seq & MWAN_FLOW_RING_MASK;
         struct sk_buff *skb = flow->ring[slot];
 
-        if (skb) {
-            u32 delivered_seq = flow->expected_seq;
-            u32 packet_len = skb->len;
-            int ifindex = skb->dev ? skb->dev->ifindex : 0;
-            int rx_ret;
-
+        if (skb && flow->slot_seq[slot] == flow->expected_seq) {
             flow->ring[slot] = NULL;
+            flow->slot_seq[slot] = 0;
             flow->slot_time[slot] = 0;
             flow->reorder_queued--;
             flow->expected_seq++;
-            rx_ret = netif_rx(skb);
-            if (unlikely(rx_ret == NET_RX_DROP))
-                mwan_reorder_drop_trace(MWAN_DROP_NETIF_RX, flow, NULL,
-                                        delivered_seq, packet_len, ifindex,
-                                        rx_ret);
+            mwan_l2_rx_batch_append(flow, &batch, skb);
             continue;
         }
 
@@ -264,6 +314,9 @@ static void mwan_l2_rx_reorder_timeout(struct timer_list *timer)
     next_expected = flow->expected_seq;
     spin_unlock_bh(&flow->reorder_lock);
 
+    if (!skb_queue_empty(&batch))
+        mwan_l2_rx_reinject_batch(flow, &batch);
+
     if (skipped && READ_ONCE(mwan_l2_diag_enabled))
         pr_warn_ratelimited("mwan_kmod: L2D REORDER_TIMEOUT token=%016llx first_missing=%u skipped=%u next_expected=%u timeout_ms=%u\n",
                             flow->flow_token, first_missing, skipped,
@@ -282,6 +335,8 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     cfg->flows.cfg = cfg;
     cfg->flows.stopping = false;
     INIT_DELAYED_WORK(&cfg->flows.gc_work, mwan_l2_flow_gc_workfn);
+    INIT_DELAYED_WORK(&cfg->flows.tx_dispatch_work,
+                      mwan_l2_tx_dispatch_workfn);
     atomic_set(&cfg->flows.tx_count, 0);
     atomic_set(&cfg->flows.rx_count, 0);
     atomic64_set(&cfg->flows.tx_created, 0);
@@ -309,13 +364,67 @@ int mwan_l2_flow_manager_init(struct mwan_config *cfg)
     atomic64_set(&cfg->flows.rx_pipeline_promoted, 0);
     atomic64_set(&cfg->flows.tx_pipeline_dropped, 0);
     atomic64_set(&cfg->flows.rx_pipeline_dropped, 0);
+    atomic64_set(&cfg->flows.tx_backlog_packets, 0);
+    atomic64_set(&cfg->flows.tx_backlog_bytes, 0);
+    atomic_set(&cfg->flows.tx_backlog_flows, 0);
+    spin_lock_init(&cfg->flows.tx_backlog_lock);
+    atomic64_set(&cfg->flows.tx_emit_batches, 0);
+    atomic64_set(&cfg->flows.tx_emit_packets, 0);
+    atomic64_set(&cfg->flows.tx_emit_tombstones, 0);
+    atomic64_set(&cfg->flows.tx_emit_max_batch, 0);
+    atomic64_set(&cfg->flows.tx_emit_xmit_failures, 0);
+    atomic64_set(&cfg->flows.tx_emit_schedule_collisions, 0);
     for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
         INIT_HLIST_HEAD(&cfg->flows.tx[i].head);
         spin_lock_init(&cfg->flows.tx[i].lock);
         INIT_HLIST_HEAD(&cfg->flows.rx[i].head);
         spin_lock_init(&cfg->flows.rx[i].lock);
     }
+    cfg->flows.tx_emit_wq = alloc_workqueue(
+        "mwan_emit", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM, 1);
+    if (!cfg->flows.tx_emit_wq)
+        return -ENOMEM;
     return 0;
+}
+
+void mwan_l2_tx_emit_stop(struct mwan_config *cfg)
+{
+    struct workqueue_struct *wq;
+
+    if (!cfg)
+        return;
+    wq = xchg(&cfg->flows.tx_emit_wq, NULL);
+    if (wq)
+        destroy_workqueue(wq);
+}
+
+static void mwan_l2_tx_dispatch_workfn(struct work_struct *work)
+{
+    struct mwan_l2_flow_manager *manager =
+        container_of(to_delayed_work(work), struct mwan_l2_flow_manager,
+                     tx_dispatch_work);
+    struct mwan_config *cfg = manager->cfg;
+    int i;
+
+    if (READ_ONCE(manager->stopping))
+        return;
+
+    for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
+        struct mwan_l2_flow_bucket *bucket = &manager->tx[i];
+        struct mwan_l2_tx_flow *flow;
+
+        spin_lock_bh(&bucket->lock);
+        hlist_for_each_entry(flow, &bucket->head, node) {
+            if (READ_ONCE(flow->backlog.qlen))
+                mwan_multicore_tx_refill(cfg, flow);
+        }
+        spin_unlock_bh(&bucket->lock);
+    }
+
+    if (!READ_ONCE(manager->stopping) &&
+        atomic64_read(&manager->tx_backlog_packets))
+        schedule_delayed_work(&manager->tx_dispatch_work,
+                              MWAN_L2_TX_BACKLOG_RETRY);
 }
 
 static void mwan_l2_flow_gc_workfn(struct work_struct *work)
@@ -336,13 +445,13 @@ static void mwan_l2_flow_gc_workfn(struct work_struct *work)
             bool expired;
 
             spin_lock(&flow->submit_lock);
-            if (!atomic_read(&flow->pending_crypto) &&
+            if (mwan_l2_tx_flow_idle(flow) &&
                 mwan_l2_tx_balance_inactive(flow)) {
                 mwan_l2_tx_balance_deactivate(cfg, flow);
                 if (mwan_l2_tx_worker_inactive(flow))
                     mwan_l2_tx_worker_deactivate(cfg, flow);
             }
-            expired = !atomic_read(&flow->pending_crypto) &&
+            expired = mwan_l2_tx_flow_idle(flow) &&
                       mwan_l2_flow_expired(READ_ONCE(flow->last_seen),
                                            READ_ONCE(flow->closing));
             spin_unlock(&flow->submit_lock);
@@ -435,6 +544,7 @@ static void mwan_l2_free_rx_ring(struct mwan_l2_rx_flow *flow)
                                     0, 0, -ESHUTDOWN);
             kfree_skb(flow->ring[i]);
             flow->ring[i] = NULL;
+            flow->slot_seq[i] = 0;
             flow->slot_time[i] = 0;
         }
     }
@@ -449,7 +559,9 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
     if (!cfg)
         return;
     WRITE_ONCE(cfg->flows.stopping, true);
+    cancel_delayed_work_sync(&cfg->flows.tx_dispatch_work);
     cancel_delayed_work_sync(&cfg->flows.gc_work);
+    mwan_l2_tx_emit_stop(cfg);
 
     for (i = 0; i < MWAN_FLOW_HASH_SIZE; i++) {
         struct mwan_l2_tx_flow *tx;
@@ -459,6 +571,7 @@ void mwan_l2_flow_manager_stop(struct mwan_config *cfg)
         spin_lock_bh(&cfg->flows.tx[i].lock);
         hlist_for_each_entry_safe(tx, tmp, &cfg->flows.tx[i].head, node) {
             hlist_del_init(&tx->node);
+            mwan_multicore_tx_backlog_purge(cfg, tx);
             mwan_l2_tx_balance_deactivate(cfg, tx);
             mwan_l2_tx_worker_deactivate(cfg, tx);
             mwan_l2_tx_flow_put(tx);
@@ -505,7 +618,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             spin_lock(&flow->submit_lock);
             if (allow_tunnel_remap &&
                 !READ_ONCE(flow->closing) &&
-                !atomic_read(&flow->pending_crypto) &&
+                mwan_l2_tx_flow_idle(flow) &&
                 mwan_l2_tx_worker_inactive(flow)) {
                 mwan_l2_tx_balance_deactivate(cfg, flow);
                 mwan_l2_tx_worker_deactivate(cfg, flow);
@@ -530,7 +643,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             } else if (allow_tunnel_remap &&
                        READ_ONCE(flow->tunnel_idx) !=
                            READ_ONCE(flow->home_tunnel_idx) &&
-                       !atomic_read(&flow->pending_crypto) &&
+                       mwan_l2_tx_flow_idle(flow) &&
                        refcount_read(&flow->refs) == 1 &&
                        mwan_tunnel_balance_is_active(
                            cfg, READ_ONCE(flow->home_tunnel_idx))) {
@@ -554,7 +667,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
                            READ_ONCE(flow->home_tunnel_idx) &&
                        READ_ONCE(flow->rebalance_on_recovery) &&
                        !READ_ONCE(flow->closing) &&
-                       !atomic_read(&flow->pending_crypto) &&
+                       mwan_l2_tx_flow_idle(flow) &&
                        refcount_read(&flow->refs) == 1) {
                 u16 old_tunnel_idx = READ_ONCE(flow->tunnel_idx);
                 u16 active_count = 0;
@@ -602,15 +715,23 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     candidate = kzalloc(sizeof(*candidate), GFP_ATOMIC);
     if (!candidate)
         return NULL;
+    candidate->streams = kcalloc(cfg->num_tunnels,
+                                 sizeof(*candidate->streams), GFP_ATOMIC);
+    if (!candidate->streams) {
+        kfree(candidate);
+        return NULL;
+    }
+    candidate->manager = &cfg->flows;
+    candidate->num_streams = cfg->num_tunnels;
     owner = mwan_l2_select_tx_worker(cfg, flow_hash, -1, control_packet);
     if (owner < 0) {
-        kfree(candidate);
+        mwan_l2_tx_flow_free(candidate);
         return NULL;
     }
     if (requested_tunnel_idx >= 0) {
         if (requested_tunnel_idx >= cfg->num_tunnels) {
             atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
-            kfree(candidate);
+            mwan_l2_tx_flow_free(candidate);
             return NULL;
         }
         /* Exact-path callers are control probes (notably BFD). Data flows
@@ -624,11 +745,12 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     }
     if (tunnel_idx < 0) {
         atomic64_dec(&cfg->l2_workers[owner].tx_assigned_flows);
-        kfree(candidate);
+        mwan_l2_tx_flow_free(candidate);
         return NULL;
     }
     candidate->key = *key;
     candidate->flow_token = mwan_l2_new_flow_token();
+    candidate->flow_id = flow_hash;
     refcount_set(&candidate->refs, 1); /* table reference */
     atomic_set(&candidate->next_seq, 0);
     atomic_set(&candidate->pending_crypto, 0);
@@ -638,6 +760,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     atomic_set(&candidate->exec_mode, MWAN_FLOW_EXEC_LEGACY);
     candidate->pipeline_worker = -1;
     spin_lock_init(&candidate->submit_lock);
+    skb_queue_head_init(&candidate->backlog);
+    candidate->backlog_bytes = 0;
     candidate->owner_worker = owner;
     candidate->home_tunnel_idx = (u16)tunnel_idx;
     candidate->tunnel_idx = (u16)tunnel_idx;
@@ -657,7 +781,7 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
             if (atomic_read(&candidate->balance_counted))
                 mwan_tunnel_balance_release_flow(
                     cfg, candidate->tunnel_idx);
-            kfree(candidate);
+            mwan_l2_tx_flow_free(candidate);
             return flow;
         }
     }
@@ -713,7 +837,7 @@ mwan_l2_tx_flow_hold(struct mwan_l2_tx_flow *flow)
 void mwan_l2_tx_flow_put(struct mwan_l2_tx_flow *flow)
 {
     if (flow && refcount_dec_and_test(&flow->refs))
-        kfree(flow);
+        mwan_l2_tx_flow_free(flow);
 }
 
 bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
@@ -733,8 +857,9 @@ bool mwan_l2_tx_flow_release_queued(struct mwan_config *cfg,
 
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
-        if (!mwan_l2_flow_key_equal(&flow->key, key) ||
-            flow->owner_worker != owner_worker)
+        /* A single flow can now have packets queued on several crypto lanes;
+         * the full key, not the home worker, identifies the reference. */
+        if (!mwan_l2_flow_key_equal(&flow->key, key))
             continue;
         if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
             /* The table reference keeps flow alive while bucket->lock is
@@ -760,11 +885,256 @@ void mwan_l2_tx_flow_touch(struct mwan_l2_tx_flow *flow, bool closing)
 void mwan_l2_tx_flow_complete(struct mwan_config *cfg,
                               struct mwan_l2_tx_flow *flow)
 {
+    bool idle;
+
     if (!cfg || !flow)
         return;
-    if (atomic_dec_return(&flow->pending_crypto) == 0 &&
-        READ_ONCE(flow->closing))
+    spin_lock_bh(&flow->submit_lock);
+    idle = atomic_dec_return(&flow->pending_crypto) == 0 &&
+           skb_queue_empty(&flow->backlog);
+    spin_unlock_bh(&flow->submit_lock);
+    if (idle && READ_ONCE(flow->closing))
         mwan_l2_tx_balance_deactivate(cfg, flow);
+}
+
+static void mwan_l2_tx_flow_complete_count(struct mwan_config *cfg,
+                                           struct mwan_l2_tx_flow *flow,
+                                           unsigned int count)
+{
+    bool idle;
+    int pending;
+
+    if (!cfg || !flow || !count)
+        return;
+    spin_lock_bh(&flow->submit_lock);
+    pending = atomic_sub_return(count, &flow->pending_crypto);
+    WARN_ON_ONCE(pending < 0);
+    idle = pending == 0 && skb_queue_empty(&flow->backlog);
+    spin_unlock_bh(&flow->submit_lock);
+    if (idle && READ_ONCE(flow->closing))
+        mwan_l2_tx_balance_deactivate(cfg, flow);
+}
+
+int mwan_l2_tx_flow_prepare_stream(struct mwan_config *cfg,
+                                   struct mwan_l2_tx_flow *flow,
+                                   u16 tunnel_idx)
+{
+    struct mwan_l2_tx_stream *stream;
+    unsigned int window;
+    unsigned int ring_size;
+    int emitter_worker;
+
+    if (!cfg || !flow || tunnel_idx >= flow->num_streams)
+        return -EINVAL;
+    if (flow->streams[tunnel_idx])
+        return 0;
+
+    window = max_t(unsigned int, 8U, cfg->num_workers * 4U);
+    window = min_t(unsigned int, window, MWAN_FLOW_RING_SIZE - 1U);
+    ring_size = roundup_pow_of_two(window);
+    emitter_worker = mwan_l2_select_tx_emitter(cfg, flow->flow_id,
+                                                tunnel_idx);
+    if (emitter_worker < 0)
+        return emitter_worker;
+    stream = kzalloc(struct_size(stream, slots, ring_size), GFP_ATOMIC);
+    if (!stream)
+        return -ENOMEM;
+    stream->flow = flow;
+    stream->tunnel_idx = tunnel_idx;
+    stream->ring_size = ring_size;
+    stream->ring_mask = ring_size - 1U;
+    stream->emit_seq = 1;
+    stream->emitter_worker = emitter_worker;
+    spin_lock_init(&stream->lock);
+    INIT_WORK(&stream->emit_work, mwan_l2_tx_emit_workfn);
+    flow->streams[tunnel_idx] = stream;
+    return 0;
+}
+
+u32 mwan_l2_tx_flow_next_emit_seq(struct mwan_l2_tx_flow *flow,
+                                  u16 tunnel_idx)
+{
+    struct mwan_l2_tx_stream *stream;
+
+    if (WARN_ON_ONCE(!flow || tunnel_idx >= flow->num_streams))
+        return 0;
+    stream = flow->streams[tunnel_idx];
+    if (WARN_ON_ONCE(!stream))
+        return 0;
+    return ++stream->next_emit_seq;
+}
+
+/* Publish one completed TX crypto operation into its flow commit ring.  The
+ * caller transfers both the skb (when non-NULL) and exactly one flow
+ * reference.  A NULL skb is a tombstone for a failed crypto operation, so a
+ * later packet can never wait forever behind a known failure. */
+void mwan_l2_tx_flow_publish(struct mwan_config *cfg,
+                             struct mwan_l2_tx_flow *flow,
+                             struct sk_buff *skb, u16 tunnel_idx,
+                             u32 emit_seq)
+{
+    struct mwan_l2_tx_stream *stream;
+    struct workqueue_struct *emit_wq;
+    bool schedule = false;
+    u32 delta;
+    u32 slot;
+
+    if (unlikely(!cfg || !flow)) {
+        kfree_skb(skb);
+        if (flow) {
+            mwan_l2_tx_flow_complete(cfg, flow);
+            mwan_l2_tx_flow_put(flow);
+        }
+        return;
+    }
+
+    if (unlikely(tunnel_idx >= flow->num_streams ||
+                 !(stream = READ_ONCE(flow->streams[tunnel_idx])))) {
+        WARN_ON_ONCE(1);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+
+    spin_lock_bh(&stream->lock);
+    if (unlikely((s32)(emit_seq - stream->emit_seq) < 0)) {
+        spin_unlock_bh(&stream->lock);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+    delta = emit_seq - stream->emit_seq;
+    if (unlikely(delta >= stream->ring_size)) {
+        /* The execution window is capped below the ring size, so reaching
+         * this branch indicates broken accounting rather than congestion. */
+        spin_unlock_bh(&stream->lock);
+        WARN_ON_ONCE(1);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+
+    slot = emit_seq & stream->ring_mask;
+    if (unlikely(stream->slots[slot].ready)) {
+        spin_unlock_bh(&stream->lock);
+        WARN_ON_ONCE(1);
+        kfree_skb(skb);
+        mwan_l2_tx_flow_complete(cfg, flow);
+        mwan_l2_tx_flow_put(flow);
+        return;
+    }
+    stream->slots[slot].skb = skb;
+    stream->slots[slot].emit_seq = emit_seq;
+    stream->slots[slot].ready = true;
+    if (!stream->emitting) {
+        stream->emitting = true;
+        /* Slot references are released one by one below.  Keep a separate
+         * drain reference so GC cannot free the flow after the final pending
+         * operation reaches zero but before the emitter exits its loop. */
+        refcount_inc(&flow->refs);
+        schedule = true;
+    }
+    spin_unlock_bh(&stream->lock);
+
+    if (!schedule)
+        return;
+    emit_wq = READ_ONCE(cfg->flows.tx_emit_wq);
+    if (likely(emit_wq) &&
+        queue_work_on(cfg->l2_workers[stream->emitter_worker].cpu,
+                      emit_wq, &stream->emit_work))
+        return;
+
+    atomic64_inc(&cfg->flows.tx_emit_schedule_collisions);
+    if (work_busy(&stream->emit_work)) {
+        mwan_l2_tx_flow_put(flow); /* redundant emitter reference */
+        return;
+    }
+    if (emit_wq && queue_work(emit_wq, &stream->emit_work))
+        return;
+    if (work_busy(&stream->emit_work)) {
+        mwan_l2_tx_flow_put(flow); /* work raced with the fallback */
+        return;
+    }
+    /* This is reachable only during teardown after producers should already
+     * be stopped. Drain synchronously so no committed slot is stranded. */
+    mwan_l2_tx_emit_workfn(&stream->emit_work);
+}
+
+static void mwan_l2_tx_emit_workfn(struct work_struct *work)
+{
+    struct mwan_l2_tx_stream *stream =
+        container_of(work, struct mwan_l2_tx_stream, emit_work);
+    struct mwan_l2_tx_flow *flow = stream->flow;
+    struct mwan_l2_flow_manager *manager = flow->manager;
+    struct mwan_config *cfg = manager->cfg;
+    struct mwan_l2_worker *worker = NULL;
+
+    if (stream->emitter_worker >= 0 &&
+        stream->emitter_worker < cfg->num_workers)
+        worker = &cfg->l2_workers[stream->emitter_worker];
+    if (worker)
+        atomic_inc(&worker->tx_emit_busy);
+
+    for (;;) {
+        struct sk_buff *batch[MWAN_L2_TX_EMIT_BATCH];
+        unsigned int count = 0;
+        unsigned int packets = 0;
+        unsigned int tombstones = 0;
+        unsigned int i;
+
+        local_bh_disable();
+        spin_lock(&stream->lock);
+        while (count < ARRAY_SIZE(batch)) {
+            u32 slot = stream->emit_seq & stream->ring_mask;
+            struct mwan_l2_tx_emit_slot *entry = &stream->slots[slot];
+
+            if (!entry->ready || entry->emit_seq != stream->emit_seq)
+                break;
+            batch[count++] = entry->skb;
+            entry->skb = NULL;
+            entry->emit_seq = 0;
+            entry->ready = false;
+            stream->emit_seq++;
+        }
+        if (!count) {
+            stream->emitting = false;
+            spin_unlock(&stream->lock);
+            local_bh_enable();
+            break;
+        }
+        spin_unlock(&stream->lock);
+
+        for (i = 0; i < count; i++) {
+            if (batch[i]) {
+                int ret = dev_queue_xmit(batch[i]);
+
+                packets++;
+                if (net_xmit_eval(ret))
+                    atomic64_inc(&manager->tx_emit_xmit_failures);
+            } else {
+                tombstones++;
+            }
+        }
+        local_bh_enable();
+
+        atomic64_inc(&manager->tx_emit_batches);
+        atomic64_add(packets, &manager->tx_emit_packets);
+        atomic64_add(tombstones, &manager->tx_emit_tombstones);
+        mwan_l2_atomic64_update_max(&manager->tx_emit_max_batch, count);
+        mwan_l2_tx_flow_complete_count(cfg, flow, count);
+        for (i = 0; i < count; i++)
+            mwan_l2_tx_flow_put(flow); /* slot reference */
+        if (mwan_multicore_tx_refill(cfg, flow))
+            mwan_multicore_tx_backlog_kick(cfg);
+        cond_resched();
+    }
+
+    if (worker)
+        atomic_dec(&worker->tx_emit_busy);
+    mwan_l2_tx_flow_put(flow); /* emitter reference */
 }
 
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow)
@@ -905,8 +1275,9 @@ bool mwan_l2_rx_flow_release_queued(struct mwan_config *cfg, u64 flow_token,
 
     spin_lock_bh(&bucket->lock);
     hlist_for_each_entry(flow, &bucket->head, node) {
-        if (flow->flow_token != flow_token ||
-            flow->owner_worker != owner_worker)
+        /* flow_token is globally unique for the configuration.  Packets of
+         * this flow may be queued on any crypto worker. */
+        if (flow->flow_token != flow_token)
             continue;
         if (atomic_add_unless(&flow->pending_crypto, -1, 0)) {
             mwan_l2_rx_flow_put(flow);
@@ -930,6 +1301,7 @@ void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing)
 void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                              struct sk_buff *skb, u32 flow_seq)
 {
+    struct sk_buff_head batch;
     u32 delta;
     u32 slot;
 
@@ -941,6 +1313,7 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         return;
     }
 
+    __skb_queue_head_init(&batch);
     spin_lock_bh(&flow->reorder_lock);
     if (unlikely((s32)(flow_seq - flow->expected_seq) < 0)) {
         atomic64_inc(&flow->manager->reorder_late);
@@ -955,101 +1328,97 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     delta = (u32)(flow_seq - flow->expected_seq);
     if (unlikely(delta >= MWAN_FLOW_RING_SIZE)) {
         u32 advance = delta - (MWAN_FLOW_RING_SIZE - 1);
-        u32 evicted = 0;
         u32 old_expected = flow->expected_seq;
-        u32 old_expected_slot = old_expected & MWAN_FLOW_RING_MASK;
+        u32 inspect = min_t(u32, advance, MWAN_FLOW_RING_SIZE);
+        u32 delivered = 0;
         u32 preserved = 0;
         int i;
 
         /* This function is reached only after AES-GCM authentication has
-         * succeeded.  A validated packet to the right of the receive window
-         * must advance the window.  Slide only far enough to include the new
-         * packet and retain every buffered packet which overlaps the new
-         * window.  The old flush-all policy amplified a small sequence gap
-         * into loss of all authenticated packets already held in the ring.
-         *
-         * Every occupied slot belongs to the current window, so its offset
-         * from old_expected is recoverable from the masked slot index.  This
-         * avoids per-slot sequence metadata and keeps the normal fast path
-         * and RX-flow memory footprint unchanged apart from the larger ring. */
+         * succeeded. Slide only far enough to include it. Buffered packets
+         * that leave the window are emitted in sequence order; only sequence
+         * numbers that are genuinely absent are skipped. */
         atomic64_inc(&flow->manager->reorder_too_far);
-        mwan_rekey_diag_count_drop(flow->manager->cfg,
-                                   MWAN_REKEY_DROP_REORDER_TOO_FAR, 0);
         atomic64_inc(&flow->manager->reorder_resync);
-        atomic64_add(advance, &flow->manager->reorder_resync_skipped);
-        for (i = 0; i < MWAN_FLOW_RING_SIZE; i++) {
-            u32 offset;
+        for (i = 0; i < inspect; i++) {
+            u32 seq = flow->expected_seq + i;
+            u32 old_slot = seq & MWAN_FLOW_RING_MASK;
+            struct sk_buff *old = flow->ring[old_slot];
 
-            if (!flow->ring[i])
+            if (!old || flow->slot_seq[old_slot] != seq)
                 continue;
-            offset = ((u32)i - old_expected_slot) &
-                     MWAN_FLOW_RING_MASK;
-            if (offset >= advance) {
-                preserved++;
-                continue;
-            }
-            mwan_reorder_drop_trace(MWAN_DROP_REORDER_EVICT, flow,
-                                    flow->ring[i], old_expected + offset,
-                                    0, 0, -ENOBUFS);
-            kfree_skb(flow->ring[i]);
-            flow->ring[i] = NULL;
-            flow->slot_time[i] = 0;
+            flow->ring[old_slot] = NULL;
+            flow->slot_seq[old_slot] = 0;
+            flow->slot_time[old_slot] = 0;
             flow->reorder_queued--;
-            evicted++;
+            delivered++;
+            mwan_l2_rx_batch_append(flow, &batch, old);
         }
-        if (evicted)
-            atomic64_add(evicted,
-                         &flow->manager->reorder_resync_flushed);
+        atomic64_add((u64)advance - delivered,
+                     &flow->manager->reorder_resync_skipped);
+        flow->expected_seq += advance;
+        for (i = 0; i < MWAN_FLOW_RING_SIZE; i++)
+            if (flow->ring[i])
+                preserved++;
         if (preserved)
             atomic64_add(preserved,
                          &flow->manager->reorder_resync_preserved);
-        flow->expected_seq += advance;
         if (READ_ONCE(mwan_l2_diag_enabled)) {
-            /* Keep the legacy line stable for existing log parsers. */
-            pr_warn_ratelimited("mwan_kmod: L2D REORDER_TOO_FAR token=%016llx expected=%u received=%u gap=%u flushed=%u window=%u\n",
+            pr_warn_ratelimited("mwan_kmod: L2D REORDER_TOO_FAR token=%016llx expected=%u received=%u gap=%u flushed=0 window=%u\n",
                                 flow->flow_token, old_expected, flow_seq,
-                                delta, evicted, MWAN_FLOW_RING_SIZE);
-            pr_warn_ratelimited("mwan_kmod: L2D REORDER_SLIDE token=%016llx advanced=%u preserved=%u new_expected=%u\n",
-                                flow->flow_token, advance, preserved,
-                                flow->expected_seq);
+                                delta, MWAN_FLOW_RING_SIZE);
+            pr_warn_ratelimited("mwan_kmod: L2D REORDER_SLIDE token=%016llx advanced=%u delivered=%u preserved=%u new_expected=%u\n",
+                                flow->flow_token, advance, delivered,
+                                preserved, flow->expected_seq);
         }
     }
 
     slot = flow_seq & MWAN_FLOW_RING_MASK;
     if (unlikely(flow->ring[slot])) {
-        atomic64_inc(&flow->manager->reorder_duplicate);
-        spin_unlock_bh(&flow->reorder_lock);
-        mwan_reorder_drop_trace(MWAN_DROP_REORDER_DUPLICATE, flow, skb,
-                                flow_seq, 0, 0, -EEXIST);
-        kfree_skb(skb);
-        return;
+        if (flow->slot_seq[slot] == flow_seq) {
+            atomic64_inc(&flow->manager->reorder_duplicate);
+            spin_unlock_bh(&flow->reorder_lock);
+            if (!skb_queue_empty(&batch))
+                mwan_l2_rx_reinject_batch(flow, &batch);
+            mwan_reorder_drop_trace(MWAN_DROP_REORDER_DUPLICATE, flow, skb,
+                                    flow_seq, 0, 0, -EEXIST);
+            kfree_skb(skb);
+            return;
+        }
+        /* Two distinct sequence numbers cannot occupy one slot while both
+         * are inside the active receive window. Recover stale metadata without
+         * sacrificing the newly authenticated packet. */
+        WARN_ON_ONCE(1);
+        mwan_reorder_drop_trace(MWAN_DROP_REORDER_EVICT, flow,
+                                flow->ring[slot], flow->slot_seq[slot],
+                                0, 0, -ENOBUFS);
+        kfree_skb(flow->ring[slot]);
+        flow->ring[slot] = NULL;
+        flow->slot_seq[slot] = 0;
+        flow->slot_time[slot] = 0;
+        flow->reorder_queued--;
+        atomic64_inc(&flow->manager->reorder_resync_flushed);
     }
     flow->ring[slot] = skb;
+    flow->slot_seq[slot] = flow_seq;
     flow->slot_time[slot] = (u32)jiffies;
     flow->reorder_queued++;
     while (1) {
         u32 expected_slot = flow->expected_seq & MWAN_FLOW_RING_MASK;
         struct sk_buff *pending = flow->ring[expected_slot];
-        u32 delivered_seq;
-        u32 packet_len;
-        int ifindex;
-        int rx_ret;
 
-        if (!pending)
+        if (!pending || flow->slot_seq[expected_slot] != flow->expected_seq)
             break;
-        delivered_seq = flow->expected_seq;
-        packet_len = pending->len;
-        ifindex = pending->dev ? pending->dev->ifindex : 0;
         flow->ring[expected_slot] = NULL;
+        flow->slot_seq[expected_slot] = 0;
         flow->slot_time[expected_slot] = 0;
         flow->reorder_queued--;
         flow->expected_seq++;
-        rx_ret = netif_rx(pending);
-        if (unlikely(rx_ret == NET_RX_DROP))
-            mwan_reorder_drop_trace(MWAN_DROP_NETIF_RX, flow, NULL,
-                                    delivered_seq, packet_len, ifindex,
-                                    rx_ret);
+        mwan_l2_rx_batch_append(flow, &batch, pending);
     }
     mwan_l2_reorder_arm_locked(flow);
     spin_unlock_bh(&flow->reorder_lock);
+
+    if (!skb_queue_empty(&batch))
+        mwan_l2_rx_reinject_batch(flow, &batch);
 }

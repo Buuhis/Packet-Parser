@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 7
+#define MWAN_GENL_VERSION 8
 #define MWAN_GENL_PEER_EVENTS_GROUP "peer_events"
 
 /* ---- Crypto Constants ---- */
@@ -73,6 +73,8 @@ enum mwan_genl_cmds {
     MWAN_CMD_SET_DATAPATH_GATE, /* full -id: block/unblock active data paths */
     MWAN_CMD_DETACH_TUNNEL,    /* release one data tunnel independently of key */
     MWAN_CMD_PEER_CHANGED,     /* kernel multicast: discovery learned a new peer */
+    MWAN_CMD_SET_LB_MODE,      /* select per-flow or per-packet for data traffic */
+    MWAN_CMD_GET_LB_MODE,      /* query the current data load-balance mode */
     __MWAN_CMD_MAX,
 };
 #define MWAN_CMD_MAX (__MWAN_CMD_MAX - 1)
@@ -104,6 +106,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_DATAPATH_BLOCKED,  /* u8: 1=fail closed, 0=allow active cfg */
     MWAN_ATTR_PEER_GENERATION,   /* u32: monotonic discovery peer identity */
     MWAN_ATTR_NONCE_DOMAIN,      /* u8: identity-ordered L2-PQC nonce half */
+    MWAN_ATTR_LB_MODE,           /* u8: enum mwan_lb_mode */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)
@@ -112,6 +115,11 @@ enum mwan_pqc_key_state {
     MWAN_PQC_KEY_STABLE = 0,
     MWAN_PQC_KEY_STAGED,
     MWAN_PQC_KEY_ACTIVE_WITH_PREV,
+};
+
+enum mwan_lb_mode {
+    MWAN_LB_PER_FLOW = 0,
+    MWAN_LB_PER_PACKET = 1,
 };
 
 /* ---- Tunnel Sub-Attributes ---- */
