@@ -2823,7 +2823,7 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
      * override only the egress tunnel while retaining one flow object for
      * home accounting, the token and L2-PQC sequence ordering. */
     if (unlikely(READ_ONCE(flow->tunnel_idx) != tunnel_idx) &&
-        !allow_tunnel_override) {
+        !allow_tunnel_override && READ_ONCE(cfg->weight_enabled)) {
         mwan_rekey_diag_count_drop(cfg, MWAN_REKEY_DROP_TX_FLOW, 0);
         mwan_worker_drop_trace(MWAN_DROP_TX_TUNNEL_INVALID, NULL, skb,
                                flow->flow_token, MWAN_DROP_SEQ_UNKNOWN,

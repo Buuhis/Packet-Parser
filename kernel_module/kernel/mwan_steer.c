@@ -364,6 +364,30 @@ static unsigned int mwan_hook_post_routing(void *priv, struct sk_buff *skb, cons
     // pr_info_ratelimited("mwan_kmod: MATCHED managed tunnel: %s (ifindex: %d). Steering flow...\n",
     //                     state->out->name, state->out->ifindex);
 
+    /* Routing-only policy: preserve Linux's selected device, including when
+     * BFD reports DOWN. BFD publication/query stays active independently.
+     * Plaintext retains the normal IPv4 output path; crypto still runs. */
+    if (!READ_ONCE(cfg->weight_enabled)) {
+        struct mwan_tunnel *routed =
+            find_mwan_tunnel(cfg, state->out->ifindex);
+        unsigned int ret;
+
+        if (!routed) {
+            rcu_read_unlock();
+            return NF_DROP;
+        }
+        if (routed->encap_type == MWAN_ENCAP_NONE) {
+            rcu_read_unlock();
+            return NF_ACCEPT;
+        }
+        ret = nf_conntrack_confirm(skb);
+        if (ret == NF_ACCEPT)
+            ret = mwan_dispatch_encap(skb, cfg,
+                                     (u8)(routed - cfg->tunnels), NULL);
+        rcu_read_unlock();
+        return ret;
+    }
+
     /* Steer & Encrypt all matched tunnel traffic */
 
     /* 2. Hash: Use kernel-cached/hardware RSS hash, but fallback to custom L3-only hash for IP fragments */

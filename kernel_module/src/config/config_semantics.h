@@ -7,7 +7,7 @@
 
 /* Validate the complete userspace weight snapshot. Enabled profiles use
  * integer percentages (0..100) whose sum is exactly 100. Disabled profiles
- * are normalized by the DB loader to equal runtime weights of one. */
+ * use an explicit disabled flag and do not require a nonzero weight sum. */
 bool config_weights_valid(const app_config_t *cfg);
 
 /* Compare only values consumed by the running userspace/kernel datapath.
@@ -20,7 +20,8 @@ bool config_kernel_equal(const app_config_t *left,
                          const app_config_t *right);
 
 /* True when the only values visible to the kernel that changed are tunnel
- * weights. This permits an in-place update without replacing runtime state. */
+ * weights or weight_enabled. This permits an in-place update without
+ * replacing runtime state or restarting BFD/PQC. */
 bool config_kernel_weight_only_changed(const app_config_t *left,
                                        const app_config_t *right);
 

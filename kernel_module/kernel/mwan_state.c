@@ -54,6 +54,7 @@ mwan_active_paths_build_weights(const struct mwan_config *cfg,
         if (!tun->dev || !tun->published_up || !weight)
             continue;
         paths->active_count++;
+        paths->weights[i] = weight;
         paths->total_weight += weight;
         last_active = (int)i;
     }
@@ -543,7 +544,8 @@ int mwan_state_update(struct mwan_config *new_cfg)
         }
     }
 
-    if (new_cfg->num_tunnels && !new_cfg->total_weight) {
+    if (new_cfg->weight_enabled && new_cfg->num_tunnels &&
+        !new_cfg->total_weight) {
         pr_err("mwan_kmod: At least one tunnel weight must be non-zero\n");
         err = -EINVAL;
         goto err_release_devices;
@@ -752,7 +754,7 @@ err_release_devices:
 int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
                                      const u32 *ifindices,
                                      const u32 *weights,
-                                     u32 count)
+                                     u32 count, bool weight_enabled)
 {
     struct mwan_active_paths *new_paths;
     struct mwan_active_paths *old_paths;
@@ -824,7 +826,7 @@ int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
             goto out_unlock;
         }
     }
-    if (!total_weight) {
+    if (weight_enabled && !total_weight) {
         ret = -EINVAL;
         goto out_unlock;
     }
@@ -846,12 +848,13 @@ int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
         cfg->active_paths,
         lockdep_is_held(&mwan_cfg_update_lock));
     rcu_assign_pointer(cfg->active_paths, new_paths);
+    WRITE_ONCE(cfg->weight_enabled, weight_enabled);
     spin_unlock_bh(&cfg->tunnel_balance_lock);
 
     synchronize_rcu();
     kfree(old_paths);
-    pr_info("mwan_kmod: WEIGHT-UPDATE generation=%u tunnels=%u total=%u runtime_preserved=1\n",
-            generation, count, total_weight);
+    pr_info("mwan_kmod: WEIGHT-UPDATE generation=%u tunnels=%u total=%u enabled=%u runtime_preserved=1\n",
+            generation, count, total_weight, weight_enabled);
 
 out_unlock:
     mutex_unlock(&mwan_cfg_update_lock);

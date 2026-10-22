@@ -2,6 +2,7 @@
 
 #include "mwan_lb_mode.h"
 #include "mwan_per_packet_diag.h"
+#include "mwan_weighted_rr.h"
 #include "../mwan_multicore.h"
 #include "../mwan_state.h"
 
@@ -26,6 +27,8 @@ struct mwan_packet_entry {
     u32 generation;
     u32 packets;
     u32 window;
+    u32 cursor;
+    const struct mwan_active_paths *paths_cookie;
     unsigned long last_seen;
     u16 selected_tunnel;
     bool valid;
@@ -40,7 +43,7 @@ static struct mwan_packet_bucket *mwan_packet_table;
 static DEFINE_MUTEX(mwan_packet_mode_lock);
 
 /* A value of one is genuine packet-by-packet rotation.  The parameters stay
- * tunable for controlled comparison tests without changing the mode define. */
+ * tunable for controlled comparison tests without changing the runtime mode. */
 static unsigned int mwan_packet_tcp_window = 1U;
 static unsigned int mwan_packet_udp_window = 1U;
 static unsigned int mwan_packet_other_window = 1U;
@@ -113,67 +116,6 @@ static u32 mwan_packet_window(const struct mwan_l2_flow_key *key)
     return max_t(u32, window, 1U);
 }
 
-static bool mwan_packet_tunnel_eligible(const struct mwan_config *cfg,
-                                        u16 tunnel_idx,
-                                        u16 routed_tunnel_idx)
-{
-    const struct mwan_tunnel *tun;
-    const struct mwan_tunnel *routed;
-
-    if (!cfg || tunnel_idx >= cfg->num_tunnels ||
-        routed_tunnel_idx >= cfg->num_tunnels)
-        return false;
-    tun = &cfg->tunnels[tunnel_idx];
-    routed = &cfg->tunnels[routed_tunnel_idx];
-    return READ_ONCE(tun->published_up) && READ_ONCE(tun->weight) != 0 &&
-           READ_ONCE(tun->dev) && tun->encap_type == routed->encap_type;
-}
-
-static int mwan_packet_pick_nth(const struct mwan_config *cfg,
-                                u16 routed_tunnel_idx, u32 ordinal,
-                                u16 *selected)
-{
-    u32 eligible = 0;
-    u32 i;
-
-    for (i = 0; i < cfg->num_tunnels; i++) {
-        if (mwan_packet_tunnel_eligible(cfg, (u16)i, routed_tunnel_idx))
-            eligible++;
-    }
-    if (!eligible)
-        return -ENETDOWN;
-    ordinal %= eligible;
-    for (i = 0; i < cfg->num_tunnels; i++) {
-        if (!mwan_packet_tunnel_eligible(cfg, (u16)i,
-                                         routed_tunnel_idx))
-            continue;
-        if (!ordinal--) {
-            *selected = (u16)i;
-            return 0;
-        }
-    }
-    return -ENETDOWN;
-}
-
-static int mwan_packet_pick_after(const struct mwan_config *cfg,
-                                  u16 routed_tunnel_idx,
-                                  u16 current_tunnel,
-                                  u16 *selected)
-{
-    u32 step;
-
-    for (step = 1; step <= cfg->num_tunnels; step++) {
-        u16 candidate = (u16)((current_tunnel + step) % cfg->num_tunnels);
-
-        if (mwan_packet_tunnel_eligible(cfg, candidate,
-                                        routed_tunnel_idx)) {
-            *selected = candidate;
-            return 0;
-        }
-    }
-    return -ENETDOWN;
-}
-
 bool mwan_per_packet_enabled(void)
 {
     return mwan_lb_per_packet_enabled() &&
@@ -229,24 +171,6 @@ out:
     return ret;
 }
 
-static void mwan_packet_advance(struct mwan_config *cfg,
-                                struct mwan_packet_entry *entry,
-                                u16 routed_tunnel_idx)
-{
-    u16 next;
-
-    entry->packets++;
-    if (entry->packets < entry->window)
-        return;
-    entry->packets = 0;
-    if (!mwan_packet_pick_after(cfg, routed_tunnel_idx,
-                                entry->selected_tunnel, &next) &&
-        next != entry->selected_tunnel) {
-        entry->selected_tunnel = next;
-        mwan_pp_diag_switched();
-    }
-}
-
 int mwan_per_packet_select(struct mwan_config *cfg,
                            const struct mwan_tx_flow_info *info,
                            u16 routed_tunnel_idx,
@@ -257,15 +181,30 @@ int mwan_per_packet_select(struct mwan_config *cfg,
     struct mwan_packet_entry *entry = NULL;
     struct mwan_packet_entry *victim;
     struct mwan_l2_flow_key key;
+    const struct mwan_active_paths *paths;
+    u32 weights[MAX_MWAN_TUNNELS] = {0};
     unsigned long oldest;
     u32 hash;
     u32 way;
     int err = 0;
+    u32 i;
 
-    if (!cfg || !info || !selected_tunnel_idx || !mwan_per_packet_enabled())
+    if (!cfg || !info || !selected_tunnel_idx || !mwan_per_packet_enabled() ||
+        !READ_ONCE(cfg->weight_enabled))
         return -EINVAL;
     if (routed_tunnel_idx >= cfg->num_tunnels)
         return -EINVAL;
+
+    /* Caller holds RCU. Use the same immutable BFD/weight publication as
+     * per-flow admission, but preserve exact ratios rather than LUT slots. */
+    paths = rcu_dereference(cfg->active_paths);
+    if (!paths)
+        return -ENETDOWN;
+    for (i = 0; i < cfg->num_tunnels; i++)
+        if (READ_ONCE(cfg->tunnels[i].dev) &&
+            cfg->tunnels[i].encap_type ==
+                cfg->tunnels[routed_tunnel_idx].encap_type)
+            weights[i] = paths->weights[i];
 
     key = info->key;
     mwan_packet_normalize_key(&key);
@@ -304,22 +243,29 @@ int mwan_per_packet_select(struct mwan_config *cfg,
         entry->key = key;
         entry->generation = cfg->generation;
         entry->window = mwan_packet_window(&key);
-        err = mwan_packet_pick_nth(cfg, routed_tunnel_idx, hash,
-                                   &entry->selected_tunnel);
-        if (err)
-            goto out;
+        entry->cursor = hash;
         entry->valid = true;
-    } else if (!mwan_packet_tunnel_eligible(
-                   cfg, entry->selected_tunnel, routed_tunnel_idx)) {
-        err = mwan_packet_pick_nth(cfg, routed_tunnel_idx, hash,
-                                   &entry->selected_tunnel);
-        if (err)
-            goto out;
+    }
+    if (entry->paths_cookie != paths ||
+        !weights[entry->selected_tunnel]) {
         entry->packets = 0;
+        entry->paths_cookie = paths;
         mwan_pp_diag_reselected();
     }
 
     entry->window = mwan_packet_window(&key);
+    if (!entry->packets) {
+        int selected = mwan_weighted_rr_pick(weights, cfg->num_tunnels,
+                                              &entry->cursor);
+
+        if (selected < 0) {
+            err = -ENETDOWN;
+            goto out;
+        }
+        if (entry->selected_tunnel != selected)
+            mwan_pp_diag_switched();
+        entry->selected_tunnel = (u16)selected;
+    }
     entry->last_seen = jiffies;
     *selected_tunnel_idx = entry->selected_tunnel;
     mwan_pp_diag_selected(entry->selected_tunnel);
@@ -332,7 +278,8 @@ int mwan_per_packet_select(struct mwan_config *cfg,
     /* Reserve the cursor while holding the bucket lock.  This is deliberate:
      * advancing only from an asynchronous completion lets multiple CPUs
      * choose the same tunnel before any completion updates the entry. */
-    mwan_packet_advance(cfg, entry, routed_tunnel_idx);
+    if (++entry->packets >= entry->window)
+        entry->packets = 0;
 out:
     spin_unlock_bh(&bucket->lock);
     return err;

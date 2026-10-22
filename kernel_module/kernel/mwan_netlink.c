@@ -51,6 +51,7 @@ static const struct nla_policy mwan_genl_policy[MWAN_ATTR_MAX + 1] = {
     [MWAN_ATTR_PEER_GENERATION] = { .type = NLA_U32 },
     [MWAN_ATTR_NONCE_DOMAIN] = { .type = NLA_U8 },
     [MWAN_ATTR_LB_MODE] = { .type = NLA_U8 },
+    [MWAN_ATTR_WEIGHT_ENABLED] = { .type = NLA_U8 },
 };
 
 int mwan_netlink_notify_peer_changed(u32 ifindex, __be32 peer_tunnel_ip,
@@ -119,11 +120,19 @@ static int mwan_genl_set_config(struct sk_buff *skb, struct genl_info *info)
         return -EINVAL;
     }
 
+    /* Do not guess disabled/enabled from equal tunnel weights. Require the
+     * explicit policy from the matching userspace protocol version. */
+    if (!info->attrs[MWAN_ATTR_WEIGHT_ENABLED] ||
+        nla_get_u8(info->attrs[MWAN_ATTR_WEIGHT_ENABLED]) > 1)
+        return -EINVAL;
+
     new_cfg = kvzalloc(sizeof(*new_cfg), GFP_KERNEL);
     if (!new_cfg)
         return -ENOMEM;
 
     new_cfg->node_id   = nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]);
+    new_cfg->weight_enabled =
+        nla_get_u8(info->attrs[MWAN_ATTR_WEIGHT_ENABLED]) != 0;
     new_cfg->generation =
         nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]);
     if (new_cfg->generation == 0) {
@@ -424,6 +433,9 @@ static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
     int err;
 
     (void)skb;
+    if (!info->attrs[MWAN_ATTR_WEIGHT_ENABLED] ||
+        nla_get_u8(info->attrs[MWAN_ATTR_WEIGHT_ENABLED]) > 1)
+        return -EINVAL;
     if (!info->attrs[MWAN_ATTR_NODE_ID] ||
         !info->attrs[MWAN_ATTR_CONFIG_GENERATION] ||
         !info->attrs[MWAN_ATTR_TUNNELS])
@@ -451,7 +463,8 @@ static int mwan_genl_set_tunnel_weights(struct sk_buff *skb,
     return mwan_state_update_tunnel_weights(
         nla_get_u32(info->attrs[MWAN_ATTR_NODE_ID]),
         nla_get_u32(info->attrs[MWAN_ATTR_CONFIG_GENERATION]),
-        ifindices, weights, count);
+        ifindices, weights, count,
+        nla_get_u8(info->attrs[MWAN_ATTR_WEIGHT_ENABLED]) != 0);
 }
 
 static int mwan_genl_rebind_tunnel(struct sk_buff *skb,

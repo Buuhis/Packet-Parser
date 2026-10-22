@@ -139,8 +139,8 @@ bool mwan_tunnel_balance_is_active(const struct mwan_config *cfg,
 
 /* Select the lowest effective load/weight, where effective load includes an
  * immediate reservation for flows admitted in the current sample. If loads
- * are equal, select the lowest active-flow count/weight. Userspace sends
- * weight=1 for every tunnel when profile weighting is disabled. The weighted
+ * are equal, select the lowest active-flow count/weight. Disabled weighting
+ * bypasses this selector and preserves Linux routing. The weighted
  * active LUT is only a stable final tie-breaker; an existing flow never uses
  * it to migrate while its pinned tunnel remains UP.
  */

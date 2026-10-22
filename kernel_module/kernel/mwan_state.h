@@ -137,6 +137,8 @@ struct mwan_tunnel {
 struct mwan_active_paths {
     u32 active_count;
     u32 total_weight;
+    /* Exact eligible weights for packet scheduling, without LUT rounding. */
+    u32 weights[MAX_MWAN_TUNNELS];
     u8 tunnel_idx_lut[MWAN_LUT_SIZE];
 };
 
@@ -549,6 +551,7 @@ struct mwan_l2_replay_manager;
 struct mwan_config {
     u32 node_id;
     u32 generation;
+    bool weight_enabled;
     u32 num_tunnels;
     u32 total_weight; /* Pre-calculated total weight */
     
@@ -558,8 +561,7 @@ struct mwan_config {
     struct mwan_tunnel tunnels[MAX_MWAN_TUNNELS];
     struct mwan_active_paths __rcu *active_paths;
 
-    /* Serializes new-flow tunnel admission and its recent-load samples. This
-     * lock is never taken for ordinary packets of an existing flow. */
+    /* Serializes new-flow tunnel admission and weight-policy publication. */
     spinlock_t tunnel_balance_lock;
     u64 tunnel_balance_sample_ns;
 
@@ -622,7 +624,7 @@ int mwan_state_update(struct mwan_config *new_cfg);
 int mwan_state_update_tunnel_weights(u32 node_id, u32 generation,
                                      const u32 *ifindices,
                                      const u32 *weights,
-                                     u32 count);
+                                     u32 count, bool weight_enabled);
 int mwan_state_set_tunnel_state(u32 ifindex, u32 generation,
                                 u32 sequence, bool up);
 int mwan_state_get_tunnel_state(u32 ifindex, u32 *generation,

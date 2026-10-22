@@ -157,7 +157,8 @@ static int parse_tunnel_row(PGresult *res, int row, bool weight_enabled,
             return -1;
         }
     }
-    tun->weight = weight_enabled ? (int)configured_weight : 1;
+    /* Disabled weighting delegates egress selection to Linux routing. */
+    tun->weight = weight_enabled ? (int)configured_weight : 0;
     tun->latency = PQgetisnull(res, row, 6) ? 0 :
                    atoi(PQgetvalue(res, row, 6));
     tun->latency_enabled = pg_bool(res, row, 7);

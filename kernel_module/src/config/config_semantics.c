@@ -16,11 +16,6 @@ bool config_weights_valid(const app_config_t *cfg)
     for (i = 0; i < cfg->sdwan_tun_count; i++) {
         int weight = cfg->sdwan_tuns[i].weight;
 
-        if (!cfg->weight_enabled) {
-            if (weight != 1)
-                return false;
-            continue;
-        }
         if (weight < 0 || weight > (int)MWAN_WEIGHT_MAX)
             return false;
         total += (unsigned int)weight;
@@ -90,6 +85,7 @@ bool config_kernel_equal(const app_config_t *left,
 
     if (!left || !right ||
         left->node_id != right->node_id ||
+        left->weight_enabled != right->weight_enabled ||
         left->sdwan_tun_count != right->sdwan_tun_count ||
         !encrypt_equal(&left->encrypt, &right->encrypt))
         return false;
@@ -128,7 +124,7 @@ bool config_kernel_weight_only_changed(const app_config_t *left,
         if (left_tun->weight != right_tun->weight)
             weight_changed = true;
     }
-    return weight_changed;
+    return weight_changed || left->weight_enabled != right->weight_enabled;
 }
 
 bool config_failover_equal(const app_config_t *left,

@@ -4,7 +4,7 @@
 #include <linux/types.h>
 
 #define MWAN_GENL_NAME "MWAN_STEER"
-#define MWAN_GENL_VERSION 8
+#define MWAN_GENL_VERSION 9
 #define MWAN_GENL_PEER_EVENTS_GROUP "peer_events"
 
 /* ---- Crypto Constants ---- */
@@ -107,6 +107,7 @@ enum mwan_genl_attrs {
     MWAN_ATTR_PEER_GENERATION,   /* u32: monotonic discovery peer identity */
     MWAN_ATTR_NONCE_DOMAIN,      /* u8: identity-ordered L2-PQC nonce half */
     MWAN_ATTR_LB_MODE,           /* u8: enum mwan_lb_mode */
+    MWAN_ATTR_WEIGHT_ENABLED,    /* u8: 0=Linux routing, 1=weighted steering */
     __MWAN_ATTR_MAX,
 };
 #define MWAN_ATTR_MAX (__MWAN_ATTR_MAX - 1)

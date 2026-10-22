@@ -508,6 +508,9 @@ enum kernel_sync_result kernel_sync_push_config(const app_context_t *ctx) {
 
     nla_put_u32(msg, MWAN_ATTR_NODE_ID, push_ctx->cfg.node_id);
     nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation);
+    if (nla_put_u8(msg, MWAN_ATTR_WEIGHT_ENABLED,
+                    push_ctx->cfg.weight_enabled ? 1 : 0) < 0)
+        goto out;
     
     struct nlattr *tunnels = nla_nest_start(msg, MWAN_ATTR_TUNNELS);
     for (size_t i = 0; i < push_ctx->cfg.sdwan_tun_count; i++) {
@@ -884,7 +887,9 @@ int kernel_sync_update_tunnel_weights(const app_context_t *ctx)
                      MWAN_CMD_SET_TUNNEL_WEIGHTS, MWAN_GENL_VERSION) ||
         nla_put_u32(msg, MWAN_ATTR_NODE_ID,
                     (uint32_t)ctx->cfg.node_id) < 0 ||
-        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0) {
+        nla_put_u32(msg, MWAN_ATTR_CONFIG_GENERATION, generation) < 0 ||
+        nla_put_u8(msg, MWAN_ATTR_WEIGHT_ENABLED,
+                    ctx->cfg.weight_enabled ? 1 : 0) < 0) {
         ret = -EMSGSIZE;
         goto out;
     }
