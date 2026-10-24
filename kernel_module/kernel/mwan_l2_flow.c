@@ -763,6 +763,8 @@ mwan_l2_tx_flow_get(struct mwan_config *cfg,
     skb_queue_head_init(&candidate->backlog);
     candidate->backlog_bytes = 0;
     candidate->owner_worker = owner;
+    candidate->pp_lane = -1;
+    candidate->pp_lane_left = 0;
     candidate->home_tunnel_idx = (u16)tunnel_idx;
     candidate->tunnel_idx = (u16)tunnel_idx;
     candidate->admission_active_count = admission_active_count;
@@ -923,6 +925,7 @@ int mwan_l2_tx_flow_prepare_stream(struct mwan_config *cfg,
     unsigned int window;
     unsigned int ring_size;
     int emitter_worker;
+    int emitter_pipeline;
 
     if (!cfg || !flow || tunnel_idx >= flow->num_streams)
         return -EINVAL;
@@ -936,6 +939,8 @@ int mwan_l2_tx_flow_prepare_stream(struct mwan_config *cfg,
                                                 tunnel_idx);
     if (emitter_worker < 0)
         return emitter_worker;
+    emitter_pipeline = mwan_l2_select_tx_emit_pipeline(cfg, flow,
+                                                        tunnel_idx);
     stream = kzalloc(struct_size(stream, slots, ring_size), GFP_ATOMIC);
     if (!stream)
         return -ENOMEM;
@@ -945,6 +950,7 @@ int mwan_l2_tx_flow_prepare_stream(struct mwan_config *cfg,
     stream->ring_mask = ring_size - 1U;
     stream->emit_seq = 1;
     stream->emitter_worker = emitter_worker;
+    stream->emitter_pipeline = emitter_pipeline;
     spin_lock_init(&stream->lock);
     INIT_WORK(&stream->emit_work, mwan_l2_tx_emit_workfn);
     flow->streams[tunnel_idx] = stream;
@@ -962,6 +968,16 @@ u32 mwan_l2_tx_flow_next_emit_seq(struct mwan_l2_tx_flow *flow,
     if (WARN_ON_ONCE(!stream))
         return 0;
     return ++stream->next_emit_seq;
+}
+
+static int mwan_l2_tx_stream_emit_cpu(const struct mwan_config *cfg,
+                                      const struct mwan_l2_tx_stream *stream)
+{
+    if (stream->emitter_pipeline >= 0 &&
+        stream->emitter_pipeline < cfg->num_pipeline_workers &&
+        cfg->pipeline_workers)
+        return cfg->pipeline_workers[stream->emitter_pipeline].cpu;
+    return cfg->l2_workers[stream->emitter_worker].cpu;
 }
 
 /* Publish one completed TX crypto operation into its flow commit ring.  The
@@ -1043,7 +1059,7 @@ void mwan_l2_tx_flow_publish(struct mwan_config *cfg,
         return;
     emit_wq = READ_ONCE(cfg->flows.tx_emit_wq);
     if (likely(emit_wq) &&
-        queue_work_on(cfg->l2_workers[stream->emitter_worker].cpu,
+        queue_work_on(mwan_l2_tx_stream_emit_cpu(cfg, stream),
                       emit_wq, &stream->emit_work))
         return;
 
@@ -1071,12 +1087,30 @@ static void mwan_l2_tx_emit_workfn(struct work_struct *work)
     struct mwan_l2_flow_manager *manager = flow->manager;
     struct mwan_config *cfg = manager->cfg;
     struct mwan_l2_worker *worker = NULL;
+    struct mwan_pipeline_worker *pipeline = NULL;
+    atomic64_t *role_emit_ns = NULL;
+    atomic64_t *role_emit_packets = NULL;
+    unsigned int budget = MWAN_L2_TX_EMIT_BUDGET;
+    bool requeued = false;
 
-    if (stream->emitter_worker >= 0 &&
-        stream->emitter_worker < cfg->num_workers)
+    /* An emitter on the output-role pool is accounted there, so crypto lane
+     * selection no longer treats its CPU as emit-busy. */
+    if (stream->emitter_pipeline >= 0 &&
+        stream->emitter_pipeline < cfg->num_pipeline_workers &&
+        cfg->pipeline_workers)
+        pipeline = &cfg->pipeline_workers[stream->emitter_pipeline];
+    else if (stream->emitter_worker >= 0 &&
+             stream->emitter_worker < cfg->num_workers)
         worker = &cfg->l2_workers[stream->emitter_worker];
-    if (worker)
+    if (pipeline) {
+        atomic_inc(&pipeline->tx_emit_busy);
+        role_emit_ns = &pipeline->role_emit_ns;
+        role_emit_packets = &pipeline->role_emit_packets;
+    } else if (worker) {
         atomic_inc(&worker->tx_emit_busy);
+        role_emit_ns = &worker->role_emit_ns;
+        role_emit_packets = &worker->role_emit_packets;
+    }
 
     for (;;) {
         struct sk_buff *batch[MWAN_L2_TX_EMIT_BATCH];
@@ -1084,8 +1118,10 @@ static void mwan_l2_tx_emit_workfn(struct work_struct *work)
         unsigned int packets = 0;
         unsigned int tombstones = 0;
         unsigned int i;
+        u64 role_start;
 
         local_bh_disable();
+        role_start = mwan_role_clock();
         spin_lock(&stream->lock);
         while (count < ARRAY_SIZE(batch)) {
             u32 slot = stream->emit_seq & stream->ring_mask;
@@ -1118,6 +1154,10 @@ static void mwan_l2_tx_emit_workfn(struct work_struct *work)
                 tombstones++;
             }
         }
+        if (role_emit_ns) {
+            mwan_role_charge(role_emit_ns, &role_start);
+            atomic64_add(packets, role_emit_packets);
+        }
         local_bh_enable();
 
         atomic64_inc(&manager->tx_emit_batches);
@@ -1130,11 +1170,29 @@ static void mwan_l2_tx_emit_workfn(struct work_struct *work)
         if (mwan_multicore_tx_refill(cfg, flow))
             mwan_multicore_tx_backlog_kick(cfg);
         cond_resched();
+        if (!--budget) {
+            struct workqueue_struct *emit_wq =
+                READ_ONCE(cfg->flows.tx_emit_wq);
+
+            /* Yield the emit CPU to other streams queued behind this run.
+             * emitting stays true, so producers do not schedule a second
+             * run, and the drain reference moves to the requeued run. */
+            if (emit_wq &&
+                queue_work_on(mwan_l2_tx_stream_emit_cpu(cfg, stream),
+                              emit_wq, &stream->emit_work)) {
+                requeued = true;
+                break;
+            }
+            budget = MWAN_L2_TX_EMIT_BUDGET;
+        }
     }
 
-    if (worker)
+    if (pipeline)
+        atomic_dec(&pipeline->tx_emit_busy);
+    else if (worker)
         atomic_dec(&worker->tx_emit_busy);
-    mwan_l2_tx_flow_put(flow); /* emitter reference */
+    if (!requeued)
+        mwan_l2_tx_flow_put(flow); /* emitter reference */
 }
 
 u32 mwan_l2_tx_flow_next_seq(struct mwan_l2_tx_flow *flow)
@@ -1298,28 +1356,20 @@ void mwan_l2_rx_flow_touch(struct mwan_l2_rx_flow *flow, bool closing)
         WRITE_ONCE(flow->closing, true);
 }
 
-void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
-                             struct sk_buff *skb, u32 flow_seq)
+/* Called with reorder_lock held. Places one authenticated packet in the
+ * reorder ring and moves every packet that is now in order onto @batch.
+ * Late and duplicate packets are traced and freed here. */
+static void mwan_l2_rx_flow_insert_locked(struct mwan_l2_rx_flow *flow,
+                                          struct sk_buff *skb, u32 flow_seq,
+                                          struct sk_buff_head *batch)
 {
-    struct sk_buff_head batch;
     u32 delta;
     u32 slot;
 
-    if (!flow || !skb) {
-        if (skb)
-            mwan_reorder_drop_trace(MWAN_DROP_RX_FLOW_FAILED, flow, skb,
-                                    flow_seq, 0, 0, -EINVAL);
-        kfree_skb(skb);
-        return;
-    }
-
-    __skb_queue_head_init(&batch);
-    spin_lock_bh(&flow->reorder_lock);
     if (unlikely((s32)(flow_seq - flow->expected_seq) < 0)) {
         atomic64_inc(&flow->manager->reorder_late);
         mwan_rekey_diag_count_drop(flow->manager->cfg,
                                    MWAN_REKEY_DROP_REORDER_LATE, 0);
-        spin_unlock_bh(&flow->reorder_lock);
         mwan_reorder_drop_trace(MWAN_DROP_REORDER_LATE, flow, skb,
                                 flow_seq, 0, 0, -ERANGE);
         kfree_skb(skb);
@@ -1352,7 +1402,7 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
             flow->slot_time[old_slot] = 0;
             flow->reorder_queued--;
             delivered++;
-            mwan_l2_rx_batch_append(flow, &batch, old);
+            mwan_l2_rx_batch_append(flow, batch, old);
         }
         atomic64_add((u64)advance - delivered,
                      &flow->manager->reorder_resync_skipped);
@@ -1377,9 +1427,6 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
     if (unlikely(flow->ring[slot])) {
         if (flow->slot_seq[slot] == flow_seq) {
             atomic64_inc(&flow->manager->reorder_duplicate);
-            spin_unlock_bh(&flow->reorder_lock);
-            if (!skb_queue_empty(&batch))
-                mwan_l2_rx_reinject_batch(flow, &batch);
             mwan_reorder_drop_trace(MWAN_DROP_REORDER_DUPLICATE, flow, skb,
                                     flow_seq, 0, 0, -EEXIST);
             kfree_skb(skb);
@@ -1414,11 +1461,49 @@ void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
         flow->slot_time[expected_slot] = 0;
         flow->reorder_queued--;
         flow->expected_seq++;
-        mwan_l2_rx_batch_append(flow, &batch, pending);
+        mwan_l2_rx_batch_append(flow, batch, pending);
     }
+}
+
+/* Deliver a run of authenticated packets of one flow. The whole run is
+ * inserted under a single reorder_lock acquisition, which keeps the ordered
+ * section short when a crypto lane completes a burst of one flow. */
+void mwan_l2_rx_flow_deliver_batch(struct mwan_l2_rx_flow *flow,
+                                   struct sk_buff **skbs, const u32 *seqs,
+                                   unsigned int count)
+{
+    struct sk_buff_head batch;
+    unsigned int i;
+
+    if (!count)
+        return;
+    if (!flow) {
+        for (i = 0; i < count; i++) {
+            if (!skbs[i])
+                continue;
+            mwan_reorder_drop_trace(MWAN_DROP_RX_FLOW_FAILED, flow, skbs[i],
+                                    seqs[i], 0, 0, -EINVAL);
+            kfree_skb(skbs[i]);
+        }
+        return;
+    }
+
+    __skb_queue_head_init(&batch);
+    spin_lock_bh(&flow->reorder_lock);
+    for (i = 0; i < count; i++)
+        if (skbs[i])
+            mwan_l2_rx_flow_insert_locked(flow, skbs[i], seqs[i], &batch);
     mwan_l2_reorder_arm_locked(flow);
     spin_unlock_bh(&flow->reorder_lock);
 
     if (!skb_queue_empty(&batch))
         mwan_l2_rx_reinject_batch(flow, &batch);
+}
+
+void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
+                             struct sk_buff *skb, u32 flow_seq)
+{
+    if (!skb)
+        return;
+    mwan_l2_rx_flow_deliver_batch(flow, &skb, &flow_seq, 1);
 }

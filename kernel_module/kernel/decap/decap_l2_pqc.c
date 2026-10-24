@@ -262,6 +262,9 @@ static void mwan_l2_update_ewma(struct mwan_l2_worker *worker, u64 sample_ns)
         old = atomic64_read(&worker->processing_ewma_ns);
         next = old ? old - (old >> 3) + ((s64)sample_ns >> 3) : sample_ns;
     } while (atomic64_cmpxchg(&worker->processing_ewma_ns, old, next) != old);
+#if MWAN_ENABLE_ROLE_STATS
+    atomic64_add(sample_ns, &worker->role_rx_ns);
+#endif
 }
 
 static bool mwan_l2_schedule_rx_worker(struct mwan_l2_worker *worker)
@@ -417,6 +420,8 @@ void mwan_l2_rx_output_worker_fn(struct work_struct *work)
         work, struct mwan_l2_worker, rx_output_work);
     struct sk_buff *skb;
     unsigned int batch = 0;
+    unsigned int packets = 0;
+    u64 role_start = mwan_role_clock();
 
     for (;;) {
         while ((skb = skb_dequeue(&worker->rx_output_queue)) != NULL) {
@@ -424,11 +429,15 @@ void mwan_l2_rx_output_worker_fn(struct work_struct *work)
             atomic64_sub(skb->truesize,
                          &worker->rx_output_queued_bytes);
             netif_rx(skb);
+            packets++;
             if (++batch == 64) {
                 batch = 0;
+                mwan_role_charge(&worker->role_rx_out_ns, &role_start);
                 cond_resched();
+                role_start = mwan_role_clock();
             }
         }
+        mwan_role_charge(&worker->role_rx_out_ns, &role_start);
 
         spin_lock_bh(&worker->rx_output_queue.lock);
         if (!skb_queue_empty(&worker->rx_output_queue)) {
@@ -439,6 +448,9 @@ void mwan_l2_rx_output_worker_fn(struct work_struct *work)
         spin_unlock_bh(&worker->rx_output_queue.lock);
         break;
     }
+#if MWAN_ENABLE_ROLE_STATS
+    atomic64_add(packets, &worker->role_rx_out_packets);
+#endif
 }
 
 static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
@@ -476,8 +488,7 @@ static int mwan_l2_enqueue_skb(struct mwan_config *cfg, struct sk_buff *skb,
      * Preserve the caller's deterministic candidate worker in that case;
      * only established flows can supply a home worker for lane selection. */
     if (flow)
-        owner = mwan_l2_select_rx_lane(cfg, diag_id, flow_seq,
-                                       READ_ONCE(flow->owner_worker));
+        owner = mwan_l2_select_rx_lane_flow(cfg, flow, diag_id, flow_seq);
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu))
         return -ENODEV;
@@ -734,12 +745,41 @@ static bool mwan_l2_release_corrupt_cb_flow(struct mwan_l2_worker *worker,
     return mwan_l2_rx_flow_release_queued(cfg, flow_token, owner);
 }
 
+#if MWAN_ENABLE_RX_DELIVER_BATCH
+/* Deliver the pending run of one flow, then release the per-packet flow
+ * references the run was holding. */
+static void mwan_l2_rx_run_flush(struct mwan_l2_rx_flow **run_flow,
+                                  struct sk_buff **skbs, u32 *seqs,
+                                  unsigned int *count)
+{
+    struct mwan_l2_rx_flow *flow = *run_flow;
+    unsigned int n = *count;
+    unsigned int i;
+
+    if (!n)
+        return;
+    mwan_l2_rx_flow_deliver_batch(flow, skbs, seqs, n);
+    for (i = 0; i < n; i++) {
+        atomic_dec(&flow->pending_crypto);
+        mwan_l2_rx_flow_put(flow);
+    }
+    *count = 0;
+    *run_flow = NULL;
+}
+#endif
+
 void mwan_l2_rx_worker_fn(struct work_struct *work)
 {
     struct mwan_l2_worker *worker = container_of(work, struct mwan_l2_worker,
                                                  work);
     struct sk_buff *skb;
     unsigned int batch = 0;
+#if MWAN_ENABLE_RX_DELIVER_BATCH
+    struct mwan_l2_rx_flow *run_flow = NULL;
+    struct sk_buff *run_skbs[MWAN_L2_RX_DELIVER_BATCH];
+    u32 run_seqs[MWAN_L2_RX_DELIVER_BATCH];
+    unsigned int run_count = 0;
+#endif
 
     atomic64_inc(&worker->work_runs);
     atomic_set(&worker->busy, 1);
@@ -761,6 +801,7 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
             u64 packet_nonce = 0;
             u64 start_ns = ktime_get_ns();
             bool pipeline_owned = false;
+            bool run_owned = false;
             int decrypt_ret;
             int replay_ret = 0;
             int ret;
@@ -1044,19 +1085,39 @@ void mwan_l2_rx_worker_fn(struct work_struct *work)
                         kfree_skb(skb);
                     }
                 } else {
+#if MWAN_ENABLE_RX_DELIVER_BATCH
+                    if (run_count &&
+                        (run_flow != flow ||
+                         run_count == MWAN_L2_RX_DELIVER_BATCH))
+                        mwan_l2_rx_run_flush(&run_flow, run_skbs, run_seqs,
+                                              &run_count);
+                    /* The run takes over this packet's flow reference. */
+                    run_flow = flow;
+                    run_skbs[run_count] = skb;
+                    run_seqs[run_count++] = flow_seq;
+                    run_owned = true;
+#else
                     mwan_l2_rx_flow_deliver(flow, skb, flow_seq);
+#endif
                 }
             }
 
-            if (flow && !pipeline_owned) {
+            if (flow && !pipeline_owned && !run_owned) {
                 atomic_dec(&flow->pending_crypto);
                 mwan_l2_rx_flow_put(flow);
             }
             if (++batch == 64) {
                 batch = 0;
+#if MWAN_ENABLE_RX_DELIVER_BATCH
+                mwan_l2_rx_run_flush(&run_flow, run_skbs, run_seqs,
+                                      &run_count);
+#endif
                 cond_resched();
             }
         }
+#if MWAN_ENABLE_RX_DELIVER_BATCH
+        mwan_l2_rx_run_flush(&run_flow, run_skbs, run_seqs, &run_count);
+#endif
 
         spin_lock_bh(&worker->rx_queue.lock);
         if (!skb_queue_empty(&worker->rx_queue)) {
@@ -1201,6 +1262,73 @@ static int mwan_l2_stats_open(struct inode *inode, struct file *file)
 static const struct file_operations mwan_l2_stats_fops = {
     .owner = THIS_MODULE,
     .open = mwan_l2_stats_open,
+    .read = seq_read,
+    .llseek = seq_lseek,
+    .release = single_release,
+};
+
+/* Cumulative busy time per data-plane role. Sample twice and divide each
+ * ns delta by the now_ns delta to get per-CPU role utilization; see
+ * tools/mwan_role_util.sh. */
+static int mwan_l2_roles_show(struct seq_file *m, void *unused)
+{
+    struct mwan_config *cfg;
+    int i;
+
+    (void)unused;
+    /* TODO(photo IMG_E4914/IMG_E4916): user will supply the full
+     * seq_printf(m, "now_ns=..." ...) header; its right end is not visible.
+     * TODO(photo IMG_E4914/IMG_E4916): user will supply the full
+     * seq_puts(m, "kind cpu..." ...) column header; its right end is not visible.
+     */
+    rcu_read_lock();
+    cfg = rcu_dereference(g_mwan_cfg);
+    if (!cfg || !cfg->l2_workers) {
+        seq_puts(m, "L2-PQC workers are not active\n");
+        rcu_read_unlock();
+        return 0;
+    }
+    for (i = 0; i < cfg->num_workers; i++) {
+        struct mwan_l2_worker *w = &cfg->l2_workers[i];
+
+        seq_printf(m, "crypto %d %lld %lld %lld %lld %lld %lld %lld %lld %d\n",
+                    w->cpu,
+                    atomic64_read(&w->role_tx_ns),
+                    atomic64_read(&w->role_rx_ns),
+                    atomic64_read(&w->role_emit_ns),
+                    atomic64_read(&w->role_rx_out_ns),
+                    atomic64_read(&w->tx_processed_packets),
+                    atomic64_read(&w->processed_packets),
+                    atomic64_read(&w->role_emit_packets),
+                    atomic64_read(&w->role_rx_out_packets),
+                    atomic_read(&w->tx_emit_busy));
+    }
+    for (i = 0; cfg->pipeline_workers && i < cfg->num_pipeline_workers;
+         i++) {
+        struct mwan_pipeline_worker *p = &cfg->pipeline_workers[i];
+
+        seq_printf(m, "output %d %lld 0 %lld %lld %lld 0 %lld %lld %d\n",
+                    p->cpu,
+                    atomic64_read(&p->role_tx_out_ns),
+                    atomic64_read(&p->role_emit_ns),
+                    atomic64_read(&p->role_rx_out_ns),
+                    atomic64_read(&p->tx_completed),
+                    atomic64_read(&p->role_emit_packets),
+                    atomic64_read(&p->rx_completed),
+                    atomic_read(&p->tx_emit_busy));
+    }
+    rcu_read_unlock();
+    return 0;
+}
+
+static int mwan_l2_roles_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, mwan_l2_roles_show, inode->i_private);
+}
+
+static const struct file_operations mwan_l2_roles_fops = {
+    .owner = THIS_MODULE,
+    .open = mwan_l2_roles_open,
     .read = seq_read,
     .llseek = seq_lseek,
     .release = single_release,
@@ -1662,6 +1790,8 @@ int mwan_decap_l2_pqc_init(void)
                             &mwan_l2_stats_fops);
         debugfs_create_file("l2_diag", 0444, mwan_debugfs_dir, NULL,
                             &mwan_l2_diag_fops);
+        debugfs_create_file("l2_roles", 0444, mwan_debugfs_dir, NULL,
+                            &mwan_l2_roles_fops);
         mwan_drop_trace_debugfs_init(mwan_debugfs_dir);
     }
     dev_add_pack(&l2_pqc_packet_type);

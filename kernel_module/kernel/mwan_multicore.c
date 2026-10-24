@@ -49,6 +49,9 @@
 #define MWAN_EMERGENCY_COOL_SAMPLES       3U
 #define MWAN_TX_QUEUE_HIGH_DIV             8U
 #define MWAN_TX_QUEUE_LOW_DIV             32U
+/* A lane keeps an in-progress per-packet burst until its queue reaches this
+ * depth; above it the remaining burst moves to a less-loaded lane. */
+#define MWAN_PP_LANE_KEEP_PACKETS (4U * MWAN_PP_LANE_BURST)
 #define MWAN_SHED_START_BP               100U
 #define MWAN_CONTROL_PQC_PORT           7090U
 #define MWAN_CONTROL_BFD_PORT_1         3784U
@@ -976,6 +979,7 @@ static void mwan_pipeline_tx_workfn(struct work_struct *work)
     struct mwan_config *cfg = pipeline->cfg;
     struct sk_buff *skb;
     unsigned int batch = 0;
+    u64 role_start = mwan_role_clock();
 
     for (;;) {
         while ((skb = skb_dequeue(&pipeline->tx_queue)) != NULL) {
@@ -1022,9 +1026,12 @@ static void mwan_pipeline_tx_workfn(struct work_struct *work)
             }
             if (++batch == 64) {
                 batch = 0;
+                mwan_role_charge(&pipeline->role_tx_out_ns, &role_start);
                 cond_resched();
+                role_start = mwan_role_clock();
             }
         }
+        mwan_role_charge(&pipeline->role_tx_out_ns, &role_start);
         spin_lock_bh(&pipeline->tx_queue.lock);
         if (!skb_queue_empty(&pipeline->tx_queue)) {
             spin_unlock_bh(&pipeline->tx_queue.lock);
@@ -1043,6 +1050,7 @@ static void mwan_pipeline_rx_workfn(struct work_struct *work)
     struct mwan_config *cfg = pipeline->cfg;
     struct sk_buff *skb;
     unsigned int batch = 0;
+    u64 role_start = mwan_role_clock();
 
     for (;;) {
         while ((skb = skb_dequeue(&pipeline->rx_queue)) != NULL) {
@@ -1080,9 +1088,12 @@ static void mwan_pipeline_rx_workfn(struct work_struct *work)
             }
             if (++batch == 64) {
                 batch = 0;
+                mwan_role_charge(&pipeline->role_rx_out_ns, &role_start);
                 cond_resched();
+                role_start = mwan_role_clock();
             }
         }
+        mwan_role_charge(&pipeline->role_rx_out_ns, &role_start);
         spin_lock_bh(&pipeline->rx_queue.lock);
         if (!skb_queue_empty(&pipeline->rx_queue)) {
             spin_unlock_bh(&pipeline->rx_queue.lock);
@@ -2157,6 +2168,169 @@ int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
                                    false);
 }
 
+#if MWAN_ENABLE_PP_LANE_BURST
+/* A burst may stay on (or start on) a lane while that lane admits work and
+ * its directional queue is below limit packets. */
+static bool mwan_pp_lane_open(const struct mwan_config *cfg, int idx,
+                               bool tx, u64 limit)
+{
+    const struct mwan_l2_worker *worker;
+    u64 queued;
+
+    if (idx < 0 || idx >= cfg->num_workers)
+        return false;
+    worker = &cfg->l2_workers[idx];
+    if (!cpu_online(worker->cpu) ||
+        atomic_read(&worker->admission_blocked))
+        return false;
+    if (tx && (atomic_read(&worker->emergency_shed) ||
+               mwan_tx_worker_queue_high(worker)))
+        return false;
+    queued = tx ? atomic64_read(&worker->tx_queued_packets) :
+                  atomic64_read(&worker->queued_packets);
+    return queued < limit;
+}
+#endif
+
+/* Non-strict flow-based lane selection for one per-packet flow.  Keeping a
+ * burst of consecutive sequence numbers on one lane keeps flow state in one
+ * CPU cache and hands the emitter and the RX reorder ring contiguous runs.
+ * The home lane is preferred; only while it already holds a full burst does
+ * the next burst spill to the least-loaded lane.  Caller holds submit_lock. */
+int mwan_l2_select_tx_lane_flow(const struct mwan_config *cfg,
+                                struct mwan_l2_tx_flow *flow, u32 flow_seq)
+{
+    int home;
+#if MWAN_ENABLE_PP_LANE_BURST
+    int lane;
+#endif
+
+    if (!cfg || !flow || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -1;
+    home = READ_ONCE(flow->owner_worker);
+#if MWAN_ENABLE_PP_LANE_BURST
+    if (flow->pp_lane_left &&
+        mwan_pp_lane_open(cfg, flow->pp_lane, true,
+                           MWAN_PP_LANE_KEEP_PACKETS)) {
+        flow->pp_lane_left--;
+        return flow->pp_lane;
+    }
+    if (mwan_pp_lane_open(cfg, home, true, MWAN_PP_LANE_BURST))
+        lane = home;
+    else
+        lane = mwan_select_packet_lane(cfg, flow->flow_id, flow_seq, home,
+                                         true);
+    flow->pp_lane = lane;
+    flow->pp_lane_left = lane >= 0 ? MWAN_PP_LANE_BURST - 1U : 0;
+    return lane;
+#else
+    return mwan_select_packet_lane(cfg, flow->flow_id, flow_seq, home, true);
+#endif
+}
+
+/* RX counterpart.  Packets of one flow arrive on several ingress CPUs at
+ * once, so the burst decision lives in an atomic hint keyed by sequence
+ * block instead of a locked countdown. */
+int mwan_l2_select_rx_lane_flow(const struct mwan_config *cfg,
+                                struct mwan_l2_rx_flow *flow, u32 flow_id,
+                                u32 flow_seq)
+{
+    int home;
+#if MWAN_ENABLE_PP_LANE_BURST
+    u32 block;
+    u64 hint;
+    int lane;
+#endif
+
+    if (!cfg || !flow || !cfg->l2_workers || cfg->num_workers <= 0)
+        return -1;
+    home = READ_ONCE(flow->owner_worker);
+#if MWAN_ENABLE_PP_LANE_BURST
+    block = flow_seq / MWAN_PP_LANE_BURST;
+    hint = (u64)atomic64_read(&flow->lane_hint);
+    lane = (int)lower_32_bits(hint) - 1;
+    if (upper_32_bits(hint) == block &&
+        mwan_pp_lane_open(cfg, lane, false, MWAN_PP_LANE_KEEP_PACKETS))
+        return lane;
+    if (mwan_pp_lane_open(cfg, home, false, MWAN_PP_LANE_BURST))
+        lane = home;
+    else
+        lane = mwan_select_packet_lane(cfg, flow_id, flow_seq, home, false);
+    if (lane >= 0)
+        atomic64_set(&flow->lane_hint,
+                     (s64)(((u64)block << 32) | (u32)(lane + 1)));
+    return lane;
+#else
+    return mwan_select_packet_lane(cfg, flow_id, flow_seq, home, false);
+#endif
+}
+
+#if MWAN_ENABLE_PP_ROLE_EMIT && MWAN_ENABLE_ROLE_PIPELINE && \
+    MWAN_ENABLE_FIXED_ROLE_LAYOUT
+static bool mwan_tx_flow_emits_on(const struct mwan_l2_tx_flow *flow,
+                                   u16 tunnel_idx, int pipeline_idx)
+{
+    u16 i;
+
+    for (i = 0; i < flow->num_streams; i++) {
+        const struct mwan_l2_tx_stream *stream = flow->streams[i];
+
+        if (i != tunnel_idx && stream &&
+            stream->emitter_pipeline == pipeline_idx)
+            return true;
+    }
+    return false;
+}
+#endif
+
+/* Pick an output-role CPU for a per-packet stream emitter so dev_queue_xmit()
+ * never runs on a crypto lane.  The first pass keeps the tunnels of one flow
+ * on different output CPUs so their ordered emitters run concurrently.
+ * Returns -1 when no dedicated role pool exists.  Caller holds submit_lock. */
+int mwan_l2_select_tx_emit_pipeline(const struct mwan_config *cfg,
+                                    const struct mwan_l2_tx_flow *flow,
+                                    u16 tunnel_idx)
+{
+#if MWAN_ENABLE_PP_ROLE_EMIT && MWAN_ENABLE_ROLE_PIPELINE && \
+    MWAN_ENABLE_FIXED_ROLE_LAYOUT
+    int best_busy = INT_MAX;
+    int best = -1;
+    int start;
+    int pass;
+    int off;
+
+    if (!cfg || !flow || !cfg->pipeline_workers ||
+        cfg->num_pipeline_workers <= 0)
+        return -1;
+    start = jhash_2words(flow->flow_id, tunnel_idx, 0x656d6974U) %
+            cfg->num_pipeline_workers;
+    for (pass = 0; pass < 2 && best < 0; pass++) {
+        for (off = 0; off < cfg->num_pipeline_workers; off++) {
+            int idx = (start + off) % cfg->num_pipeline_workers;
+            const struct mwan_pipeline_worker *worker =
+                &cfg->pipeline_workers[idx];
+            int busy;
+
+            if (!(worker->role_mask & MWAN_PIPELINE_ROLE_TX) ||
+                !cpu_online(worker->cpu) ||
+                (!pass && mwan_tx_flow_emits_on(flow, tunnel_idx, idx)))
+                continue;
+            busy = atomic_read(&worker->tx_emit_busy);
+            if (busy < best_busy) {
+                best = idx;
+                best_busy = busy;
+            }
+        }
+    }
+    return best;
+#else
+    (void)cfg;
+    (void)flow;
+    (void)tunnel_idx;
+    return -1;
+#endif
+}
+
 u64 mwan_multicore_admitted_get(void)
 {
     return atomic64_read(&mwan_new_flow_admitted);
@@ -2710,8 +2884,7 @@ bool mwan_multicore_tx_refill(struct mwan_config *cfg,
             break;
 
         seq = (u32)atomic_read(&flow->next_seq) + 1U;
-        owner = mwan_l2_select_tx_lane(cfg, flow->flow_id, seq,
-                                       READ_ONCE(flow->owner_worker));
+        owner = mwan_l2_select_tx_lane_flow(cfg, flow, seq);
         if (owner < 0 || owner >= cfg->num_workers ||
             !cpu_online(cfg->l2_workers[owner].cpu))
             break;
@@ -2848,8 +3021,7 @@ int mwan_multicore_tx_submit(struct sk_buff *skb, struct mwan_config *cfg,
             return err;
         }
         execution_window = mwan_l2_tx_execution_window(cfg);
-        owner = mwan_l2_select_tx_lane(cfg, info->flow_id, candidate_seq,
-                                       owner);
+        owner = mwan_l2_select_tx_lane_flow(cfg, flow, candidate_seq);
     }
     if (owner < 0 || owner >= cfg->num_workers ||
         !cpu_online(cfg->l2_workers[owner].cpu)) {
@@ -3103,6 +3275,9 @@ void mwan_l2_tx_worker_fn(struct work_struct *work)
             processing_ns = ktime_get_ns() - start_ns;
             mwan_atomic64_update_ewma(&worker->tx_processing_ewma_ns,
                                       processing_ns);
+#if MWAN_ENABLE_ROLE_STATS
+            atomic64_add(processing_ns, &worker->role_tx_ns);
+#endif
             if (cb_ok && encap_type == MWAN_ENCAP_L2_PQC)
                 mwan_bitrate_account(&worker->tx_bitrate, processing_ns,
                                      transmitted_bytes);

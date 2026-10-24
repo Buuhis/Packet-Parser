@@ -9,6 +9,7 @@
 #include <linux/spinlock.h>
 #include <linux/timer.h>
 #include <linux/jiffies.h>
+#include <linux/ktime.h>
 #include <linux/workqueue.h>
 #include <linux/wait.h>
 #include <linux/if_ether.h>
@@ -47,7 +48,27 @@
 #define MWAN_L2_TX_BACKLOG_GLOBAL_BYTES   (64U * 1024U * 1024U)
 #define MWAN_L2_TX_BACKLOG_RETRY msecs_to_jiffies(10)
 #define MWAN_L2_TX_EMIT_BATCH       16U
+/* Batches one emitter run may send before it requeues itself.  mwan_emit runs
+ * one work item per CPU at a time, so this keeps streams sharing an emit CPU
+ * from starving each other under continuous traffic. */
+#define MWAN_L2_TX_EMIT_BUDGET      8U
 #define MWAN_L2_RX_OUTPUT_BATCH     32U
+/* Per-packet crypto lanes use non-strict flow-based distribution: a flow keeps
+ * MWAN_PP_LANE_BURST consecutive sequence numbers on one lane, prefers its
+ * home lane, and spills a burst to the least-loaded lane only while the home
+ * lane already holds a full burst.  0 restores per-packet least-loaded lanes.
+ * Like the other datapath switches these are compile-time only. */
+#define MWAN_ENABLE_PP_LANE_BURST   1
+#define MWAN_PP_LANE_BURST          8U
+/* Run per-packet stream emitters on the output-role pool CPUs instead of the
+ * crypto lanes.  Without a role pool the emitter stays on a crypto lane. */
+#define MWAN_ENABLE_PP_ROLE_EMIT    1
+/* Insert consecutive authenticated RX packets of one flow into the reorder
+ * ring under a single reorder_lock acquisition. */
+#define MWAN_ENABLE_RX_DELIVER_BATCH 1
+#define MWAN_L2_RX_DELIVER_BATCH    16U
+/* Cumulative busy time per data-plane role, exposed in debugfs l2_roles. */
+#define MWAN_ENABLE_ROLE_STATS      1
 #define MWAN_L2_DIAG_MAX_FLOWS    128
 #define MWAN_FLOW_COOKIE_MASK GENMASK_ULL(55, 0)
 #define MWAN_FLOW_KEY_ID_SHIFT 56
@@ -188,6 +209,9 @@ struct mwan_l2_tx_stream {
     u16 ring_size;
     u16 ring_mask;
     int emitter_worker;
+    /* Output-role pool index when the emitter runs off the crypto lanes;
+     * -1 keeps it on emitter_worker. */
+    int emitter_pipeline;
     bool emitting;
     struct mwan_l2_tx_emit_slot slots[];
 };
@@ -230,6 +254,9 @@ struct mwan_l2_tx_flow {
     struct mwan_l2_tx_stream **streams;
     u16 num_streams;
     int owner_worker;
+    /* Per-packet lane burst state, protected by submit_lock. */
+    int pp_lane;
+    u16 pp_lane_left;
     /* Keep the path chosen when the flow was admitted. Failover changes only
      * tunnel_idx, so a recovered path can be restored without re-hashing or
      * disturbing flows that were never failed over. */
@@ -256,6 +283,9 @@ struct mwan_l2_rx_flow {
      * moves authenticated reorder/reinjection onto a pipeline egress CPU. */
     atomic_t exec_mode;
     int pipeline_worker;
+    /* RX lane burst hint: (flow_seq / MWAN_PP_LANE_BURST) << 32 | lane + 1.
+     * Ingress CPUs race benignly; a lost update only splits one burst. */
+    atomic64_t lane_hint;
     unsigned long last_seen;
     bool closing;
     bool stopping;
@@ -309,6 +339,34 @@ static inline u32 mwan_l2_rx_cb_checksum(const struct mwan_l2_rx_cb *cb)
 static inline u8 mwan_netdev_reg_state(const struct net_device *dev) {
     return dev->reg_state;
 }
+
+/* Role busy-time accounting.  Charge before every cond_resched() and restart
+ * the clock after it so time spent by other tasks is never attributed. */
+#if MWAN_ENABLE_ROLE_STATS
+static inline u64 mwan_role_clock(void)
+{
+    return ktime_get_ns();
+}
+
+static inline void mwan_role_charge(atomic64_t *counter, u64 *start)
+{
+    u64 now = ktime_get_ns();
+
+    atomic64_add(now - *start, counter);
+    *start = now;
+}
+#else
+static inline u64 mwan_role_clock(void)
+{
+    return 0;
+}
+
+static inline void mwan_role_charge(atomic64_t *counter, u64 *start)
+{
+    (void)counter;
+    (void)start;
+}
+#endif
 
 struct mwan_l2_tx_cb {
     uintptr_t flow_ptr;
@@ -505,6 +563,14 @@ struct mwan_l2_worker {
     atomic64_t rx_ecn_marked;
     atomic64_t tx_overload_dropped;
     atomic64_t tx_control_preserved;
+    /* Cumulative ns spent in each role on this CPU.  Readers sample twice and
+     * divide the delta by wall time, like sw-cio on IOS XE. */
+    atomic64_t role_tx_ns;
+    atomic64_t role_rx_ns;
+    atomic64_t role_emit_ns;
+    atomic64_t role_rx_out_ns;
+    atomic64_t role_emit_packets;
+    atomic64_t role_rx_out_packets;
 
     /* One counter set per worker prevents every TX CPU from modifying the
      * same tunnel cache line for every packet. The balance sampler aggregates
@@ -544,6 +610,12 @@ struct mwan_pipeline_worker {
     atomic64_t rx_backpressure_events;
     atomic64_t tx_backpressure_wait_ns;
     atomic64_t rx_backpressure_wait_ns;
+    /* Per-packet stream emitters bound to this output-role CPU. */
+    atomic_t tx_emit_busy;
+    atomic64_t role_emit_ns;
+    atomic64_t role_emit_packets;
+    atomic64_t role_tx_out_ns;
+    atomic64_t role_rx_out_ns;
 };
 
 struct mwan_l2_replay_manager;
@@ -674,6 +746,14 @@ int mwan_l2_select_tx_emitter(const struct mwan_config *cfg, u32 flow_id,
                               u16 tunnel_idx);
 int mwan_l2_select_rx_lane(const struct mwan_config *cfg, u32 flow_id,
                            u32 flow_seq, int home_worker);
+int mwan_l2_select_tx_lane_flow(const struct mwan_config *cfg,
+                                struct mwan_l2_tx_flow *flow, u32 flow_seq);
+int mwan_l2_select_rx_lane_flow(const struct mwan_config *cfg,
+                                struct mwan_l2_rx_flow *flow, u32 flow_id,
+                                u32 flow_seq);
+int mwan_l2_select_tx_emit_pipeline(const struct mwan_config *cfg,
+                                    const struct mwan_l2_tx_flow *flow,
+                                    u16 tunnel_idx);
 bool mwan_l2_schedule_tx_worker(struct mwan_l2_worker *worker);
 void mwan_l2_tx_worker_fn(struct work_struct *work);
 void mwan_l2_rx_worker_fn(struct work_struct *work);
@@ -750,5 +830,9 @@ bool mwan_l2_rx_reinject_batch(struct mwan_l2_rx_flow *flow,
                                struct sk_buff_head *batch);
 void mwan_l2_rx_flow_deliver(struct mwan_l2_rx_flow *flow,
                              struct sk_buff *skb, u32 flow_seq);
+
+void mwan_l2_rx_flow_deliver_batch(struct mwan_l2_rx_flow *flow,
+                                   struct sk_buff **skbs, const u32 *seqs,
+                                   unsigned int count);
 
 #endif /* MWAN_STATE_H */
